@@ -1,0 +1,40 @@
+syntax = "proto3";
+
+package cybermesh.control.v1;
+
+// ReputationEvent represents control.reputation.v1 message from backend to AI service
+// Purpose: Provide feedback on AI detection quality for model tuning
+// TODO: BACKEND - Implement producer (currently no backend implementation)
+message ReputationEvent {
+  // Message tracking
+  string ai_message_id = 1;         // Original anomaly/evidence/policy ID
+  bytes ai_producer_id = 2;         // AI node that produced message (32-byte Ed25519 pubkey)
+  string message_type = 3;          // "anomaly", "evidence", or "policy"
+  
+  // Reputation score and feedback
+  int32 score = 4;                  // Reputation score -100 to +100
+                                    // -100 = false positive (harmful)
+                                    //    0 = neutral (uncertain)
+                                    // +100 = excellent detection (very useful)
+  
+  string reason = 5;                // Human-readable reason for score
+  
+  // Ground truth (if available)
+  bool confirmed = 6;               // True if threat confirmed by analyst
+  bool false_positive = 7;          // True if determined to be false alarm
+  string analyst_notes = 8;         // Optional analyst feedback/notes
+  
+  // Impact assessment
+  uint32 incident_severity = 9;     // Actual incident severity (1-10) if confirmed
+  bool prevented_attack = 10;       // True if AI detection prevented successful attack
+  
+  // Metadata
+  int64 timestamp = 11;             // Unix timestamp (seconds)
+  int64 block_height = 12;          // Block height where original message was committed
+  
+  // Cryptographic envelope
+  bytes producer_id = 13;           // Backend node public key (32 bytes Ed25519)
+  bytes signature = 14;             // Ed25519 signature (64 bytes)
+  bytes pubkey = 15;                // Ed25519 public key (32 bytes)
+  string alg = 16;                  // Signature algorithm "Ed25519"
+}

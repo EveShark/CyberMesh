@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package cybermesh.ai.v1;
+
+// ChainOfCustodyEntry represents a single entry in evidence chain-of-custody
+message ChainOfCustodyEntry {
+  bytes ref_hash = 1;               // Reference hash (32 bytes SHA-256)
+  bytes actor_id = 2;               // Actor public key (32 bytes Ed25519)
+  int64 ts = 3;                     // Unix timestamp (seconds)
+  bytes signature = 4;              // Ed25519 signature (64 bytes)
+}
+
+// EvidenceEvent represents ai.evidence.v1 message from AI service to backend
+// Backend consumer: backend/pkg/ingest/kafka/consumer.go
+// Backend validator: backend/pkg/ingest/kafka/verifier.go
+message EvidenceEvent {
+  // Message identification
+  string id = 1;                    // Evidence unique identifier (UUIDv4)
+  string evidence_type = 2;         // Evidence type (e.g., "pcap", "log", "network_flow")
+  
+  // References and data
+  repeated bytes refs = 3;          // References to related anomalies/evidence (32 bytes SHA-256 each, max 1000)
+  bytes proof_blob = 4;             // Binary proof data (PCAP, logs, etc., max 256KB)
+  
+  // Chain of custody
+  repeated ChainOfCustodyEntry coc = 5; // Chain-of-custody trail (max 100 entries)
+  
+  // Timing
+  int64 ts = 6;                     // Unix timestamp (seconds)
+  
+  // Cryptographic envelope
+  bytes content_hash = 7;           // SHA-256 of proof_blob (32 bytes)
+  bytes producer_id = 8;            // AI node public key (32 bytes Ed25519)
+  bytes nonce = 9;                  // Unique nonce (16 bytes binary)
+  bytes signature = 10;             // Ed25519 signature (64 bytes)
+  bytes pubkey = 11;                // Ed25519 public key (32 bytes)
+  string alg = 12;                  // Signature algorithm "Ed25519"
+}

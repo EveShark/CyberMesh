@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package cybermesh.control.v1;
+
+// CommitEvent represents control.commits.v1 message from backend to AI service
+// Purpose: Notify AI service that backend committed a block with AI-submitted transactions
+// TODO: BACKEND - Implement producer in backend/pkg/ingest/kafka/producer.go
+// Current backend: 84-byte ad-hoc binary (height, hash, root, count, ts)
+// Target: Replace with this signed protobuf message
+message CommitEvent {
+  // Block information
+  int64 height = 1;                 // Block height
+  bytes block_hash = 2;             // Block hash (32 bytes SHA-256)
+  bytes state_root = 3;             // State merkle root (32 bytes SHA-256)
+  uint32 tx_count = 4;              // Total transactions in block
+  
+  // Transaction breakdown (optional)
+  uint32 anomaly_count = 5;         // Number of anomaly transactions committed
+  uint32 evidence_count = 6;        // Number of evidence transactions committed
+  uint32 policy_count = 7;          // Number of policy transactions committed
+  
+  // Timing
+  int64 timestamp = 8;              // Unix timestamp (seconds)
+  
+  // Cryptographic envelope
+  bytes producer_id = 9;            // Backend node public key (32 bytes Ed25519)
+  bytes signature = 10;             // Ed25519 signature (64 bytes)
+  bytes pubkey = 11;                // Ed25519 public key (32 bytes)
+  string alg = 12;                  // Signature algorithm "Ed25519"
+}

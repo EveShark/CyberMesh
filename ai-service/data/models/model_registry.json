@@ -1,0 +1,61 @@
+{
+  "models": {
+    "ddos_lgbm": {
+      "version": "1.0.0",
+      "path": "ddos_lgbm_v1.0.0.pkl",
+      "fingerprint": "ee00a3273dea9f08f3ec0fc9080b674ebdc15b84ddf1b0c8040fc859be2a8049",
+      "algorithm": "LightGBM",
+      "calibration": "sigmoid",
+      "performance": {
+        "auc": 1.0,
+        "fpr": 0.0,
+        "tpr": 1.0,
+        "tp": 600,
+        "fp": 0,
+        "tn": 1000,
+        "fn": 0
+      },
+      "trained_at": "2025-10-04T05:15:56.189249Z",
+      "feature_count": 30,
+      "threat_type": "ddos"
+    },
+    "malware_lgbm": {
+      "version": "1.0.0",
+      "path": "malware_lgbm_v1.0.0.pkl",
+      "fingerprint": "187d3d650f76dff214b96180ced28293f1f917de4383c62adfe0a4647cf5aaba",
+      "algorithm": "LightGBM",
+      "calibration": "sigmoid",
+      "performance": {
+        "auc": 0.9999999999999999,
+        "fpr": 0.0,
+        "tpr": 1.0,
+        "tp": 400,
+        "fp": 0,
+        "tn": 800,
+        "fn": 0
+      },
+      "trained_at": "2025-10-04T05:17:32.671206Z",
+      "feature_count": 256,
+      "threat_type": "malware"
+    },
+    "anomaly_iforest": {
+      "version": "1.0.0",
+      "path": "anomaly_iforest_v1.0.0.pkl",
+      "fingerprint": "24019dbcbf3dbbc0b05869b3ee18ee9ef5456016c15864f002c0bbcbb49b5386",
+      "algorithm": "IsolationForest",
+      "calibration": "none",
+      "performance": {
+        "auc": 1.0,
+        "fpr": 0.10083333333333333,
+        "tpr": 1.0,
+        "tp": 200,
+        "fp": 121,
+        "tn": 1079,
+        "fn": 0
+      },
+      "trained_at": "2025-10-04T05:17:38.053948Z",
+      "feature_count": 30,
+      "threat_type": "anomaly"
+    }
+  }
+}

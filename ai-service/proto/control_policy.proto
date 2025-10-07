@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package cybermesh.control.v1;
+
+// PolicyUpdateEvent represents control.policy.v1 message from backend to AI service
+// Purpose: Update AI detection rules/policies dynamically
+// TODO: BACKEND - Implement producer (currently no backend implementation)
+message PolicyUpdateEvent {
+  // Policy identification
+  string policy_id = 1;             // Policy unique identifier
+  string action = 2;                // "add", "remove", "update", "enable", "disable"
+  
+  // Policy content
+  string rule_type = 3;             // Rule type:
+                                    // "threshold" - Adjust detection threshold
+                                    // "blacklist" - Add to blacklist
+                                    // "whitelist" - Add to whitelist
+                                    // "feature_flag" - Enable/disable feature
+                                    // "rate_limit" - Adjust rate limits
+                                    // "model_param" - Update model parameter
+  
+  bytes rule_data = 4;              // JSON-encoded rule parameters
+                                    // Examples:
+                                    // threshold: {"ddos_confidence": 0.90}
+                                    // blacklist: {"ips": ["192.168.1.100", "10.0.0.5"]}
+                                    // feature_flag: {"enable_ddos_detection": true}
+                                    // rate_limit: {"anomaly_capacity": 1000}
+  
+  // Validation and rollback
+  bytes rule_hash = 5;              // SHA-256 of rule_data for validation (32 bytes)
+  bool requires_ack = 6;            // True if AI service must acknowledge successful application
+  string rollback_policy_id = 7;    // Policy to revert to if this fails (optional)
+  
+  // Timing and scope
+  int64 timestamp = 8;              // Unix timestamp (seconds)
+  int64 effective_height = 9;       // Block height when policy takes effect
+  int64 expiration_height = 10;     // Block height when policy expires (0 = no expiration)
+  
+  // Cryptographic envelope
+  bytes producer_id = 11;           // Backend node public key (32 bytes Ed25519)
+  bytes signature = 12;             // Ed25519 signature (64 bytes)
+  bytes pubkey = 13;                // Ed25519 public key (32 bytes)
+  string alg = 14;                  // Signature algorithm "Ed25519"
+}

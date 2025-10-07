@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package cybermesh.ai.v1;
+
+// AnomalyEvent represents ai.anomalies.v1 message from AI service to backend
+// Backend consumer: backend/pkg/ingest/kafka/consumer.go
+// Backend validator: backend/pkg/ingest/kafka/verifier.go
+message AnomalyEvent {
+  // Message identification
+  string id = 1;                    // Anomaly unique identifier (UUIDv4)
+  string type = 2;                  // Anomaly type (e.g., "ddos", "port_scan", "malware")
+  string source = 3;                // Source IP/hostname
+  
+  // Detection metrics
+  uint32 severity = 4;              // Severity level 1-10 (1=low, 10=critical)
+  double confidence = 5;            // Confidence score 0.0-1.0
+  
+  // Timing and data
+  int64 ts = 6;                     // Unix timestamp (seconds)
+  bytes content_hash = 7;           // SHA-256 of payload (32 bytes)
+  bytes payload = 8;                // Binary payload data (max 512KB)
+  string model_version = 9;         // AI model version (e.g., "ddos-v1.2.0")
+  
+  // Cryptographic envelope
+  bytes producer_id = 10;           // AI node public key (32 bytes Ed25519)
+  bytes nonce = 11;                 // Unique nonce (16 bytes binary)
+  bytes signature = 12;             // Ed25519 signature (64 bytes)
+  bytes pubkey = 13;                // Ed25519 public key (32 bytes)
+  string alg = 14;                  // Signature algorithm "Ed25519"
+}

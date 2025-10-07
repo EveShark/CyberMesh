@@ -1,0 +1,151 @@
+# Claude Code
+.claude/
+
+# Environment files - Keep structure but ignore sensitive data
+.env
+.env.*
+!.env.example
+*.env
+*.env.*
+
+# Logs and runtime data
+*.log
+logs/
+*.log.*
+backend_stdout.log
+backend_stderr.log
+logs.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+.hypothesis/
+
+# AI/ML Model files and checkpoints
+ai-service/models/
+*.joblib
+*.joblib.backup
+*.pkl
+*.h5
+*.pt
+*.pth
+checkpoint_*
+*.metadata.json
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/bin/
+/pkg/
+vendor/
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+
+# Security - Keys and Certificates
+keys/
+/keys/
+*.key
+*.pem
+*.crt
+!certs/root.crt
+*.p12
+*.pfx
+*.jks
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Node.js (if applicable)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+*.backup
+*.swp
+
+# OS files
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Audit and security reports
+security_audit_*.json
+
+# Old backups
+Old env/
+/Old env/
+*.old
+
+# Tests
+ai-service/tests/
+backend/tests/
+
+# Documentation
+/docs/
+AGENTS.md
+
+# Tools
+/tools/
+
+# Scripts
+/scripts/
+
+# Protobuf generated files (optional - uncomment if you want to ignore)
+# *_pb2.py
+# *_pb2_grpc.py
+# *.pb.go
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# Local development directories
+.pytest_cache/

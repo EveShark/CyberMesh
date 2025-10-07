@@ -1,0 +1,412 @@
+## 1. ConnectionGater IP Extraction Bug (Medium Priority)
+
+```diff
+diff --git a/p2p/refactored_router.go b/p2p/router.go
+@@ -690,18 +690,23 @@ func (g *connGater) allowIP(addr multiaddr.Multiaddr) bool {
+ 		return true // no restriction
+ 	}
+-	var ip net.IP
+ 	
+-	// Extract IP from multiaddr
+-	protocols := addr.Protocols()
+-	for _, proto := range protocols {
+-		if proto.Code == multiaddr.P_IP4 || proto.Code == multiaddr.P_IP6 {
+-			val, err := addr.ValueForProtocol(proto.Code)
+-			if err == nil {
+-				ip = net.ParseIP(val)
+-				break
+-			}
+-		}
++	// Use multiaddr's built-in IP extraction
++	var ip net.IP
++	multiaddr.ForEach(addr, func(c multiaddr.Component) bool {
++		switch c.Protocol().Code {
++		case multiaddr.P_IP4, multiaddr.P_IP6:
++			ip = net.ParseIP(c.Value())
++			return false // stop iteration
++		}
++		return true // continue
++	})
++	
++	if ip == nil {
++		if g.log != nil {
++			g.log.Warn("could not extract IP from multiaddr",
++				utils.ZapString("addr", addr.String()))
++		}
++		return false
+ 	}
+-	
+-	if ip == nil {
+-		return false
+-	}
++	
+ 	for _, n := range g.allowed {
+```
+
+## 2. Peer Eviction Implementation (Low Priority but Memory Leak)
+
+```diff
+diff --git a/p2p/refactored_state.go b/p2p/state.go
+@@ -358,6 +358,35 @@ func (s *State) observeCounts() {
+ 	s.metrics.SetGauge("p2p_known_peers", float64(len(s.peers)), nil)
+ }
+ 
++// evictLowestScorePeer removes the lowest-scoring non-quarantined peer
++func (s *State) evictLowestScorePeer() {
++	var lowestID peer.ID
++	lowestScore := math.MaxFloat64
++	
++	for id, ps := range s.peers {
++		// Don't evict quarantined peers (let them expire naturally)
++		if ps.Quarantined {
++			continue
++		}
++		if ps.Score < lowestScore {
++			lowestScore = ps.Score
++			lowestID = id
++		}
++	}
++	
++	if lowestID != "" {
++		delete(s.peers, lowestID)
++		s.log.Info("evicted peer due to max limit",
++			utils.ZapString("peer_id", lowestID.String()),
++			utils.ZapFloat64("score", lowestScore),
++			utils.ZapInt("peer_count", len(s.peers)))
++	}
++}
++
+ func (s *State) ensure(id peer.ID) *PeerState {
++	// Check max peers limit
++	if len(s.peers) >= s.maxPeers {
++		s.evictLowestScorePeer()
++	}
++	
+ 	if ps, ok := s.peers[id]; ok {
+ 		return ps
+```
+
+---
+
+# Patch 1 — `router.go`
+
+```diff
+--- a/p2p/router.go
++++ b/p2p/router.go
+@@
+-	"github.com/libp2p/go-libp2p/core/routing"
+ 	"github.com/libp2p/go-libp2p/core/network"
++	"github.com/libp2p/go-libp2p/core/control"
+@@
+ 	connmgr "github.com/libp2p/go-libp2p/p2p/net/connmgr"
+ 	multiaddr "github.com/multiformats/go-multiaddr"
++	yamux "github.com/libp2p/go-libp2p/p2p/muxer/yamux"
++	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
++	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
++	mdns "github.com/libp2p/go-libp2p/p2p/discovery/mdns"
++	manet "github.com/multiformats/go-multiaddr/net"
+@@
+-	host, err := libp2p.New(
++	// Lightweight Resource Manager (autoscaled to host capacity)
++	lim := rcmgr.DefaultLimits.AutoScale()
++	rm, _ := rcmgr.NewResourceManager(rcmgr.NewFixedLimiter(lim))
++
++	host, err := libp2p.New(
+ 		libp2p.Identity(priv),
+ 		libp2p.ListenAddrStrings(listenAddrs...),
+ 		libp2p.ConnectionManager(cm),
+ 		libp2p.ConnectionGater(gater),
++		libp2p.ResourceManager(rm),
++		// modern transports/muxers & NAT traversal
++		libp2p.Transport(quic.NewTransport),
++		libp2p.Muxer(yamux.ID, yamux.DefaultTransport),
++		libp2p.NATPortMap(),
++		libp2p.EnableHolePunching(),
+ 		secOpts...,
+ 	)
+@@
+-	// discovery advertise loop
+-	go func() {
++	// advertise now, then on a schedule
++	_, _ = discovery.Advertise(ctx, rd, rendezvous)
++	go func() {
+ 		t := time.NewTicker(30 * time.Second)
+ 		defer t.Stop()
+ 		for {
+-			_, _ = discovery.Advertise(ctx, rd, rendezvous)
+ 			select {
+ 			case <-ctx.Done():
+ 				return
+ 			case <-t.C:
++				_, _ = discovery.Advertise(ctx, rd, rendezvous)
+ 			}
+ 		}
+ 	}()
+@@
++	// Optional LAN discovery (dev/test)
++	if opts.EnableMDNS {
++		if svc, err := mdns.NewMdnsService(ctx, host, rendezvous, nil); err != nil {
++			log.Warn("mdns init failed", utils.ZapError(err))
++		} else {
++			_ = svc // retain reference
++		}
++	}
+@@
+-	_, priv, err := crypto.GenerateEd25519Key(nil)
++	priv, _, err := crypto.GenerateEd25519Key(nil)
+ 	if err != nil {
+ 		return nil, "", err
+ 	}
+ 	pid, err := peer.IDFromPrivateKey(priv)
+ 	return priv, pid, err
+ }
+ 
+-func fromSeed(seed []byte) (crypto.PrivKey, peer.ID, error) {
+-	priv := ed25519.NewKeyFromSeed(seed)
+-	libPriv, _, err := crypto.KeyPairFromStdKey(&priv)
+-	if err != nil {
+-		return nil, "", err
+-	}
+-	pid, err := peer.IDFromPrivateKey(libPriv)
+-	return libPriv, pid, err
++func fromSeed(seed []byte) (crypto.PrivKey, peer.ID, error) {
++	std := ed25519.NewKeyFromSeed(seed)
++	libPriv, err := crypto.UnmarshalEd25519PrivateKey(std)
++	if err != nil {
++		return nil, "", err
++	}
++	pid, err := peer.IDFromPrivateKey(libPriv)
++	return libPriv, pid, err
+ }
+@@
+-func (g *connGater) allowIP(addr multiaddr.Multiaddr) bool {
++func (g *connGater) allowIP(addr multiaddr.Multiaddr) bool {
+ 	if len(g.allowed) == 0 {
+ 		return true // no restriction
+ 	}
+-	var ip net.IP
+-	// Extract IP from multiaddr
+-	protocols := addr.Protocols()
+-	for _, proto := range protocols {
+-		if proto.Code == multiaddr.P_IP4 || proto.Code == multiaddr.P_IP6 {
+-			val, err := addr.ValueForProtocol(proto.Code)
+-			if err == nil {
+-				ip = net.ParseIP(val)
+-				break
+-			}
+-		}
+-	}
++	ip, _ := manet.ToIP(addr)
+ 	if ip == nil {
+ 		return false
+ 	}
+ 	for _, n := range g.allowed {
+ 		if n.Contains(ip) {
+ 			return true
+ 		}
+ 	}
+ 	return false
+ }
+@@
+-func (g *connGater) InterceptUpgraded(network.Conn) (allow bool, reason control.DisconnectReason) { 
++func (g *connGater) InterceptUpgraded(network.Conn) (allow bool, reason control.DisconnectReason) {
+ 	return true, 0 
+ }
+```
+
+
+
+---
+
+# Patch 2 — `state.go`
+
+```diff
+--- a/p2p/state.go
++++ b/p2p/state.go
+@@
+ type PeerState struct {
+   ID           peer.ID
+   LastSeen     time.Time
++  LastDecayAt  time.Time
+   BytesIn      uint64
+   MsgIn        uint64
+   Score        float64
+   Quarantined  bool
+   QuarantineAt time.Time
+   Labels       map[string]string
+ }
+@@
+ func (s *State) ensure(id peer.ID) *PeerState {
+   if ps, ok := s.peers[id]; ok { return ps }
+-  ps := &PeerState{ID: id, LastSeen: time.Now(), Score: 0.0, Labels: map[string]string{}}
++  now := time.Now()
++  ps := &PeerState{
++    ID: id, LastSeen: now, LastDecayAt: now,
++    Score: 0.0, Labels: map[string]string{},
++  }
+   s.peers[id] = ps
+   return ps
+ }
+@@
+ func (s *State) Snapshot() map[peer.ID]PeerState {
+   s.mu.RLock()
+   defer s.mu.RUnlock()
+   out := make(map[peer.ID]PeerState, len(s.peers))
+   for id, ps := range s.peers {
+-    out[id] = *ps
++    cp := *ps
++    if ps.Labels != nil {
++      lm := make(map[string]string, len(ps.Labels))
++      for k, v := range ps.Labels { lm[k] = v }
++      cp.Labels = lm
++    }
++    out[id] = cp
+   }
+   return out
+ }
+@@
+ func (s *State) OnConnect(pid peer.ID, labels map[string]string) {
+   s.mu.Lock(); defer s.mu.Unlock()
+   ps := s.ensure(pid)
+   ps.LastSeen = time.Now()
+-  if labels != nil { ps.Labels = labels }
++  if labels != nil {
++    lm := make(map[string]string, len(labels))
++    for k, v := range labels { lm[k] = v }
++    ps.Labels = lm
++  }
+-  ps.Score += 0.2
++  ps.Score = clamp(ps.Score+0.2, -100, 100)
+   s.observeCounts()
+ }
+@@
+ func (s *State) OnDisconnect(pid peer.ID) {
+   s.mu.Lock(); defer s.mu.Unlock()
+   if ps, ok := s.peers[pid]; ok {
+-    ps.Score -= 0.3
++    ps.Score = clamp(ps.Score-0.3, -100, 100)
+   }
+   s.observeCounts()
+ }
+@@
+ func (s *State) Penalize(pid peer.ID, reason string, delta float64) {
+   s.mu.Lock(); defer s.mu.Unlock()
+   ps := s.ensure(pid)
+-  ps.Score -= math.Abs(delta)
++  ps.Score = clamp(ps.Score-math.Abs(delta), -100, 100)
+   if !ps.Quarantined && ps.Score <= s.quarantineThreshold {
+     ps.Quarantined = true
+     ps.QuarantineAt = time.Now()
+     s.log.Warn("peer quarantined", utils.ZapString("peer_id", pid.String()), utils.ZapString("reason", reason))
+   }
+   s.observeCounts()
+ }
+@@
+ func (s *State) OnMessage(topic string, from peer.ID, n int) {
+   if n <= 0 { return }
+   s.mu.Lock(); defer s.mu.Unlock()
+   ps := s.ensure(from)
+   ps.MsgIn += uint64(n)
+-  ps.Score = clamp(ps.Score+0.05, -100, 100)
++  // modest positive reinforcement; cap within minute
++  if ps.Labels == nil { ps.Labels = map[string]string{} }
++  nowMin := time.Now().Truncate(time.Minute).Unix()
++  if ps.Labels["bonus_minute"] != fmt.Sprint(nowMin) {
++    ps.Labels["bonus_minute"] = fmt.Sprint(nowMin)
++    ps.Score = clamp(ps.Score+0.5, -100, 100)
++  }
+   s.observeCounts()
+ }
+@@
+ func (s *State) IsQuarantined(pid peer.ID) bool {
+-  s.mu.RLock()
+-  defer s.mu.RUnlock()
+-  if ps, ok := s.peers[pid]; ok {
+-    isQuarantined := ps.Quarantined && time.Since(ps.QuarantineAt) < s.quarantineTTL
+-    if ps.Quarantined && time.Since(ps.QuarantineAt) >= s.quarantineTTL {
+-      // decay loop will clear later; report false now to avoid stale state
+-      return false
+-    }
+-    return isQuarantined
+-  }
++  s.mu.Lock()
++  defer s.mu.Unlock()
++  if ps, ok := s.peers[pid]; ok {
++    if ps.Quarantined && time.Since(ps.QuarantineAt) >= s.quarantineTTL {
++      ps.Quarantined = false
++      return false
++    }
++    return ps.Quarantined
++  }
+   return false
+ }
+@@
+ func (s *State) applyDecay() {
+   s.mu.Lock()
+   defer s.mu.Unlock()
+   now := time.Now()
+   decayed, released := 0, 0
+   for _, ps := range s.peers {
+-    old := ps.Score
+-    age := now.Sub(ps.LastSeen)
+-    steps := float64(age) / float64(s.decayInterval)
+-    if steps > 0 {
+-      ps.Score *= math.Pow(s.decayFactor, steps)
+-      if math.Abs(old-ps.Score) > 0.01 { decayed++ }
+-    }
++    old := ps.Score
++    elapsed := now.Sub(ps.LastDecayAt)
++    if elapsed > 0 {
++      steps := float64(elapsed) / float64(s.decayInterval)
++      ps.Score *= math.Pow(s.decayFactor, steps)
++      ps.LastDecayAt = now
++      if math.Abs(old-ps.Score) > 0.01 { decayed++ }
++    }
+     if ps.Quarantined && now.Sub(ps.QuarantineAt) >= s.quarantineTTL {
+       ps.Quarantined = false
+       released++
+     }
+   }
+-  if decayed > 0 || released > 0 {
+-    s.log.Debug("state decay tick",
+-      utils.ZapInt("decayed", decayed),
+-      utils.ZapInt("released", released))
+-  }
++  if decayed > 0 || released > 0 {
++    s.log.Debug("state decay tick",
++      utils.ZapInt("decayed", decayed),
++      utils.ZapInt("released", released))
++  }
++  s.gcUnlocked(now)
+   s.observeCounts()
+ }
+@@
+ func (s *State) checkLiveness() {
+   s.mu.Lock()
+   defer s.mu.Unlock()
+   now := time.Now()
+   dropped := 0
+   for id, ps := range s.peers {
+     if now.Sub(ps.LastSeen) > s.livenessTimeout {
+       ps.Score = clamp(ps.Score-1.0, -100, 100)
+       dropped++
+     }
+   }
+   if dropped > 0 {
+     s.log.Debug("peer liveness penalties", utils.ZapInt("count", dropped))
+   }
++  s.gcUnlocked(now)
+   s.observeCounts()
+ }
++
++// gcUnlocked trims long-idle, low-score peers if we exceed maxPeers.
++func (s *State) gcUnlocked(now time.Time) {
++  if s.maxPeers <= 0 || len(s.peers) <= s.maxPeers { return }
++  for id, ps := range s.peers {
++    if len(s.peers) <= s.maxPeers { break }
++    if now.Sub(ps.LastSeen) > 15*time.Minute && ps.Score < 0 {
++      delete(s.peers, id)
++    }
++  }
++}
+```

@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package cybermesh.control.v1;
+
+// EvidenceRequestEvent represents control.evidence.v1 message from backend to AI service
+// Purpose: Request additional evidence or notify AI of evidence validation results
+// TODO: BACKEND - Implement producer (currently no backend implementation)
+message EvidenceRequestEvent {
+  // Request identification
+  string request_id = 1;            // Unique request identifier (UUIDv4)
+  string anomaly_id = 2;            // Related anomaly ID (if applicable)
+  string evidence_id = 3;           // Related evidence ID (if applicable)
+  
+  // Request type
+  string request_type = 4;          // Request type:
+                                    // "request_additional" - Request more evidence
+                                    // "validation_result" - Evidence validation outcome
+                                    // "request_reprocess" - Reprocess with updated model
+                                    // "challenge" - Challenge evidence authenticity
+  
+  // For request_additional
+  repeated string requested_types = 5; // Requested evidence types
+                                       // Examples: ["pcap", "network_flow", "system_logs"]
+  
+  string request_reason = 6;        // Human-readable reason for request
+  int64 deadline_ts = 7;            // Unix timestamp deadline for response (0 = no deadline)
+  
+  // For validation_result
+  bool evidence_accepted = 8;       // True if evidence accepted, false if rejected
+  string rejection_reason = 9;      // Reason for rejection (if applicable)
+  uint32 evidence_quality_score = 10; // Quality score 1-10 (1=poor, 10=excellent)
+  
+  // For challenge
+  string challenge_reason = 11;     // Reason for challenging evidence
+  bytes challenge_data = 12;        // Additional data supporting challenge
+  
+  // Metadata
+  int64 timestamp = 13;             // Unix timestamp (seconds)
+  int64 block_height = 14;          // Block height of related transaction
+  
+  // Cryptographic envelope
+  bytes producer_id = 15;           // Backend node public key (32 bytes Ed25519)
+  bytes signature = 16;             // Ed25519 signature (64 bytes)
+  bytes pubkey = 17;                // Ed25519 public key (32 bytes)
+  string alg = 18;                  // Signature algorithm "Ed25519"
+}
