@@ -49,6 +49,10 @@ const (
 	MessageTypeNewView
 	MessageTypeHeartbeat
 	MessageTypeEvidence
+	MessageTypeGenesisReady
+	MessageTypeGenesisCertificate
+	MessageTypeProposalIntent
+	MessageTypeReadyToVote
 )
 
 // Message is the base interface for all consensus messages
@@ -78,4 +82,8 @@ const (
 	DomainNewView    = "CONSENSUS_NEWVIEW_V1"
 	DomainHeartbeat  = "CONSENSUS_HEARTBEAT_V1"
 	DomainEvidence   = "CONSENSUS_EVIDENCE_V1"
+	DomainGenesisReady       = "CONSENSUS_GENESIS_READY_V1"
+	DomainGenesisCertificate = "CONSENSUS_GENESIS_CERT_V1"
+	DomainProposalIntent     = "CONSENSUS_PROPOSAL_INTENT_V1"
+	DomainReadyToVote        = "CONSENSUS_READY_TO_VOTE_V1"
 )

@@ -45,6 +45,9 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// Statistics
 	mux.HandleFunc(basePath+"/stats", s.handleStats)
 
+	// P2P info (for peer discovery) - DISABLED: handler method missing
+	// mux.HandleFunc(basePath+"/p2p/info", s.handleP2PInfo)
+
 	s.logger.Info("routes registered",
 		utils.ZapString("base_path", basePath),
 		utils.ZapInt("endpoint_count", 9))

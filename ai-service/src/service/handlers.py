@@ -22,6 +22,11 @@ from ..contracts import (
     EvidenceRequestEvent,
 )
 from ..logging import get_logger
+import json
+import time
+import hashlib
+from ..utils.tokens import token_ip, token_flow_key
+from ..contracts import EvidenceMessage
 
 
 class MessageHandlers:
@@ -165,20 +170,56 @@ class MessageHandlers:
         """
         import uuid
         decision = result.decision
-        evidence_bytes = decision.metadata.get('evidence', b'')
         
         # Map score to severity (1-10)
         severity = max(1, min(10, int(decision.final_score * 10)))
-        
-        # Publish anomaly
+
+        # Derive tokens from minimal network context (no PII in anomaly)
+        net_ctx = (decision.metadata or {}).get('network_context') or {}
+        src_ip = net_ctx.get('src_ip')
+        dst_ip = net_ctx.get('dst_ip')
+        src_port = net_ctx.get('src_port')
+        dst_port = net_ctx.get('dst_port')
+        proto = net_ctx.get('protocol')
+
+        source_token = token_ip(src_ip) if src_ip is not None else None
+        target_token = token_ip(dst_ip) if dst_ip is not None else None
+        flow_token = token_flow_key(src_ip, dst_ip, src_port, dst_port, proto)
+
+        # Model version best-effort
+        model_version = (decision.metadata or {}).get('model_version') or 'phase_6.1'
+
+        # Detection timestamp from commit event if available
+        detection_ts = getattr(event, 'timestamp', None) or int(time.time())
+
+        # Build JSON payload with required metadata + pseudonymous tokens
+        payload_obj = {
+            'anomaly_id': str(uuid.uuid4()),
+            'detection_timestamp': int(detection_ts),
+            'threat_type': decision.threat_type.value if decision.threat_type else 'unknown',
+            'severity': int(severity),
+            'confidence': float(decision.confidence),
+            'final_score': float(decision.final_score),
+            'llr': float(decision.llr),
+            'source_token': source_token,
+            'target_token': target_token,
+            'flow_key': flow_token,
+            'model_version': model_version,
+        }
+        payload_bytes = json.dumps(payload_obj, separators=(",", ":")).encode('utf-8')
+
+        # Pre-compute anomaly content hash (for evidence linking)
+        anomaly_content_hash = hashlib.sha256(payload_bytes).digest()
+
+        # Publish anomaly (payload must be JSON)
         anomaly_id = self.service_manager.publisher.publish_anomaly(
-            anomaly_id=str(uuid.uuid4()),
+            anomaly_id=payload_obj['anomaly_id'],
             anomaly_type=decision.threat_type.value,
             source='ml_pipeline',
             severity=severity,
             confidence=decision.confidence,
-            payload=evidence_bytes,
-            model_version='phase_6.1'
+            payload=payload_bytes,
+            model_version=model_version
         )
         
         self.logger.info(
@@ -192,6 +233,27 @@ class MessageHandlers:
                 'latency_ms': result.total_latency_ms
             }
         )
+
+        # Publish supporting evidence linked to anomaly (Option 1)
+        try:
+            ev_bytes = (decision.metadata or {}).get('evidence')
+            if ev_bytes:
+                ev_msg = EvidenceMessage.from_bytes(ev_bytes)
+                # Re-publish evidence with explicit ref to anomaly content hash
+                self.service_manager.publisher.publish_evidence(
+                    evidence_id=str(uuid.uuid4()),
+                    evidence_type='ml_detection',
+                    refs=[anomaly_content_hash],
+                    proof_blob=ev_msg.proof_blob,
+                    chain_of_custody=ev_msg.chain_of_custody,
+                )
+                self.logger.info(
+                    "Published supporting evidence",
+                    extra={'anomaly_id': anomaly_id}
+                )
+        except Exception as e:
+            # Do not fail handler on evidence publication errors
+            self.logger.error("Failed to publish evidence", exc_info=True, extra={'error': str(e)})
     
     def handle_reputation_event(self, event: ReputationEvent):
         """

@@ -1,12 +1,12 @@
 package leader
 
 import (
-    "context"
-    "fmt"
-    "sync"
-    "time"
+	"context"
+	"fmt"
+	"sync"
+	"time"
 
-    "backend/pkg/consensus/types"
+	"backend/pkg/consensus/types"
 )
 
 // HeartbeatManager handles leader liveness via periodic heartbeats
@@ -178,10 +178,10 @@ func (hm *HeartbeatManager) runChecker(ctx context.Context) {
 
 // sendHeartbeat creates and broadcasts a heartbeat message
 func (hm *HeartbeatManager) sendHeartbeat(ctx context.Context) error {
-    hm.mu.RLock()
-    view := hm.pacemaker.GetCurrentView()
-    height := hm.pacemaker.GetCurrentHeight()
-    hm.mu.RUnlock()
+	hm.mu.RLock()
+	view := hm.pacemaker.GetCurrentView()
+	height := hm.pacemaker.GetCurrentHeight()
+	hm.mu.RUnlock()
 
 	// Check if we're the leader
 	isLeader, err := hm.rotation.IsLeader(ctx, hm.crypto.GetKeyID(), view)
@@ -210,7 +210,7 @@ func (hm *HeartbeatManager) sendHeartbeat(ctx context.Context) error {
 	}
 	hbMsg.Signature = signature
 
-    hm.logger.InfoContext(ctx, "heartbeat sent",
+	hm.logger.InfoContext(ctx, "heartbeat sent",
 		"view", view,
 		"height", height,
 	)
@@ -220,13 +220,13 @@ func (hm *HeartbeatManager) sendHeartbeat(ctx context.Context) error {
 		_ = hm.publisher.PublishHeartbeat(ctx, hbMsg)
 	}
 
-    // Leader does not receive its own heartbeat via pubsub; update local liveness to avoid self-timeouts.
-    hm.mu.Lock()
-    hm.lastHeartbeat = time.Now()
-    if hm.checkTicker != nil {
-        hm.checkTicker.Reset(hm.config.MaxIdleTime)
-    }
-    hm.mu.Unlock()
+	// Leader does not receive its own heartbeat via pubsub; update local liveness to avoid self-timeouts.
+	hm.mu.Lock()
+	hm.lastHeartbeat = time.Now()
+	if hm.checkTicker != nil {
+		hm.checkTicker.Reset(hm.config.MaxIdleTime)
+	}
+	hm.mu.Unlock()
 
 	return nil
 }
@@ -299,34 +299,34 @@ func (hm *HeartbeatManager) OnProposal(ctx context.Context) {
 
 // checkLiveness verifies leader is making progress
 func (hm *HeartbeatManager) checkLiveness(ctx context.Context) error {
-    hm.mu.RLock()
-    defer hm.mu.RUnlock()
+	hm.mu.RLock()
+	defer hm.mu.RUnlock()
 
-    // If we are the current leader, skip heartbeat-missing timeout logic for self.
-    // Leader does not receive its own heartbeat via pubsub; liveness should be
-    // governed by proposal progress when leader.
-    isLeader, err := hm.rotation.IsLeader(ctx, hm.crypto.GetKeyID(), hm.pacemaker.GetCurrentView())
-    if err == nil && isLeader {
-        return hm.checkProposalIdleness(ctx)
-    }
+	// If we are the current leader, skip heartbeat-missing timeout logic for self.
+	// Leader does not receive its own heartbeat via pubsub; liveness should be
+	// governed by proposal progress when leader.
+	isLeader, err := hm.rotation.IsLeader(ctx, hm.crypto.GetKeyID(), hm.pacemaker.GetCurrentView())
+	if err == nil && isLeader {
+		return hm.checkProposalIdleness(ctx)
+	}
 
-    return hm.checkProposalIdleness(ctx)
+	return hm.checkProposalIdleness(ctx)
 }
 
 // checkProposalIdleness verifies proposals are being made despite heartbeats
 func (hm *HeartbeatManager) checkProposalIdleness(ctx context.Context) error {
 	now := time.Now()
-    // If no proposal has been observed in the current view, do not trigger idleness.
-    if hm.lastProposal.IsZero() {
-        return nil
-    }
+	// If no proposal has been observed in the current view, do not trigger idleness.
+	if hm.lastProposal.IsZero() {
+		return nil
+	}
 	timeSinceProposal := now.Sub(hm.lastProposal)
 	timeSinceHeartbeat := now.Sub(hm.lastHeartbeat)
 
 	// If we haven't seen a heartbeat at all, trigger timeout
-    // Skip this condition if we are the current leader; leaders don't receive their own heartbeats.
-    isLeader, _ := hm.rotation.IsLeader(ctx, hm.crypto.GetKeyID(), hm.pacemaker.GetCurrentView())
-    if !isLeader && timeSinceHeartbeat > hm.config.MaxIdleTime {
+	// Skip this condition if we are the current leader; leaders don't receive their own heartbeats.
+	isLeader, _ := hm.rotation.IsLeader(ctx, hm.crypto.GetKeyID(), hm.pacemaker.GetCurrentView())
+	if !isLeader && timeSinceHeartbeat > hm.config.MaxIdleTime {
 		view := hm.pacemaker.GetCurrentView()
 
 		hm.logger.WarnContext(ctx, "heartbeat timeout detected",
@@ -348,8 +348,8 @@ func (hm *HeartbeatManager) checkProposalIdleness(ctx context.Context) error {
 			}
 		}
 
-        // Trigger view change via pacemaker
-        return hm.pacemaker.TriggerViewChange(ctx)
+		// Trigger view change via pacemaker
+		return hm.pacemaker.TriggerViewChange(ctx)
 	}
 
 	// CRITICAL FIX: Even if heartbeats are recent, check if proposals are stale
@@ -439,8 +439,8 @@ func (hm *HeartbeatManager) ResetLiveness() {
 
 	now := time.Now()
 	hm.lastHeartbeat = now
-    // New view: mark as no proposal observed yet to avoid false-positive idleness
-    hm.lastProposal = time.Time{}
+	// New view: mark as no proposal observed yet to avoid false-positive idleness
+	hm.lastProposal = time.Time{}
 
 	if hm.checkTicker != nil {
 		hm.checkTicker.Reset(hm.config.MaxIdleTime)
@@ -473,7 +473,7 @@ func (hm *HeartbeatManager) heartbeatSignBytes(hb *HeartbeatMsg) []byte {
 	buf := make([]byte, 0, 96)
 
 	// Domain separator
-    buf = append(buf, []byte(types.DomainHeartbeat)...)
+	buf = append(buf, []byte(types.DomainHeartbeat)...)
 	buf = append(buf, 0x00) // Separator
 
 	// View and height
@@ -483,8 +483,8 @@ func (hm *HeartbeatManager) heartbeatSignBytes(hb *HeartbeatMsg) []byte {
 	// Leader
 	buf = append(buf, hb.LeaderID[:]...)
 
-    // Timestamp: match messages.Heartbeat.SignBytes precision to ensure round-trip
-    buf = appendInt64(buf, hb.Timestamp.UnixMilli())
+	// Timestamp: match messages.Heartbeat.SignBytes precision to ensure round-trip
+	buf = appendInt64(buf, hb.Timestamp.UnixMilli())
 
 	return buf
 }

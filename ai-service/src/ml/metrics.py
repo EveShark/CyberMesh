@@ -118,6 +118,26 @@ class PrometheusMetrics:
             'Number of features extracted per run',
             buckets=[10, 30, 50, 100, 300, 500, 1000]
         )
+
+        # Variant-level metrics (Phase C)
+        self.variant_inference_latency = Histogram(
+            'ml_variant_inference_ms',
+            'Inference latency per malware variant',
+            ['variant'],
+            buckets=[0.5, 1, 2, 5, 10, 25, 50, 100]
+        )
+
+        self.variant_inferences = Counter(
+            'ml_variant_inferences_total',
+            'Total variant inferences by outcome',
+            ['variant', 'outcome']  # outcome: ok|threshold|dlq|error
+        )
+
+        self.variant_dlq = Counter(
+            'ml_variant_dlq_total',
+            'DLQ actions for variant validation failures',
+            ['variant', 'reason']
+        )
     
     def record_pipeline_result(
         self,
@@ -200,3 +220,22 @@ class PrometheusMetrics:
             quality_score: Quality score [0,1]
         """
         self.quality_score_dist.observe(quality_score)
+
+    # Variant helpers
+    def record_variant_latency(self, variant: str, ms: float):
+        try:
+            self.variant_inference_latency.labels(variant=variant).observe(ms)
+        except Exception:
+            pass
+
+    def inc_variant(self, variant: str, outcome: str):
+        try:
+            self.variant_inferences.labels(variant=variant, outcome=outcome).inc()
+        except Exception:
+            pass
+
+    def inc_variant_dlq(self, variant: str, reason: str):
+        try:
+            self.variant_dlq.labels(variant=variant, reason=reason).inc()
+        except Exception:
+            pass

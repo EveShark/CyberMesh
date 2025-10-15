@@ -36,7 +36,7 @@ type HotStuff struct {
 	currentHeight uint64
 	lockedQC      types.QC
 	prepareQC     types.QC
-	votesSent     map[uint64]bool // Tracks views where we voted (safety)
+	votesSent     map[uint64]types.BlockHash // Tracks block hash we voted for in each view (safety)
 
 	// Proposal tracking
 	pendingVotes map[types.BlockHash]map[types.ValidatorID]*messages.Vote // blockHash -> votes
@@ -103,7 +103,7 @@ func NewHotStuff(
 		config:       config,
 		audit:        audit,
 		logger:       logger,
-		votesSent:    make(map[uint64]bool),
+		votesSent:    make(map[uint64]types.BlockHash),
 		pendingVotes: make(map[types.BlockHash]map[types.ValidatorID]*messages.Vote),
 		stopCh:       make(chan struct{}),
 		callbacks:    callbacks,
@@ -152,14 +152,37 @@ func (hs *HotStuff) Stop() error {
 // OnProposal processes a received proposal (replica path)
 func (hs *HotStuff) OnProposal(ctx context.Context, proposal *messages.Proposal) error {
 	hs.mu.Lock()
-	defer hs.mu.Unlock()
+	qc, err := hs.onProposalLocked(ctx, proposal)
+	hs.mu.Unlock()
 
-	hs.logger.InfoContext(ctx, "received proposal",
-		"view", proposal.View,
-		"height", proposal.Height,
-		"block_hash", fmt.Sprintf("%x", proposal.BlockHash[:8]),
-		"proposer", fmt.Sprintf("%x", proposal.ProposerID[:8]),
-	)
+	if err != nil {
+		return err
+	}
+
+	if qc != nil {
+		hs.pacemaker.OnQC(ctx, qc)
+	}
+
+	return nil
+}
+
+func (hs *HotStuff) onProposalLocked(ctx context.Context, proposal *messages.Proposal) (types.QC, error) {
+	// Track first proposal for startup diagnostic
+	if proposal.View == 0 && proposal.Height == 0 {
+		hs.logger.InfoContext(ctx, "[DIAGNOSTIC] First proposal received",
+			"view", proposal.View,
+			"height", proposal.Height,
+			"block_hash", fmt.Sprintf("%x", proposal.BlockHash[:8]),
+			"proposer", fmt.Sprintf("%x", proposal.ProposerID[:8]),
+		)
+	} else {
+		hs.logger.InfoContext(ctx, "received proposal",
+			"view", proposal.View,
+			"height", proposal.Height,
+			"block_hash", fmt.Sprintf("%x", proposal.BlockHash[:8]),
+			"proposer", fmt.Sprintf("%x", proposal.ProposerID[:8]),
+		)
+	}
 
 	// Validate proposal structure
 	if err := hs.validator.ValidateProposal(ctx, proposal); err != nil {
@@ -171,21 +194,30 @@ func (hs *HotStuff) OnProposal(ctx context.Context, proposal *messages.Proposal)
 				"proposer": fmt.Sprintf("%x", proposal.ProposerID[:]),
 			})
 		}
-		return fmt.Errorf("proposal validation failed: %w", err)
+		return nil, fmt.Errorf("proposal validation failed: %w", err)
 	}
 
 	// Check if we already voted in this view (safety rule)
-	if hs.votesSent[proposal.View] {
+	if votedHash, hasVoted := hs.votesSent[proposal.View]; hasVoted {
+		if votedHash == proposal.BlockHash {
+			hs.logger.InfoContext(ctx, "duplicate proposal received for view",
+				"view", proposal.View,
+				"block_hash", fmt.Sprintf("%x", proposal.BlockHash[:8]),
+			)
+			return nil, nil // idempotent re-delivery: already processed this proposal
+		}
 		hs.logger.WarnContext(ctx, "already voted in this view",
 			"view", proposal.View,
+			"existing_block", fmt.Sprintf("%x", votedHash[:8]),
+			"incoming_block", fmt.Sprintf("%x", proposal.BlockHash[:8]),
 		)
-		return fmt.Errorf("already voted in view %d", proposal.View)
+		return nil, fmt.Errorf("already voted in view %d", proposal.View)
 	}
 
 	// Validate justifyQC
 	if proposal.JustifyQC != nil {
 		if err := hs.validator.ValidateQC(ctx, proposal.JustifyQC); err != nil {
-			return fmt.Errorf("invalid justifyQC: %w", err)
+			return nil, fmt.Errorf("invalid justifyQC: %w", err)
 		}
 
 		// Update lockedQC if justifyQC is higher
@@ -200,19 +232,19 @@ func (hs *HotStuff) OnProposal(ctx context.Context, proposal *messages.Proposal)
 			"proposal_view", proposal.View,
 			"locked_view", getQCView(hs.lockedQC),
 		)
-		return fmt.Errorf("proposal conflicts with locked QC")
+		return nil, fmt.Errorf("proposal conflicts with locked QC")
 	}
 
 	// Validate block content (if validator configured)
 	if hs.config.BlockValidationFunc != nil {
 		if err := hs.config.BlockValidationFunc(ctx, proposal.Block); err != nil {
-			return fmt.Errorf("block validation failed: %w", err)
+			return nil, fmt.Errorf("block validation failed: %w", err)
 		}
 	}
 
 	// Store proposal
 	if err := hs.storage.StoreProposal(proposal); err != nil {
-		return fmt.Errorf("failed to store proposal: %w", err)
+		return nil, fmt.Errorf("failed to store proposal: %w", err)
 	}
 
 	// Notify pacemaker of proposal
@@ -227,10 +259,15 @@ func (hs *HotStuff) OnProposal(ctx context.Context, proposal *messages.Proposal)
 
 	// Vote if enabled
 	if hs.config.EnableVoting {
-		return hs.sendVote(ctx, proposal)
+		hs.logger.InfoContext(ctx, "creating vote for proposal",
+			"view", proposal.View,
+			"height", proposal.Height,
+			"block_hash", fmt.Sprintf("%x", proposal.BlockHash[:8]))
+		return hs.sendVoteLocked(ctx, proposal)
 	}
 
-	return nil
+	hs.logger.InfoContext(ctx, "voting disabled - skipping vote")
+	return nil, nil
 }
 
 // isSafeToVote implements the HotStuff safety rule
@@ -252,36 +289,37 @@ func (hs *HotStuff) isSafeToVote(ctx context.Context, proposal *messages.Proposa
 	return proposal.JustifyQC.GetView() >= hs.lockedQC.GetView()
 }
 
-// sendVote creates and sends a vote for a proposal
-func (hs *HotStuff) sendVote(ctx context.Context, proposal *messages.Proposal) error {
+// sendVoteLocked creates and sends a vote for a proposal. Caller must hold hs.mu.
+func (hs *HotStuff) sendVoteLocked(ctx context.Context, proposal *messages.Proposal) (types.QC, error) {
+	ts := time.Now()
 	vote := &messages.Vote{
 		View:      proposal.View,
 		Height:    proposal.Height,
 		Round:     proposal.Round,
 		BlockHash: proposal.BlockHash,
 		VoterID:   messages.KeyID(hs.crypto.GetKeyID()),
-		Timestamp: time.Now(),
+		Timestamp: ts,
 	}
 
 	// Sign vote
 	signBytes := vote.SignBytes()
 	signature, err := hs.crypto.SignWithContext(ctx, signBytes)
 	if err != nil {
-		return fmt.Errorf("failed to sign vote: %w", err)
+		return nil, fmt.Errorf("failed to sign vote: %w", err)
 	}
 
 	vote.Signature = messages.Signature{
 		Bytes:     signature,
 		KeyID:     hs.crypto.GetKeyID(),
-		Timestamp: time.Now(),
+		Timestamp: ts,
 	}
 
 	// Mark that we voted in this view
-	hs.votesSent[proposal.View] = true
+	hs.votesSent[proposal.View] = proposal.BlockHash
 
 	// Store our vote
 	if err := hs.storage.StoreVote(vote); err != nil {
-		return fmt.Errorf("failed to store vote: %w", err)
+		return nil, fmt.Errorf("failed to store vote: %w", err)
 	}
 
 	hs.logger.InfoContext(ctx, "vote sent",
@@ -310,11 +348,12 @@ func (hs *HotStuff) sendVote(ctx context.Context, proposal *messages.Proposal) e
 	hs.logger.InfoContext(ctx, "leader check", "is_leader", isLeader, "view", proposal.View)
 	if isLeader {
 		hs.logger.InfoContext(ctx, "calling onVoteInternal as leader")
-		err := hs.onVoteInternal(ctx, vote)
+		qc, err := hs.onVoteInternal(ctx, vote)
 		if err != nil {
 			hs.logger.ErrorContext(ctx, "onVoteInternal failed", "error", err)
+			return nil, err
 		}
-		return err
+		return qc, nil
 	}
 
 	// DEV-ONLY SAFETY: single-node self-delivery fallback
@@ -333,18 +372,28 @@ func (hs *HotStuff) sendVote(ctx context.Context, proposal *messages.Proposal) e
 	}
 
 	hs.logger.WarnContext(ctx, "vote NOT delivered - neither leader nor single-node")
-	return nil
+	return nil, nil
 }
 
 // OnVote processes a received vote (leader path) - external entry point with locking
 func (hs *HotStuff) OnVote(ctx context.Context, vote *messages.Vote) error {
 	hs.mu.Lock()
-	defer hs.mu.Unlock()
-	return hs.onVoteInternal(ctx, vote)
+	qc, err := hs.onVoteInternal(ctx, vote)
+	hs.mu.Unlock()
+
+	if err != nil {
+		return err
+	}
+
+	if qc != nil {
+		hs.pacemaker.OnQC(ctx, qc)
+	}
+
+	return nil
 }
 
 // onVoteInternal processes a vote without locking (called internally when lock is already held)
-func (hs *HotStuff) onVoteInternal(ctx context.Context, vote *messages.Vote) error {
+func (hs *HotStuff) onVoteInternal(ctx context.Context, vote *messages.Vote) (types.QC, error) {
 
 	hs.logger.InfoContext(ctx, "OnVote ENTERED",
 		"view", vote.View,
@@ -363,7 +412,7 @@ func (hs *HotStuff) onVoteInternal(ctx context.Context, vote *messages.Vote) err
 				"error": err.Error(),
 			})
 		}
-		return fmt.Errorf("vote validation failed: %w", err)
+		return nil, fmt.Errorf("vote validation failed: %w", err)
 	}
 	hs.logger.InfoContext(ctx, "OnVote: validation PASSED")
 
@@ -371,7 +420,7 @@ func (hs *HotStuff) onVoteInternal(ctx context.Context, vote *messages.Vote) err
 	hs.logger.InfoContext(ctx, "OnVote: checking equivocation")
 	if err := hs.detectVoteEquivocation(ctx, vote); err != nil {
 		hs.logger.ErrorContext(ctx, "OnVote: equivocation detected", "error", err)
-		return err
+		return nil, err
 	}
 	hs.logger.InfoContext(ctx, "OnVote: no equivocation")
 
@@ -379,7 +428,7 @@ func (hs *HotStuff) onVoteInternal(ctx context.Context, vote *messages.Vote) err
 	hs.logger.InfoContext(ctx, "OnVote: storing vote")
 	if err := hs.storage.StoreVote(vote); err != nil {
 		hs.logger.ErrorContext(ctx, "OnVote: storage FAILED", "error", err)
-		return fmt.Errorf("failed to store vote: %w", err)
+		return nil, fmt.Errorf("failed to store vote: %w", err)
 	}
 	hs.logger.InfoContext(ctx, "OnVote: vote stored")
 
@@ -389,25 +438,40 @@ func (hs *HotStuff) onVoteInternal(ctx context.Context, vote *messages.Vote) err
 	}
 	hs.pendingVotes[vote.BlockHash][types.ValidatorID(vote.VoterID)] = vote
 
-	// DEBUG: Log quorum check
+	// DEBUG: Log quorum check with detailed progress
 	voteCount := len(hs.pendingVotes[vote.BlockHash])
 	validatorCount := hs.validatorSet.GetValidatorCount()
 	quorumThreshold := hs.quorum.GetQuorumThreshold()
-	hs.logger.InfoContext(ctx, "quorum check",
+	remaining := quorumThreshold - voteCount
+	if remaining < 0 {
+		remaining = 0
+	}
+	hs.logger.InfoContext(ctx, "OnVote: quorum progress",
 		"vote_count", voteCount,
 		"validator_count", validatorCount,
 		"quorum_threshold", quorumThreshold,
+		"remaining", remaining,
 		"block_hash", fmt.Sprintf("%x", vote.BlockHash[:8]),
+		"view", vote.View,
 	)
 
 	// Check if we have quorum
 	if hs.quorum.HasQuorum(hs.pendingVotes[vote.BlockHash]) {
-		hs.logger.InfoContext(ctx, "QUORUM REACHED - forming QC")
+		hs.logger.InfoContext(ctx, "QUORUM REACHED - forming QC",
+			"block_hash", fmt.Sprintf("%x", vote.BlockHash[:8]),
+			"view", vote.View,
+			"height", vote.Height)
 		return hs.formQC(ctx, vote.BlockHash, vote.View)
 	}
 
-	hs.logger.WarnContext(ctx, "quorum NOT reached", "need", quorumThreshold, "have", voteCount)
-	return nil
+	hs.logger.InfoContext(ctx, "quorum NOT reached yet",
+		"needed", quorumThreshold,
+		"have", voteCount,
+		"remaining", remaining,
+		"block_hash", fmt.Sprintf("%x", vote.BlockHash[:8]),
+		"view", vote.View,
+	)
+	return nil, nil
 }
 
 // detectVoteEquivocation checks for double voting
@@ -477,7 +541,7 @@ func (hs *HotStuff) createEquivocationEvidence(ctx context.Context, vote1, vote2
 }
 
 // formQC aggregates votes into a Quorum Certificate
-func (hs *HotStuff) formQC(ctx context.Context, blockHash [32]byte, view uint64) error {
+func (hs *HotStuff) formQC(ctx context.Context, blockHash [32]byte, view uint64) (types.QC, error) {
 	votes := hs.pendingVotes[blockHash]
 
 	hs.logger.InfoContext(ctx, "forming QC",
@@ -505,12 +569,22 @@ func (hs *HotStuff) formQC(ctx context.Context, blockHash [32]byte, view uint64)
 
 	// Validate QC
 	if err := hs.validator.ValidateQC(ctx, qc); err != nil {
-		return fmt.Errorf("QC validation failed: %w", err)
+		hs.logger.ErrorContext(ctx, "qc validation failed",
+			"view", view,
+			"block_hash", fmt.Sprintf("%x", blockHash[:8]),
+			"error", err,
+		)
+		return nil, fmt.Errorf("QC validation failed: %w", err)
 	}
 
 	// Store QC
 	if err := hs.storage.StoreQC(qc); err != nil {
-		return fmt.Errorf("failed to store QC: %w", err)
+		hs.logger.ErrorContext(ctx, "qc storage failed",
+			"view", view,
+			"block_hash", fmt.Sprintf("%x", blockHash[:8]),
+			"error", err,
+		)
+		return nil, fmt.Errorf("failed to store QC: %w", err)
 	}
 
 	if hs.audit != nil {
@@ -524,12 +598,14 @@ func (hs *HotStuff) formQC(ctx context.Context, blockHash [32]byte, view uint64)
 	// Update prepareQC
 	hs.prepareQC = qc
 
-	// Notify pacemaker
-	hs.pacemaker.OnQC(ctx, qc)
-
 	// Check commit rule (2-chain)
+	hs.logger.InfoContext(ctx, "checking commit rule",
+		"qc_view", qc.View,
+		"qc_height", qc.Height)
 	if err := hs.checkCommitRule(ctx, qc); err != nil {
 		hs.logger.ErrorContext(ctx, "commit check failed", "error", err)
+	} else {
+		hs.logger.InfoContext(ctx, "commit rule check completed")
 	}
 
 	// Callback
@@ -542,7 +618,7 @@ func (hs *HotStuff) formQC(ctx context.Context, blockHash [32]byte, view uint64)
 	// Cleanup pending votes
 	delete(hs.pendingVotes, blockHash)
 
-	return nil
+	return qc, nil
 }
 
 // checkCommitRule implements HotStuff 2-chain commit rule
@@ -550,36 +626,56 @@ func (hs *HotStuff) checkCommitRule(ctx context.Context, qc types.QC) error {
 	// 2-chain rule: commit if we have QC(view N) and QC(view N-1) for consecutive blocks
 	// QC → parentQC (consecutive views = commit)
 
+	hs.logger.InfoContext(ctx, "checkCommitRule ENTERED",
+		"qc_view", qc.GetView(),
+		"qc_height", qc.GetHeight())
+
 	// CRITICAL FIX (BUG-015): Single-node mode immediate commit
 	// In single-node mode (1 validator), there's no Byzantine fault risk.
 	// Commit immediately when QC is formed to avoid getting stuck.
 	validatorCount := hs.validatorSet.GetValidatorCount()
+	hs.logger.InfoContext(ctx, "checking validator count for single-node mode",
+		"validator_count", validatorCount)
 	if validatorCount == 1 {
 		// Single-node mode: commit immediately
+		hs.logger.InfoContext(ctx, "single-node mode detected - committing immediately")
 		proposal := hs.storage.GetProposal(qc.GetBlockHash())
 		if proposal == nil {
+			hs.logger.ErrorContext(ctx, "cannot find proposal for QC block")
 			return fmt.Errorf("cannot find proposal for QC block")
 		}
-		
+
 		hs.logger.InfoContext(ctx, "single-node mode: committing immediately",
 			"height", proposal.Block.GetHeight(),
 			"view", qc.GetView(),
 		)
-		
+
 		return hs.commitBlock(ctx, proposal.Block, qc)
 	}
 
 	// Multi-node mode: use 2-chain rule
+	hs.logger.InfoContext(ctx, "multi-node mode: checking 2-chain rule",
+		"validator_count", validatorCount)
 	if hs.lockedQC == nil {
+		hs.logger.InfoContext(ctx, "no lockedQC yet - setting it",
+			"qc_view", qc.GetView(),
+			"qc_height", qc.GetHeight())
 		hs.lockedQC = qc
 		return nil
 	}
 
 	// Check if this QC and previous QC form a 2-chain
+	hs.logger.InfoContext(ctx, "checking 2-chain consecutive views",
+		"current_qc_view", qc.GetView(),
+		"locked_qc_view", hs.lockedQC.GetView(),
+		"consecutive", qc.GetView() == hs.lockedQC.GetView()+1)
 	if qc.GetView() == hs.lockedQC.GetView()+1 {
 		// Consecutive views - commit the block from lockedQC
+		hs.logger.InfoContext(ctx, "2-chain rule satisfied - committing lockedQC block",
+			"commit_height", hs.lockedQC.GetHeight())
 		proposal := hs.storage.GetProposal(hs.lockedQC.GetBlockHash())
 		if proposal == nil {
+			hs.logger.ErrorContext(ctx, "cannot find proposal for committed block")
 			return fmt.Errorf("cannot find proposal for committed block")
 		}
 
@@ -587,6 +683,9 @@ func (hs *HotStuff) checkCommitRule(ctx context.Context, qc types.QC) error {
 	}
 
 	// Update lockedQC if newer
+	hs.logger.InfoContext(ctx, "2-chain not satisfied - updating lockedQC",
+		"old_locked_view", hs.lockedQC.GetView(),
+		"new_qc_view", qc.GetView())
 	if qc.GetView() > hs.lockedQC.GetView() {
 		hs.lockedQC = qc
 	}
@@ -657,15 +756,32 @@ func (hs *HotStuff) CreateProposal(ctx context.Context, block types.Block) (*mes
 	// Handle nil QC (genesis block or single-node mode)
 	var justifyQCMsg *messages.QC
 	if justifyQC != nil {
-		justifyQCMsg = justifyQC.(*messages.QC)
+		var err error
+		justifyQCMsg, err = convertToMessageQC(justifyQC)
+		if err != nil {
+			return nil, fmt.Errorf("failed to convert highest QC to message: %w", err)
+		}
 	}
 
-	proposal := &messages.Proposal{
-		View:       currentView,
-		Height:     hs.currentHeight,
+	// Determine parent hash for proposal:
+	// - If we have a highest QC, its block becomes the parent for the next proposal
+	// - For genesis (height 1), allow zero parent
+	var parentHash [32]byte
+	if justifyQCMsg != nil {
+		parentHash = justifyQCMsg.BlockHash
+	} else {
+		// genesis/first block – keep zero parent
+		parentHash = [32]byte{}
+	}
+
+    // Align proposal height with pacemaker state to avoid stale-height rejections.
+    // Pacemaker is the single source of truth for liveness/view/height seen by validators.
+    proposal := &messages.Proposal{
+        View:       currentView,
+        Height:     hs.pacemaker.GetCurrentHeight(),
 		Round:      0, // Single round per view in HotStuff
 		BlockHash:  block.GetHash(),
-		ParentHash: getParentHash(block),
+		ParentHash: parentHash,
 		ProposerID: hs.crypto.GetKeyID(),
 		Timestamp:  time.Now(),
 		JustifyQC:  justifyQCMsg, // Can be nil for genesis block or single-node mode
@@ -705,6 +821,30 @@ func (hs *HotStuff) CreateProposal(ctx context.Context, block types.Block) (*mes
 	}
 
 	return proposal, nil
+}
+
+// convertToMessageQC converts any implementation of types.QC to the wire-format messages.QC.
+// This is required because HotStuff internally uses pbft.QuorumCertificate while network
+// messages expect *messages.QC. The fields between the two representations are equivalent.
+func convertToMessageQC(qc types.QC) (*messages.QC, error) {
+	switch typed := qc.(type) {
+	case nil:
+		return nil, nil
+	case *messages.QC:
+		return typed, nil
+	case *QuorumCertificate:
+		return &messages.QC{
+			View:         typed.View,
+			Height:       typed.Height,
+			Round:        typed.Round,
+			BlockHash:    typed.BlockHash,
+			Signatures:   append([]types.Signature(nil), typed.Signatures...),
+			Timestamp:    typed.Timestamp,
+			AggregatorID: typed.AggregatorID,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported QC type %T", qc)
+	}
 }
 
 // loadState loads consensus state from storage
@@ -775,6 +915,38 @@ func (hs *HotStuff) GetLockedQC() types.QC {
 	hs.mu.RLock()
 	defer hs.mu.RUnlock()
 	return hs.lockedQC
+}
+
+// AdvanceView advances the consensus to a new view
+func (hs *HotStuff) AdvanceView(ctx context.Context, newView uint64, highestQC types.QC) error {
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+
+	if newView <= hs.currentView {
+		return fmt.Errorf("cannot advance to view %d, currently at view %d", newView, hs.currentView)
+	}
+
+	oldView := hs.currentView
+	hs.currentView = newView
+
+	// Update locked QC if the new one is higher
+	if highestQC != nil && (hs.lockedQC == nil || highestQC.GetView() > hs.lockedQC.GetView()) {
+		hs.lockedQC = highestQC
+		hs.prepareQC = highestQC
+		// Advance height if needed
+		if highestQC.GetHeight() >= hs.currentHeight {
+			hs.currentHeight = highestQC.GetHeight() + 1
+		}
+	}
+
+	hs.logger.InfoContext(ctx, "view advanced",
+		"old_view", oldView,
+		"new_view", newView,
+		"height", hs.currentHeight,
+		"locked_qc_view", getQCView(hs.lockedQC),
+	)
+
+	return nil
 }
 
 // Helper functions

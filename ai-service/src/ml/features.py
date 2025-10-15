@@ -58,53 +58,38 @@ class NetworkFlowExtractor:
         
         self.feature_names = self._get_feature_names()
     
-    def extract(self, flows: List[Dict], window_sec: int = 5) -> np.ndarray:
-        """
-        Extract features from network flow records.
-        
-        Args:
-            flows: List of flow dictionaries with keys:
-                - src_ip, dst_ip, src_port, dst_port
-                - protocol, duration, packets_fwd, packets_bwd
-                - bytes_fwd, bytes_bwd, syn_count, ack_count
-                - timestamp
-            window_sec: Time window for aggregation (default: 5s)
-        
-        Returns:
-            Feature matrix (n_windows, 30)
-            
-        Raises:
-            ValueError: If flows empty or missing required fields
-        """
+    def extract_raw(self, flows: List[Dict], window_sec: int = 5) -> np.ndarray:
+        """Extract raw (unnormalized) features from network flow records."""
         if not flows:
             raise ValueError("No flows provided for feature extraction")
-        
-        # Aggregate flows into time windows
         windows = self._aggregate_by_window(flows, window_sec)
-        
-        # Extract features per window
         features_list = []
         for window_flows in windows:
             features = self._extract_window_features(window_flows)
             features_list.append(features)
-        
-        # Convert to numpy array
         X = np.array(features_list)
-        
         if X.shape[1] != self.FEATURE_COUNT:
             raise ValueError(
                 f"Feature count mismatch: expected {self.FEATURE_COUNT}, got {X.shape[1]}"
             )
-        
-        # Normalize if scaler fitted
+        self.logger.debug(f"Extracted RAW features shape: {X.shape}")
+        return X
+
+    def normalize(self, X: np.ndarray) -> np.ndarray:
+        """Normalize features using StandardScaler (fit on first call)."""
+        if not isinstance(X, np.ndarray) or X.ndim != 2 or X.shape[1] != self.FEATURE_COUNT:
+            raise ValueError("Invalid feature matrix for normalization")
         if self.scaler_fitted:
-            X = self.scaler.transform(X)
-        else:
-            # Fit scaler on first batch
-            self.logger.info("Fitting StandardScaler on first batch")
-            X = self.scaler.fit_transform(X)
-            self.scaler_fitted = True
-        
+            return self.scaler.transform(X)
+        self.logger.info("Fitting StandardScaler on first batch")
+        Xn = self.scaler.fit_transform(X)
+        self.scaler_fitted = True
+        return Xn
+
+    def extract(self, flows: List[Dict], window_sec: int = 5) -> np.ndarray:
+        """Backward-compatible: extract raw features then normalize them."""
+        X_raw = self.extract_raw(flows, window_sec)
+        X = self.normalize(X_raw)
         self.logger.debug(f"Extracted features shape: {X.shape}")
         return X
     
@@ -198,12 +183,12 @@ class NetworkFlowExtractor:
         features[4] = total_bytes  # total bytes
         
         # Features 6-10: Packet ratios
-        total_fwd = sum(packets_fwd) + 1e-10
-        total_bwd = sum(packets_bwd) + 1e-10
-        features[5] = total_fwd / total_bwd  # fwd/bwd ratio
-        total_syn = sum(syn_counts) + 1e-10
-        total_ack = sum(ack_counts) + 1e-10
-        features[6] = total_syn / total_ack  # SYN/ACK ratio
+        total_fwd = float(sum(packets_fwd))
+        total_bwd = float(sum(packets_bwd))
+        features[5] = total_fwd / max(total_bwd, 1.0)
+        total_syn = float(sum(syn_counts))
+        total_ack = float(sum(ack_counts))
+        features[6] = total_syn / max(total_ack, 1.0)
         features[7] = sum([f.get('fin_count', 0) for f in flows])  # FIN count
         features[8] = sum([f.get('rst_count', 0) for f in flows])  # RST count
         features[9] = sum([f.get('psh_count', 0) for f in flows])  # PSH count

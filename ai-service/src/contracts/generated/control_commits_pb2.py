@@ -24,14 +24,13 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x15\x63ontrol_commits.proto\x12\x14\x63ybermesh.control.v1\"\xf4\x01\n\x0b\x43ommitEvent\x12\x0e\n\x06height\x18\x01 \x01(\x03\x12\x12\n\nblock_hash\x18\x02 \x01(\x0c\x12\x12\n\nstate_root\x18\x03 \x01(\x0c\x12\x10\n\x08tx_count\x18\x04 \x01(\r\x12\x15\n\ranomaly_count\x18\x05 \x01(\r\x12\x16\n\x0e\x65vidence_count\x18\x06 \x01(\r\x12\x14\n\x0cpolicy_count\x18\x07 \x01(\r\x12\x11\n\ttimestamp\x18\x08 \x01(\x03\x12\x13\n\x0bproducer_id\x18\t \x01(\x0c\x12\x11\n\tsignature\x18\n \x01(\x0c\x12\x0e\n\x06pubkey\x18\x0b \x01(\x0c\x12\x0b\n\x03\x61lg\x18\x0c \x01(\tB\x12Z\x10\x62\x61\x63kend/proto;pbb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x15\x63ontrol_commits.proto\x12\x14\x63ybermesh.control.v1\"\x89\x02\n\x0b\x43ommitEvent\x12\x0e\n\x06height\x18\x01 \x01(\x03\x12\x12\n\nblock_hash\x18\x02 \x01(\x0c\x12\x12\n\nstate_root\x18\x03 \x01(\x0c\x12\x10\n\x08tx_count\x18\x04 \x01(\r\x12\x15\n\ranomaly_count\x18\x05 \x01(\r\x12\x16\n\x0e\x65vidence_count\x18\x06 \x01(\r\x12\x14\n\x0cpolicy_count\x18\x07 \x01(\r\x12\x13\n\x0b\x61nomaly_ids\x18\r \x03(\t\x12\x11\n\ttimestamp\x18\x08 \x01(\x03\x12\x13\n\x0bproducer_id\x18\t \x01(\x0c\x12\x11\n\tsignature\x18\n \x01(\x0c\x12\x0e\n\x06pubkey\x18\x0b \x01(\x0c\x12\x0b\n\x03\x61lg\x18\x0c \x01(\tb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'control_commits_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
-  _globals['DESCRIPTOR']._loaded_options = None
-  _globals['DESCRIPTOR']._serialized_options = b'Z\020backend/proto;pb'
+  DESCRIPTOR._loaded_options = None
   _globals['_COMMITEVENT']._serialized_start=48
-  _globals['_COMMITEVENT']._serialized_end=292
+  _globals['_COMMITEVENT']._serialized_end=313
 # @@protoc_insertion_point(module_scope)

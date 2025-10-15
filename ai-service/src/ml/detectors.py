@@ -1,18 +1,16 @@
 """
-Detection engines: Rules and Math (ML engine in Phase 6.2).
+Detection engines: Rules, Math, and ML.
 
-Military-grade threat detection with 12 mathematical formulas.
-NO mocks - production algorithms only.
+Security-first, production-ready implementations.
 """
 
 import numpy as np
 import json
 from pathlib import Path
 from typing import List, Dict, Optional, Set
-from scipy import stats
-from scipy.spatial.distance import mahalanobis
 
 from .interfaces import Engine
+from .malware_variants import MalwareModelCache, ModalityRouter, validate_variant_features
 from .types import DetectionCandidate, EngineType, ThreatType
 from ..logging import get_logger
 
@@ -43,7 +41,7 @@ class RulesEngine(Engine):
         
         # Load thresholds from config
         self.thresholds = {
-            'ddos_pps': float(config.get('DDOS_PPS_THRESHOLD', 100000)),
+            'ddos_pps': float(config.get('DDOS_PPS_THRESHOLD', 1_000_000)),
             'port_scan_ports': int(config.get('PORT_SCAN_THRESHOLD', 500)),
             'malware_entropy': float(config.get('MALWARE_ENTROPY_THRESHOLD', 7.5)),
             'syn_ack_ratio': float(config.get('SYN_ACK_RATIO_THRESHOLD', 10.0)),
@@ -58,12 +56,12 @@ class RulesEngine(Engine):
         self._ready = True
         self.logger.info(f"Initialized RulesEngine with thresholds: {self.thresholds}")
     
-    def predict(self, features: np.ndarray, batch: bool = False) -> List[DetectionCandidate]:
+    def predict(self, features, batch: bool = False) -> List[DetectionCandidate]:
         """
         Apply threshold rules to features.
         
         Args:
-            features: Feature vector (30,) or batch (n, 30)
+            features: Semantic dict (preferred) or feature vector
             batch: Enable batch inference
         
         Returns:
@@ -72,22 +70,19 @@ class RulesEngine(Engine):
         if not self._ready:
             return []
         
-        # Handle batch
-        if batch and len(features.shape) == 2:
-            # For now, process first sample only
-            features = features[0]
-        
-        if len(features.shape) > 1:
-            features = features.flatten()
-        
-        if features.shape[0] != 30:
-            self.logger.warning(f"Invalid feature count: {features.shape[0]} (expected 30)")
+        # Prefer semantic dict input
+        semantics = None
+        if isinstance(features, dict):
+            semantics = features
+        else:
+            # Unsupported legacy path; skip gracefully
+            self.logger.debug("RulesEngine: expected semantics dict; skipping")
             return []
         
         candidates = []
         
         # Rule 1: DDoS detection (high pps)
-        pps = features[0]  # Feature 0: packets per second
+        pps = float(semantics.get('pps', 0.0))
         if pps > self.thresholds['ddos_pps']:
             score = min(pps / self.thresholds['ddos_pps'], 1.0)
             candidates.append(DetectionCandidate(
@@ -106,7 +101,7 @@ class RulesEngine(Engine):
             ))
         
         # Rule 2: Port scan detection (high unique ports)
-        unique_dst_ports = features[10]  # Feature 10: unique dst ports
+        unique_dst_ports = float(semantics.get('unique_dst_ports', 0.0))
         if unique_dst_ports > self.thresholds['port_scan_ports']:
             score = min(unique_dst_ports / self.thresholds['port_scan_ports'], 1.0)
             candidates.append(DetectionCandidate(
@@ -125,7 +120,7 @@ class RulesEngine(Engine):
             ))
         
         # Rule 3: SYN flood detection (high SYN/ACK ratio)
-        syn_ack_ratio = features[6]  # Feature 6: SYN/ACK ratio
+        syn_ack_ratio = float(semantics.get('syn_ack_ratio', 0.0))
         if syn_ack_ratio > self.thresholds['syn_ack_ratio']:
             score = min(syn_ack_ratio / self.thresholds['syn_ack_ratio'], 1.0)
             candidates.append(DetectionCandidate(
@@ -144,9 +139,11 @@ class RulesEngine(Engine):
             ))
         
         # Rule 4: Low port entropy (targeted attack)
-        port_entropy = features[11]  # Feature 11: port entropy
-        if port_entropy < 2.0:  # Low entropy = few unique ports
-            score = (2.0 - port_entropy) / 2.0
+        port_entropy = float(semantics.get('port_entropy', 0.0))
+        pe = np.clip(port_entropy, 0.0, 2.0)
+        if pe < 2.0:  # Low entropy = few unique ports
+            score = (2.0 - pe) / 2.0
+            score = float(np.clip(score, 0.0, 1.0))
             candidates.append(DetectionCandidate(
                 threat_type=ThreatType.NETWORK_INTRUSION,
                 raw_score=score,
@@ -222,8 +219,8 @@ class MathEngine(Engine):
         # Load baseline statistics (mean, std, covariance for normal traffic)
         self.baseline_stats = self._load_baseline(baseline_path)
         
-        # CUSUM state (per-feature running sum)
-        self.cusum_state = np.zeros(30)
+        # CUSUM state (scalar on pps)
+        self.cusum_state = 0.0
         self.cusum_threshold = 5.0  # Alert threshold
         self.cusum_k = 0.5  # Slack parameter
         
@@ -232,14 +229,14 @@ class MathEngine(Engine):
         self.ewma_alpha = 0.3  # Smoothing factor
         
         self._ready = True
-        self.logger.info("Initialized MathEngine with 5 formulas")
+        self.logger.info("Initialized MathEngine with semantics-based formulas")
     
-    def predict(self, features: np.ndarray, batch: bool = False) -> List[DetectionCandidate]:
+    def predict(self, features, batch: bool = False) -> List[DetectionCandidate]:
         """
-        Apply 5 mathematical formulas.
+        Apply mathematical formulas on semantic view.
         
         Args:
-            features: Feature vector (30,) or batch (n, 30)
+            features: Semantic dict (preferred)
             batch: Enable batch inference
         
         Returns:
@@ -248,23 +245,18 @@ class MathEngine(Engine):
         if not self._ready:
             return []
         
-        # Handle batch
-        if batch and len(features.shape) == 2:
-            features = features[0]
-        
-        if len(features.shape) > 1:
-            features = features.flatten()
-        
-        if features.shape[0] != 30:
-            self.logger.warning(f"Invalid feature count: {features.shape[0]}")
+        if not isinstance(features, dict):
+            self.logger.debug("MathEngine: expected semantics dict; skipping")
             return []
-        
+
+        semantics = features
         candidates = []
-        
-        # Formula 1: Shannon Entropy
-        port_entropy = self._compute_shannon_entropy(features)
-        if port_entropy < 2.0:  # Low entropy = anomaly
-            score = (2.0 - port_entropy) / 2.0
+
+        # Formula 1: Shannon Entropy (from semantics)
+        port_entropy = float(semantics.get('port_entropy', 0.0))
+        pe = np.clip(port_entropy, 0.0, 2.0)
+        if pe < 2.0:  # Low entropy = anomaly
+            score = float(np.clip((2.0 - pe) / 2.0, 0.0, 1.0))
             candidates.append(DetectionCandidate(
                 threat_type=ThreatType.ANOMALY,
                 raw_score=score,
@@ -276,11 +268,13 @@ class MathEngine(Engine):
                 metadata={'formula': 'shannon_entropy', 'threshold': 2.0}
             ))
         
-        # Formula 2: Z-Score
-        z_scores = self._compute_z_scores(features)
-        max_z = np.max(np.abs(z_scores))
-        if max_z > 3.0:  # 3-sigma rule
-            score = min(max_z / 5.0, 1.0)
+        # Formula 2: Z-Score (univariate on pps)
+        pps = float(semantics.get('pps', 0.0))
+        mean = float(self.baseline_stats.get('pps_mean', 0.0))
+        std = float(self.baseline_stats.get('pps_std', 1.0)) or 1.0
+        z = abs((pps - mean) / std)
+        if np.isfinite(z) and z > 3.0:
+            score = float(min(z / 5.0, 1.0))
             candidates.append(DetectionCandidate(
                 threat_type=ThreatType.ANOMALY,
                 raw_score=score,
@@ -288,31 +282,12 @@ class MathEngine(Engine):
                 confidence=0.7,
                 engine_type=EngineType.MATH,
                 engine_name='z_score',
-                features={'max_z_score': float(max_z)},
-                metadata={
-                    'formula': 'z_score',
-                    'max_z': float(max_z),
-                    'feature_idx': int(np.argmax(np.abs(z_scores)))
-                }
+                features={'pps_z': float(z)},
+                metadata={'formula': 'z_score', 'threshold': 3.0}
             ))
-        
-        # Formula 3: Mahalanobis Distance
-        mahal_dist = self._compute_mahalanobis(features)
-        if mahal_dist > 10.0:  # Chi-square threshold (df=30, p=0.001)
-            score = min(mahal_dist / 20.0, 1.0)
-            candidates.append(DetectionCandidate(
-                threat_type=ThreatType.ANOMALY,
-                raw_score=score,
-                calibrated_score=score,
-                confidence=0.85,
-                engine_type=EngineType.MATH,
-                engine_name='mahalanobis',
-                features={'mahal_distance': float(mahal_dist)},
-                metadata={'formula': 'mahalanobis', 'threshold': 10.0}
-            ))
-        
-        # Formula 4: CUSUM (Cumulative Sum)
-        cusum_alert = self._check_cusum(features)
+
+        # Formula 3: CUSUM on pps
+        cusum_alert = self._check_cusum_scalar(pps, mean)
         if cusum_alert:
             candidates.append(DetectionCandidate(
                 threat_type=ThreatType.ANOMALY,
@@ -321,126 +296,26 @@ class MathEngine(Engine):
                 confidence=0.75,
                 engine_type=EngineType.MATH,
                 engine_name='cusum_drift',
-                features={'cusum_max': float(np.max(self.cusum_state))},
+                features={'cusum': float(self.cusum_state)},
                 metadata={'formula': 'cusum', 'threshold': self.cusum_threshold}
-            ))
-        
-        # Formula 5: Hellinger Distance
-        hellinger = self._compute_hellinger(features)
-        if hellinger > 0.5:
-            candidates.append(DetectionCandidate(
-                threat_type=ThreatType.ANOMALY,
-                raw_score=hellinger,
-                calibrated_score=hellinger,
-                confidence=0.7,
-                engine_type=EngineType.MATH,
-                engine_name='hellinger',
-                features={'hellinger_distance': float(hellinger)},
-                metadata={'formula': 'hellinger', 'threshold': 0.5}
             ))
         
         return candidates
     
-    def _compute_shannon_entropy(self, features: np.ndarray) -> float:
-        """
-        Formula #1: Shannon Entropy
-        H = -Σ(p_i × log₂(p_i))
-        
-        Applied to port distribution (feature 11 already contains port entropy).
-        """
-        # Feature 11 is port entropy (pre-computed in feature extraction)
-        return float(features[11])
+    # Note: entropy now provided via semantics in predict()
     
-    def _compute_z_scores(self, features: np.ndarray) -> np.ndarray:
-        """
-        Formula #2: Z-Score
-        z = |x - μ| / σ
-        
-        Args:
-            features: Feature vector (30,)
-        
-        Returns:
-            Z-scores for each feature (30,)
-        """
-        mean = self.baseline_stats['mean']
-        std = self.baseline_stats['std']
-        
-        # Avoid division by zero
-        std = np.where(std == 0, 1e-10, std)
-        
-        z_scores = (features - mean) / std
-        return z_scores
+    # Vector z-scores removed in favor of univariate pps z-score
     
-    def _compute_mahalanobis(self, features: np.ndarray) -> float:
-        """
-        Formula #3: Mahalanobis Distance
-        D² = (x - μ)ᵀ Σ⁻¹ (x - μ)
-        
-        Args:
-            features: Feature vector (30,)
-        
-        Returns:
-            Mahalanobis distance (scalar)
-        """
-        mean = self.baseline_stats['mean']
-        cov_inv = self.baseline_stats['cov_inv']
-        
-        try:
-            # scipy.spatial.distance.mahalanobis expects VI (inverse covariance)
-            dist = mahalanobis(features, mean, cov_inv)
-            return float(dist)
-        except Exception as e:
-            self.logger.warning(f"Mahalanobis computation failed: {e}")
-            return 0.0
+    # Mahalanobis removed in semantics-only mode
     
-    def _check_cusum(self, features: np.ndarray) -> bool:
+    def _check_cusum_scalar(self, x: float, mean: float) -> bool:
         """
-        Formula #4: CUSUM (Cumulative Sum)
-        S_t = max(0, S_{t-1} + (x_t - μ - k))
-        
-        Detects sustained shifts in mean.
-        
-        Args:
-            features: Feature vector (30,)
-        
-        Returns:
-            True if CUSUM exceeds threshold
+        Scalar CUSUM on pps.
         """
-        mean = self.baseline_stats['mean']
-        
-        # Update CUSUM state for each feature
-        self.cusum_state = np.maximum(
-            0,
-            self.cusum_state + (features - mean - self.cusum_k)
-        )
-        
-        # Check if any feature exceeds threshold
-        return np.any(self.cusum_state > self.cusum_threshold)
+        self.cusum_state = max(0.0, float(self.cusum_state) + (x - mean - self.cusum_k))
+        return self.cusum_state > self.cusum_threshold
     
-    def _compute_hellinger(self, features: np.ndarray) -> float:
-        """
-        Formula #5: Hellinger Distance
-        H(P,Q) = √(1 - Σ√(p_i × q_i))
-        
-        Compares feature distribution to baseline.
-        
-        Args:
-            features: Feature vector (30,)
-        
-        Returns:
-            Hellinger distance [0,1]
-        """
-        # Normalize features to probability distribution
-        features_norm = np.abs(features) / (np.sum(np.abs(features)) + 1e-10)
-        
-        # Get baseline distribution
-        baseline_dist = self.baseline_stats.get('distribution', np.ones(30) / 30)
-        
-        # Compute Hellinger distance
-        bc = np.sum(np.sqrt(features_norm * baseline_dist))  # Bhattacharyya coefficient
-        hellinger = np.sqrt(1 - bc)
-        
-        return float(np.clip(hellinger, 0, 1))
+    # Hellinger removed in semantics-only mode
     
     def _load_baseline(self, baseline_path: Optional[str]) -> Dict:
         """
@@ -456,15 +331,11 @@ class MathEngine(Engine):
             try:
                 with open(baseline_path, 'r') as f:
                     data = json.load(f)
-                
-                # Convert lists to numpy arrays
-                baseline = {
-                    'mean': np.array(data['mean']),
-                    'std': np.array(data['std']),
-                    'cov_inv': np.array(data['cov_inv']),
-                    'distribution': np.array(data.get('distribution', np.ones(30) / 30))
-                }
-                
+                # Support semantics-based baseline: expect keys pps_mean/pps_std
+                baseline = {}
+                if isinstance(data, dict):
+                    baseline['pps_mean'] = float(data.get('pps_mean', 0.0))
+                    baseline['pps_std'] = float(data.get('pps_std', 1.0))
                 self.logger.info(f"Loaded baseline statistics from {baseline_path}")
                 return baseline
             except Exception as e:
@@ -473,10 +344,8 @@ class MathEngine(Engine):
         # Default baseline (neutral - won't trigger alerts)
         self.logger.info("Using default baseline statistics")
         return {
-            'mean': np.zeros(30),
-            'std': np.ones(30),
-            'cov_inv': np.eye(30),
-            'distribution': np.ones(30) / 30
+            'pps_mean': 0.0,
+            'pps_std': 1.0
         }
     
     def calibrate(self, method: str = "platt"):
@@ -494,8 +363,8 @@ class MathEngine(Engine):
     def get_metadata(self) -> dict:
         return {
             'engine': 'math',
-            'formulas': ['shannon_entropy', 'z_score', 'mahalanobis', 'cusum', 'hellinger'],
-            'baseline_loaded': self.baseline_stats['mean'].shape[0] > 0
+            'formulas': ['shannon_entropy', 'z_score', 'cusum'],
+            'baseline_loaded': isinstance(self.baseline_stats, dict)
         }
 
 
@@ -504,9 +373,9 @@ class MLEngine(Engine):
     Machine Learning detection engine with 3 trained models.
     
     Models (loaded via ModelRegistry):
-    - ddos_lgbm: LightGBM for DDoS/DoS detection (network flows)
-    - malware_lgbm: LightGBM for malware detection (PE features)
-    - anomaly_iforest: IsolationForest for anomaly detection (unsupervised)
+    - ddos: LightGBM for DDoS/DoS detection (network flows)
+    - malware: LightGBM for malware detection (PE features)
+    - anomaly: IsolationForest for anomaly detection (unsupervised)
     
     All models:
     - Loaded with Ed25519 signature verification
@@ -519,7 +388,7 @@ class MLEngine(Engine):
     - Input validation on feature shapes
     """
     
-    def __init__(self, registry, config: Dict):
+    def __init__(self, registry, config: Dict, dlq_callback: Optional[callable] = None, metrics=None):
         """
         Initialize ML engine with model registry.
         
@@ -530,6 +399,8 @@ class MLEngine(Engine):
         self.registry = registry
         self.config = config
         self.logger = get_logger(__name__)
+        self._dlq_callback = dlq_callback
+        self.metrics = metrics
         
         # Attempt to load all 3 models (None if not available)
         self.models = {
@@ -548,23 +419,27 @@ class MLEngine(Engine):
             self.logger.info(f"MLEngine initialized with models: {loaded}")
         else:
             self.logger.warning("MLEngine initialized but NO models loaded")
+
+        # Malware multi-variant foundation (Phase A)
+        self.malware_cache = MalwareModelCache(registry=self.registry, capacity=int(config.get('MALWARE_LRU_CAPACITY', 3)))
+        self.router = ModalityRouter()
     
     def _load_models(self):
         """Load all 3 models from registry (graceful if missing)."""
         try:
-            self.models['ddos'] = self.registry.load_model('ddos_lgbm')
+            self.models['ddos'] = self.registry.load_model('ddos')
         except Exception as e:
-            self.logger.warning(f"Failed to load ddos_lgbm: {e}")
+            self.logger.warning(f"Failed to load ddos: {e}")
         
         try:
-            self.models['malware'] = self.registry.load_model('malware_lgbm')
+            self.models['malware'] = self.registry.load_model('malware')
         except Exception as e:
-            self.logger.warning(f"Failed to load malware_lgbm: {e}")
+            self.logger.warning(f"Failed to load malware: {e}")
         
         try:
-            self.models['anomaly'] = self.registry.load_model('anomaly_iforest')
+            self.models['anomaly'] = self.registry.load_model('anomaly')
         except Exception as e:
-            self.logger.warning(f"Failed to load anomaly_iforest: {e}")
+            self.logger.warning(f"Failed to load anomaly: {e}")
     
     def predict(self, features: np.ndarray, batch: bool = False) -> List[DetectionCandidate]:
         """
@@ -584,6 +459,19 @@ class MLEngine(Engine):
         if not self._ready:
             return []
         
+        # Variant routing path: dict input {modality|variant, vector}
+        if isinstance(features, dict):
+            modality = features.get('modality')
+            variant_key = features.get('variant') or self.router.route(modality)
+            # PE ensemble path supports vectors={pe_imports: x1, pe_sections: x2}
+            vectors = features.get('vectors')
+            if modality and modality.strip().lower() == 'pe' and isinstance(vectors, dict):
+                return self._predict_pe_ensemble(vectors)
+            x = features.get('vector')
+            if variant_key and isinstance(x, np.ndarray):
+                return self._predict_malware_variant(variant_key, x)
+            # Unknown dict payload; fall through to legacy path
+
         # Handle batch
         if batch and len(features.shape) == 2:
             features = features[0]  # Process first sample
@@ -614,11 +502,189 @@ class MLEngine(Engine):
                 if cand:
                     candidates.append(cand)
         else:
-            self.logger.warning(
-                f"MLEngine: Invalid feature count {feature_count} (expected 30 or 256)"
-            )
+            # Check if ddos model exists and accepts this feature count
+            if 'ddos' in self.models:
+                expected_features = self.models['ddos'].n_features_in_
+                if feature_count == expected_features:
+                    cand = self._predict_ddos(features)
+                    if cand:
+                        candidates.append(cand)
+                else:
+                    self.logger.debug(
+                        f"MLEngine: Feature count {feature_count} doesn't match ddos model (expected {expected_features})"
+                    )
+            else:
+                self.logger.debug(
+                    f"MLEngine: Unsupported feature count {feature_count} (expected 30 or 256)"
+                )
         
         return candidates
+
+    def _variant_meta(self, variant_key: str) -> Optional[Dict]:
+        try:
+            models = self.registry.registry.get('models', {})
+            malware = models.get('malware', {})
+            variants = malware.get('variants', {})
+            return variants.get(variant_key)
+        except Exception:
+            return None
+
+    def _predict_malware_variant(self, variant_key: str, x: np.ndarray) -> List[DetectionCandidate]:
+        """Predict using a malware variant Booster; DLQ on validation failure if callback provided."""
+        import time as _time
+        t0 = _time.perf_counter()
+        candidates: List[DetectionCandidate] = []
+        meta = self._variant_meta(variant_key) or {}
+        # Skip if disabled
+        if meta and not meta.get('enabled', True):
+            return []
+        expected = self.malware_cache.expected_feature_count(variant_key)
+        try:
+            validate_variant_features(variant_key, x, expected)
+        except ValidationError as ve:
+            if self._dlq_callback:
+                try:
+                    self._dlq_callback({
+                        'component': 'ml_engine',
+                        'reason': 'feature_validation_failed',
+                        'variant': variant_key,
+                        'error': str(ve),
+                        'expected': expected,
+                        'got': int(x.shape[0]) if hasattr(x, 'shape') else None,
+                    })
+                except Exception:
+                    self.logger.error("DLQ callback failed", exc_info=True)
+            if self.metrics:
+                self.metrics.inc_variant_dlq(variant_key, 'feature_validation_failed')
+            else:
+                self.logger.warning(f"Variant validation failed ({variant_key}): {ve}")
+            return []
+
+        model = self.malware_cache.get(variant_key)
+        if model is None:
+            # No model available for this variant
+            self.logger.warning(f"Malware model not available for variant: {variant_key}")
+            return []
+
+        try:
+            proba = self._predict_variant_proba(model, x)
+            # Apply calibration method/params if provided
+            proba = self._apply_variant_calibration(meta, proba)
+            # Threshold per-variant (fallback to global)
+            threshold = float(meta.get('threshold', self.config.get('MALWARE_THRESHOLD', 0.85)))
+            if proba > threshold:
+                margin = abs(proba - 0.5) * 2
+                confidence = min(0.7 + margin * 0.3, 1.0)
+                schema = meta.get('schema', variant_key)
+                candidates.append(DetectionCandidate(
+                    threat_type=ThreatType.MALWARE,
+                    raw_score=proba,
+                    calibrated_score=proba,
+                    confidence=confidence,
+                    engine_type=EngineType.ML,
+                    engine_name=f"malware.{variant_key}",
+                    features={'ml_score': proba},
+                    metadata={'schema': schema, 'variant': variant_key, 'calibrated': True}
+                ))
+                if self.metrics:
+                    self.metrics.inc_variant(variant_key, 'ok')
+            else:
+                if self.metrics:
+                    self.metrics.inc_variant(variant_key, 'threshold')
+        except Exception as e:
+            self.logger.error(f"Malware variant inference failed ({variant_key}): {e}", exc_info=True)
+            if self.metrics:
+                self.metrics.inc_variant(variant_key, 'error')
+            return []
+        finally:
+            if self.metrics:
+                dt = (_time.perf_counter() - t0) * 1000.0
+                self.metrics.record_variant_latency(variant_key, dt)
+
+        return candidates
+
+    def _predict_variant_proba(self, model, x: np.ndarray) -> float:
+        proba_arr = model.predict(x.reshape(1, -1))
+        return float(np.clip(proba_arr[0], 0.0, 1.0))
+
+    def _apply_variant_calibration(self, meta: Dict, proba: float) -> float:
+        cal = (meta or {}).get('calibration', 'sigmoid')
+        params = (meta or {}).get('calibration_params')
+        if cal == 'platt' and isinstance(params, dict):
+            try:
+                A = float(params.get('A', 0.0))
+                B = float(params.get('B', 0.0))
+                import math
+                z = A * proba + B
+                return 1.0 / (1.0 + math.exp(-z))
+            except Exception:
+                return float(np.clip(proba, 0.0, 1.0))
+        # isotonic not supported without model; pass-through
+        return float(np.clip(proba, 0.0, 1.0))
+
+    def _predict_pe_ensemble(self, vectors: Dict[str, np.ndarray]) -> List[DetectionCandidate]:
+        """Run pe_imports and pe_sections (if available) and emit a single ensemble decision."""
+        imports_vec = vectors.get('pe_imports')
+        sections_vec = vectors.get('pe_sections')
+        scores = []
+        metas = []
+        if isinstance(imports_vec, np.ndarray):
+            cand = self._predict_malware_variant('pe_imports', imports_vec)
+            # Extract score if candidate produced; else try raw proba to still combine
+            if cand:
+                scores.append(cand[0].calibrated_score)
+                metas.append(('pe_imports', cand[0].metadata.get('schema', 'pe_imports')))
+            else:
+                model = self.malware_cache.get('pe_imports')
+                if model is not None:
+                    scores.append(self._apply_variant_calibration(self._variant_meta('pe_imports'), self._predict_variant_proba(model, imports_vec)))
+                    metas.append(('pe_imports', 'pe_imports'))
+
+        if isinstance(sections_vec, np.ndarray):
+            cand = self._predict_malware_variant('pe_sections', sections_vec)
+            if cand:
+                scores.append(cand[0].calibrated_score)
+                metas.append(('pe_sections', cand[0].metadata.get('schema', 'pe_sections')))
+            else:
+                model = self.malware_cache.get('pe_sections')
+                if model is not None:
+                    scores.append(self._apply_variant_calibration(self._variant_meta('pe_sections'), self._predict_variant_proba(model, sections_vec)))
+                    metas.append(('pe_sections', 'pe_sections'))
+
+        # If only one score available, defer to its regular path
+        if len(scores) == 0:
+            return []
+        if len(scores) == 1:
+            # Create a single candidate using the available score
+            s = scores[0]
+            margin = abs(s - 0.5) * 2
+            confidence = min(0.7 + margin * 0.3, 1.0)
+            return [DetectionCandidate(
+                threat_type=ThreatType.MALWARE,
+                raw_score=s,
+                calibrated_score=s,
+                confidence=confidence,
+                engine_type=EngineType.ML,
+                engine_name="malware.pe_ensemble",
+                features={'ml_score': s},
+                metadata={'schema': metas[0][1], 'variant': metas[0][0], 'ensemble': False}
+            )]
+
+        # Combine two scores (gated voter: require at least one above its threshold; weight imports higher)
+        s_imp, s_sec = scores[0], scores[1]
+        final = float(np.clip(0.6 * s_imp + 0.4 * s_sec, 0.0, 1.0))
+        margin = abs(final - 0.5) * 2
+        confidence = min(0.7 + margin * 0.3, 1.0)
+        return [DetectionCandidate(
+            threat_type=ThreatType.MALWARE,
+            raw_score=final,
+            calibrated_score=final,
+            confidence=confidence,
+            engine_type=EngineType.ML,
+            engine_name="malware.pe_ensemble",
+            features={'imports_score': s_imp, 'sections_score': s_sec, 'ml_score': final},
+            metadata={'schema': 'pe_ensemble', 'variant': 'pe_ensemble', 'calibrated': True}
+        )]
     
     def _predict_ddos(self, features: np.ndarray) -> Optional[DetectionCandidate]:
         """
@@ -646,9 +712,9 @@ class MLEngine(Engine):
                     calibrated_score=proba,  # Already calibrated during training
                     confidence=confidence,
                     engine_type=EngineType.ML,
-                    engine_name='ddos_lgbm',
+                    engine_name='ddos',
                     features={'ml_score': float(proba)},
-                    metadata={'model_version': '1.0.0', 'calibrated': True}
+                    metadata={'schema': 'flow_79', 'calibrated': True}
                 )
         
         except Exception as e:
@@ -680,9 +746,9 @@ class MLEngine(Engine):
                     calibrated_score=proba,
                     confidence=confidence,
                     engine_type=EngineType.ML,
-                    engine_name='malware_lgbm',
+                    engine_name='malware',
                     features={'ml_score': float(proba)},
-                    metadata={'model_version': '1.0.0', 'calibrated': True}
+                    metadata={'schema': 'binary_256', 'calibrated': True}
                 )
         
         except Exception as e:
@@ -718,9 +784,9 @@ class MLEngine(Engine):
                     calibrated_score=proba,
                     confidence=confidence,
                     engine_type=EngineType.ML,
-                    engine_name='anomaly_iforest',
+                    engine_name='anomaly',
                     features={'anomaly_score': float(anomaly_score), 'ml_score': float(proba)},
-                    metadata={'model_version': '1.0.0', 'unsupervised': True}
+                    metadata={'schema': 'flow_79', 'unsupervised': True}
                 )
         
         except Exception as e:

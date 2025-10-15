@@ -11,7 +11,7 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from .telemetry import TelemetrySource
-from .features import NetworkFlowExtractor
+from .feature_adapter import FeatureAdapter
 from .interfaces import Engine
 from .ensemble import EnsembleVoter
 from .evidence import EvidenceGenerator
@@ -41,7 +41,7 @@ class DetectionPipeline:
     def __init__(
         self,
         telemetry_source: TelemetrySource,
-        feature_extractor: NetworkFlowExtractor,
+        feature_extractor,
         engines: List[Engine],
         ensemble: EnsembleVoter,
         evidence_generator: EvidenceGenerator,
@@ -68,6 +68,7 @@ class DetectionPipeline:
         self.circuit_breaker = circuit_breaker
         self.config = config
         self.logger = get_logger(__name__)
+        self._feature_adapter = FeatureAdapter()
         
         # Pipeline statistics
         self.stats = {
@@ -121,8 +122,11 @@ class DetectionPipeline:
             # Stage 2: Feature extraction
             stage_start = time.perf_counter()
             try:
-                features = self.feature_extractor.extract(flows, window_sec=5)
-                feature_count = features.shape[0] * features.shape[1]
+                # Unified 79-feature path
+                features_79 = self.feature_extractor.extract_raw(flows)
+                features_norm = self.feature_extractor.normalize(features_79)
+                semantics_list = self._feature_adapter.derive_semantics(flows, features_79)
+                feature_count = features_79.shape[0] * features_79.shape[1]
             except Exception as e:
                 self.logger.error(f"Feature extraction failed: {e}", exc_info=True)
                 raise
@@ -139,8 +143,12 @@ class DetectionPipeline:
                     continue
                 
                 try:
-                    # Run inference on first feature window
-                    candidates = engine.predict(features[0] if len(features) > 0 else features)
+                    if engine.engine_type.value == 'ml':
+                        feats = features_norm[0] if len(features_norm) > 0 else features_norm
+                    else:
+                        # Pass semantic dict for first flow
+                        feats = semantics_list[0] if semantics_list else {}
+                    candidates = engine.predict(feats)
                     all_candidates.extend(candidates)
                     
                     self.logger.debug(
@@ -159,6 +167,27 @@ class DetectionPipeline:
             # Stage 4: Ensemble voting
             stage_start = time.perf_counter()
             decision = self.ensemble.decide(all_candidates)
+            # Attach minimal network context for downstream tokenization/evidence
+            try:
+                if flows:
+                    f = flows[0] or {}
+                    def _get(k: str, *alts, default=None):
+                        for key in (k,)+alts:
+                            if key in f and f[key] is not None:
+                                return f[key]
+                        return default
+                    net_ctx = {
+                        'src_ip': _get('src_ip', 'src', 'source'),
+                        'dst_ip': _get('dst_ip', 'dst', 'destination'),
+                        'src_port': _get('src_port', 'sport', 'source_port', default=0),
+                        'dst_port': _get('dst_port', 'dport', 'destination_port', default=0),
+                        'protocol': _get('protocol', 'proto', default=''),
+                        'flow_id': _get('flow_id', 'id', default=''),
+                    }
+                    decision.metadata['network_context'] = net_ctx
+            except Exception:
+                # Best-effort only; do not fail pipeline on context extraction
+                pass
             latencies['ensemble_vote'] = (time.perf_counter() - stage_start) * 1000
             
             # Stage 5: Evidence generation (if publishing)
@@ -166,7 +195,7 @@ class DetectionPipeline:
                 stage_start = time.perf_counter()
                 evidence_bytes = self.evidence_gen.generate(
                     decision=decision,
-                    raw_features={'flows': flows}
+                    raw_features={'flows': flows, 'semantics': semantics_list[:5]}
                 )
                 decision.metadata['evidence'] = evidence_bytes
                 latencies['evidence_generation'] = (time.perf_counter() - stage_start) * 1000

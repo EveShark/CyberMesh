@@ -1,5 +1,5 @@
 from typing import Optional
-from .errors import ValidationError
+from .errors import ValidationError, TimestampSkewError
 from .time import now
 from .limits import VALUE_LIMITS, TIME_LIMITS
 from .id_gen import validate_uuid4
@@ -63,12 +63,12 @@ def validate_timestamp(timestamp: int, max_skew_seconds: int = None):
     current_time = now()
     
     if timestamp > current_time + max_skew_seconds:
-        raise ValidationError(
+        raise TimestampSkewError(
             f"Timestamp {timestamp} is too far in the future (current: {current_time}, max skew: {max_skew_seconds}s)"
         )
     
     if timestamp < current_time - max_skew_seconds:
-        raise ValidationError(
+        raise TimestampSkewError(
             f"Timestamp {timestamp} is too far in the past (current: {current_time}, max skew: {max_skew_seconds}s)"
         )
 

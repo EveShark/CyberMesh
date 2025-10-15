@@ -22,24 +22,32 @@ type (
 
 // Re-export message types
 const (
-	TypeProposal   = types.MessageTypeProposal
-	TypeVote       = types.MessageTypeVote
-	TypeQC         = types.MessageTypeQC
-	TypeViewChange = types.MessageTypeViewChange
-	TypeNewView    = types.MessageTypeNewView
-	TypeHeartbeat  = types.MessageTypeHeartbeat
-	TypeEvidence   = types.MessageTypeEvidence
+	TypeProposal           = types.MessageTypeProposal
+	TypeVote               = types.MessageTypeVote
+	TypeQC                 = types.MessageTypeQC
+	TypeViewChange         = types.MessageTypeViewChange
+	TypeNewView            = types.MessageTypeNewView
+	TypeHeartbeat          = types.MessageTypeHeartbeat
+	TypeEvidence           = types.MessageTypeEvidence
+	TypeGenesisReady       = types.MessageTypeGenesisReady
+	TypeGenesisCertificate = types.MessageTypeGenesisCertificate
+	TypeProposalIntent     = types.MessageTypeProposalIntent
+	TypeReadyToVote        = types.MessageTypeReadyToVote
 )
 
 // Re-export domain separators
 const (
-	DomainProposal   = types.DomainProposal
-	DomainVote       = types.DomainVote
-	DomainQC         = types.DomainQC
-	DomainViewChange = types.DomainViewChange
-	DomainNewView    = types.DomainNewView
-	DomainHeartbeat  = types.DomainHeartbeat
-	DomainEvidence   = types.DomainEvidence
+	DomainProposal           = types.DomainProposal
+	DomainVote               = types.DomainVote
+	DomainQC                 = types.DomainQC
+	DomainViewChange         = types.DomainViewChange
+	DomainNewView            = types.DomainNewView
+	DomainHeartbeat          = types.DomainHeartbeat
+	DomainEvidence           = types.DomainEvidence
+	DomainGenesisReady       = types.DomainGenesisReady
+	DomainGenesisCertificate = types.DomainGenesisCertificate
+	DomainProposalIntent     = types.DomainProposalIntent
+	DomainReadyToVote        = types.DomainReadyToVote
 )
 
 // Re-export evidence types
@@ -87,7 +95,7 @@ func (p *Proposal) SignBytes() []byte {
 	// Timestamp (Unix nanos for precision)
 	buf = appendInt64(buf, p.Timestamp.UnixNano())
 
-    // Do not include signature metadata in canonical bytes
+	// Do not include signature metadata in canonical bytes
 
 	// JustifyQC hash if present
 	if p.JustifyQC != nil {
@@ -141,7 +149,7 @@ func (v *Vote) SignBytes() []byte {
 	buf = appendUint64(buf, v.Round)
 	buf = append(buf, v.BlockHash[:]...)
 	buf = append(buf, v.VoterID[:]...)
-    buf = appendInt64(buf, v.Timestamp.UnixNano())
+	buf = appendInt64(buf, v.Timestamp.UnixNano())
 
 	return buf
 }
@@ -249,8 +257,8 @@ func (vc *ViewChange) SignBytes() []byte {
 	buf = appendUint64(buf, vc.OldView)
 	buf = appendUint64(buf, vc.NewView)
 	buf = appendUint64(buf, vc.Height)
-    buf = append(buf, vc.SenderID[:]...)
-    buf = appendInt64(buf, vc.Timestamp.UnixNano())
+	buf = append(buf, vc.SenderID[:]...)
+	buf = appendInt64(buf, vc.Timestamp.UnixNano())
 
 	if vc.HighestQC != nil {
 		h := vc.HighestQC.Hash()
@@ -300,8 +308,8 @@ func (nv *NewView) SignBytes() []byte {
 
 	buf = appendUint64(buf, nv.View)
 	buf = appendUint64(buf, nv.Height)
-    buf = append(buf, nv.LeaderID[:]...)
-    buf = appendInt64(buf, nv.Timestamp.UnixNano())
+	buf = append(buf, nv.LeaderID[:]...)
+	buf = appendInt64(buf, nv.Timestamp.UnixNano())
 
 	// Hash all ViewChanges
 	for _, vc := range nv.ViewChanges {
@@ -355,9 +363,9 @@ func (hb *Heartbeat) SignBytes() []byte {
 
 	buf = appendUint64(buf, hb.View)
 	buf = appendUint64(buf, hb.Height)
-    buf = append(buf, hb.LeaderID[:]...)
-    // Use millisecond precision to avoid CBOR time precision loss across encode/decode
-    buf = appendInt64(buf, hb.Timestamp.UnixMilli())
+	buf = append(buf, hb.LeaderID[:]...)
+	// Use millisecond precision to avoid CBOR time precision loss across encode/decode
+	buf = appendInt64(buf, hb.Timestamp.UnixMilli())
 
 	return buf
 }
@@ -410,8 +418,8 @@ func (e *Evidence) SignBytes() []byte {
 	proofHash := sha256.Sum256(e.Proof)
 	buf = append(buf, proofHash[:]...)
 
-    buf = append(buf, e.ReporterID[:]...)
-    buf = appendInt64(buf, e.Timestamp.UnixNano())
+	buf = append(buf, e.ReporterID[:]...)
+	buf = appendInt64(buf, e.Timestamp.UnixNano())
 
 	return buf
 }
@@ -438,6 +446,145 @@ func (e *Evidence) GetView() uint64 {
 func (e *Evidence) GetTimestamp() time.Time {
 	return e.Timestamp
 }
+
+// GenesisReady is a cryptographic attestation that a validator is ready to join consensus.
+type GenesisReady struct {
+	ValidatorID ValidatorID `cbor:"1,keyasint"`
+	Timestamp   time.Time   `cbor:"2,keyasint"`
+	ConfigHash  [32]byte    `cbor:"3,keyasint"`
+	PeerHash    [32]byte    `cbor:"4,keyasint"`
+	Nonce       [32]byte    `cbor:"5,keyasint"`
+	Signature   Signature   `cbor:"6,keyasint"`
+}
+
+// SignBytes returns the canonical bytes for signing a GenesisReady attestation.
+func (gr *GenesisReady) SignBytes() []byte {
+	buf := make([]byte, 0, 160)
+	buf = append(buf, []byte(DomainGenesisReady)...)
+	buf = append(buf, 0x00)
+	buf = append(buf, gr.ValidatorID[:]...)
+	buf = appendInt64(buf, gr.Timestamp.UnixNano())
+	buf = append(buf, gr.ConfigHash[:]...)
+	buf = append(buf, gr.PeerHash[:]...)
+	buf = append(buf, gr.Nonce[:]...)
+	return buf
+}
+
+// Hash returns the content hash of the attestation.
+func (gr *GenesisReady) Hash() BlockHash {
+	return sha256.Sum256(gr.SignBytes())
+}
+
+// Type returns the message type.
+func (gr *GenesisReady) Type() MessageType { return TypeGenesisReady }
+
+// GetView returns the view; genesis messages are view-agnostic.
+func (gr *GenesisReady) GetView() uint64 { return 0 }
+
+// GetTimestamp returns the attestation timestamp.
+func (gr *GenesisReady) GetTimestamp() time.Time { return gr.Timestamp }
+
+// GenesisCertificate aggregates READY attestations proving quorum readiness.
+type GenesisCertificate struct {
+	Attestations []GenesisReady `cbor:"1,keyasint"`
+	Aggregator   ValidatorID    `cbor:"2,keyasint"`
+	Timestamp    time.Time      `cbor:"3,keyasint"`
+	Signature    Signature      `cbor:"4,keyasint"`
+}
+
+// SignBytes returns the canonical bytes representing the certificate contents.
+func (gc *GenesisCertificate) SignBytes() []byte {
+	buf := make([]byte, 0, 256)
+	buf = append(buf, []byte(DomainGenesisCertificate)...)
+	buf = append(buf, 0x00)
+	buf = append(buf, gc.Aggregator[:]...)
+	buf = appendInt64(buf, gc.Timestamp.UnixNano())
+	for _, att := range gc.Attestations {
+		h := att.Hash()
+		buf = append(buf, h[:]...)
+	}
+	return buf
+}
+
+// Hash returns the content hash of the certificate.
+func (gc *GenesisCertificate) Hash() BlockHash {
+	return sha256.Sum256(gc.SignBytes())
+}
+
+// Type returns the message type.
+func (gc *GenesisCertificate) Type() MessageType { return TypeGenesisCertificate }
+
+// GetView returns the view; certificates are view-agnostic.
+func (gc *GenesisCertificate) GetView() uint64 { return 0 }
+
+// GetTimestamp returns the timestamp of the certificate aggregation.
+func (gc *GenesisCertificate) GetTimestamp() time.Time { return gc.Timestamp }
+
+// ProposalIntent announces a leader's intent to propose and challenges replicas for readiness.
+type ProposalIntent struct {
+	View      uint64      `cbor:"1,keyasint"`
+	Height    uint64      `cbor:"2,keyasint"`
+	LeaderID  ValidatorID `cbor:"3,keyasint"`
+	Nonce     [32]byte    `cbor:"4,keyasint"`
+	Timestamp time.Time   `cbor:"5,keyasint"`
+	Signature Signature   `cbor:"6,keyasint"`
+}
+
+func (pi *ProposalIntent) SignBytes() []byte {
+	buf := make([]byte, 0, 128)
+	buf = append(buf, []byte(DomainProposalIntent)...)
+	buf = append(buf, 0x00)
+	buf = appendUint64(buf, pi.View)
+	buf = appendUint64(buf, pi.Height)
+	buf = append(buf, pi.LeaderID[:]...)
+	buf = append(buf, pi.Nonce[:]...)
+	buf = appendInt64(buf, pi.Timestamp.UnixNano())
+	return buf
+}
+
+func (pi *ProposalIntent) Hash() BlockHash {
+	return sha256.Sum256(pi.SignBytes())
+}
+
+func (pi *ProposalIntent) Type() MessageType { return TypeProposalIntent }
+
+func (pi *ProposalIntent) GetView() uint64 { return pi.View }
+
+func (pi *ProposalIntent) GetTimestamp() time.Time { return pi.Timestamp }
+
+// ReadyToVote acknowledges a leader's proposal intent and readiness to vote.
+type ReadyToVote struct {
+	View        uint64      `cbor:"1,keyasint"`
+	Height      uint64      `cbor:"2,keyasint"`
+	ValidatorID ValidatorID `cbor:"3,keyasint"`
+	LeaderID    ValidatorID `cbor:"4,keyasint"`
+	Nonce       [32]byte    `cbor:"5,keyasint"`
+	Timestamp   time.Time   `cbor:"6,keyasint"`
+	Signature   Signature   `cbor:"7,keyasint"`
+}
+
+func (rtv *ReadyToVote) SignBytes() []byte {
+	buf := make([]byte, 0, 160)
+	buf = append(buf, []byte(DomainReadyToVote)...)
+	buf = append(buf, 0x00)
+	buf = appendUint64(buf, rtv.View)
+	buf = appendUint64(buf, rtv.Height)
+	buf = append(buf, rtv.ValidatorID[:]...)
+	buf = append(buf, rtv.LeaderID[:]...)
+	buf = append(buf, rtv.Nonce[:]...)
+	buf = appendInt64(buf, rtv.Timestamp.UnixNano())
+	return buf
+}
+
+func (rtv *ReadyToVote) Hash() BlockHash {
+	return sha256.Sum256(rtv.SignBytes())
+}
+
+func (rtv *ReadyToVote) Type() MessageType { return TypeReadyToVote }
+
+func (rtv *ReadyToVote) GetView() uint64 { return rtv.View }
+
+func (rtv *ReadyToVote) GetTimestamp() time.Time { return rtv.Timestamp }
 
 // Message is a union type for all consensus messages
 type Message interface {

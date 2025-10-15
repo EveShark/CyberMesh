@@ -99,6 +99,7 @@ def load_settings(env_file: Optional[str] = None) -> Settings:
         aes_key=aes_key,
         model_ddos_path=Path(model_ddos_path) if model_ddos_path else None,
         model_malware_path=Path(model_malware_path) if model_malware_path else None,
+        min_confidence=_get_float_env("MIN_CONFIDENCE", 0.85),
     )
     
     # Final validation
@@ -110,13 +111,18 @@ def load_settings(env_file: Optional[str] = None) -> Settings:
 
 
 def _load_env_file(env_file: str):
-    """Load environment variables from .env file."""
+    """Load environment variables from .env file.
+
+    Precedence: existing OS environment variables take priority over .env.
+    This allows tests and runtime to override defaults declared in .env.
+    """
     if not os.path.exists(env_file):
         raise ConfigError(f".env file not found: {env_file}")
     
     try:
         from dotenv import load_dotenv
-        load_dotenv(env_file, override=True)
+        # Do NOT override existing environment variables; let explicit env vars win.
+        load_dotenv(env_file, override=False)
     except ImportError:
         raise ConfigError(
             "python-dotenv not installed. "
@@ -303,4 +309,16 @@ def _get_int_env(key: str, default: int) -> int:
     except ValueError:
         raise ConfigError(
             f"Invalid integer value for {key}: {value}"
+        )
+
+def _get_float_env(key: str, default: float) -> float:
+    """Get float environment variable."""
+    value = os.getenv(key)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        raise ConfigError(
+            f"Invalid float value for {key}: {value}"
         )

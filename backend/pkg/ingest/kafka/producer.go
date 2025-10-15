@@ -89,7 +89,8 @@ func NewProducer(ctx context.Context, cfg ProducerConfig, saramaCfg *sarama.Conf
 
 // PublishCommit publishes a block commit event to control.commits.v1
 // Called after durable persistence completes
-func (p *Producer) PublishCommit(ctx context.Context, height uint64, hash [32]byte, stateRoot [32]byte, txCount int, ts int64) error {
+// Fix: Gap 2 - Added anomalyIDs parameter to enable COMMITTED state tracking
+func (p *Producer) PublishCommit(ctx context.Context, height uint64, hash [32]byte, stateRoot [32]byte, txCount int, ts int64, anomalyIDs []string) error {
 	p.mu.RLock()
 	if p.closed {
 		p.mu.RUnlock()
@@ -107,12 +108,14 @@ func (p *Producer) PublishCommit(ctx context.Context, height uint64, hash [32]by
 	copy(stateRootCopy, stateRoot[:])
 
 	// Build protobuf CommitEvent
+	// Fix: Gap 2 - Include anomaly IDs for individual tracking
 	evt := &pb.CommitEvent{
-		Height:    int64(height),
-		BlockHash: blockHash,
-		StateRoot: stateRootCopy,
-		TxCount:   uint32(txCount),
-		Timestamp: ts,
+		Height:      int64(height),
+		BlockHash:   blockHash,
+		StateRoot:   stateRootCopy,
+		TxCount:     uint32(txCount),
+		AnomalyIds:  anomalyIDs,  // New field
+		Timestamp:   ts,
 	}
 
 	if err := p.signer.Sign(evt); err != nil {
@@ -160,10 +163,11 @@ func (p *Producer) PublishCommit(ctx context.Context, height uint64, hash [32]by
 	// Success
 	if p.audit != nil {
 		_ = p.audit.Info("kafka_commit_published", map[string]interface{}{
-			"height":    height,
-			"hash":      fmt.Sprintf("%x", hash[:8]),
-			"partition": partition,
-			"offset":    offset,
+			"height":        height,
+			"hash":          fmt.Sprintf("%x", hash[:8]),
+			"partition":     partition,
+			"offset":        offset,
+			"anomaly_count": len(anomalyIDs),
 		})
 	}
 
@@ -172,7 +176,8 @@ func (p *Producer) PublishCommit(ctx context.Context, height uint64, hash [32]by
 			utils.ZapUint64("height", height),
 			utils.ZapString("hash", fmt.Sprintf("%x", hash[:8])),
 			utils.ZapInt32("partition", partition),
-			utils.ZapInt64("offset", offset))
+			utils.ZapInt64("offset", offset),
+			utils.ZapInt("anomaly_ids_tracked", len(anomalyIDs)))
 	}
 
 	return nil

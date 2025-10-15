@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -8,11 +9,13 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -23,6 +26,7 @@ import (
 	"backend/pkg/block"
 	"backend/pkg/config"
 	"backend/pkg/consensus/api"
+	"backend/pkg/consensus/genesis"
 	ctypes "backend/pkg/consensus/types"
 	"backend/pkg/ingest/kafka"
 	"backend/pkg/mempool"
@@ -86,7 +90,7 @@ func main() {
 	fmt.Println()
 
 	// Try multiple .env paths (Load doesn't overwrite existing env vars)
-	envPaths := []string{".env", "../../.env", "../.env"}
+	envPaths := []string{".env", "../../../.env", "../../.env", "../.env"}
 	envLoaded := false
 	for _, path := range envPaths {
 		if err := godotenv.Load(path); err == nil {
@@ -149,8 +153,8 @@ func main() {
 		log.Fatalf("ip allowlist init failed: %v", err)
 	}
 
-    // Create logger adapter now; crypto adapter will be built after validator set is loaded
-    loggerAdapter := api.NewLoggerAdapter(logger)
+	// Create logger adapter now; crypto adapter will be built after validator set is loaded
+	loggerAdapter := api.NewLoggerAdapter(logger)
 	allowlistAdapter := api.NewIPAllowlistAdapter(allowlist)
 
 	localPublicKey, err := cryptoSvc.GetPublicKey()
@@ -163,9 +167,9 @@ func main() {
 		log.Fatalf("load validator infos failed: %v", err)
 	}
 
-    vSet := newValidatorSet(validatorInfos)
-    // Build crypto adapter with validator registry so verification can use peers' public keys (fixes BUG-032)
-    cryptoAdapter := api.NewCryptoAdapter(cryptoSvc, vSet)
+	vSet := newValidatorSet(validatorInfos)
+	// Build crypto adapter with validator registry so verification can use peers' public keys (fixes BUG-032)
+	cryptoAdapter := api.NewCryptoAdapter(cryptoSvc, vSet)
 	localValidatorID := deriveValidatorID(localPublicKey)
 	if !vSet.IsValidator(localValidatorID) {
 		log.Fatalf("local validator id %x is not present in consensus set", localValidatorID[:8])
@@ -191,7 +195,7 @@ func main() {
 	if signingKey := cfgMgr.GetString("AUDIT_SIGNING_KEY", ""); signingKey != "" && len(signingKey) >= 32 {
 		auditConfig.SigningKey = []byte(signingKey)
 	}
-	
+
 	auditLogger, err := utils.NewAuditLogger(auditConfig)
 	var auditAdapter *utils.AuditLoggerAdapter
 	if err != nil {
@@ -262,13 +266,83 @@ func main() {
 		log.Fatalf("wiring service init failed: %v", err)
 	}
 
+	// Ensure the engine has a peer observer for activation gating in multi-node setups.
+	// The wiring service will also set this when P2P is enabled; this early wiring is safe and idempotent.
+	if p2pRouter != nil {
+		consensusEngine.SetPeerObserver(p2pRouter)
+	}
+
+	validatorsSnapshot := vSet.GetValidators()
+	configHash := computeGenesisConfigHash(engineConfig, cfgMgr, validatorsSnapshot)
+	peerHash := computeValidatorSetHash(validatorsSnapshot)
+	statePath := cfgMgr.GetString("GENESIS_STATE_PATH", "")
+	if statePath == "" {
+		statePath = filepath.Join(cfgMgr.GetString("DATA_DIR", "data"), "genesis_state.json")
+	}
+	statePath = filepath.Clean(statePath)
+	runtimeSkew := cfgMgr.GetDuration("CONSENSUS_CLOCK_SKEW_TOLERANCE", 5*time.Second)
+	if runtimeSkew <= 0 {
+		runtimeSkew = 5 * time.Second
+	}
+	genesisSkew := cfgMgr.GetDuration("CONSENSUS_GENESIS_CLOCK_SKEW_TOLERANCE", 0)
+	if genesisSkew <= 0 {
+		genesisSkew = cfgMgr.GetDuration("GENESIS_CLOCK_SKEW_TOLERANCE", 15*time.Minute)
+	}
+	genesisCfg := genesis.Config{
+		ReadyTimeout:              cfgMgr.GetDuration("GENESIS_READY_TIMEOUT", 30*time.Second),
+		CertificateTimeout:        cfgMgr.GetDuration("GENESIS_CERTIFICATE_TIMEOUT", 60*time.Second),
+		ClockSkewTolerance:        runtimeSkew,
+		GenesisClockSkewTolerance: genesisSkew,
+		ReadyRefreshInterval:      cfgMgr.GetDuration("GENESIS_READY_REFRESH_INTERVAL", 30*time.Second),
+		ConfigHash:                configHash,
+		PeerHash:                  peerHash,
+		StatePath:                 statePath,
+	}
+	genesisCoord, err := genesis.NewCoordinator(genesisCfg, localValidatorID, vSet, consensusEngine.LeaderRotation(), cryptoAdapter, consensusEngine, p2pRouter, loggerAdapter, auditAdapter)
+	if err != nil {
+		log.Fatalf("genesis coordinator init failed: %v", err)
+	}
+	consensusEngine.SetGenesisCoordinator(genesisCoord)
+
+	// CRITICAL: Allow P2P subscriptions to fully propagate before starting consensus
+	// This prevents the 1ms race where proposals are published before all validators subscribe
+	// Root cause fix for validators missing view 0 messages (Point 3 from diagnostic plan)
+	logger.Info("[DIAGNOSTIC] P2P handlers attached, waiting for subscription propagation...",
+		utils.ZapInt("local_node_id", nodeID))
+	syncStart := time.Now()
+	time.Sleep(100 * time.Millisecond)
+	logger.Info("[DIAGNOSTIC] P2P subscription sync complete, starting consensus",
+		utils.ZapDuration("sync_delay", time.Since(syncStart)))
+
 	if err := consensusEngine.Start(ctx); err != nil {
 		log.Fatalf("consensus engine start failed: %v", err)
 	}
 
+	// START SERVICE BEFORE GENESIS - Proposer needs to run regardless of genesis completion
 	if err := service.Start(ctx); err != nil {
 		log.Fatalf("service start failed: %v", err)
 	}
+
+	if err := genesisCoord.Start(ctx); err != nil {
+		log.Fatalf("genesis ceremony start failed: %v", err)
+	}
+	
+	// Wait for genesis asynchronously - don't block proposer
+	go func() {
+		for {
+			cert, err := genesisCoord.WaitForCertificate(ctx)
+			if err == nil {
+				logger.Info("genesis ceremony completed; consensus timers activated",
+					utils.ZapInt("attestations", len(cert.Attestations)))
+				break
+			}
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				logger.Warn("genesis ceremony aborted", utils.ZapError(err))
+				break
+			}
+			logger.Warn("genesis wait interrupted; retrying", utils.ZapError(err))
+		}
+	}()
 
 	fmt.Println("Startup complete. Kafka ingest, mempool, and consensus wiring are active.")
 	fmt.Println("Press Ctrl+C to initiate shutdown.")
@@ -289,6 +363,89 @@ func main() {
 	}
 
 	fmt.Println("Shutdown complete.")
+}
+
+func computeGenesisConfigHash(engineConfig *api.EngineConfig, cfgMgr *utils.ConfigManager, validators []ctypes.ValidatorInfo) [32]byte {
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "node_type=%s\n", engineConfig.NodeType)
+	fmt.Fprintf(&buf, "enable_proposing=%t\n", engineConfig.EnableProposing)
+	fmt.Fprintf(&buf, "enable_voting=%t\n", engineConfig.EnableVoting)
+	fmt.Fprintf(&buf, "block_timeout=%s\n", engineConfig.BlockTimeout)
+
+	durations := []struct {
+		key   string
+		value time.Duration
+	}{
+		{"CONSENSUS_BASE_TIMEOUT", cfgMgr.GetDuration("CONSENSUS_BASE_TIMEOUT", 10*time.Second)},
+		{"CONSENSUS_MAX_TIMEOUT", cfgMgr.GetDuration("CONSENSUS_MAX_TIMEOUT", 60*time.Second)},
+		{"CONSENSUS_MIN_TIMEOUT", cfgMgr.GetDuration("CONSENSUS_MIN_TIMEOUT", 5*time.Second)},
+		{"CONSENSUS_TIMEOUT_DECREASE_DELTA", cfgMgr.GetDuration("CONSENSUS_TIMEOUT_DECREASE_DELTA", 200*time.Millisecond)},
+		{"CONSENSUS_VIEWCHANGE_TIMEOUT", cfgMgr.GetDuration("CONSENSUS_VIEWCHANGE_TIMEOUT", 30*time.Second)},
+		{"CONSENSUS_HEARTBEAT_INTERVAL", cfgMgr.GetDuration("CONSENSUS_HEARTBEAT_INTERVAL", 500*time.Millisecond)},
+		{"CONSENSUS_MAX_IDLE_TIME", cfgMgr.GetDuration("CONSENSUS_MAX_IDLE_TIME", 3*time.Second)},
+	}
+	for _, item := range durations {
+		fmt.Fprintf(&buf, "%s=%s\n", item.key, item.value)
+	}
+
+	bools := []struct {
+		key   string
+		value bool
+	}{
+		{"CONSENSUS_ENABLE_AIMD", cfgMgr.GetBool("CONSENSUS_ENABLE_AIMD", true)},
+		{"CONSENSUS_ENABLE_REPUTATION", cfgMgr.GetBool("CONSENSUS_ENABLE_REPUTATION", true)},
+		{"CONSENSUS_ENABLE_QUARANTINE", cfgMgr.GetBool("CONSENSUS_ENABLE_QUARANTINE", true)},
+	}
+	for _, item := range bools {
+		fmt.Fprintf(&buf, "%s=%t\n", item.key, item.value)
+	}
+
+	floats := []struct {
+		key   string
+		value float64
+	}{
+		{"CONSENSUS_TIMEOUT_INCREASE_FACTOR", cfgMgr.GetFloat64("CONSENSUS_TIMEOUT_INCREASE_FACTOR", 1.5)},
+		{"CONSENSUS_HEARTBEAT_JITTER", cfgMgr.GetFloat64("CONSENSUS_HEARTBEAT_JITTER", 0.05)},
+		{"CONSENSUS_MIN_LEADER_REPUTATION", cfgMgr.GetFloat64("CONSENSUS_MIN_LEADER_REPUTATION", 0.7)},
+	}
+	for _, item := range floats {
+		fmt.Fprintf(&buf, "%s=%.6f\n", item.key, item.value)
+	}
+
+	ints := []struct {
+		key   string
+		value int
+	}{
+		{"CONSENSUS_MISSED_HEARTBEATS", cfgMgr.GetInt("CONSENSUS_MISSED_HEARTBEATS", 6)},
+	}
+	for _, item := range ints {
+		fmt.Fprintf(&buf, "%s=%d\n", item.key, item.value)
+	}
+
+	validatorIDs := make([]string, len(validators))
+	for i := range validators {
+		validatorIDs[i] = fmt.Sprintf("%x", validators[i].ID[:])
+	}
+	sort.Strings(validatorIDs)
+	for _, id := range validatorIDs {
+		fmt.Fprintf(&buf, "validator=%s\n", id)
+	}
+
+	return sha256.Sum256(buf.Bytes())
+}
+
+func computeValidatorSetHash(validators []ctypes.ValidatorInfo) [32]byte {
+	ids := make([]string, len(validators))
+	for i := range validators {
+		ids[i] = fmt.Sprintf("%x", validators[i].ID[:])
+	}
+	sort.Strings(ids)
+	var buf bytes.Buffer
+	for _, id := range ids {
+		buf.WriteString(id)
+		buf.WriteByte('\n')
+	}
+	return sha256.Sum256(buf.Bytes())
 }
 
 func resolveLocalNodeID(cfgMgr *utils.ConfigManager) (int, error) {
@@ -553,6 +710,7 @@ func buildWiringConfig(
 		MinMempoolTxs:     cfgMgr.GetInt("BLOCK_MIN_MEMPOOL_TXS", 1),
 		TimestampSkew:     cfgMgr.GetDuration("STATE_TIMESTAMP_SKEW", 30*time.Second),
 		GenesisHash:       [32]byte{},
+		BlockTimeout:      cfgMgr.GetDuration("CONSENSUS_BLOCK_TIMEOUT", 5*time.Second),
 		EnablePersistence: false,
 		EnableKafka:       enableKafka,
 		ConfigManager:     cfgMgr,
@@ -560,15 +718,29 @@ func buildWiringConfig(
 	}
 
 	if enableKafka {
+		// Each node uses a unique consumer group to consume ALL partitions
+		// This ensures all nodes see all transactions for consensus
+		baseGroupID := cfgMgr.GetString("KAFKA_CONSUMER_GROUP_ID", "cybermesh-consensus")
+		nodeID := cfgMgr.GetString("NODE_ID", "")
+		consumerGroupID := baseGroupID
+		if nodeID != "" {
+			consumerGroupID = fmt.Sprintf("%s-node-%s", baseGroupID, nodeID)
+		}
+
 		wiringCfg.KafkaConsumerCfg = kafka.ConsumerConfig{
 			Brokers:  kafkaBrokers,
-			GroupID:  cfgMgr.GetString("KAFKA_CONSUMER_GROUP_ID", "backend-validators"),
+			GroupID:  consumerGroupID,
 			Topics:   consumerTopics,
 			DLQTopic: cfgMgr.GetString("KAFKA_DLQ_TOPIC", "ai.dlq.v1"),
 			VerifierCfg: kafka.VerifierConfig{
 				MaxTimestampSkew: cfgMgr.GetDuration("KAFKA_MAX_TIMESTAMP_SKEW", 5*time.Minute),
 			},
 		}
+
+		logger.Info("Kafka consumer configured",
+			utils.ZapString("group_id", consumerGroupID),
+			utils.ZapStringArray("topics", consumerTopics),
+			utils.ZapString("strategy", "all-partitions-per-node"))
 
 		wiringCfg.KafkaProducerCfg = kafka.ProducerConfig{
 			Brokers: wiringCfg.KafkaConsumerCfg.Brokers,
@@ -634,11 +806,11 @@ func buildWiringConfig(
 	if cfgMgr.GetBool("ENABLE_P2P", false) {
 		// Load node config using actual structure
 		nodeCfg := &config.NodeConfig{
-			NodeID:       cfgMgr.GetInt("NODE_ID", 1),
-			NodeType:     cfgMgr.GetString("NODE_TYPE", "validator"),
-			Version:      cfgMgr.GetString("NODE_VERSION", "1.0.0"),
-			Environment:  cfgMgr.GetString("ENVIRONMENT", "development"),
-			Region:       cfgMgr.GetString("REGION", "local"),
+			NodeID:      cfgMgr.GetInt("NODE_ID", 1),
+			NodeType:    cfgMgr.GetString("NODE_TYPE", "validator"),
+			Version:     cfgMgr.GetString("NODE_VERSION", "1.0.0"),
+			Environment: cfgMgr.GetString("ENVIRONMENT", "development"),
+			Region:      cfgMgr.GetString("REGION", "local"),
 		}
 
 		// Load or create security config
@@ -678,7 +850,7 @@ func buildWiringConfig(
 			logger.Warn("p2p router init failed, continuing without P2P", utils.ZapError(routerErr))
 			p2pRouter = nil
 		} else {
-			logger.Info("P2P router initialized", 
+			logger.Info("P2P router initialized",
 				utils.ZapInt("node_id", nodeCfg.NodeID),
 				utils.ZapString("rendezvous", routerOpts.Rendezvous),
 				utils.ZapInt("topics", len(topics)))

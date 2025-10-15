@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -362,44 +363,44 @@ type ExternalAIService struct {
 // Kafka Configuration - Military-grade security for Confluent Cloud
 type KafkaConfig struct {
 	// Connection
-	Brokers         []string      `json:"brokers"`          // Comma-separated Kafka brokers
-	Timeout         time.Duration `json:"timeout"`          // Connection timeout (default: 30s)
-	
+	Brokers []string      `json:"brokers"` // Comma-separated Kafka brokers
+	Timeout time.Duration `json:"timeout"` // Connection timeout (default: 30s)
+
 	// Security (TLS/SASL)
-	TLSEnabled      bool          `json:"tls_enabled"`      // Enable TLS (required in production)
-	SASLMechanism   string        `json:"sasl_mechanism"`   // SCRAM-SHA-256, SCRAM-SHA-512, PLAIN
-	SASLUsername    string        `json:"sasl_username"`    // SASL username
-	SASLPassword    string        `json:"-"`                // SASL password (never logged)
-	
+	TLSEnabled    bool   `json:"tls_enabled"`    // Enable TLS (required in production)
+	SASLMechanism string `json:"sasl_mechanism"` // SCRAM-SHA-256, SCRAM-SHA-512, PLAIN
+	SASLUsername  string `json:"sasl_username"`  // SASL username
+	SASLPassword  string `json:"-"`              // SASL password (never logged)
+
 	// Topics - Input (AI → Backend)
-	InputTopics     []string      `json:"input_topics"`     // ai.anomalies.v1, ai.evidence.v1, ai.policy.v1
-	
+	InputTopics []string `json:"input_topics"` // ai.anomalies.v1, ai.evidence.v1, ai.policy.v1
+
 	// Topics - Output (Backend → AI)
-	OutputTopicCommits     string   `json:"output_topic_commits"`     // control.commits.v1
-	OutputTopicReputation  string   `json:"output_topic_reputation"`  // control.reputation.v1
-	OutputTopicPolicy      string   `json:"output_topic_policy"`      // control.policy.v1
-	OutputTopicEvidence    string   `json:"output_topic_evidence"`    // control.evidence.v1
-	
+	OutputTopicCommits    string `json:"output_topic_commits"`    // control.commits.v1
+	OutputTopicReputation string `json:"output_topic_reputation"` // control.reputation.v1
+	OutputTopicPolicy     string `json:"output_topic_policy"`     // control.policy.v1
+	OutputTopicEvidence   string `json:"output_topic_evidence"`   // control.evidence.v1
+
 	// Consumer Settings
-	ConsumerGroupID        string        `json:"consumer_group_id"`        // Consumer group (e.g., "backend-validators")
-	ConsumerOffsetInitial  string        `json:"consumer_offset_initial"`  // "latest" or "earliest"
+	ConsumerGroupID        string        `json:"consumer_group_id"`         // Consumer group (e.g., "backend-validators")
+	ConsumerOffsetInitial  string        `json:"consumer_offset_initial"`   // "latest" or "earliest"
 	ConsumerMaxPollRecords int           `json:"consumer_max_poll_records"` // Max records per poll (default: 500)
-	ConsumerSessionTimeout time.Duration `json:"consumer_session_timeout"` // Session timeout (default: 10s)
-	ConsumerHeartbeat      time.Duration `json:"consumer_heartbeat"`      // Heartbeat interval (default: 3s)
-	
+	ConsumerSessionTimeout time.Duration `json:"consumer_session_timeout"`  // Session timeout (default: 10s)
+	ConsumerHeartbeat      time.Duration `json:"consumer_heartbeat"`        // Heartbeat interval (default: 3s)
+
 	// Producer Settings
-	ProducerIdempotent     bool          `json:"producer_idempotent"`     // Idempotent producer (default: true)
-	ProducerRequiredAcks   int16         `json:"producer_required_acks"`  // Required acks: -1 (all), 1 (leader), 0 (none)
-	ProducerRetries        int           `json:"producer_retries"`        // Max retries (default: 3)
-	ProducerCompression    string        `json:"producer_compression"`    // none, gzip, snappy, lz4, zstd
-	
+	ProducerIdempotent   bool   `json:"producer_idempotent"`    // Idempotent producer (default: true)
+	ProducerRequiredAcks int16  `json:"producer_required_acks"` // Required acks: -1 (all), 1 (leader), 0 (none)
+	ProducerRetries      int    `json:"producer_retries"`       // Max retries (default: 3)
+	ProducerCompression  string `json:"producer_compression"`   // none, gzip, snappy, lz4, zstd
+
 	// Dead Letter Queue
-	DLQEnabled             bool          `json:"dlq_enabled"`             // Enable DLQ routing
-	DLQTopicSuffix         string        `json:"dlq_topic_suffix"`        // DLQ suffix (default: ".dlq")
-	
+	DLQEnabled     bool   `json:"dlq_enabled"`      // Enable DLQ routing
+	DLQTopicSuffix string `json:"dlq_topic_suffix"` // DLQ suffix (default: ".dlq")
+
 	// Limits (DoS Protection)
-	MaxMessageSize         int           `json:"max_message_size"`        // Max message size in bytes (default: 1MB)
-	MaxPayloadSize         int           `json:"max_payload_size"`        // Max payload size (default: 512KB)
+	MaxMessageSize int `json:"max_message_size"` // Max message size in bytes (default: 1MB)
+	MaxPayloadSize int `json:"max_payload_size"` // Max payload size (default: 512KB)
 }
 
 // TopologyEnvironmentProvider provides access to environment variables with validation
@@ -430,14 +431,14 @@ type FlexibleConfigLoader struct {
 // NewFlexibleConfigLoader creates a new flexible config loader
 func NewFlexibleConfigLoader(configManager *utils.ConfigManager) (*FlexibleConfigLoader, error) {
 	env := NewTopologyEnvironmentProvider(configManager)
-	
+
 	// Create crypto service
 	cryptoConfig := utils.DefaultCryptoConfig()
 	cryptoService, err := utils.NewCryptoService(cryptoConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create crypto service: %w", err)
 	}
-	
+
 	return &FlexibleConfigLoader{
 		env:           env,
 		configManager: configManager,
@@ -612,7 +613,7 @@ func (loader *EnhancedConfigLoader) loadStorageConfig(ctx context.Context) (*Sto
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Convert EnhancedStorageConfig to StorageConfig for backwards compatibility
 	return &StorageConfig{
 		DatabaseURL:      enhancedStorage.DatabaseURL,
@@ -688,7 +689,7 @@ func calculateConsensusNodes() []int {
 	consensusStr := os.Getenv("CONSENSUS_NODES")
 	if consensusStr != "" {
 		if nodes, err := parseIntList(consensusStr, 1, ClusterSize); err == nil {
-			return nodes
+			return uniqueSortedInts(nodes)
 		}
 	}
 
@@ -707,7 +708,7 @@ func calculateConsensusNodes() []int {
 		}
 	}
 
-	return nodes
+	return uniqueSortedInts(nodes)
 }
 
 func parseIntList(input string, min, max int) ([]int, error) {
@@ -737,6 +738,26 @@ func parseIntList(input string, min, max int) ([]int, error) {
 	}
 
 	return result, nil
+}
+
+func uniqueSortedInts(values []int) []int {
+	if len(values) == 0 {
+		return values
+	}
+
+	sort.Ints(values)
+
+	out := values[:1]
+	last := values[0]
+	for _, v := range values[1:] {
+		if v == last {
+			continue
+		}
+		out = append(out, v)
+		last = v
+	}
+
+	return out
 }
 
 // Main entry point for loading complete integrated configuration

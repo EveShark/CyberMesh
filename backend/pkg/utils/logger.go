@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -133,10 +134,10 @@ func DefaultLogConfig() *LogConfig {
 		OutputPath:         getEnvOrDefault("LOG_FILE_PATH", ""),
 		ErrorOutputPath:    "stderr",
 		EnableRotation:     getEnvOrDefault("LOG_FILE_PATH", "") != "",
-		MaxSize:            DefaultLogFileSize,
-		MaxBackups:         DefaultMaxBackups,
-		MaxAge:             DefaultMaxAge,
-		Compress:           true,
+		MaxSize:            getEnvAsIntOrDefault("LOG_MAX_SIZE", DefaultLogFileSize),
+		MaxBackups:         getEnvAsIntOrDefault("LOG_MAX_BACKUPS", DefaultMaxBackups),
+		MaxAge:             getEnvAsIntOrDefault("LOG_MAX_AGE", DefaultMaxAge),
+		Compress:           getEnvAsBoolOrDefault("LOG_COMPRESS", true),
 		EnableSampling:     true,
 		SampleRate:         DefaultSampleRate,
 		EnableSanitization: true,
@@ -181,6 +182,10 @@ type Logger struct {
 func NewLogger(config *LogConfig) (*Logger, error) {
 	if config == nil {
 		config = DefaultLogConfig()
+	}
+
+	if config.EnableSampling && config.SampleRate <= 0 {
+		config.SampleRate = DefaultSampleRate
 	}
 
 	// Parse log level
@@ -474,6 +479,10 @@ func extractContextFields(ctx context.Context) []zap.Field {
 }
 
 func (l *Logger) startPerformanceMonitor() {
+	if !l.config.EnableSampling {
+		return
+	}
+
 	l.wg.Add(1)
 	go func() {
 		defer l.wg.Done()
@@ -508,11 +517,18 @@ func (l *Logger) startPerformanceMonitor() {
 }
 
 func (l *Logger) shouldSample() bool {
+	if !l.config.EnableSampling {
+		return false
+	}
 	if !l.sampling.Load() {
 		return false
 	}
+	sampleRate := l.config.SampleRate
+	if sampleRate <= 0 {
+		return false
+	}
 	counter := atomic.AddUint64(&l.sampleCounter, 1)
-	return counter%uint64(l.config.SampleRate) != 0
+	return counter%uint64(sampleRate) != 0
 }
 
 // sanitizer handles sensitive data redaction
@@ -710,6 +726,24 @@ func CreateTestLogger() *Logger {
 func getEnvOrDefault(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
+	}
+	return defaultValue
+}
+
+func getEnvAsIntOrDefault(key string, defaultValue int) int {
+	if value := os.Getenv(key); value != "" {
+		if intVal, err := strconv.Atoi(value); err == nil {
+			return intVal
+		}
+	}
+	return defaultValue
+}
+
+func getEnvAsBoolOrDefault(key string, defaultValue bool) bool {
+	if value := os.Getenv(key); value != "" {
+		if boolVal, err := strconv.ParseBool(value); err == nil {
+			return boolVal
+		}
 	}
 	return defaultValue
 }

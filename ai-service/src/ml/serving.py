@@ -46,6 +46,8 @@ class ModelRegistry:
         
         # Loaded models cache
         self.loaded_models: Dict[str, Any] = {}
+        # Malware variants cache (by variant key)
+        self.loaded_malware_variants: Dict[str, Any] = {}
         
         # Model metadata
         self.model_metadata: Dict[str, Dict] = {}
@@ -57,7 +59,7 @@ class ModelRegistry:
         Load and verify model.
         
         Args:
-            model_name: Model name ("ddos_lgbm", "malware_lgbm", "anomaly_iforest")
+            model_name: Model name ("ddos", "malware", "anomaly")
         
         Returns:
             Loaded model object or None
@@ -103,6 +105,47 @@ class ModelRegistry:
         
         except Exception as e:
             self.logger.error(f"Failed to load model {model_name}: {e}", exc_info=True)
+            return None
+
+    def load_malware_variant(self, variant_key: str) -> Optional[Any]:
+        """
+        Load a malware variant model by key from models.malware.variants.
+
+        Args:
+            variant_key: One of the keys under registry['models']['malware']['variants']
+
+        Returns:
+            Loaded model or None
+        """
+        # Cache check
+        if variant_key in self.loaded_malware_variants:
+            self.logger.debug(f"Malware variant cache hit: {variant_key}")
+            return self.loaded_malware_variants[variant_key]
+
+        models = self.registry.get('models', {})
+        malware = models.get('malware', {})
+        variants = malware.get('variants', {})
+        meta = variants.get(variant_key)
+        if not meta:
+            self.logger.warning(f"Malware variant not in registry: {variant_key}")
+            return None
+
+        model_file = self.models_path / meta['path'] if meta.get('path') else None
+        if not model_file or not model_file.exists():
+            self.logger.warning(f"Malware variant file not found for {variant_key}: {model_file}")
+            return None
+        sig_file = model_file.with_suffix('.pkl.sig')
+        if not sig_file.exists():
+            self.logger.warning(f"Signature file not found for {variant_key}: {sig_file}")
+            return None
+
+        try:
+            model = self._load_and_verify(model_file, sig_file, meta.get('fingerprint', ''))
+            self.loaded_malware_variants[variant_key] = model
+            self.logger.info(f"Loaded malware variant: {variant_key}")
+            return model
+        except Exception as e:
+            self.logger.error(f"Failed to load malware variant {variant_key}: {e}", exc_info=True)
             return None
     
     def _load_and_verify(self, model_path: Path, sig_path: Path, expected_fingerprint: str) -> Any:

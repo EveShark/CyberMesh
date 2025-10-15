@@ -1,8 +1,10 @@
 package leader
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -17,6 +19,7 @@ type Rotation struct {
 	audit        AuditLogger
 	logger       Logger
 	mu           sync.RWMutex
+	readiness    types.ReadinessOracle
 }
 
 // RotationConfig contains leader selection parameters
@@ -82,39 +85,39 @@ func (noopQuarantine) Quarantine(types.ValidatorID, time.Duration, string) error
 
 func (noopQuarantine) Release(types.ValidatorID) error { return nil }
 
-// SelectLeader returns the leader for a given view using deterministic round-robin
+// SelectLeader returns the leader for the given view.
+// Leader election is deterministic to maintain PBFT compliance.
 func (r *Rotation) SelectLeader(ctx context.Context, view uint64) (*ValidatorInfo, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	// Get all validators
 	allValidators := r.validatorSet.GetValidators()
 	if len(allValidators) == 0 {
 		return nil, fmt.Errorf("no validators in set")
 	}
 
-	// Filter eligible validators
-	eligible := r.filterEligible(ctx, allValidators, view)
-
-	// Handle empty eligible set
+	enforceReadiness := r.readiness != nil && view > 0
+	eligible := r.filterEligible(ctx, allValidators, view, enforceReadiness)
 	if len(eligible) == 0 {
-		return r.handleNoEligible(ctx, allValidators, view)
+		return r.handleNoEligible(ctx, allValidators, view, enforceReadiness)
 	}
 
-	// Deterministic selection with seed
-	index := r.selectIndex(view, len(eligible))
-	leader := &eligible[index]
+	ordered := make([]ValidatorInfo, len(eligible))
+	copy(ordered, eligible)
+	sortValidatorsDeterministic(ordered)
+	position := int(view % uint64(len(ordered)))
+	leader := &ordered[position]
 
-	// Audit the selection
+	eligibleCount := len(ordered)
 	if r.config.AuditSelections {
-		r.auditSelection(ctx, view, leader, len(eligible), len(allValidators))
+		r.auditSelection(ctx, view, leader, eligibleCount, len(allValidators))
 	}
 
 	return leader, nil
 }
 
 // filterEligible applies reputation and quarantine filters
-func (r *Rotation) filterEligible(ctx context.Context, validators []ValidatorInfo, view uint64) []ValidatorInfo {
+func (r *Rotation) filterEligible(ctx context.Context, validators []ValidatorInfo, view uint64, enforceReadiness bool) []ValidatorInfo {
 	eligible := make([]ValidatorInfo, 0, len(validators))
 
 	for _, v := range validators {
@@ -125,15 +128,6 @@ func (r *Rotation) filterEligible(ctx context.Context, validators []ValidatorInf
 
 		// Check if joined before this view
 		if v.JoinedView > view {
-			continue
-		}
-
-		// Check quarantine status
-		if r.config.EnableQuarantine && r.quarantine.IsQuarantined(v.ID) {
-			r.logger.InfoContext(ctx, "validator quarantined, skipping",
-				"validator", fmt.Sprintf("%x", v.ID[:8]),
-				"view", view,
-			)
 			continue
 		}
 
@@ -148,14 +142,46 @@ func (r *Rotation) filterEligible(ctx context.Context, validators []ValidatorInf
 			continue
 		}
 
+		if enforceReadiness && !r.readiness.IsValidatorReady(v.ID) {
+			r.logger.InfoContext(ctx, "validator not marked ready; skipping from leader rotation",
+				"validator", fmt.Sprintf("%x", v.ID[:8]),
+				"view", view,
+			)
+			continue
+		}
+
 		eligible = append(eligible, v)
 	}
 
 	return eligible
 }
 
+func (r *Rotation) findNextReadyLeader(validators []ValidatorInfo, startIndex int, view uint64) *ValidatorInfo {
+	if r.readiness == nil {
+		return nil
+	}
+	total := len(validators)
+	if total <= 1 {
+		return nil
+	}
+	for offset := 1; offset < total; offset++ {
+		idx := (startIndex + offset) % total
+		candidate := validators[idx]
+		if !candidate.IsActive {
+			continue
+		}
+		if candidate.JoinedView > view {
+			continue
+		}
+		if r.readiness.IsValidatorReady(candidate.ID) {
+			return &validators[idx]
+		}
+	}
+	return nil
+}
+
 // handleNoEligible handles the case when no validators are eligible
-func (r *Rotation) handleNoEligible(ctx context.Context, allValidators []ValidatorInfo, view uint64) (*ValidatorInfo, error) {
+func (r *Rotation) handleNoEligible(ctx context.Context, allValidators []ValidatorInfo, view uint64, enforceReadiness bool) (*ValidatorInfo, error) {
 	// Check quarantine ratio
 	quarantinedCount := r.quarantine.GetQuarantinedCount()
 	totalCount := len(allValidators)
@@ -187,6 +213,10 @@ func (r *Rotation) handleNoEligible(ctx context.Context, allValidators []Validat
 			quarantinedRatio, r.config.MaxQuarantinedRatio)
 	}
 
+	if enforceReadiness {
+		return nil, fmt.Errorf("no validators marked ready for view %d", view)
+	}
+
 	// Fallback to all active validators if configured
 	if !r.config.FallbackToAll {
 		return nil, fmt.Errorf("no eligible validators and fallback disabled")
@@ -203,6 +233,8 @@ func (r *Rotation) handleNoEligible(ctx context.Context, allValidators []Validat
 	if len(activeValidators) == 0 {
 		return nil, fmt.Errorf("no active validators available")
 	}
+
+	sortValidatorsDeterministic(activeValidators)
 
 	// Select from active validators
 	index := r.selectIndex(view, len(activeValidators))
@@ -251,8 +283,50 @@ func (r *Rotation) GetEligibleCount(ctx context.Context, view uint64) int {
 	defer r.mu.RUnlock()
 
 	allValidators := r.validatorSet.GetValidators()
-	eligible := r.filterEligible(ctx, allValidators, view)
-	return len(eligible)
+	enforceReadiness := r.readiness != nil && view > 0
+	return len(r.filterEligible(ctx, allValidators, view, enforceReadiness))
+}
+
+// IsLeaderEligibleToPropose reports whether the specified validator meets all
+// eligibility requirements to propose in the given view, along with the first
+// failure reason when ineligible.
+func (r *Rotation) IsLeaderEligibleToPropose(ctx context.Context, validatorID types.ValidatorID, view uint64) (bool, string) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if r.validatorSet == nil {
+		return false, "validator set unavailable"
+	}
+
+	info, err := r.validatorSet.GetValidator(validatorID)
+	if err != nil || info == nil {
+		return false, "validator not found"
+	}
+
+	if !info.IsActive {
+		return false, "validator inactive"
+	}
+
+	if info.JoinedView > view {
+		return false, fmt.Sprintf("validator joins at view %d", info.JoinedView)
+	}
+
+	if r.config.EnableReputation && info.Reputation < r.config.MinReputation {
+		return false, fmt.Sprintf("reputation %.2f below threshold %.2f", info.Reputation, r.config.MinReputation)
+	}
+
+	if r.quarantine != nil && r.quarantine.IsQuarantined(validatorID) {
+		if expiry, ok := r.quarantine.GetQuarantineExpiry(validatorID); ok {
+			return false, fmt.Sprintf("validator quarantined until %s", expiry.UTC().Format(time.RFC3339))
+		}
+		return false, "validator quarantined"
+	}
+
+	if r.readiness != nil && view > 0 && !r.readiness.IsValidatorReady(validatorID) {
+		return false, "validator not marked ready"
+	}
+
+	return true, ""
 }
 
 // auditSelection logs leader selection for audit trail
@@ -277,6 +351,13 @@ func (r *Rotation) auditSelection(ctx context.Context, view uint64, leader *Vali
 	}
 }
 
+// SetReadinessOracle wires a readiness oracle used to filter leader eligibility.
+func (r *Rotation) SetReadinessOracle(oracle types.ReadinessOracle) {
+	r.mu.Lock()
+	r.readiness = oracle
+	r.mu.Unlock()
+}
+
 // UpdateConfig allows runtime configuration updates
 func (r *Rotation) UpdateConfig(config *RotationConfig) {
 	r.mu.Lock()
@@ -289,6 +370,24 @@ func (r *Rotation) GetConfig() RotationConfig {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return *r.config
+}
+
+func sortValidatorsDeterministic(validators []ValidatorInfo) {
+	sort.SliceStable(validators, func(i, j int) bool {
+		if cmp := bytes.Compare(validators[i].ID[:], validators[j].ID[:]); cmp != 0 {
+			return cmp < 0
+		}
+		if validators[i].JoinedView != validators[j].JoinedView {
+			return validators[i].JoinedView < validators[j].JoinedView
+		}
+		if validators[i].Reputation != validators[j].Reputation {
+			return validators[i].Reputation > validators[j].Reputation
+		}
+		if validators[i].IsActive != validators[j].IsActive {
+			return validators[i].IsActive
+		}
+		return validators[i].ID[0] < validators[j].ID[0]
+	})
 }
 
 // ValidateRotation performs sanity checks on rotation configuration

@@ -46,19 +46,19 @@ const (
 
 // Errors
 var (
-	ErrInvalidKeySize           = errors.New("crypto: invalid key size")
-	ErrCryptoInvalidSignature   = errors.New("crypto: signature verification failed")
-	ErrDataTooLarge             = errors.New("crypto: data exceeds maximum size")
-	ErrKeyNotFound         = errors.New("crypto: key not found")
-	ErrKeyExpired          = errors.New("crypto: key has expired")
-	ErrInsufficientEntropy = errors.New("crypto: insufficient entropy")
-	ErrReplayDetected      = errors.New("crypto: replay attack detected")
-	ErrInvalidCiphertext   = errors.New("crypto: invalid ciphertext format")
-	ErrInvalidNonce        = errors.New("crypto: invalid nonce")
-	ErrKeyVersionMismatch  = errors.New("crypto: key version mismatch")
-	ErrContextCanceled     = errors.New("crypto: operation canceled")
-	ErrDecryptionFailed    = errors.New("crypto: decryption failed")
-	ErrEncryptionFailed    = errors.New("crypto: encryption failed")
+	ErrInvalidKeySize         = errors.New("crypto: invalid key size")
+	ErrCryptoInvalidSignature = errors.New("crypto: signature verification failed")
+	ErrDataTooLarge           = errors.New("crypto: data exceeds maximum size")
+	ErrKeyNotFound            = errors.New("crypto: key not found")
+	ErrKeyExpired             = errors.New("crypto: key has expired")
+	ErrInsufficientEntropy    = errors.New("crypto: insufficient entropy")
+	ErrReplayDetected         = errors.New("crypto: replay attack detected")
+	ErrInvalidCiphertext      = errors.New("crypto: invalid ciphertext format")
+	ErrInvalidNonce           = errors.New("crypto: invalid nonce")
+	ErrKeyVersionMismatch     = errors.New("crypto: key version mismatch")
+	ErrContextCanceled        = errors.New("crypto: operation canceled")
+	ErrDecryptionFailed       = errors.New("crypto: decryption failed")
+	ErrEncryptionFailed       = errors.New("crypto: encryption failed")
 )
 
 // KeyVersion represents a versioned cryptographic key
@@ -473,11 +473,6 @@ func (cs *CryptoService) VerifyWithContext(ctx context.Context, data, signedData
 		if _, err := io.ReadFull(buf, nonce); err != nil {
 			return ErrInvalidNonce
 		}
-
-		// Check for replay attack
-		if cs.replayCache.Check(nonce) {
-			return ErrReplayDetected
-		}
 	}
 
 	// Read signature
@@ -495,6 +490,14 @@ func (cs *CryptoService) VerifyWithContext(ctx context.Context, data, signedData
 		signedDataBuf.Write(nonce)
 	}
 	signedDataBuf.Write(data)
+
+	var payloadHash [32]byte
+	if cs.config.EnableReplayProtection {
+		payloadHash = sha256.Sum256(signedDataBuf.Bytes())
+		if err := cs.replayCache.Check(nonce, payloadHash); err != nil {
+			return err
+		}
+	}
 
 	// Get verification key
 	var verifyKey ed25519.PublicKey
@@ -522,7 +525,7 @@ func (cs *CryptoService) VerifyWithContext(ctx context.Context, data, signedData
 
 	// Add to replay cache
 	if cs.config.EnableReplayProtection && nonce != nil {
-		cs.replayCache.Add(nonce)
+		cs.replayCache.Add(nonce, payloadHash)
 	}
 
 	atomic.AddUint64(&cs.verifyCount, 1)
@@ -782,30 +785,43 @@ func (cs *CryptoService) startReplayCacheCleanup() {
 // replayCache provides thread-safe replay attack prevention
 type replayCache struct {
 	mu      sync.RWMutex
-	cache   map[string]time.Time
+	cache   map[string]replayEntry
 	maxSize int
+}
+
+type replayEntry struct {
+	timestamp time.Time
+	hash      [32]byte
 }
 
 func newReplayCache(maxSize int) *replayCache {
 	return &replayCache{
-		cache:   make(map[string]time.Time),
+		cache:   make(map[string]replayEntry),
 		maxSize: maxSize,
 	}
 }
 
-func (rc *replayCache) Check(nonce []byte) bool {
+func (rc *replayCache) Check(nonce []byte, hash [32]byte) error {
 	rc.mu.RLock()
-	defer rc.mu.RUnlock()
-	key := string(nonce)
-	_, exists := rc.cache[key]
-	return exists
+	entry, exists := rc.cache[string(nonce)]
+	rc.mu.RUnlock()
+	if !exists {
+		return nil
+	}
+	if entry.hash != hash {
+		return ErrReplayDetected
+	}
+	return nil
 }
 
-func (rc *replayCache) Add(nonce []byte) {
+func (rc *replayCache) Add(nonce []byte, hash [32]byte) {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
 	key := string(nonce)
-	rc.cache[key] = time.Now()
+	rc.cache[key] = replayEntry{
+		timestamp: time.Now(),
+		hash:      hash,
+	}
 
 	if len(rc.cache) > rc.maxSize {
 		rc.cleanupLocked()
@@ -820,8 +836,8 @@ func (rc *replayCache) Cleanup() {
 
 func (rc *replayCache) cleanupLocked() {
 	cutoff := time.Now().Add(-5 * time.Minute)
-	for key, timestamp := range rc.cache {
-		if timestamp.Before(cutoff) {
+	for key, entry := range rc.cache {
+		if entry.timestamp.Before(cutoff) {
 			delete(rc.cache, key)
 		}
 	}

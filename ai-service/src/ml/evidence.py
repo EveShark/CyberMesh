@@ -82,6 +82,31 @@ class EvidenceGenerator:
         top_features = self._extract_top_features(decision, top_n=10)
         
         # 4. Build evidence data payload (JSON proof_blob)
+        # Derive minimal full network context (first flow only)
+        full_ctx = {}
+        try:
+            flows = (raw_features or {}).get('flows') or []
+            if flows:
+                f = flows[0] or {}
+                def _get(k: str, *alts, default=None):
+                    for key in (k,)+alts:
+                        if key in f and f[key] is not None:
+                            return f[key]
+                    return default
+                full_ctx = {
+                    'src_ip': _get('src_ip', 'src', 'source'),
+                    'dst_ip': _get('dst_ip', 'dst', 'destination'),
+                    'src_port': _get('src_port', 'sport', 'source_port', default=0),
+                    'dst_port': _get('dst_port', 'dport', 'destination_port', default=0),
+                    'protocol': _get('protocol', 'proto', default=''),
+                    'flow_id': _get('flow_id', 'id', default=''),
+                }
+        except Exception:
+            full_ctx = {}
+
+        semantics = (raw_features or {}).get('semantics') or []
+        sem0 = semantics[0] if semantics else {}
+
         evidence_data = {
             'threat_type': decision.threat_type.value if decision.threat_type else 'unknown',
             'final_score': float(decision.final_score),
@@ -91,7 +116,12 @@ class EvidenceGenerator:
             'top_features': top_features,
             'engines': [c.engine_name for c in decision.candidates],
             'num_engines': len(set(c.engine_type for c in decision.candidates)),
-            'metadata': decision.metadata
+            'metadata': {k: v for k, v in (decision.metadata or {}).items() if k != 'evidence'},
+            'full_network_context': full_ctx,
+            'packet_samples': [],
+            'raw_features': {
+                'semantics': sem0
+            }
         }
         
         # 5. Serialize evidence data to proof_blob

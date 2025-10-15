@@ -6,12 +6,18 @@ import (
 	"time"
 )
 
+// Logger defines the interface for validation logging
+type Logger interface {
+	WarnContext(ctx context.Context, msg string, args ...interface{})
+}
+
 // Validator handles consensus message validation
 type Validator struct {
 	validatorSet ValidatorSet
 	state        ConsensusState
 	config       *ValidationConfig
 	encoder      *Encoder
+	logger       Logger
 }
 
 // ValidationConfig contains validation parameters
@@ -76,6 +82,7 @@ func NewValidator(
 	state ConsensusState,
 	encoder *Encoder,
 	config *ValidationConfig,
+	logger Logger,
 ) *Validator {
 	if config == nil {
 		config = DefaultValidationConfig()
@@ -86,6 +93,7 @@ func NewValidator(
 		state:        state,
 		encoder:      encoder,
 		config:       config,
+		logger:       logger,
 	}
 }
 
@@ -98,11 +106,18 @@ func (v *Validator) ValidateProposal(ctx context.Context, p *Proposal) error {
 
 	// Verify proposer is a validator
 	if !v.validatorSet.IsValidator(p.ProposerID) {
+		v.logger.WarnContext(ctx, "proposal validation failed: proposer not a validator",
+			"proposer_id", fmt.Sprintf("%x", p.ProposerID[:8]),
+			"view", p.View,
+			"height", p.Height)
 		return fmt.Errorf("proposer %x is not a validator", p.ProposerID)
 	}
 
 	// Verify proposer is active in this view
 	if !v.validatorSet.IsActiveInView(p.ProposerID, p.View) {
+		v.logger.WarnContext(ctx, "proposal validation failed: proposer not active",
+			"proposer_id", fmt.Sprintf("%x", p.ProposerID[:8]),
+			"view", p.View)
 		return fmt.Errorf("proposer %x is not active in view %d", p.ProposerID, p.View)
 	}
 
@@ -112,6 +127,11 @@ func (v *Validator) ValidateProposal(ctx context.Context, p *Proposal) error {
 		return fmt.Errorf("failed to get leader for view %d: %w", p.View, err)
 	}
 	if p.ProposerID != expectedLeader {
+		v.logger.WarnContext(ctx, "proposal validation failed: wrong leader",
+			"proposer_id", fmt.Sprintf("%x", p.ProposerID[:8]),
+			"expected_leader", fmt.Sprintf("%x", expectedLeader[:8]),
+			"view", p.View,
+			"height", p.Height)
 		return fmt.Errorf("proposer %x is not the leader for view %d (expected %x)",
 			p.ProposerID, p.View, expectedLeader)
 	}
@@ -119,6 +139,9 @@ func (v *Validator) ValidateProposal(ctx context.Context, p *Proposal) error {
 	// Check view progression
 	currentView := v.state.GetCurrentView()
 	if v.config.StrictMonotonicity && p.View < currentView {
+		v.logger.WarnContext(ctx, "proposal validation failed: view regression",
+			"proposal_view", p.View,
+			"current_view", currentView)
 		return fmt.Errorf("proposal view %d is less than current view %d", p.View, currentView)
 	}
 	if p.View > currentView+v.config.MaxViewJump {
@@ -145,12 +168,21 @@ func (v *Validator) ValidateProposal(ctx context.Context, p *Proposal) error {
 
 		// JustifyQC must justify the parent block
 		if p.JustifyQC.BlockHash != p.ParentHash {
+			v.logger.WarnContext(ctx, "proposal validation failed: JustifyQC/ParentHash mismatch",
+				"justifyqc_blockhash", fmt.Sprintf("%x", p.JustifyQC.BlockHash[:8]),
+				"parent_hash", fmt.Sprintf("%x", p.ParentHash[:8]),
+				"view", p.View,
+				"height", p.Height)
 			return fmt.Errorf("JustifyQC block hash %x does not match parent hash %x",
 				p.JustifyQC.BlockHash, p.ParentHash)
 		}
 
 		// JustifyQC view must be less than proposal view
 		if p.JustifyQC.View >= p.View {
+			v.logger.WarnContext(ctx, "proposal validation failed: JustifyQC view not less than proposal view",
+				"justifyqc_view", p.JustifyQC.View,
+				"proposal_view", p.View,
+				"height", p.Height)
 			return fmt.Errorf("JustifyQC view %d must be less than proposal view %d",
 				p.JustifyQC.View, p.View)
 		}

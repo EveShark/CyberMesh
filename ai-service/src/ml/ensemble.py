@@ -58,8 +58,8 @@ class EnsembleVoter:
             ThreatType.POLICY_VIOLATION: float(config.get('ANOMALY_THRESHOLD', 0.75)),
         }
         
-        # Minimum confidence for publishing
-        self.min_confidence = float(config.get('MIN_CONFIDENCE', 0.85))
+        # Minimum confidence for publishing (TESTING ONLY - lowered to 0.70)
+        self.min_confidence = float(config.get('MIN_CONFIDENCE', 0.70))
         
         # Trust scores (learned from feedback, start equal)
         self.trust_scores = {

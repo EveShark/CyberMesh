@@ -252,6 +252,33 @@ func (s *State) GetPeerCount() int {
 	return len(s.peers)
 }
 
+// GetConnectedPeerCount returns the number of non-quarantined peers.
+func (s *State) GetConnectedPeerCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	count := 0
+	for _, ps := range s.peers {
+		if !ps.Quarantined {
+			count++
+		}
+	}
+	return count
+}
+
+// GetActivePeerCount returns the number of recently active peers.
+func (s *State) GetActivePeerCount(since time.Duration) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	now := time.Now()
+	count := 0
+	for _, ps := range s.peers {
+		if !ps.Quarantined && now.Sub(ps.LastSeen) < since {
+			count++
+		}
+	}
+	return count
+}
+
 // GetQuarantinedCount returns the number of quarantined peers
 func (s *State) GetQuarantinedCount() int {
 	s.mu.RLock()

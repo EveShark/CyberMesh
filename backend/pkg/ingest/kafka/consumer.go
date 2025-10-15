@@ -1,17 +1,17 @@
 package kafka
 
 import (
-	"context"
-	"errors"
-	"fmt"
-	"sync"
-	"time"
+    "context"
+    "errors"
+    "fmt"
+    "sync"
+    "time"
 
-	"backend/pkg/mempool"
-	"backend/pkg/state"
-	"backend/pkg/utils"
+    "backend/pkg/mempool"
+    "backend/pkg/state"
+    "backend/pkg/utils"
 
-	"github.com/IBM/sarama"
+    "github.com/IBM/sarama"
 )
 
 // Consumer handles consuming messages from Kafka ai.* topics and submitting to mempool
@@ -107,12 +107,17 @@ func NewConsumer(ctx context.Context, cfg ConsumerConfig, saramaCfg *sarama.Conf
 		})
 	}
 
-	if logger != nil {
-		logger.InfoContext(ctx, "Kafka consumer created",
-			utils.ZapString("group_id", cfg.GroupID),
-			utils.ZapInt("topics", len(cfg.Topics)),
-			utils.ZapBool("dlq_enabled", cfg.DLQTopic != ""))
-	}
+    if logger != nil {
+        offsetMode := "newest"
+        if saramaCfg != nil && saramaCfg.Consumer.Offsets.Initial == sarama.OffsetOldest {
+            offsetMode = "earliest"
+        }
+        logger.InfoContext(ctx, "Kafka consumer created",
+            utils.ZapString("group_id", cfg.GroupID),
+            utils.ZapStringArray("topics", cfg.Topics),
+            utils.ZapString("offset_initial", offsetMode),
+            utils.ZapBool("dlq_enabled", cfg.DLQTopic != ""))
+    }
 
 	return c, nil
 }
@@ -191,7 +196,7 @@ func (c *Consumer) consumeLoop() {
 				return
 			}
 			if c.logger != nil {
-				c.logger.ErrorContext(c.ctx, "Kafka consumer error",
+				c.logger.ErrorContext(c.ctx, "Kafka consumer error, retrying after backoff",
 					utils.ZapError(err))
 			}
 			// Backoff before retry
@@ -212,37 +217,77 @@ func (c *Consumer) consumeLoop() {
 
 // consumerGroupHandler implements sarama.ConsumerGroupHandler
 type consumerGroupHandler struct {
-	consumer *Consumer
+    consumer *Consumer
 }
 
 // Setup is called at the beginning of a new session, before ConsumeClaim
-func (h *consumerGroupHandler) Setup(sarama.ConsumerGroupSession) error {
-	if h.consumer.logger != nil {
-		h.consumer.logger.Info("Kafka consumer session setup")
-	}
-	return nil
+func (h *consumerGroupHandler) Setup(session sarama.ConsumerGroupSession) error {
+    if h.consumer.logger != nil {
+        claims := session.Claims()
+        totalPartitions := 0
+        // Log partition assignments per topic
+        for topic, partitions := range claims {
+            totalPartitions += len(partitions)
+            // Convert []int32 -> []int for logging helper
+            ints := make([]int, len(partitions))
+            for i, p := range partitions {
+                ints[i] = int(p)
+            }
+            h.consumer.logger.Info("Kafka partitions assigned",
+                utils.ZapString("topic", topic),
+                utils.ZapInts("partitions", ints))
+        }
+        h.consumer.logger.Info("Kafka consumer session ready",
+            utils.ZapInt("topics", len(claims)),
+            utils.ZapInt("total_partitions", totalPartitions))
+    }
+    return nil
 }
 
 // Cleanup is called at the end of a session, once all ConsumeClaim goroutines have exited
 func (h *consumerGroupHandler) Cleanup(sarama.ConsumerGroupSession) error {
 	if h.consumer.logger != nil {
-		h.consumer.logger.Info("Kafka consumer session cleanup")
+		h.consumer.logger.Info("Kafka consumer session closed")
 	}
 	return nil
 }
 
 // ConsumeClaim processes messages from a partition
 func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+	if h.consumer.logger != nil {
+		h.consumer.logger.Info("[DEBUG] ConsumeClaim() CALLED!",
+			utils.ZapString("topic", claim.Topic()),
+			utils.ZapInt("partition", int(claim.Partition())),
+			utils.ZapInt64("initial_offset", claim.InitialOffset()))
+	}
+
 	ctx := session.Context()
 
 	for {
 		select {
 		case <-ctx.Done():
+			if h.consumer.logger != nil {
+				h.consumer.logger.Info("[DEBUG] ConsumeClaim context done, exiting")
+			}
 			return nil
 
 		case message := <-claim.Messages():
+			if h.consumer.logger != nil {
+				h.consumer.logger.Info("[DEBUG] Message received from channel!",
+					utils.ZapString("topic", message.Topic),
+					utils.ZapInt("partition", int(message.Partition)),
+					utils.ZapInt64("offset", message.Offset))
+			}
 			if message == nil {
+				if h.consumer.logger != nil {
+					h.consumer.logger.Info("[DEBUG] Received nil message, partition closed")
+				}
 				return nil
+			}
+
+			if h.consumer.logger != nil {
+				h.consumer.logger.Info("[DEBUG] Processing message...",
+					utils.ZapInt64("offset", message.Offset))
 			}
 
 			// Process message
@@ -250,7 +295,9 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 			if err := h.consumer.processMessage(ctx, session, message); err != nil {
 				// Message processing failed (already logged)
 				h.consumer.incrementFailed()
-				// Continue to next message (offset NOT committed for failed message)
+				// Mark message to advance offset (prevents infinite reprocessing)
+				// Poisoned messages already routed to DLQ in processMessage
+				session.MarkMessage(message, "")
 				continue
 			}
 
@@ -263,18 +310,62 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 
 // processMessage handles a single Kafka message: decode → verify → mempool.Admit
 func (c *Consumer) processMessage(ctx context.Context, session sarama.ConsumerGroupSession, message *sarama.ConsumerMessage) error {
+	if c.logger != nil {
+		c.logger.Info("[DEBUG] processMessage() CALLED",
+			utils.ZapString("topic", message.Topic),
+			utils.ZapInt64("offset", message.Offset))
+	}
+
 	// Decode message based on topic
 	var tx state.Transaction
 	var meta mempool.AdmissionMeta
 	var err error
 
+	if c.logger != nil {
+		c.logger.Info("[DEBUG] Routing to handler by topic",
+			utils.ZapString("topic", message.Topic))
+	}
+
 	switch message.Topic {
 	case "ai.anomalies.v1":
+		if c.logger != nil {
+			c.logger.Info("[DEBUG] Calling processAnomalyMessage()")
+		}
 		tx, meta, err = c.processAnomalyMessage(message)
+		if c.logger != nil {
+			if err != nil {
+				c.logger.Info("[DEBUG] processAnomalyMessage() returned ERROR",
+					utils.ZapError(err))
+			} else {
+				c.logger.Info("[DEBUG] processAnomalyMessage() returned SUCCESS")
+			}
+		}
 	case "ai.evidence.v1":
+		if c.logger != nil {
+			c.logger.Info("[DEBUG] Calling processEvidenceMessage()")
+		}
 		tx, meta, err = c.processEvidenceMessage(message)
+		if c.logger != nil {
+			if err != nil {
+				c.logger.Info("[DEBUG] processEvidenceMessage() returned ERROR",
+					utils.ZapError(err))
+			} else {
+				c.logger.Info("[DEBUG] processEvidenceMessage() returned SUCCESS")
+			}
+		}
 	case "ai.policy.v1":
+		if c.logger != nil {
+			c.logger.Info("[DEBUG] Calling processPolicyMessage()")
+		}
 		tx, meta, err = c.processPolicyMessage(message)
+		if c.logger != nil {
+			if err != nil {
+				c.logger.Info("[DEBUG] processPolicyMessage() returned ERROR",
+					utils.ZapError(err))
+			} else {
+				c.logger.Info("[DEBUG] processPolicyMessage() returned SUCCESS")
+			}
+		}
 	default:
 		// Unknown topic
 		if c.logger != nil {
@@ -285,16 +376,31 @@ func (c *Consumer) processMessage(ctx context.Context, session sarama.ConsumerGr
 	}
 
 	if err != nil {
+		if c.logger != nil {
+			c.logger.Info("[DEBUG] Handler returned error, routing to DLQ",
+				utils.ZapError(err))
+		}
 		// Decode/verify failed - route to DLQ
 		c.routeToDLQ(ctx, message, err)
 		return err
 	}
 
+	if c.logger != nil {
+		c.logger.Info("[DEBUG] Message decoded and verified successfully")
+	}
+
 	c.incrementVerified()
 
 	// Submit to mempool
+	if c.logger != nil {
+		c.logger.Info("[DEBUG] Calling mempool.Add()")
+	}
 	now := time.Now()
 	if err := c.mempool.Add(tx, meta, now); err != nil {
+		if c.logger != nil {
+			c.logger.Info("[DEBUG] mempool.Add() returned ERROR",
+				utils.ZapError(err))
+		}
 		// Mempool admission failed (rate limit, full, duplicate, etc.)
 		if c.audit != nil {
 			_ = c.audit.Warn("mempool_admit_failed", map[string]interface{}{
@@ -314,14 +420,35 @@ func (c *Consumer) processMessage(ctx context.Context, session sarama.ConsumerGr
 		return err
 	}
 
+	if c.logger != nil {
+		c.logger.Info("[DEBUG] mempool.Add() SUCCESS - message fully processed")
+	}
+
 	// Success
 	return nil
 }
 
 // processAnomalyMessage decodes and verifies ai.anomalies.v1 message
 func (c *Consumer) processAnomalyMessage(message *sarama.ConsumerMessage) (state.Transaction, mempool.AdmissionMeta, error) {
+	if c.logger != nil {
+		c.logger.Info("[DEBUG] processAnomalyMessage() STARTED",
+			utils.ZapInt64("offset", message.Offset),
+			utils.ZapInt("payload_bytes", len(message.Value)))
+	}
+
 	// Decode
+	if c.logger != nil {
+		c.logger.Info("[DEBUG] Calling DecodeAnomalyMsg()")
+	}
 	msg, err := DecodeAnomalyMsg(message.Value)
+	if c.logger != nil {
+		if err != nil {
+			c.logger.Info("[DEBUG] DecodeAnomalyMsg() FAILED",
+				utils.ZapError(err))
+		} else {
+			c.logger.Info("[DEBUG] DecodeAnomalyMsg() SUCCESS")
+		}
+	}
 	if err != nil {
 		if c.logger != nil {
 			c.logger.WarnContext(c.ctx, "Failed to decode anomaly message",
@@ -332,7 +459,18 @@ func (c *Consumer) processAnomalyMessage(message *sarama.ConsumerMessage) (state
 	}
 
 	// Verify signature and convert to state.EventTx
+	if c.logger != nil {
+		c.logger.Info("[DEBUG] Calling VerifyAnomalyMsg()")
+	}
 	tx, err := VerifyAnomalyMsg(msg, c.verifierCfg, c.logger)
+	if c.logger != nil {
+		if err != nil {
+			c.logger.Info("[DEBUG] VerifyAnomalyMsg() FAILED",
+				utils.ZapError(err))
+		} else {
+			c.logger.Info("[DEBUG] VerifyAnomalyMsg() SUCCESS")
+		}
+	}
 	if err != nil {
 		if c.audit != nil {
 			_ = c.audit.Security("kafka_message_verification_failed", map[string]interface{}{

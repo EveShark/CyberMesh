@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"strings"
 	"time"
 
 	"backend/pkg/utils"
@@ -100,7 +101,7 @@ func BuildSaramaConfig(ctx context.Context, cm *utils.ConfigManager, log *utils.
 
 	// TLS Configuration (REQUIRED in production/staging)
 	tlsEnabled := cm.GetBool("KAFKA_TLS_ENABLED", true)
-	
+
 	// Enforce TLS in production/staging (fail-closed)
 	if (env == EnvProduction || env == EnvStaging) && !tlsEnabled {
 		if audit != nil {
@@ -111,7 +112,7 @@ func BuildSaramaConfig(ctx context.Context, cm *utils.ConfigManager, log *utils.
 		}
 		return nil, fmt.Errorf("kafka: TLS is REQUIRED in %s environment (fail-closed)", env)
 	}
-	
+
 	if !tlsEnabled {
 		log.WarnContext(ctx, "Kafka TLS DISABLED - this is INSECURE and should only be used in dev",
 			utils.ZapString("environment", string(env)))
@@ -164,9 +165,19 @@ func BuildSaramaConfig(ctx context.Context, cm *utils.ConfigManager, log *utils.
 	// Consumer Configuration
 	cfg.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{sarama.NewBalanceStrategyRoundRobin()}
 	cfg.Consumer.Offsets.Initial = sarama.OffsetNewest // Start from latest on first run
-	offsetInitial := cm.GetString("KAFKA_CONSUMER_OFFSET_INITIAL", "latest")
-	if offsetInitial == "earliest" {
+	offsetInitial := strings.ToLower(strings.TrimSpace(cm.GetString("KAFKA_CONSUMER_OFFSET_INITIAL", "")))
+	if offsetInitial == "" {
+		offsetInitial = strings.ToLower(strings.TrimSpace(cm.GetString("KAFKA_CONSUMER_AUTO_OFFSET_RESET", "")))
+	}
+	if offsetInitial == "" {
+		offsetInitial = "latest"
+	}
+	// Acceptable values: earliest/oldest/beginning → OffsetOldest, anything else → OffsetNewest
+	switch offsetInitial {
+	case "earliest", "oldest", "beginning":
 		cfg.Consumer.Offsets.Initial = sarama.OffsetOldest
+	default:
+		cfg.Consumer.Offsets.Initial = sarama.OffsetNewest
 	}
 	cfg.Consumer.MaxProcessingTime = cm.GetDuration("KAFKA_CONSUMER_MAX_PROCESSING_TIME", 30*time.Second)
 	cfg.Consumer.Group.Session.Timeout = cm.GetDuration("KAFKA_CONSUMER_SESSION_TIMEOUT", 10*time.Second)
@@ -181,7 +192,7 @@ func BuildSaramaConfig(ctx context.Context, cm *utils.ConfigManager, log *utils.
 	cfg.Producer.Retry.Max = cm.GetInt("KAFKA_PRODUCER_RETRIES", 3)
 	cfg.Producer.Return.Successes = true
 	cfg.Producer.Return.Errors = true
-	
+
 	// Idempotent producer requires MaxOpenRequests = 1
 	if cfg.Producer.Idempotent {
 		cfg.Net.MaxOpenRequests = 1

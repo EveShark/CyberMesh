@@ -158,6 +158,18 @@ type LeaderRotation interface {
 	GetLeaderForView(ctx context.Context, view uint64) (ValidatorID, error)
 	IsLeader(ctx context.Context, validatorID ValidatorID, view uint64) (bool, error)
 	GetEligibleCount(ctx context.Context, view uint64) int
+	IsLeaderEligibleToPropose(ctx context.Context, validatorID ValidatorID, view uint64) (bool, string)
+}
+
+// ReadinessOracle exposes validator readiness state to leader rotation and other components.
+type ReadinessOracle interface {
+	IsValidatorReady(id ValidatorID) bool
+}
+
+// PeerObserver provides peer connectivity metrics from the network layer.
+type PeerObserver interface {
+	GetConnectedPeerCount() int
+	GetActivePeerCount(since time.Duration) int
 }
 
 // Pacemaker manages view timing and synchronization

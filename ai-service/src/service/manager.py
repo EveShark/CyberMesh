@@ -198,6 +198,15 @@ class ServiceManager:
                     circuit_breaker=self.circuit_breaker
                 )
                 
+                # Initialize backend validator trust store (for signature verification)
+                self.logger.info("Initializing backend validator trust store")
+                from ..contracts.commit import CommitEvent
+                from ..contracts.policy import PolicyUpdateEvent
+                keys_dir = settings.backend_validators_keys_dir if hasattr(settings, 'backend_validators_keys_dir') else None
+                CommitEvent.initialize_trust_store(keys_dir)
+                PolicyUpdateEvent.initialize_trust_store(keys_dir)
+                self.logger.info("Trust store initialized for commit and policy verification")
+                
                 # Initialize Kafka consumer
                 self.logger.info("Initializing Kafka consumer")
                 self.consumer = AIConsumer(
@@ -713,7 +722,8 @@ class ServiceManager:
             settings: Service configuration
         """
         from ..ml.telemetry import FileTelemetrySource
-        from ..ml.features import NetworkFlowExtractor
+        from ..ml.telemetry_postgres import PostgresTelemetrySource
+        from ..ml.features_flow import FlowFeatureExtractor
         from ..ml.detectors import RulesEngine, MathEngine, MLEngine
         from ..ml.ensemble import EnsembleVoter
         from ..ml.evidence import EvidenceGenerator
@@ -722,7 +732,13 @@ class ServiceManager:
         from ..ml.serving import ModelRegistry
         
         # Helper to get config values with defaults
+        import os
         def get_config(key: str, default):
+            # Try environment variable first (for new fields not in Settings)
+            env_val = os.getenv(key)
+            if env_val is not None:
+                return env_val
+            # Fall back to settings attribute
             try:
                 return getattr(settings, key.lower(), default)
             except:
@@ -746,14 +762,27 @@ class ServiceManager:
             'BASELINE_STATS_PATH': get_config('BASELINE_STATS_PATH', 'data/models/baseline_stats.json'),
         }
         
-        # 1. Telemetry source (file-based for Phase 6.1)
-        telemetry_source = FileTelemetrySource(
-            flows_path=ml_config['TELEMETRY_FLOWS_PATH'],
-            files_path=ml_config['TELEMETRY_FILES_PATH']
-        )
+        # 1. Telemetry source - use PostgreSQL if configured
+        telemetry_source_type = get_config('TELEMETRY_SOURCE_TYPE', 'file')
+        if telemetry_source_type == 'postgres':
+            db_config = {
+                'host': get_config('DB_HOST', 'localhost'),
+                'port': int(get_config('DB_PORT', 5432)),
+                'dbname': get_config('DB_NAME', 'cybermesh'),
+                'user': get_config('DB_USER', 'postgres'),
+                'password': get_config('DB_PASSWORD', 'postgres'),
+            }
+            telemetry_source = PostgresTelemetrySource(db_config=db_config, sample_size=100)
+            self.logger.info('Using PostgreSQL telemetry source')
+        else:
+            telemetry_source = FileTelemetrySource(
+                flows_path=ml_config['TELEMETRY_FLOWS_PATH'],
+                files_path=ml_config['TELEMETRY_FILES_PATH']
+            )
+            self.logger.info('Using file telemetry source')
         
-        # 2. Feature extractor
-        feature_extractor = NetworkFlowExtractor()
+        # 2. Feature extractor: single 79-feature path
+        feature_extractor = FlowFeatureExtractor()
         
         # 3. Model registry (loads 3 ML models)
         model_registry = ModelRegistry(
@@ -762,10 +791,36 @@ class ServiceManager:
         )
         
         # 4. Detection engines (Rules + Math + ML)
+        # DLQ emitter for ML validation faults (uses producer to send to DLQ topic)
+        def _ml_dlq_emit(payload: dict):
+            try:
+                from confluent_kafka import Producer
+                import json as _json, hashlib as _hashlib
+                topic = settings.kafka_topics.dlq
+                data = _json.dumps({
+                    "component": payload.get("component", "ml_engine"),
+                    "reason": payload.get("reason", "unknown"),
+                    "variant": payload.get("variant"),
+                    "error": payload.get("error"),
+                    "expected": payload.get("expected"),
+                    "got": payload.get("got"),
+                    "timestamp": int(time.time()),
+                    "node_id": settings.node_id,
+                }, separators=(",", ":")).encode()
+                key = _hashlib.sha256(data).digest()
+                # Reuse existing producer if available
+                if self.producer and getattr(self.producer, 'producer', None):
+                    self.producer.producer.produce(topic, value=data, key=key)
+                    self.producer.producer.flush(3)
+            except Exception:
+                # Metrics-only fallback
+                if self.logger:
+                    self.logger.warning("ML DLQ emit failed; logged only")
+
         engines = [
             RulesEngine(config=ml_config),
             MathEngine(config=ml_config, baseline_path=ml_config['BASELINE_STATS_PATH']),
-            MLEngine(registry=model_registry, config=ml_config)
+            MLEngine(registry=model_registry, config=ml_config, dlq_callback=_ml_dlq_emit, metrics=self.ml_metrics)
         ]
         
         # Log engine status

@@ -15,6 +15,7 @@ import (
     consapi "backend/pkg/consensus/api"
 	"backend/pkg/config"
 	"backend/pkg/mempool"
+	"backend/pkg/p2p"
 	"backend/pkg/state"
 	"backend/pkg/storage/cockroach"
 	"backend/pkg/utils"
@@ -32,6 +33,7 @@ type Server struct {
 	stateStore state.StateStore
 	mempool    *mempool.Mempool
     engine     *consapi.ConsensusEngine
+	p2pRouter  *p2p.Router
 
 	// Middleware components
 	rateLimiter *RateLimiter
@@ -54,6 +56,7 @@ type Dependencies struct {
 	StateStore  state.StateStore
 	Mempool     *mempool.Mempool
     Engine      *consapi.ConsensusEngine
+	P2PRouter   *p2p.Router
 }
 
 // NewServer creates a new API server
@@ -90,6 +93,7 @@ func NewServer(deps Dependencies) (*Server, error) {
 		stateStore:  deps.StateStore,
 		mempool:     deps.Mempool,
         engine:      deps.Engine,
+		p2pRouter:   deps.P2PRouter,
 		stopCh:      make(chan struct{}),
 	}
 

@@ -41,7 +41,7 @@ CyberMesh Backend is a **production-ready Byzantine Fault Tolerant (BFT) consens
 │  ┌────────────────────────────────────────────────────────────┐             │
 │  │           Kafka Consumer (pkg/ingest/kafka/)                │             │
 │  │  • Subscribes to 3 topics (anomalies, evidence, policy)    │             │
-│  │  • Consumer group: backend-validators                       │             │
+│  │  • Consumer group: cybermesh-consensus                      │             │
 │  │  • Ed25519 signature verification (CRITICAL)                │             │
 │  │  • Timestamp skew validation (5-minute window)              │             │
 │  │  • Content hash verification (SHA-256)                      │             │
@@ -237,7 +237,7 @@ valid := ed25519.Verify(publicKey, signBytes, signature)
 KAFKA_BROKERS=pkc-ldvr1.asia-southeast1.gcp.confluent.cloud:9092
 KAFKA_TLS_ENABLED=true
 KAFKA_SASL_MECHANISM=PLAIN
-KAFKA_CONSUMER_GROUP_ID=backend-validators
+KAFKA_CONSUMER_GROUP_ID=cybermesh-consensus
 ```
 
 ### 2. Mempool (`pkg/mempool/`)
@@ -452,7 +452,7 @@ CyberMesh Backend - Kafka Consumer (Production)
 [4/5] Setting up Kafka consumer...
   Brokers: [pkc-ldvr1.asia-southeast1.gcp.confluent.cloud:9092]
   Topics: [ai.anomalies.v1 ai.evidence.v1 ai.policy.v1]
-  Group ID: backend-validators
+  Group ID: cybermesh-consensus
   ✓ Consumer created
 [5/5] Starting Kafka consumer...
   ✓ Consumer running
@@ -489,7 +489,7 @@ KAFKA_OUTPUT_TOPIC_COMMITS=control.commits.v1
 KAFKA_DLQ_TOPIC=ai.anomalies.v1.dlq
 
 # Consumer settings
-KAFKA_CONSUMER_GROUP_ID=backend-validators
+KAFKA_CONSUMER_GROUP_ID=cybermesh-consensus
 KAFKA_CONSUMER_OFFSET_INITIAL=latest
 KAFKA_CONSUMER_SESSION_TIMEOUT=10s
 ```

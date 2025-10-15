@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"backend/pkg/block"
+	"backend/pkg/ingest/kafka"
 	"backend/pkg/state"
 	"backend/pkg/storage/cockroach"
 	"backend/pkg/utils"
@@ -23,7 +24,8 @@ type PersistenceTask struct {
 
 // PersistenceSuccessCallback is called after successful block persistence
 // Used to trigger downstream actions like Kafka publishing
-type PersistenceSuccessCallback func(ctx context.Context, height uint64, hash [32]byte, stateRoot [32]byte, txCount int, ts int64)
+// Fix: Gap 2 - Added anomalyIDs parameter to enable COMMITTED state tracking
+type PersistenceSuccessCallback func(ctx context.Context, height uint64, hash [32]byte, stateRoot [32]byte, txCount int, ts int64, anomalyIDs []string)
 
 // PersistenceWorkerConfig holds configuration for the persistence worker
 type PersistenceWorkerConfig struct {
@@ -274,8 +276,11 @@ func (pw *PersistenceWorker) processTask(ctx context.Context, task *PersistenceT
 						}
 					}()
 
-					// Call callback with block metadata
-					pw.onSuccess(ctx, task.Block.GetHeight(), bh, task.StateRoot, task.Block.GetTransactionCount(), task.Block.GetTimestamp().Unix())
+					// Fix: Gap 2 - Extract anomaly IDs from block transactions
+					anomalyIDs := extractAnomalyIDs(task.Block, pw.logger)
+
+					// Call callback with block metadata + anomaly IDs
+					pw.onSuccess(ctx, task.Block.GetHeight(), bh, task.StateRoot, task.Block.GetTransactionCount(), task.Block.GetTimestamp().Unix(), anomalyIDs)
 				}()
 			}
 
@@ -371,4 +376,48 @@ func (pw *PersistenceWorker) GetStats() map[string]interface{} {
 		"error_count": pw.errorCount,
 		"workers":     pw.cfg.WorkerCount,
 	}
+}
+
+// extractAnomalyIDs extracts anomaly IDs from EventTx transactions in a block
+// Fix: Gap 2 - Enable COMMITTED state tracking by extracting anomaly UUIDs
+func extractAnomalyIDs(block *block.AppBlock, logger *utils.Logger) []string {
+	if block == nil {
+		return nil
+	}
+
+	txs := block.Transactions()
+	if len(txs) == 0 {
+		return nil
+	}
+
+	var anomalyIDs []string
+	for _, tx := range txs {
+		// Only process EventTx (anomaly transactions)
+		if tx.Type() != state.TxEvent {
+			continue
+		}
+
+		eventTx, ok := tx.(*state.EventTx)
+		if !ok {
+			continue
+		}
+
+		// Decode the protobuf AnomalyEvent from payload
+		msg, err := kafka.DecodeAnomalyMsg(eventTx.Data)
+		if err != nil {
+			// Not an anomaly message or decode error - skip
+			if logger != nil {
+				logger.Debug("Failed to decode EventTx as AnomalyMsg",
+					utils.ZapError(err))
+			}
+			continue
+		}
+
+		// Extract anomaly ID
+		if msg.ID != "" {
+			anomalyIDs = append(anomalyIDs, msg.ID)
+		}
+	}
+
+	return anomalyIDs
 }

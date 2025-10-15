@@ -268,6 +268,9 @@ class Settings:
     telemetry_batch_size: int = 1000             # Flows per poll
     max_detections_per_second: int = 100         # Rate limit for publishing
     
+    # ML ensemble
+    min_confidence: float = 0.85                 # Ensemble minimum confidence threshold
+    
     
 # Legacy Settings class (keep for backward compatibility during migration)
 @dataclass(frozen=True)

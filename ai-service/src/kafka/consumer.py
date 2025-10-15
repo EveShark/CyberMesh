@@ -9,7 +9,7 @@ Topics:
 - control.policy.v1
 - control.evidence.v1
 """
-from confluent_kafka import Consumer, KafkaException, KafkaError as ConfluentKafkaError
+from confluent_kafka import Consumer, Producer, KafkaException, KafkaError as ConfluentKafkaError
 import threading
 import time
 from typing import Callable, Dict, Optional
@@ -19,7 +19,10 @@ from ..contracts import (
     PolicyUpdateEvent,
     EvidenceRequestEvent,
 )
-from ..utils.errors import ContractError, KafkaError, ValidationError, StorageError
+from ..utils.errors import ContractError, KafkaError, ValidationError, StorageError, TimestampSkewError
+from ..utils.metrics import get_metrics_collector
+import hashlib
+import json
 from ..config.settings import Settings
 from ..feedback.storage import RedisStorage
 from ..feedback.tracker import AnomalyLifecycleTracker, AnomalyState
@@ -73,6 +76,10 @@ class AIConsumer:
         
         # Manual commit tracking
         self._auto_commit_enabled = config.kafka_consumer.enable_auto_commit
+
+        # DLQ producer (initialized lazily on first use)
+        self._dlq_producer: Optional[Producer] = None
+        self._metrics = get_metrics_collector()
         
         # Message handlers (can be overridden)
         self.handlers: Dict[str, Callable] = {
@@ -217,7 +224,8 @@ class AIConsumer:
         try:
             # Parse and verify message based on topic
             if topic == self.config.kafka_topics.control_commits:
-                msg = CommitEvent.from_bytes(data, verify_signature=True)
+                # CommitEvent auto-verifies signature in __init__ (no param needed)
+                msg = CommitEvent.from_bytes(data)
                 handler = self.handlers.get("commit")
                     
             elif topic == self.config.kafka_topics.control_reputation:
@@ -225,7 +233,8 @@ class AIConsumer:
                 handler = self.handlers.get("reputation")
                     
             elif topic == self.config.kafka_topics.control_policy:
-                msg = PolicyUpdateEvent.from_bytes(data, verify_signature=True)
+                # PolicyUpdateEvent auto-verifies signature in __init__ (no param needed)
+                msg = PolicyUpdateEvent.from_bytes(data)
                 handler = self.handlers.get("policy_update")
                     
             elif topic == self.config.kafka_topics.control_evidence:
@@ -244,6 +253,27 @@ class AIConsumer:
             self._messages_processed += 1
             
         except ContractError as e:
+            # Identify timestamp skew via structured error type in the cause chain
+            cause = getattr(e, "__cause__", None)
+            is_skew = isinstance(cause, TimestampSkewError)
+            if is_skew:
+                reason = "timestamp_skew"
+                if self.logger:
+                    self.logger.warning(
+                        f"Dropping message due to timestamp skew from {topic}: {cause}"
+                    )
+                # In production, emit to DLQ with structured payload and record metrics
+                try:
+                    if getattr(self.config, "environment", "development") == "production":
+                        self._send_to_dlq(topic, data, reason, str(cause))
+                    self._metrics.record_dlq_message(topic=topic, reason=reason)
+                except Exception:
+                    # Metrics/DLQ issues must not crash consumer loop
+                    if self.logger:
+                        self.logger.error("Failed to emit DLQ/metrics for timestamp skew", exc_info=True)
+                # Treat as processed (skip) by returning without raising; caller will commit offset.
+                return
+            # Other validation errors are counted as failures and re-raised
             self._messages_failed += 1
             if self.logger:
                 self.logger.error(f"Message validation failed from {topic}: {e}")
@@ -331,11 +361,35 @@ class AIConsumer:
         Handle block commit from backend.
         
         Updates metrics and marks anomalies as committed.
-        Note: We don't have individual anomaly IDs in CommitEvent,
-        so we rely on evidence_accepted messages for individual tracking.
+        Fix: Now processes individual anomaly_ids to enable COMMITTED state.
         """
         try:
             self._commits_processed += 1
+            
+            # Fix: Gap 2 - Track individual anomalies to COMMITTED state
+            committed_count = 0
+            if hasattr(msg, 'anomaly_ids') and msg.anomaly_ids:
+                for anomaly_id in msg.anomaly_ids:
+                    try:
+                        self.tracker.record_committed(
+                            anomaly_id=anomaly_id,
+                            block_height=int(msg.height),
+                            signature=msg.signature.hex() if msg.signature else "",
+                            timestamp=float(msg.timestamp)
+                        )
+                        committed_count += 1
+                    except Exception as e:
+                        # Log but don't fail on individual anomaly errors
+                        if self.logger:
+                            self.logger.warning(
+                                f"Failed to record committed state for anomaly {anomaly_id}: {e}"
+                            )
+                        self._tracker_errors += 1
+                
+                if self.logger:
+                    self.logger.info(
+                        f"Marked {committed_count}/{len(msg.anomaly_ids)} anomalies as COMMITTED"
+                    )
             
             if self.logger:
                 self.logger.info(
@@ -345,6 +399,7 @@ class AIConsumer:
                         "block_hash": msg.block_hash.hex()[:16],
                         "tx_count": msg.tx_count,
                         "anomaly_count": msg.anomaly_count,
+                        "anomalies_tracked": committed_count,
                         "timestamp": msg.timestamp
                     }
                 )
@@ -366,3 +421,48 @@ class AIConsumer:
             "tracker_updates": self._tracker_updates,
             "tracker_errors": self._tracker_errors,
         }
+
+    def _ensure_dlq_producer(self):
+        if self._dlq_producer is not None:
+            return
+        # Build minimal producer config from settings.kafka_producer
+        producer_cfg = self.config.kafka_producer
+        security_cfg = producer_cfg.security
+        cfg = {
+            'bootstrap.servers': producer_cfg.bootstrap_servers,
+        }
+        if security_cfg.sasl_mechanism == "NONE":
+            cfg['security.protocol'] = 'SSL' if security_cfg.tls_enabled else 'PLAINTEXT'
+        else:
+            cfg['security.protocol'] = 'SASL_SSL' if security_cfg.tls_enabled else 'SASL_PLAINTEXT'
+            cfg['sasl.mechanism'] = security_cfg.sasl_mechanism
+            cfg['sasl.username'] = security_cfg.sasl_username
+            cfg['sasl.password'] = security_cfg.sasl_password
+        if security_cfg.tls_enabled and security_cfg.ca_cert_path:
+            cfg['ssl.ca.location'] = security_cfg.ca_cert_path
+        if security_cfg.client_cert_path:
+            cfg['ssl.certificate.location'] = security_cfg.client_cert_path
+        if security_cfg.client_key_path:
+            cfg['ssl.key.location'] = security_cfg.client_key_path
+        self._dlq_producer = Producer(cfg)
+
+    def _send_to_dlq(self, original_topic: str, data: bytes, reason: str, error: str):
+        self._ensure_dlq_producer()
+        dlq_topic = self.config.kafka_topics.dlq
+        payload = {
+            "original_topic": original_topic,
+            "reason": reason,
+            "error": error,
+            "timestamp": int(time.time()),
+            "node_id": getattr(self.config, "node_id", "unknown"),
+            "message_hash": hashlib.sha256(data or b'').hexdigest(),
+            "data_size": len(data or b''),
+        }
+        encoded = json.dumps(payload, separators=(",", ":")).encode()
+        key = hashlib.sha256((original_topic + payload["message_hash"]).encode()).digest()
+        try:
+            self._dlq_producer.produce(dlq_topic, value=encoded, key=key)
+            self._dlq_producer.flush(5)
+        except Exception as ex:
+            if self.logger:
+                self.logger.error(f"Failed to send DLQ message: {ex}")

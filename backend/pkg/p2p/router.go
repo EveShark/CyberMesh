@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -26,8 +27,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
-	drouting "github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	mdns "github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	drouting "github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	connmgr "github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	noise "github.com/libp2p/go-libp2p/p2p/security/noise"
 	tlsp2p "github.com/libp2p/go-libp2p/p2p/security/tls"
@@ -65,8 +66,8 @@ type Router struct {
 	mu         sync.RWMutex
 	handlerSem chan struct{} // semaphore for handler concurrency
 
-    // default topic validator used for all subscriptions
-    topicValidator func(ctx context.Context, id peer.ID, msg *pubsub.Message) pubsub.ValidationResult
+	// default topic validator used for all subscriptions
+	topicValidator func(ctx context.Context, id peer.ID, msg *pubsub.Message) pubsub.ValidationResult
 }
 
 // RouterOptions allows fine-grained tuning without hardcoding.
@@ -141,12 +142,17 @@ func NewRouter(parent context.Context, nodeCfg *config.NodeConfig, secCfg *confi
 	}
 
 	// ---- Connection manager ----
+	// For small validator networks (5-10 nodes), use conservative limits
+	// to prevent aggressive pruning of peer connections
 	low, high := opts.ConnLow, opts.ConnHigh
 	if low <= 0 || high <= 0 || high <= low {
-		low = configMgr.GetIntRange("P2P_CONN_LOW", 64, 1, 1000)
-		high = configMgr.GetIntRange("P2P_CONN_HIGH", 128, low+1, 2000)
+		// Default to validator network size + buffer
+		low = configMgr.GetIntRange("P2P_CONN_LOW", 4, 1, 1000)
+		high = configMgr.GetIntRange("P2P_CONN_HIGH", 10, low+1, 2000)
 	}
-	cm, err := connmgr.NewConnManager(low, high, connmgr.WithGracePeriod(20*time.Second))
+	// Longer grace period for validator networks to prevent spurious disconnects
+	gracePeriod := configMgr.GetDuration("P2P_CONN_GRACE_PERIOD", 60*time.Second)
+	cm, err := connmgr.NewConnManager(low, high, connmgr.WithGracePeriod(gracePeriod))
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("connmgr: %w", err)
@@ -161,7 +167,7 @@ func NewRouter(parent context.Context, nodeCfg *config.NodeConfig, secCfg *confi
 		libp2p.ConnectionGater(gater),
 	}
 	hostOpts = append(hostOpts, secOpts...)
-	
+
 	host, err := libp2p.New(hostOpts...)
 	if err != nil {
 		cancel()
@@ -221,6 +227,15 @@ func NewRouter(parent context.Context, nodeCfg *config.NodeConfig, secCfg *confi
 		pubsub.WithMessageSigning(true),
 		pubsub.WithStrictSignatureVerification(true),
 	}
+
+	// Configure GossipSub parameters for small validator networks
+	defaultParams := pubsub.DefaultGossipSubParams()
+	defaultParams.D = 3     // desired mesh size (3 of 4 other peers)
+	defaultParams.Dlo = 2   // low watermark
+	defaultParams.Dhi = 4   // high watermark (all 4 other peers)
+	defaultParams.Dlazy = 4 // gossip target
+	defaultParams.HeartbeatInterval = time.Second
+	psOpts = append(psOpts, pubsub.WithGossipSubParams(defaultParams))
 	score := &pubsub.PeerScoreParams{
 		// plumb app-specific trust from State
 		AppSpecificScore: func(p peer.ID) float64 {
@@ -233,9 +248,10 @@ func NewRouter(parent context.Context, nodeCfg *config.NodeConfig, secCfg *confi
 		DecayToZero:   0.01,
 		RetainScore:   15 * time.Minute,
 
-		// Conservative anti-spam weights
-		IPColocationFactorWeight:    -10,
-		IPColocationFactorThreshold: 10,
+		// IP colocation penalties disabled for validator networks
+		// In production, validators are trusted; in development, all run on localhost
+		IPColocationFactorWeight:    0,
+		IPColocationFactorThreshold: 100,
 		BehaviourPenaltyWeight:      -10,
 		BehaviourPenaltyThreshold:   10,
 		BehaviourPenaltyDecay:       0.9,
@@ -286,7 +302,7 @@ func NewRouter(parent context.Context, nodeCfg *config.NodeConfig, secCfg *confi
 	host.Network().Notify(&netNotifiee{r: r})
 
 	// ---- Topic validators (drop quarantined peers, oversize msgs) ----
-    validator := func(ctx context.Context, id peer.ID, msg *pubsub.Message) pubsub.ValidationResult {
+	validator := func(ctx context.Context, id peer.ID, msg *pubsub.Message) pubsub.ValidationResult {
 		if st != nil && st.IsQuarantined(id) {
 			return pubsub.ValidationReject
 		}
@@ -298,30 +314,30 @@ func NewRouter(parent context.Context, nodeCfg *config.NodeConfig, secCfg *confi
 		}
 		return pubsub.ValidationAccept
 	}
-    r.topicValidator = validator
+	r.topicValidator = validator
 
 	// subscribe to initial topics (from opts, or config)
-    topics := opts.Topics
+	topics := opts.Topics
 	if len(topics) == 0 {
 		topics = configMgr.GetStringSlice("P2P_TOPICS", []string{})
 	}
-    // Expand "consensus" into known subtopics to avoid topic mismatch when engine publishes subtopics
-    if containsTopic(topics, "consensus") {
-        topics = dedupeTopics(append(topics, []string{
-            "consensus/proposal",
-            "consensus/vote",
-            "consensus/viewchange",
-            "consensus/newview",
-            "consensus/heartbeat",
-            "consensus/evidence",
-        }...))
-    } else {
-        topics = dedupeTopics(topics)
-    }
+	// Expand "consensus" into known subtopics to avoid topic mismatch when engine publishes subtopics
+	if containsTopic(topics, "consensus") {
+		topics = dedupeTopics(append(topics, []string{
+			"consensus/proposal",
+			"consensus/vote",
+			"consensus/viewchange",
+			"consensus/newview",
+			"consensus/heartbeat",
+			"consensus/evidence",
+		}...))
+	} else {
+		topics = dedupeTopics(topics)
+	}
 	// Don't subscribe yet - let AttachConsensusHandlers do it to avoid race
 	// Just register topic validators for later
 	for _, t := range topics {
-        _ = ps.RegisterTopicValidator(t, validator)
+		_ = ps.RegisterTopicValidator(t, validator)
 	}
 
 	// ---- Bootstrap dialing (best-effort; discovery backfills) ----
@@ -367,10 +383,10 @@ func (r *Router) Subscribe(topic string, handler Handler) error {
 		}
 		r.Topics[topic] = t
 	}
-    // Ensure validator is registered for dynamically subscribed topics
-    if r.topicValidator != nil {
-        _ = r.Gossip.RegisterTopicValidator(topic, r.topicValidator)
-    }
+	// Ensure validator is registered for dynamically subscribed topics
+	if r.topicValidator != nil {
+		_ = r.Gossip.RegisterTopicValidator(topic, r.topicValidator)
+	}
 	if _, ok := r.Subs[topic]; !ok {
 		sub, err := r.Topics[topic].Subscribe()
 		if err != nil {
@@ -398,9 +414,21 @@ func (r *Router) Subscribe(topic string, handler Handler) error {
 func (r *Router) Publish(topic string, data []byte) error {
 	r.mu.RLock()
 	t, ok := r.Topics[topic]
+	subscribers := 0
+	if t != nil {
+		subscribers = len(t.ListPeers())
+	}
 	r.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("topic %s not joined", topic)
+	}
+
+	// Log genesis publish attempts with subscriber count
+	if strings.Contains(topic, "genesis") {
+		r.log.Info("[GENESIS] attempting to publish",
+			utils.ZapString("topic", topic),
+			utils.ZapInt("subscribers", subscribers),
+			utils.ZapInt("msg_bytes", len(data)))
 	}
 
 	// Validate message size
@@ -410,6 +438,18 @@ func (r *Router) Publish(topic string, data []byte) error {
 	}
 
 	err := t.Publish(r.ctx, data)
+
+	if err != nil {
+		r.log.Warn("publish failed", utils.ZapString("topic", topic), utils.ZapError(err))
+	} else {
+		// Log successful publish for genesis debugging
+		if strings.Contains(topic, "genesis") {
+			r.log.Info("[GENESIS] message published successfully",
+				utils.ZapString("topic", topic),
+				utils.ZapInt("bytes", len(data)),
+				utils.ZapInt("connected_peers", len(r.Host.Network().Peers())))
+		}
+	}
 
 	// Audit message publication
 	if r.secCfg.AuditLogger != nil {
@@ -421,6 +461,58 @@ func (r *Router) Publish(topic string, data []byte) error {
 	}
 
 	return err
+}
+
+// GetConnectedPeerCount returns the number of connected, non-quarantined peers
+// Used for quorum checks before proposing blocks
+func (r *Router) GetConnectedPeerCount() int {
+	if r.state == nil {
+		return 0
+	}
+	return r.state.GetConnectedPeerCount()
+}
+
+// GetActivePeerCount returns the number of recently active peers
+// Used to detect connected but unresponsive peers
+func (r *Router) GetActivePeerCount(since time.Duration) int {
+	if r.state == nil {
+		return 0
+	}
+	return r.state.GetActivePeerCount(since)
+}
+
+// PeerHash returns a deterministic fingerprint over the currently known peers (including self).
+func (r *Router) PeerHash() ([32]byte, error) {
+	var out [32]byte
+	if r.Host == nil {
+		return out, fmt.Errorf("router host not initialized")
+	}
+	if r.state == nil {
+		h := sha256.Sum256([]byte(r.Host.ID().String()))
+		return h, nil
+	}
+	snapshot := r.state.Snapshot()
+	ids := make([]string, 0, len(snapshot)+1)
+	ids = append(ids, r.Host.ID().String())
+	for pid := range snapshot {
+		ids = append(ids, pid.String())
+	}
+	sort.Strings(ids)
+	h := sha256.New()
+	for _, id := range ids {
+		_, _ = h.Write([]byte(id))
+		_, _ = h.Write([]byte{0})
+	}
+	copy(out[:], h.Sum(nil))
+	return out, nil
+}
+
+// GetPeerCount returns the total number of tracked peers
+func (r *Router) GetPeerCount() int {
+	if r.state == nil {
+		return 0
+	}
+	return r.state.GetPeerCount()
 }
 
 // Close shuts everything down.
@@ -450,6 +542,10 @@ func (r *Router) consume(topic string, sub *pubsub.Subscription) {
 			continue
 		}
 		from := msg.ReceivedFrom
+		r.log.Info("got message",
+			utils.ZapString("topic", topic),
+			utils.ZapString("from", from.String()),
+			utils.ZapInt("bytes", len(msg.Data)))
 		// Update peer activity in state
 		if r.state != nil {
 			r.state.OnMessage(topic, from, len(msg.Data))
@@ -631,13 +727,13 @@ func deriveIdentity(secCfg *config.SecurityConfig, configMgr *utils.ConfigManage
 func fromSeed(seed []byte) (crypto.PrivKey, peer.ID, error) {
 	// NewKeyFromSeed returns a 64-byte Ed25519 private key
 	std := ed25519.NewKeyFromSeed(seed)
-	
+
 	// UnmarshalEd25519PrivateKey expects the 64-byte private key
 	libPriv, err := crypto.UnmarshalEd25519PrivateKey([]byte(std))
 	if err != nil {
 		return nil, "", err
 	}
-	
+
 	pid, err := peer.IDFromPrivateKey(libPriv)
 	return libPriv, pid, err
 }
@@ -765,29 +861,29 @@ func parsePeerIDs(list []string) map[peer.ID]bool {
 
 // topic helpers
 func containsTopic(list []string, target string) bool {
-    for _, s := range list {
-        if strings.TrimSpace(s) == target {
-            return true
-        }
-    }
-    return false
+	for _, s := range list {
+		if strings.TrimSpace(s) == target {
+			return true
+		}
+	}
+	return false
 }
 
 func dedupeTopics(list []string) []string {
-    seen := make(map[string]struct{}, len(list))
-    out := make([]string, 0, len(list))
-    for _, s := range list {
-        s = strings.TrimSpace(s)
-        if s == "" {
-            continue
-        }
-        if _, ok := seen[s]; ok {
-            continue
-        }
-        seen[s] = struct{}{}
-        out = append(out, s)
-    }
-    return out
+	seen := make(map[string]struct{}, len(list))
+	out := make([]string, 0, len(list))
+	for _, s := range list {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
 }
 
 // mdnsNotifee handles mDNS peer discovery notifications
@@ -805,5 +901,8 @@ func (n *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
 		n.log.Warn("failed to connect to mDNS peer", utils.ZapString("peer_id", pi.ID.String()), utils.ZapError(err))
 	} else {
 		n.log.Info("connected to mDNS peer", utils.ZapString("peer_id", pi.ID.String()))
+		// Protect validator peer connections from connection manager pruning
+		n.h.ConnManager().TagPeer(pi.ID, "validator", 1000)
+		n.h.ConnManager().Protect(pi.ID, "validator-peer")
 	}
 }

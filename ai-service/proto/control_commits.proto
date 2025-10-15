@@ -19,6 +19,9 @@ message CommitEvent {
   uint32 evidence_count = 6;        // Number of evidence transactions committed
   uint32 policy_count = 7;          // Number of policy transactions committed
   
+  // Individual transaction tracking (Fix: Gap 2 - enable COMMITTED state)
+  repeated string anomaly_ids = 13; // List of committed anomaly UUIDs (UUIDv4 strings)
+  
   // Timing
   int64 timestamp = 8;              // Unix timestamp (seconds)
   

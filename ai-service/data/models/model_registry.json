@@ -1,46 +1,24 @@
 {
   "models": {
-    "ddos_lgbm": {
-      "version": "1.0.0",
-      "path": "ddos_lgbm_v1.0.0.pkl",
-      "fingerprint": "ee00a3273dea9f08f3ec0fc9080b674ebdc15b84ddf1b0c8040fc859be2a8049",
+    "ddos": {
+      "version": "2.0.0",
+      "path": "ddos.pkl",
+      "fingerprint": "d5c22bf4edc29e525c9fabb981f94329e190b43de15adf0418db4ebdc976bc54",
       "algorithm": "LightGBM",
       "calibration": "sigmoid",
       "performance": {
-        "auc": 1.0,
-        "fpr": 0.0,
-        "tpr": 1.0,
-        "tp": 600,
-        "fp": 0,
-        "tn": 1000,
-        "fn": 0
+        "auc": 0.999,
+        "trained_rows": 7650000,
+        "dataset": "CIC-DDoS2019",
+        "note": "Trained on real DDoS data (10.2M train + 2.5M test)"
       },
-      "trained_at": "2025-10-04T05:15:56.189249Z",
-      "feature_count": 30,
+      "trained_at": "2025-10-08T09:57:22.534665Z",
+      "feature_count": 79,
       "threat_type": "ddos"
     },
-    "malware_lgbm": {
+    "anomaly": {
       "version": "1.0.0",
-      "path": "malware_lgbm_v1.0.0.pkl",
-      "fingerprint": "187d3d650f76dff214b96180ced28293f1f917de4383c62adfe0a4647cf5aaba",
-      "algorithm": "LightGBM",
-      "calibration": "sigmoid",
-      "performance": {
-        "auc": 0.9999999999999999,
-        "fpr": 0.0,
-        "tpr": 1.0,
-        "tp": 400,
-        "fp": 0,
-        "tn": 800,
-        "fn": 0
-      },
-      "trained_at": "2025-10-04T05:17:32.671206Z",
-      "feature_count": 256,
-      "threat_type": "malware"
-    },
-    "anomaly_iforest": {
-      "version": "1.0.0",
-      "path": "anomaly_iforest_v1.0.0.pkl",
+      "path": "anomaly.pkl",
       "fingerprint": "24019dbcbf3dbbc0b05869b3ee18ee9ef5456016c15864f002c0bbcbb49b5386",
       "algorithm": "IsolationForest",
       "calibration": "none",
@@ -56,6 +34,71 @@
       "trained_at": "2025-10-04T05:17:38.053948Z",
       "feature_count": 30,
       "threat_type": "anomaly"
+    },
+    "malware": {
+      "variants": {
+        "windows_api_seq": {
+          "version": "1.0.0",
+          "path": "malware_api.pkl",
+          "fingerprint": "930b3863b5a776df6953a98f8618433f58d31e06ce97320c650a6689f9e71303",
+          "algorithm": "LightGBM",
+          "calibration": "sigmoid",
+          "threat_type": "malware",
+          "feature_count": 1000,
+          "schema": "windows_api_seq",
+          "enabled": true,
+          "threshold": 0.85
+        },
+        "pe_sections": {
+          "version": "1.0.0",
+          "path": "",
+          "fingerprint": "",
+          "algorithm": "LightGBM",
+          "calibration": "sigmoid",
+          "threat_type": "malware",
+          "feature_count": 0,
+          "schema": "pe_sections",
+          "enabled": false,
+          "threshold": 0.9
+        },
+        "pe_imports": {
+          "version": "1.0.0",
+          "path": "malware_pe_imports.pkl",
+          "fingerprint": "f974b5368c2097ad46ec13daa9a4959fcff866791b40fb0a7e5bd6ab2760dc36",
+          "algorithm": "LightGBM",
+          "calibration": "sigmoid",
+          "threat_type": "malware",
+          "feature_count": 1000,
+          "schema": "pe_imports",
+          "enabled": true,
+          "threshold": 0.9
+        },
+        "android_apk": {
+          "version": "1.0.0",
+          "path": "malware_android.pkl",
+          "fingerprint": "0b5a4e8db1763d07dcdbb2951ca5e7efeadff9a2e7d45446c761b4ec96cffe27",
+          "algorithm": "LightGBM",
+          "calibration": "sigmoid",
+          "threat_type": "malware",
+          "feature_count": 99,
+          "schema": "android_apk",
+          "enabled": true,
+          "threshold": 0.85
+        },
+        "net_flow_79": {
+          "version": "1.0.0",
+          "path": "malware_flow.pkl",
+          "fingerprint": "2891283b0a81d75859997a09ee374c003d8c448842fd864a15d8e1b2b0c38573",
+          "algorithm": "LightGBM",
+          "calibration": "sigmoid",
+          "threat_type": "malware",
+          "feature_count": 39,
+          "schema": "net_flow_39",
+          "enabled": true,
+          "threshold": 0.8,
+          "note": "Variant name kept per plan; current model uses 39 features"
+        }
+      }
     }
   }
 }

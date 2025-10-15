@@ -13,7 +13,8 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent / 'ai-service'))
+# Ensure ai-service package on path (absolute to avoid CWD issues)
+sys.path.insert(0, str(Path(r"B:/CyberMesh/ai-service")))
 
 print('=' * 70)
 print('TEST: AI to Backend Kafka Integration')

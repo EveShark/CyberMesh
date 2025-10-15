@@ -23,6 +23,11 @@ class ValidationError(CyberMeshError):
     pass
 
 
+class TimestampSkewError(ValidationError):
+    """Timestamp is outside the allowed clock skew window."""
+    pass
+
+
 class ConfigError(CyberMeshError):
     """Configuration loading or validation failed."""
     pass

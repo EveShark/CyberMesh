@@ -123,30 +123,31 @@ class EvidenceMessage:
             raise ContractError(f"Evidence validation failed: {e}") from e
     
     def _build_sign_bytes(self) -> bytes:
-        """Build sign bytes matching backend state.BuildSignBytes()."""
-        coc_entries = [
-            ai_evidence_pb2.ChainOfCustodyEntry(
-                ref_hash=ref_hash,
-                actor_id=actor_id,
-                ts=ts,
-                signature=sig,
-            )
-            for ref_hash, actor_id, ts, sig in self.chain_of_custody
-        ]
+        """
+        Build sign bytes matching backend state.BuildSignBytes() format.
         
-        msg = ai_evidence_pb2.EvidenceEvent(
-            id=self.evidence_id,
-            evidence_type=self.evidence_type,
-            refs=self.refs,
-            proof_blob=self.proof_blob,
-            coc=coc_entries,
-            ts=self.timestamp,
-            content_hash=self.content_hash,
-            producer_id=self.pubkey,
-            nonce=self.nonce,
-        )
+        Backend format: domain||ts(8B)||producer_id_len(2B)||producer_id||nonce(16B)||content_hash(32B)
+        Domain prefix is provided by Signer.sign() via the DOMAIN constant.
+        """
+        import struct
         
-        return msg.SerializeToString()
+        # Timestamp (8 bytes, big-endian int64)
+        ts_bytes = struct.pack('>q', self.timestamp)
+        
+        # Producer ID length (2 bytes, big-endian uint16) + producer ID
+        producer_id_len = struct.pack('>H', len(self.pubkey))
+        producer_id_bytes = producer_id_len + self.pubkey
+        
+        # Nonce (16 bytes)
+        if len(self.nonce) != 16:
+            raise ContractError(f"nonce must be exactly 16 bytes, got {len(self.nonce)}")
+        
+        # Content hash (32 bytes)
+        if len(self.content_hash) != 32:
+            raise ContractError(f"content_hash must be exactly 32 bytes, got {len(self.content_hash)}")
+        
+        # Concatenate all parts (domain will be added by Signer.sign())
+        return ts_bytes + producer_id_bytes + self.nonce + self.content_hash
     
     def to_bytes(self) -> bytes:
         """Serialize to protobuf bytes for Kafka transmission."""

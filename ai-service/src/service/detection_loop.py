@@ -164,12 +164,48 @@ class DetectionLoop:
                     if self.rate_limiter.acquire():
                         # Publish anomaly
                         import uuid
+                        import json
                         
                         anomaly_id = str(uuid.uuid4())
                         anomaly_type = result.decision.threat_type.value
                         severity = max(1, min(10, int(result.decision.final_score * 10)))
                         confidence = result.decision.confidence
-                        evidence = result.decision.metadata.get('evidence', b'')
+                        
+                        # Build JSON payload with FULL security context
+                        
+                        # Extract network context from metadata/candidates
+                        network_context = {}
+                        if result.decision.candidates:
+                            # Get features from first candidate
+                            features = result.decision.candidates[0].features
+                            network_context = {
+                                'src_ip': features.get('src_ip', 'unknown'),
+                                'dst_ip': features.get('dst_ip', 'unknown'),
+                                'src_port': features.get('src_port', 0),
+                                'dst_port': features.get('dst_port', 0),
+                                'protocol': features.get('protocol', 0),
+                                'flow_id': features.get('flow_id', 'unknown'),
+                                'flow_duration': features.get('flow_duration', 0),
+                                'total_packets': features.get('tot_fwd_pkts', 0) + features.get('tot_bwd_pkts', 0),
+                                'total_bytes': features.get('totlen_fwd_pkts', 0) + features.get('totlen_bwd_pkts', 0),
+                            }
+                        
+                        payload_obj = {
+                            # Detection metadata
+                            'detection_timestamp': time.time(),
+                            'anomaly_id': anomaly_id,
+                            'severity': severity,
+                            'confidence': float(confidence),
+                            'threat_type': anomaly_type,
+                            'final_score': float(result.decision.final_score),
+                            'llr': float(result.decision.llr),
+                            # Network context
+                            **network_context,
+                            # Model info
+                            'model_version': 'v1.0.0',
+                            'contributing_engines': [c.engine_name for c in result.decision.candidates[:3]],
+                        }
+                        payload_bytes = json.dumps(payload_obj, separators=(",", ":")).encode('utf-8')
                         
                         self.publisher.publish_anomaly(
                             anomaly_id=anomaly_id,
@@ -177,7 +213,7 @@ class DetectionLoop:
                             source='detection_loop',
                             severity=severity,
                             confidence=confidence,
-                            payload=evidence,
+                            payload=payload_bytes,
                             model_version='v1.0.0'
                         )
                         
@@ -187,6 +223,33 @@ class DetectionLoop:
                             f"Published anomaly: {anomaly_type} "
                             f"(confidence={confidence:.2f}, severity={severity})"
                         )
+                        
+                        # Publish supporting evidence (Fix: Gap 1)
+                        self.logger.info(f"[EVIDENCE_DEBUG] Starting evidence publishing attempt for anomaly {anomaly_id}")
+                        try:
+                            ev_bytes = result.decision.metadata.get('evidence')
+                            self.logger.info(f"[EVIDENCE_DEBUG] ev_bytes={'PRESENT' if ev_bytes else 'MISSING'}, metadata_keys={list(result.decision.metadata.keys())}")
+                            if ev_bytes:
+                                # Evidence is already a signed, serialized protobuf EvidenceMessage
+                                # Send it directly to Kafka
+                                topic = self.publisher.producer.topics.ai_evidence
+                                self.publisher.producer.producer.produce(
+                                    topic,
+                                    value=ev_bytes,
+                                    callback=self.publisher.producer._delivery_callback
+                                )
+                                self.publisher.producer.producer.poll(0)
+                                self.publisher.producer.producer.flush(timeout=10)
+                                
+                                self.logger.info(
+                                    f"Published evidence for anomaly {anomaly_id}"
+                                )
+                        except Exception as e:
+                            # Don't fail detection on evidence publication errors
+                            self.logger.error(
+                                f"Failed to publish evidence: {e}",
+                                exc_info=True
+                            )
                     else:
                         self._increment_metric("detections_rate_limited")
                         self.logger.warning("Rate limited detection")
@@ -195,12 +258,33 @@ class DetectionLoop:
                     with self._metrics_lock:
                         self._metrics["last_detection_time"] = time.time()
                 elif result.error:
-                    self.logger.debug(f"Pipeline returned error: {result.error}")
+                    # Promote pipeline errors to INFO for visibility at default log level
+                    self.logger.info(
+                        "Pipeline returned error",
+                        extra={"error": result.error, "latency_ms": round(detection_latency, 2)}
+                    )
                 
                 # 3. Update metrics
                 self._increment_metric("loop_iterations")
                 self._update_avg_latency(detection_latency)
                 
+                # INFO-level iteration summary to make pipeline activity visible without DEBUG
+                self.logger.info(
+                    "Detection iteration",
+                    extra={
+                        "published": bool(result.decision and result.decision.should_publish),
+                        "abstention_reason": (
+                            result.decision.abstention_reason
+                            if (result.decision and not result.decision.should_publish)
+                            else None
+                        ),
+                        "feature_count": result.feature_count,
+                        "candidate_count": result.candidate_count,
+                        "latency_ms": round(detection_latency, 2),
+                        "total_latency_ms": round(result.total_latency_ms, 2),
+                    },
+                )
+
                 self.logger.debug(
                     f"Detection iteration complete: "
                     f"published={result.decision.should_publish if result.decision else False}, "

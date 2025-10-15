@@ -90,6 +90,10 @@ keys/
 *.pfx
 *.jks
 
+# Kubernetes Secrets (contains sensitive credentials)
+k8s/secret.yaml
+k8s/sealed-secret.yaml
+
 # Database
 *.db
 *.sqlite

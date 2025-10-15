@@ -16,43 +16,62 @@ import (
 
 // Encoder handles secure message serialization
 type Encoder struct {
-	encMode     cbor.EncMode
-	decMode     cbor.DecMode
-	crypto      types.CryptoService
-	config      *EncoderConfig
-	verifyCache *expirable.LRU[string, bool]
-	mu          sync.RWMutex
+	encMode         cbor.EncMode
+	decMode         cbor.DecMode
+	crypto          types.CryptoService
+	config          *EncoderConfig
+	verifyCache     *expirable.LRU[string, bool]
+    // verifySigCache caches successful signature verifications keyed by (signBytes|keyID)
+    // to make re-verification idempotent, especially during QC validation where
+    // only signatures are available (not full messages). This prevents replay
+    // detections on identical data/signature pairs that were already verified at ingress.
+    verifySigCache *expirable.LRU[string, bool]
+	validatorSet    ValidatorSet
+	staticMinQuorum int
+	mu              sync.RWMutex
 }
 
 // EncoderConfig contains encoding security parameters
 type EncoderConfig struct {
-	MaxProposalSize      int
-	MaxVoteSize          int
-	MaxQCSize            int
-	MaxViewChangeSize    int
-	MaxNewViewSize       int
-	MaxHeartbeatSize     int
-	MaxEvidenceSize      int
-	ClockSkewTolerance   time.Duration
-	VerifyCacheSize      int
-	VerifyCacheTTL       time.Duration
-	RejectFutureMessages bool
+	MaxProposalSize           int
+	MaxVoteSize               int
+	MaxQCSize                 int
+	MaxViewChangeSize         int
+	MaxNewViewSize            int
+	MaxHeartbeatSize          int
+	MaxEvidenceSize           int
+	MaxGenesisReadySize       int
+	MaxGenesisCertificateSize int
+	MaxProposalIntentSize     int
+	MaxReadyToVoteSize        int
+	ClockSkewTolerance        time.Duration
+	GenesisClockSkewTolerance time.Duration
+	VerifyCacheSize           int
+	VerifyCacheTTL            time.Duration
+	RejectFutureMessages      bool
+	MinQuorumSize             int
 }
 
 // DefaultEncoderConfig returns secure default configuration
 func DefaultEncoderConfig() *EncoderConfig {
 	return &EncoderConfig{
-		MaxProposalSize:      1 << 20,   // 1 MB
-		MaxVoteSize:          10 << 10,  // 10 KB
-		MaxQCSize:            100 << 10, // 100 KB
-		MaxViewChangeSize:    50 << 10,  // 50 KB
-		MaxNewViewSize:       500 << 10, // 500 KB
-		MaxHeartbeatSize:     5 << 10,   // 5 KB
-		MaxEvidenceSize:      200 << 10, // 200 KB
-		ClockSkewTolerance:   5 * time.Second,
-		VerifyCacheSize:      10000,
-		VerifyCacheTTL:       5 * time.Minute,
-		RejectFutureMessages: true,
+		MaxProposalSize:           1 << 20,   // 1 MB
+		MaxVoteSize:               10 << 10,  // 10 KB
+		MaxQCSize:                 100 << 10, // 100 KB
+		MaxViewChangeSize:         50 << 10,  // 50 KB
+		MaxNewViewSize:            500 << 10, // 500 KB
+		MaxHeartbeatSize:          5 << 10,   // 5 KB
+		MaxEvidenceSize:           200 << 10, // 200 KB
+		MaxGenesisReadySize:       16 << 10,  // 16 KB
+		MaxGenesisCertificateSize: 64 << 10,  // 64 KB (attestation bundle)
+		MaxProposalIntentSize:     4 << 10,   // 4 KB
+		MaxReadyToVoteSize:        4 << 10,   // 4 KB
+		ClockSkewTolerance:        5 * time.Second,
+		GenesisClockSkewTolerance: 15 * time.Minute,
+		VerifyCacheSize:           10000,
+		VerifyCacheTTL:            5 * time.Minute,
+		RejectFutureMessages:      true,
+		MinQuorumSize:             1,
 	}
 }
 
@@ -62,11 +81,15 @@ func NewEncoder(crypto types.CryptoService, config *EncoderConfig) (*Encoder, er
 		config = DefaultEncoderConfig()
 	}
 
+	if config.GenesisClockSkewTolerance <= 0 {
+		config.GenesisClockSkewTolerance = config.ClockSkewTolerance
+	}
+
 	// Strict CBOR encoding mode
-    encOpts := cbor.CanonicalEncOptions()
-    // Preserve full timestamp precision to avoid signature mismatches
-    encOpts.Time = cbor.TimeRFC3339Nano
-    encMode, err := encOpts.EncMode()
+	encOpts := cbor.CanonicalEncOptions()
+	// Preserve full timestamp precision to avoid signature mismatches
+	encOpts.Time = cbor.TimeRFC3339Nano
+	encMode, err := encOpts.EncMode()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create CBOR encoder: %w", err)
 	}
@@ -85,19 +108,60 @@ func NewEncoder(crypto types.CryptoService, config *EncoderConfig) (*Encoder, er
 	}
 
 	// LRU cache for verified signatures to skip redundant checks
-	verifyCache := expirable.NewLRU[string, bool](
+    verifyCache := expirable.NewLRU[string, bool](
 		config.VerifyCacheSize,
 		nil,
 		config.VerifyCacheTTL,
 	)
 
+    verifySigCache := expirable.NewLRU[string, bool](
+        config.VerifyCacheSize,
+        nil,
+        config.VerifyCacheTTL,
+    )
+
 	return &Encoder{
-		encMode:     encMode,
-		decMode:     decMode,
-		crypto:      crypto,
-		config:      config,
-		verifyCache: verifyCache,
+		encMode:         encMode,
+		decMode:         decMode,
+		crypto:          crypto,
+		config:          config,
+		verifyCache:     verifyCache,
+        verifySigCache:  verifySigCache,
+		staticMinQuorum: config.MinQuorumSize,
 	}, nil
+}
+
+// SetValidatorSet wires a validator set so the encoder can enforce quorum thresholds.
+func (e *Encoder) SetValidatorSet(set ValidatorSet) {
+	e.mu.Lock()
+	e.validatorSet = set
+	e.mu.Unlock()
+}
+
+func (e *Encoder) quorumThreshold() int {
+	e.mu.RLock()
+	set := e.validatorSet
+	minQuorum := e.staticMinQuorum
+	e.mu.RUnlock()
+	if minQuorum < 1 {
+		minQuorum = 1
+	}
+	if set == nil {
+		return minQuorum
+	}
+	count := set.GetValidatorCount()
+	if count <= 0 {
+		return minQuorum
+	}
+	f := (count - 1) / 3
+	dynamic := 2*f + 1
+	if dynamic < 1 {
+		dynamic = 1
+	}
+	if dynamic > minQuorum {
+		return dynamic
+	}
+	return minQuorum
 }
 
 // Encode serializes a message to CBOR with size limits
@@ -107,9 +171,19 @@ func (e *Encoder) Encode(msg types.Message) ([]byte, error) {
 
 	var buf bytes.Buffer
 	encoder := e.encMode.NewEncoder(&buf)
-
-	if err := encoder.Encode(msg); err != nil {
-		return nil, fmt.Errorf("CBOR encode failed: %w", err)
+	// Avoid encoding non-CBOR-friendly fields (e.g., Proposal.Block is an interface)
+	switch m := msg.(type) {
+	case *Proposal:
+		cp := *m
+		// Do not send full block over the wire; peers verify via hashes/headers
+		cp.Block = nil
+		if err := encoder.Encode(&cp); err != nil {
+			return nil, fmt.Errorf("CBOR encode failed: %w", err)
+		}
+	default:
+		if err := encoder.Encode(msg); err != nil {
+			return nil, fmt.Errorf("CBOR encode failed: %w", err)
+		}
 	}
 
 	data := buf.Bytes()
@@ -202,6 +276,34 @@ func (e *Encoder) decode(data []byte, msgType MessageType) (types.Message, error
 		}
 		msg = &ev
 
+	case TypeGenesisReady:
+		var gr GenesisReady
+		if err := e.decMode.Unmarshal(data, &gr); err != nil {
+			return nil, err
+		}
+		msg = &gr
+
+	case TypeGenesisCertificate:
+		var gc GenesisCertificate
+		if err := e.decMode.Unmarshal(data, &gc); err != nil {
+			return nil, err
+		}
+		msg = &gc
+
+	case TypeProposalIntent:
+		var pi ProposalIntent
+		if err := e.decMode.Unmarshal(data, &pi); err != nil {
+			return nil, err
+		}
+		msg = &pi
+
+	case TypeReadyToVote:
+		var rtv ReadyToVote
+		if err := e.decMode.Unmarshal(data, &rtv); err != nil {
+			return nil, err
+		}
+		msg = &rtv
+
 	default:
 		return nil, fmt.Errorf("unknown message type: %v", msgType)
 	}
@@ -225,7 +327,7 @@ func (e *Encoder) verifyMessage(ctx context.Context, msg types.Message) error {
 	}
 	e.mu.RUnlock()
 
-	// Get public key for the signer
+    // Get public key for the signer
 	publicKey, err := e.crypto.GetPublicKey(keyID)
 	if err != nil {
 		return fmt.Errorf("failed to get public key: %w", err)
@@ -233,6 +335,16 @@ func (e *Encoder) verifyMessage(ctx context.Context, msg types.Message) error {
 
 	// Verify signature using constant-time comparison
 	signBytes := getSignBytes(msg)
+    // Fast-path: if we've already verified this exact (signBytes,keyID), skip crypto verify
+    if len(signBytes) > 0 {
+        sigKey := e.getSigCacheKey(signBytes, keyID)
+        e.mu.RLock()
+        if ok, cached := e.verifySigCache.Get(sigKey); cached && ok {
+            e.mu.RUnlock()
+            return nil
+        }
+        e.mu.RUnlock()
+    }
 	if err := e.crypto.VerifyWithContext(ctx, signBytes, sig, publicKey); err != nil {
 		return fmt.Errorf("invalid signature: %w", err)
 	}
@@ -240,6 +352,9 @@ func (e *Encoder) verifyMessage(ctx context.Context, msg types.Message) error {
 	// Cache successful verification
 	e.mu.Lock()
 	e.verifyCache.Add(cacheKey, true)
+    if len(signBytes) > 0 {
+        e.verifySigCache.Add(e.getSigCacheKey(signBytes, keyID), true)
+    }
 	e.mu.Unlock()
 
 	return nil
@@ -259,6 +374,14 @@ func getSignBytes(msg types.Message) []byte {
 	case *Heartbeat:
 		return m.SignBytes()
 	case *Evidence:
+		return m.SignBytes()
+	case *GenesisReady:
+		return m.SignBytes()
+	case *GenesisCertificate:
+		return m.SignBytes()
+	case *ProposalIntent:
+		return m.SignBytes()
+	case *ReadyToVote:
 		return m.SignBytes()
 	case *QC:
 		return m.SignBytes()
@@ -282,6 +405,14 @@ func (e *Encoder) extractSignature(msg types.Message) ([]byte, ValidatorID, erro
 		return m.Signature.Bytes, m.Signature.KeyID, nil
 	case *Evidence:
 		return m.Signature.Bytes, m.Signature.KeyID, nil
+	case *GenesisReady:
+		return m.Signature.Bytes, m.Signature.KeyID, nil
+	case *GenesisCertificate:
+		return m.Signature.Bytes, m.Signature.KeyID, nil
+	case *ProposalIntent:
+		return m.Signature.Bytes, m.Signature.KeyID, nil
+	case *ReadyToVote:
+		return m.Signature.Bytes, m.Signature.KeyID, nil
 	case *QC:
 		// QC doesn't have a single signature, validated separately
 		return nil, ValidatorID{}, nil
@@ -293,6 +424,7 @@ func (e *Encoder) extractSignature(msg types.Message) ([]byte, ValidatorID, erro
 // checkTimestamp validates message timestamp against clock skew
 func (e *Encoder) checkTimestamp(msg types.Message) error {
 	var timestamp time.Time
+	tolerance := e.config.ClockSkewTolerance
 	switch m := msg.(type) {
 	case *Proposal:
 		timestamp = m.Timestamp
@@ -308,20 +440,34 @@ func (e *Encoder) checkTimestamp(msg types.Message) error {
 		timestamp = m.Timestamp
 	case *Evidence:
 		timestamp = m.Timestamp
+	case *GenesisReady:
+		timestamp = m.Timestamp
+		if e.config.GenesisClockSkewTolerance > 0 {
+			tolerance = e.config.GenesisClockSkewTolerance
+		}
+	case *GenesisCertificate:
+		timestamp = m.Timestamp
+		if e.config.GenesisClockSkewTolerance > 0 {
+			tolerance = e.config.GenesisClockSkewTolerance
+		}
+	case *ProposalIntent:
+		timestamp = m.Timestamp
+	case *ReadyToVote:
+		timestamp = m.Timestamp
 	default:
 		return fmt.Errorf("unknown message type for timestamp check")
 	}
 
 	now := time.Now()
 
-	if now.Sub(timestamp) > e.config.ClockSkewTolerance {
+	if now.Sub(timestamp) > tolerance {
 		return fmt.Errorf("message timestamp too old: %v (now: %v, skew: %v)",
-			timestamp, now, e.config.ClockSkewTolerance)
+			timestamp, now, tolerance)
 	}
 
-	if e.config.RejectFutureMessages && timestamp.Sub(now) > e.config.ClockSkewTolerance {
+	if e.config.RejectFutureMessages && timestamp.Sub(now) > tolerance {
 		return fmt.Errorf("message timestamp in future: %v (now: %v, skew: %v)",
-			timestamp, now, e.config.ClockSkewTolerance)
+			timestamp, now, tolerance)
 	}
 
 	return nil
@@ -337,18 +483,62 @@ func (e *Encoder) VerifyQC(ctx context.Context, qc *QC) error {
 		return fmt.Errorf("QC has no signatures")
 	}
 
-	// CRITICAL FIX (BUG-014): Vote signatures were ALREADY verified in ValidateVote().
-	// The QC aggregates these pre-verified vote signatures. Re-verifying them here
-	// against qc.SignBytes() is WRONG - vote signatures sign vote.SignBytes(), not qc.SignBytes()!
-	// 
-	// In HotStuff/BFT consensus:
-	// 1. Each vote is individually signed and verified when received
-	// 2. QC aggregates N verified vote signatures (no re-verification needed)
-	// 3. QC itself is not signed - it's just a collection of vote signatures
-	//
-	// Skipping redundant re-verification fixes the signature mismatch bug.
+	required := e.quorumThreshold()
+	if required > 0 && len(qc.Signatures) < required {
+		return fmt.Errorf("QC has %d signatures, quorum requires %d", len(qc.Signatures), required)
+	}
+
+	seen := make(map[ValidatorID]struct{}, len(qc.Signatures))
+
+	for idx, sig := range qc.Signatures {
+		if len(sig.Bytes) == 0 {
+			return fmt.Errorf("QC signature %d is empty", idx)
+		}
+
+		if _, duplicate := seen[sig.KeyID]; duplicate {
+			return fmt.Errorf("QC contains duplicate signature from validator %x", sig.KeyID[:8])
+		}
+		seen[sig.KeyID] = struct{}{}
+
+        publicKey, err := e.crypto.GetPublicKey(sig.KeyID)
+		if err != nil {
+			return fmt.Errorf("QC signature %d failed to load public key for validator %x: %w", idx, sig.KeyID[:8], err)
+		}
+
+        voteBytes := buildVoteSignBytesFromQC(qc, sig.KeyID, sig.Timestamp)
+        // Idempotent path: if we've already verified this (signBytes,keyID), skip crypto verify
+        sigKey := e.getSigCacheKey(voteBytes, sig.KeyID)
+        e.mu.RLock()
+        if ok, cached := e.verifySigCache.Get(sigKey); cached && ok {
+            e.mu.RUnlock()
+            continue
+        }
+        e.mu.RUnlock()
+
+        if err := e.crypto.VerifyWithContext(ctx, voteBytes, sig.Bytes, publicKey); err != nil {
+			return fmt.Errorf("QC signature %d invalid for validator %x: %w", idx, sig.KeyID[:8], err)
+		}
+
+        // Cache success for idempotence
+        e.mu.Lock()
+        e.verifySigCache.Add(sigKey, true)
+        e.mu.Unlock()
+	}
 
 	return nil
+}
+
+func buildVoteSignBytesFromQC(qc *QC, voterID ValidatorID, timestamp time.Time) []byte {
+	buf := make([]byte, 0, 128)
+	buf = append(buf, []byte(DomainVote)...)
+	buf = append(buf, 0x00)
+	buf = appendUint64(buf, qc.View)
+	buf = appendUint64(buf, qc.Height)
+	buf = appendUint64(buf, qc.Round)
+	buf = append(buf, qc.BlockHash[:]...)
+	buf = append(buf, voterID[:]...)
+	buf = appendInt64(buf, timestamp.UnixNano())
+	return buf
 }
 
 // getMaxSize returns the size limit for a message type
@@ -368,6 +558,14 @@ func (e *Encoder) getMaxSize(msgType MessageType) int {
 		return e.config.MaxHeartbeatSize
 	case TypeEvidence:
 		return e.config.MaxEvidenceSize
+	case TypeGenesisReady:
+		return e.config.MaxGenesisReadySize
+	case TypeGenesisCertificate:
+		return e.config.MaxGenesisCertificateSize
+	case TypeProposalIntent:
+		return e.config.MaxProposalIntentSize
+	case TypeReadyToVote:
+		return e.config.MaxReadyToVoteSize
 	default:
 		return 1 << 20 // Default 1MB
 	}
@@ -380,6 +578,19 @@ func (e *Encoder) getCacheKey(msgHash BlockHash, keyID ValidatorID) string {
 	copy(combined[:32], msgHash[:])
 	copy(combined[32:], keyID[:])
 	return string(combined)
+}
+
+// getSigCacheKey generates a cache key from raw sign bytes and keyID.
+func (e *Encoder) getSigCacheKey(signBytes []byte, keyID ValidatorID) string {
+    combined := make([]byte, 32+len(signBytes))
+    copy(combined[:len(signBytes)], signBytes)
+    // Append keyID to strengthen uniqueness per signer
+    off := len(signBytes)
+    if len(combined) < off+32 {
+        combined = append(combined, make([]byte, off+32-len(combined))...)
+    }
+    copy(combined[off:off+32], keyID[:])
+    return string(combined)
 }
 
 // CompareSignatures performs constant-time signature comparison

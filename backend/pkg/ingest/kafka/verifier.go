@@ -35,27 +35,73 @@ func DefaultVerifierConfig() VerifierConfig {
 
 // VerifyAnomalyMsg verifies signature, content hash, and timestamp of AnomalyMsg
 func VerifyAnomalyMsg(msg *AnomalyMsg, cfg VerifierConfig, log *utils.Logger) (*state.EventTx, error) {
+	if log != nil {
+		log.Info("[DEBUG] VerifyAnomalyMsg() ENTRY")
+	}
+
 	// Validate message structure
+	if log != nil {
+		log.Info("[DEBUG] Calling ValidateAnomalyMsg()")
+	}
 	if err := ValidateAnomalyMsg(msg); err != nil {
+		if log != nil {
+			log.Info("[DEBUG] ValidateAnomalyMsg() FAILED",
+				utils.ZapError(err))
+		}
 		return nil, fmt.Errorf("validation failed: %w", err)
+	}
+	if log != nil {
+		log.Info("[DEBUG] ValidateAnomalyMsg() SUCCESS")
 	}
 
 	// Verify timestamp skew
+	if log != nil {
+		log.Info("[DEBUG] Verifying timestamp skew")
+	}
 	now := time.Now().Unix()
 	skewSeconds := int64(cfg.MaxTimestampSkew.Seconds())
 	if msg.TS > now+skewSeconds || msg.TS < now-skewSeconds {
+		if log != nil {
+			log.Info("[DEBUG] Timestamp skew FAILED",
+				utils.ZapInt64("msg_ts", msg.TS),
+				utils.ZapInt64("now", now),
+				utils.ZapInt64("skew_seconds", skewSeconds))
+		}
 		return nil, fmt.Errorf("timestamp skew exceeded: %d (now: %d, skew: %d)", msg.TS, now, skewSeconds)
+	}
+	if log != nil {
+		log.Info("[DEBUG] Timestamp skew OK")
 	}
 
 	// Check payload size BEFORE hashing (DoS protection)
+	if log != nil {
+		log.Info("[DEBUG] Checking payload size",
+			utils.ZapInt("payload_bytes", len(msg.Payload)),
+			utils.ZapInt("max_allowed", MaxPayloadSize))
+	}
 	if len(msg.Payload) > MaxPayloadSize {
+		if log != nil {
+			log.Info("[DEBUG] Payload size check FAILED")
+		}
 		return nil, fmt.Errorf("payload too large: %d bytes (max: %d)", len(msg.Payload), MaxPayloadSize)
+	}
+	if log != nil {
+		log.Info("[DEBUG] Payload size OK")
 	}
 
 	// Verify ContentHash = SHA256(payload) - mempool enforces this
+	if log != nil {
+		log.Info("[DEBUG] Verifying content hash")
+	}
 	actualContentHash := sha256.Sum256(msg.Payload)
 	if msg.ContentHash != actualContentHash {
+		if log != nil {
+			log.Info("[DEBUG] Content hash mismatch")
+		}
 		return nil, fmt.Errorf("content hash mismatch: expected %x, got %x", msg.ContentHash[:8], actualContentHash[:8])
+	}
+	if log != nil {
+		log.Info("[DEBUG] Content hash OK")
 	}
 	// PayloadHash field removed (was redundant with ContentHash)
 
@@ -88,13 +134,35 @@ func VerifyAnomalyMsg(msg *AnomalyMsg, cfg VerifierConfig, log *utils.Logger) (*
 	signBytes := append([]byte(domainAnomaly), payloadBytes...)
 
 	// Verify Ed25519 signature
+	if log != nil {
+		log.Info("[DEBUG] Verifying Ed25519 signature",
+			utils.ZapInt("pubkey_bytes", len(msg.PubKey)),
+			utils.ZapInt("signature_bytes", len(msg.Signature)),
+			utils.ZapInt("sign_bytes", len(signBytes)))
+	}
 	if !ed25519.Verify(msg.PubKey, signBytes, msg.Signature) {
+		if log != nil {
+			log.Info("[DEBUG] Ed25519 signature verification FAILED")
+		}
 		return nil, fmt.Errorf("signature verification failed")
 	}
+	if log != nil {
+		log.Info("[DEBUG] Ed25519 signature verification SUCCESS")
+	}
 
+	if log != nil {
+		log.Info("[DEBUG] Extracting priority metadata from payload")
+	}
 	severityFromPayload, confidenceFromPayload, err := extractPriorityMetadata(msg.Payload)
 	if err != nil {
+		if log != nil {
+			log.Info("[DEBUG] Priority metadata extraction FAILED",
+				utils.ZapError(err))
+		}
 		return nil, fmt.Errorf("priority metadata validation failed: %w", err)
+	}
+	if log != nil {
+		log.Info("[DEBUG] Priority metadata extraction SUCCESS")
 	}
 	if severityFromPayload != msg.Severity {
 		return nil, fmt.Errorf("priority metadata mismatch: severity")
@@ -104,6 +172,10 @@ func VerifyAnomalyMsg(msg *AnomalyMsg, cfg VerifierConfig, log *utils.Logger) (*
 	}
 	if math.Abs(confidenceFromPayload-msg.Confidence) > 1e-6 {
 		return nil, fmt.Errorf("priority metadata mismatch: confidence")
+	}
+
+	if log != nil {
+		log.Info("[DEBUG] Creating state.EventTx")
 	}
 
 	// Convert to state.EventTx
@@ -120,6 +192,10 @@ func VerifyAnomalyMsg(msg *AnomalyMsg, cfg VerifierConfig, log *utils.Logger) (*
 			Alg:         msg.Alg,
 			ContentHash: msg.ContentHash,
 		},
+	}
+
+	if log != nil {
+		log.Info("[DEBUG] VerifyAnomalyMsg() EXIT - SUCCESS")
 	}
 
 	return tx, nil
@@ -189,17 +265,28 @@ func VerifyEvidenceMsg(msg *EvidenceMsg, cfg VerifierConfig, log *utils.Logger) 
 		return nil, fmt.Errorf("content hash mismatch: expected %x, got %x", msg.ContentHash[:8], actualContentHash[:8])
 	}
 
-	// Build canonical sign bytes with AI service domain
-	// AI service Signer uses domainEvidence for evidence signatures
-	signBytes, err := state.BuildSignBytes(domainEvidence, msg.TS, msg.ProducerID, msg.Nonce, msg.ContentHash)
-	if err != nil {
-		return nil, fmt.Errorf("failed to build sign bytes: %w", err)
-	}
+    // Build canonical sign bytes consistent with AI Signer.sign(domain + data)
+    // Layout: domainEvidence || ts(8B BE) || pid_len(2B BE) || producer_id || nonce(16B) || content_hash(32B)
+    payloadBytes := make([]byte, 0, 8+2+len(msg.ProducerID)+16+32)
 
-	// Verify Ed25519 signature
-	if !ed25519.Verify(msg.PubKey, signBytes, msg.Signature) {
-		return nil, fmt.Errorf("signature verification failed")
-	}
+    var tsb [8]byte
+    binary.BigEndian.PutUint64(tsb[:], uint64(msg.TS))
+    payloadBytes = append(payloadBytes, tsb[:]...)
+
+    var pidLen [2]byte
+    binary.BigEndian.PutUint16(pidLen[:], uint16(len(msg.ProducerID)))
+    payloadBytes = append(payloadBytes, pidLen[:]...)
+    payloadBytes = append(payloadBytes, msg.ProducerID...)
+
+    payloadBytes = append(payloadBytes, msg.Nonce...)
+    payloadBytes = append(payloadBytes, msg.ContentHash[:]...)
+
+    signBytes := append([]byte(domainEvidence), payloadBytes...)
+
+    // Verify Ed25519 signature
+    if !ed25519.Verify(msg.PubKey, signBytes, msg.Signature) {
+        return nil, fmt.Errorf("signature verification failed")
+    }
 
 	// Convert CoC entries
 	var coc []state.CoCEntry

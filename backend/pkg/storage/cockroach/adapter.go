@@ -1,17 +1,19 @@
 package cockroach
 
 import (
-	"context"
-	"database/sql"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"time"
+    "context"
+    "database/sql"
+    "encoding/json"
+    "errors"
+    "fmt"
+    "strings"
+    "time"
 
-	"backend/pkg/block"
-	"backend/pkg/state"
-	"backend/pkg/utils"
-	"github.com/lib/pq"
+    "backend/pkg/block"
+    "backend/pkg/state"
+    "backend/pkg/utils"
+    "github.com/jackc/pgconn"
+    "github.com/lib/pq"
 )
 
 // Storage errors
@@ -51,17 +53,37 @@ type Adapter interface {
 }
 
 func isUniqueViolation(err error, constraint string) bool {
-	var pqErr *pq.Error
-	if !errors.As(err, &pqErr) {
-		return false
-	}
-	if pqErr.Code != "23505" {
-		return false
-	}
-	if constraint == "" {
-		return true
-	}
-	return pqErr.Constraint == constraint
+    // lib/pq error
+    var pqErr *pq.Error
+    if errors.As(err, &pqErr) {
+        if string(pqErr.Code) != "23505" {
+            return false
+        }
+        if constraint == "" {
+            return true
+        }
+        return pqErr.Constraint == constraint
+    }
+    // pgx/pgconn error
+    var pgErr *pgconn.PgError
+    if errors.As(err, &pgErr) {
+        if pgErr.Code != "23505" {
+            return false
+        }
+        if constraint == "" {
+            return true
+        }
+        return pgErr.ConstraintName == constraint
+    }
+    // Fallback: message contains SQLSTATE 23505 or duplicate key text
+    msg := err.Error()
+    if strings.Contains(msg, "SQLSTATE 23505") || strings.Contains(strings.ToLower(msg), "duplicate key value violates unique constraint") {
+        if constraint == "" {
+            return true
+        }
+        return strings.Contains(msg, constraint)
+    }
+    return false
 }
 
 // adapter implements the Adapter interface
@@ -368,7 +390,7 @@ func (a *adapter) upsertTransactions(ctx context.Context, tx *sql.Tx, blk *block
 			}
 		}
 
-		// Determine status from receipt
+        // Determine status from receipt
 		status := "success"
 		errorMsg := ""
 		if receipt.Error != "" {
@@ -376,16 +398,35 @@ func (a *adapter) upsertTransactions(ctx context.Context, tx *sql.Tx, blk *block
 			errorMsg = receipt.Error
 		}
 
-		// Try INSERT
-		contentHash := envelope.ContentHash
-		_, err = tx.ExecContext(ctx, `
+        // Compute stable transaction ID from envelope sign-bytes (prevents collisions on identical payloads)
+        contentHash := envelope.ContentHash
+        var domain string
+        switch stateTx.Type() {
+        case state.TxEvent:
+            domain = state.DomainEventTx
+        case state.TxEvidence:
+            domain = state.DomainEvidenceTx
+        case state.TxPolicy:
+            domain = state.DomainPolicyTx
+        default:
+            return fmt.Errorf("%w: unknown tx type %q", ErrInvalidData, stateTx.Type())
+        }
+        signBytes, err := state.BuildSignBytes(domain, stateTx.Timestamp(), envelope.ProducerID, envelope.Nonce, contentHash)
+        if err != nil {
+            return fmt.Errorf("build tx id: %w", err)
+        }
+        txHash := state.HashBytes(signBytes)
+
+        // Try INSERT with conflict-avoidance to keep transaction alive
+		res, err := tx.ExecContext(ctx, `
 			INSERT INTO transactions (
 				tx_hash, block_height, tx_index, tx_type, producer_id, nonce, content_hash,
 				algorithm, public_key, signature, payload, custody_chain, status, error_msg,
 				submitted_at, executed_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW())
+			ON CONFLICT (tx_hash) DO NOTHING
 		`,
-			contentHash[:],
+            txHash[:],
 			blk.GetHeight(),
 			i,
 			string(stateTx.Type()),
@@ -402,27 +443,15 @@ func (a *adapter) upsertTransactions(ctx context.Context, tx *sql.Tx, blk *block
 			time.Unix(stateTx.Timestamp(), 0),
 		)
 
-		if err == nil {
-			continue // Insert succeeded
-		}
-
-		if isUniqueViolation(err, "transactions_producer_nonce_unique") {
-			if a.auditLogger != nil {
-				_ = a.auditLogger.Security("transaction_replay_attempt_detected", map[string]interface{}{
-					"producer_id": fmt.Sprintf("%x", envelope.ProducerID),
-					"nonce":       fmt.Sprintf("%x", envelope.Nonce),
-				})
-			}
-			return fmt.Errorf("%w: duplicate producer/nonce combination", ErrIntegrityViolation)
-		}
-
-		// Check if it's a primary key conflict (idempotent retry)
-		if !isPrimaryKeyViolation(err) {
-			// Not a PK conflict - return the error immediately
+		if err != nil {
 			return fmt.Errorf("failed to insert transaction at height %d, index %d: %w", blk.GetHeight(), i, err)
 		}
 
-		// Primary key conflict detected, verify idempotency
+		if rows, _ := res.RowsAffected(); rows > 0 {
+			continue // Insert succeeded
+		}
+
+		// Conflict occurred (rows == 0), verify idempotency
 		var existingContentHash []byte
 		var existingProducerID []byte
 		var existingNonce []byte
@@ -474,12 +503,13 @@ func (a *adapter) upsertSnapshot(ctx context.Context, tx *sql.Tx, blk *block.App
 	bHash := blockHash[:]
 	sRoot := stateRoot[:]
 
-	// Try INSERT
-	_, err := tx.ExecContext(ctx, `
+	// Try INSERT with conflict-avoidance to keep transaction alive
+	res, err := tx.ExecContext(ctx, `
 		INSERT INTO state_versions (
 			version, state_root, block_height, block_hash, tx_count,
 			reputation_changes, policy_changes, quarantine_changes, created_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+		ON CONFLICT (version) DO NOTHING
 	`,
 		blk.GetHeight(), // version = height for now
 		sRoot,
@@ -491,11 +521,15 @@ func (a *adapter) upsertSnapshot(ctx context.Context, tx *sql.Tx, blk *block.App
 		0, // quarantine_changes
 	)
 
-	if err == nil {
+	if err != nil {
+		return fmt.Errorf("failed to insert snapshot: %w", err)
+	}
+
+	if rows, _ := res.RowsAffected(); rows > 0 {
 		return nil // Insert succeeded
 	}
 
-	// Conflict detected, verify state_root matches
+	// Conflict occurred (rows == 0), verify state_root matches
 	var existingStateRoot []byte
 	err = tx.QueryRowContext(ctx, `
 		SELECT state_root FROM state_versions WHERE version = $1

@@ -18,6 +18,7 @@ import (
 	"backend/pkg/state"
 	"backend/pkg/storage/cockroach"
 	"backend/pkg/utils"
+	"github.com/IBM/sarama"
 )
 
 type Config struct {
@@ -25,6 +26,7 @@ type Config struct {
 	MinMempoolTxs int
 	TimestampSkew time.Duration // For state.ApplyBlock validation
 	GenesisHash   [32]byte      // Initial parent hash for first block
+	BlockTimeout  time.Duration // Consensus block timeout (controls leader retry cadence)
 
 	// Persistence configuration
 	EnablePersistence bool                    // Enable async persistence (default: true)
@@ -73,82 +75,101 @@ type Service struct {
 	lastParent          [32]byte
 	lastRoot            [32]byte // Last committed state root
 	lastCommittedHeight uint64   // Last successfully committed block height
+	lastProposedView    uint64   // Last view we proposed in (debug visibility)
+	lastProposedHeight  uint64   // Last height we proposed (for cooldown logging)
+	lastProposalTime    time.Time
+	blockTimeout        time.Duration
 	stopCh              chan struct{}
+
+	// Genesis coordination
+	startTime          time.Time     // Service start time for genesis delay calculation
+	genesisGracePeriod time.Duration // Grace period before first proposal
 }
 
 func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, builder *block.Builder, store state.StateStore, log *utils.Logger) (*Service, error) {
 	s := &Service{
-		cfg:        cfg,
-		eng:        eng,
-		mp:         mp,
-		builder:    builder,
-		store:      store,
-		log:        log,
-		metrics:    &Metrics{},
-		lastParent: cfg.GenesisHash, // Initialize with genesis instead of zero
-		stopCh:     make(chan struct{}),
+		cfg:                cfg,
+		eng:                eng,
+		mp:                 mp,
+		builder:            builder,
+		store:              store,
+		log:                log,
+		metrics:            &Metrics{},
+		lastParent:         cfg.GenesisHash, // Initialize with genesis instead of zero
+		stopCh:             make(chan struct{}),
+		blockTimeout:       cfg.BlockTimeout,
+		// startTime will be set in Start() after genesis completes
+		genesisGracePeriod: 60 * time.Second, // Covers observed pod startup spread
+	}
+	if s.blockTimeout <= 0 {
+		s.blockTimeout = 5 * time.Second
 	}
 
-    // Initialize Kafka producer if enabled (must be before persistence worker)
-    var kafkaProducer *kafka.Producer
-    if cfg.EnableKafka {
-        // Only set up producer when a commits topic is configured
-        if cfg.KafkaProducerCfg.Topics.Commits != "" {
-            if cfg.ConfigManager == nil {
-                return nil, fmt.Errorf("kafka producer requires config manager")
-            }
+	// Ensure first proposal in view 0 isn't suppressed by cooldown guard
+	s.lastProposedView = ^uint64(0)
+	s.lastProposedHeight = ^uint64(0)
 
-            keyPath := cfg.ConfigManager.GetString("CONTROL_SIGNING_KEY_PATH", "")
-            if keyPath == "" {
-                env := cfg.ConfigManager.GetString("ENVIRONMENT", "production")
-                if env == "production" || env == "staging" {
-                    return nil, fmt.Errorf("CONTROL_SIGNING_KEY_PATH is required when Kafka producer enabled in %s", env)
-                }
-                // Dev mode: skip producer if no key
-                if log != nil {
-                    log.Warn("Kafka producer disabled: CONTROL_SIGNING_KEY_PATH not set (dev mode)")
-                }
-            } else {
-                keyPath = filepath.Clean(keyPath)
+	// Initialize Kafka producer if enabled (must be before persistence worker)
+	var kafkaProducer *kafka.Producer
+	if cfg.EnableKafka {
+		// Only set up producer when a commits topic is configured
+		if cfg.KafkaProducerCfg.Topics.Commits != "" {
+			if cfg.ConfigManager == nil {
+				return nil, fmt.Errorf("kafka producer requires config manager")
+			}
 
-                signerCfg := kafka.CommitSignerConfig{
-                    KeyPath:    keyPath,
-                    KeyID:      cfg.ConfigManager.GetString("CONTROL_SIGNING_KEY_ID", cfg.ConfigManager.GetString("NODE_ID", "")),
-                    Domain:     cfg.ConfigManager.GetString("CONTROL_SIGNING_DOMAIN", "control.commits.v1"),
-                    ProducerID: cfg.ConfigManager.GetString("CONTROL_PRODUCER_ID", ""),
-                    Logger:     log,
-                }
+			keyPath := cfg.ConfigManager.GetString("CONTROL_SIGNING_KEY_PATH", "")
+			if keyPath == "" {
+				env := cfg.ConfigManager.GetString("ENVIRONMENT", "production")
+				if env == "production" || env == "staging" {
+					return nil, fmt.Errorf("CONTROL_SIGNING_KEY_PATH is required when Kafka producer enabled in %s", env)
+				}
+				// Dev mode: skip producer if no key
+				if log != nil {
+					log.Warn("Kafka producer disabled: CONTROL_SIGNING_KEY_PATH not set (dev mode)")
+				}
+			} else {
+				keyPath = filepath.Clean(keyPath)
 
-                signer, err := kafka.NewCommitSigner(signerCfg)
-                if err != nil {
-                    return nil, fmt.Errorf("failed to initialize commit signer: %w", err)
-                }
+				signerCfg := kafka.CommitSignerConfig{
+					KeyPath:    keyPath,
+					KeyID:      cfg.ConfigManager.GetString("CONTROL_SIGNING_KEY_ID", cfg.ConfigManager.GetString("NODE_ID", "")),
+					Domain:     cfg.ConfigManager.GetString("CONTROL_SIGNING_DOMAIN", "control.commits.v1"),
+					ProducerID: cfg.ConfigManager.GetString("CONTROL_PRODUCER_ID", ""),
+					Logger:     log,
+				}
 
-                cfg.KafkaProducerCfg.Signer = signer
+				signer, err := kafka.NewCommitSigner(signerCfg)
+				if err != nil {
+					return nil, fmt.Errorf("failed to initialize commit signer: %w", err)
+				}
 
-                // Build sarama config
-                saramaCfg, err := kafka.BuildSaramaConfig(context.Background(), cfg.ConfigManager, log, cfg.AuditLogger)
-                if err != nil {
-                    return nil, fmt.Errorf("failed to build Kafka config: %w", err)
-                }
+				cfg.KafkaProducerCfg.Signer = signer
 
-                // Create producer
-                kafkaProducer, err = kafka.NewProducer(context.Background(), cfg.KafkaProducerCfg, saramaCfg, log, cfg.AuditLogger)
-                if err != nil {
-                    return nil, fmt.Errorf("failed to create Kafka producer: %w", err)
-                }
-                s.kafkaProducer = kafkaProducer
-            }
-        }
-    }
+				// Build sarama config
+				saramaCfg, err := kafka.BuildSaramaConfig(context.Background(), cfg.ConfigManager, log, cfg.AuditLogger)
+				if err != nil {
+					return nil, fmt.Errorf("failed to build Kafka config: %w", err)
+				}
+
+				// Create producer
+				kafkaProducer, err = kafka.NewProducer(context.Background(), cfg.KafkaProducerCfg, saramaCfg, log, cfg.AuditLogger)
+				if err != nil {
+					return nil, fmt.Errorf("failed to create Kafka producer: %w", err)
+				}
+				s.kafkaProducer = kafkaProducer
+			}
+		}
+	}
 
 	// Initialize persistence worker if enabled
 	if cfg.EnablePersistence && cfg.DBAdapter != nil {
 		// Wire Kafka producer as onSuccess callback
+		// Fix: Gap 2 - Updated to pass anomaly IDs for COMMITTED state tracking
 		if kafkaProducer != nil {
-			cfg.PersistenceWorker.OnSuccess = func(ctx context.Context, height uint64, hash [32]byte, stateRoot [32]byte, txCount int, ts int64) {
+			cfg.PersistenceWorker.OnSuccess = func(ctx context.Context, height uint64, hash [32]byte, stateRoot [32]byte, txCount int, ts int64, anomalyIDs []string) {
 				// Publish commit event to Kafka after successful persistence
-				if err := kafkaProducer.PublishCommit(ctx, height, hash, stateRoot, txCount, ts); err != nil {
+				if err := kafkaProducer.PublishCommit(ctx, height, hash, stateRoot, txCount, ts, anomalyIDs); err != nil {
 					if log != nil {
 						log.ErrorContext(ctx, "Failed to publish commit to Kafka",
 							utils.ZapError(err),
@@ -196,6 +217,33 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 			return nil, fmt.Errorf("failed to create Kafka consumer: %w", err)
 		}
 		s.kafkaConsumer = kafkaConsumer
+
+		// Best-effort topic validation: warn if topics missing or have no partitions
+		if len(cfg.KafkaConsumerCfg.Topics) > 0 {
+			if client, err := sarama.NewClient(cfg.KafkaConsumerCfg.Brokers, saramaCfg); err == nil {
+				for _, t := range cfg.KafkaConsumerCfg.Topics {
+					parts, perr := client.Partitions(t)
+					if perr != nil {
+						if log != nil {
+							log.Warn("Kafka topic not accessible", utils.ZapString("topic", t), utils.ZapError(perr))
+						}
+						continue
+					}
+					if len(parts) == 0 {
+						if log != nil {
+							log.Warn("Kafka topic has no partitions", utils.ZapString("topic", t))
+						}
+					} else {
+						if log != nil {
+							log.Info("Kafka topic partitions", utils.ZapString("topic", t), utils.ZapInt("partition_count", len(parts)))
+						}
+					}
+				}
+				_ = client.Close()
+			} else if log != nil {
+				log.Warn("Kafka topic validation skipped (client create failed)", utils.ZapError(err))
+			}
+		}
 	}
 
 	// Initialize API server if enabled
@@ -208,6 +256,7 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 			StateStore:  store,
 			Mempool:     mp,
 			Engine:      eng,
+			P2PRouter:   cfg.P2PRouter,
 		}
 
 		apiSrv, err := apiserver.NewServer(apiDeps)
@@ -252,6 +301,10 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 			messages.TypeNewView,
 			messages.TypeHeartbeat,
 			messages.TypeEvidence,
+			messages.TypeGenesisReady,
+			messages.TypeGenesisCertificate,
+			messages.TypeProposalIntent,
+			messages.TypeReadyToVote,
 		}
 		topicMap := make(map[string]messages.MessageType, len(types))
 		for _, mt := range types {
@@ -274,6 +327,7 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 		}
 
 		s.router = cfg.P2PRouter
+		s.eng.SetPeerObserver(cfg.P2PRouter)
 	}
 
 	return s, nil
@@ -327,6 +381,11 @@ func (s *Service) Start(ctx context.Context) error {
 	s.eng.RegisterCommitCallback(func(cctx context.Context, b api.Block, qc api.QC) error {
 		return s.onCommit(cctx, b, qc)
 	})
+
+	// Set startTime AFTER genesis completes to ensure grace period covers cluster formation
+	s.startTime = time.Now()
+	s.log.InfoContext(ctx, "service start time recorded for genesis grace period",
+		utils.ZapDuration("grace_period", s.genesisGracePeriod))
 
 	// Proposer loop
 	go s.runProposer(ctx)
