@@ -161,6 +161,7 @@ func (hs *HotStuff) OnProposal(ctx context.Context, proposal *messages.Proposal)
 
 	if qc != nil {
 		hs.pacemaker.OnQC(ctx, qc)
+		hs.handleQCFormedCallback(qc)
 	}
 
 	return nil
@@ -387,6 +388,7 @@ func (hs *HotStuff) OnVote(ctx context.Context, vote *messages.Vote) error {
 
 	if qc != nil {
 		hs.pacemaker.OnQC(ctx, qc)
+		hs.handleQCFormedCallback(qc)
 	}
 
 	return nil
@@ -540,7 +542,7 @@ func (hs *HotStuff) createEquivocationEvidence(ctx context.Context, vote1, vote2
 	return evidence
 }
 
-// formQC aggregates votes into a Quorum Certificate
+// formQC aggregates votes into a Quorum Certificate. Caller must hold hs.mu.
 func (hs *HotStuff) formQC(ctx context.Context, blockHash [32]byte, view uint64) (types.QC, error) {
 	votes := hs.pendingVotes[blockHash]
 
@@ -608,17 +610,21 @@ func (hs *HotStuff) formQC(ctx context.Context, blockHash [32]byte, view uint64)
 		hs.logger.InfoContext(ctx, "commit rule check completed")
 	}
 
-	// Callback
-	if hs.callbacks != nil {
-		if err := hs.callbacks.OnQCFormed(qc); err != nil {
-			hs.logger.ErrorContext(ctx, "QC callback failed", "error", err)
-		}
-	}
-
 	// Cleanup pending votes
 	delete(hs.pendingVotes, blockHash)
 
 	return qc, nil
+}
+
+// handleQCFormedCallback invokes the QC callback outside of the HotStuff mutex to avoid self-deadlocks.
+func (hs *HotStuff) handleQCFormedCallback(qc types.QC) {
+	if hs.callbacks == nil {
+		return
+	}
+
+	if err := hs.callbacks.OnQCFormed(qc); err != nil {
+		hs.logger.ErrorContext(context.Background(), "QC callback failed", "error", err)
+	}
 }
 
 // checkCommitRule implements HotStuff 2-chain commit rule
@@ -643,6 +649,14 @@ func (hs *HotStuff) checkCommitRule(ctx context.Context, qc types.QC) error {
 		if proposal == nil {
 			hs.logger.ErrorContext(ctx, "cannot find proposal for QC block")
 			return fmt.Errorf("cannot find proposal for QC block")
+		}
+		if proposal.Block == nil {
+			hash := qc.GetBlockHash()
+			hs.logger.ErrorContext(ctx, "proposal missing block payload",
+				"view", qc.GetView(),
+				"height", qc.GetHeight(),
+				"block_hash", fmt.Sprintf("%x", hash[:8]))
+			return fmt.Errorf("proposal missing block payload for QC view %d", qc.GetView())
 		}
 
 		hs.logger.InfoContext(ctx, "single-node mode: committing immediately",
@@ -677,6 +691,14 @@ func (hs *HotStuff) checkCommitRule(ctx context.Context, qc types.QC) error {
 		if proposal == nil {
 			hs.logger.ErrorContext(ctx, "cannot find proposal for committed block")
 			return fmt.Errorf("cannot find proposal for committed block")
+		}
+		if proposal.Block == nil {
+			hash := hs.lockedQC.GetBlockHash()
+			hs.logger.ErrorContext(ctx, "proposal missing block payload",
+				"view", hs.lockedQC.GetView(),
+				"height", hs.lockedQC.GetHeight(),
+				"block_hash", fmt.Sprintf("%x", hash[:8]))
+			return fmt.Errorf("proposal missing block payload for committed block")
 		}
 
 		return hs.commitBlock(ctx, proposal.Block, hs.lockedQC)
@@ -737,90 +759,107 @@ func (hs *HotStuff) commitBlock(ctx context.Context, block types.Block, qc types
 
 // CreateProposal creates a new proposal (leader path)
 func (hs *HotStuff) CreateProposal(ctx context.Context, block types.Block) (*messages.Proposal, error) {
-	hs.mu.Lock()
-	defer hs.mu.Unlock()
+	for {
+		currentView := hs.pacemaker.GetCurrentView()
 
-	// Verify we're the leader
-	currentView := hs.pacemaker.GetCurrentView()
-	isLeader, err := hs.rotation.IsLeader(ctx, hs.crypto.GetKeyID(), currentView)
-	if err != nil {
-		return nil, fmt.Errorf("failed to check leader status: %w", err)
-	}
-	if !isLeader {
-		return nil, fmt.Errorf("not the leader for view %d", currentView)
-	}
-
-	// Get highest QC as justification
-	justifyQC := hs.pacemaker.GetHighestQC()
-
-	// Handle nil QC (genesis block or single-node mode)
-	var justifyQCMsg *messages.QC
-	if justifyQC != nil {
-		var err error
-		justifyQCMsg, err = convertToMessageQC(justifyQC)
+		isLeader, err := hs.rotation.IsLeader(ctx, hs.crypto.GetKeyID(), currentView)
 		if err != nil {
-			return nil, fmt.Errorf("failed to convert highest QC to message: %w", err)
+			return nil, fmt.Errorf("failed to check leader status: %w", err)
 		}
+		if !isLeader {
+			return nil, fmt.Errorf("not the leader for view %d", currentView)
+		}
+
+		justifyQC := hs.pacemaker.GetHighestQC()
+		proposalHeight := hs.pacemaker.GetCurrentHeight()
+
+		hs.mu.RLock()
+		hotStuffView := hs.currentView
+		hotStuffHeight := hs.currentHeight
+		hs.mu.RUnlock()
+
+		if hotStuffView != currentView {
+			hs.logger.InfoContext(ctx, "[CREATE_PROPOSAL] view advanced before proposal assembled",
+				"expected_view", currentView,
+				"actual_view", hotStuffView)
+			continue
+		}
+
+		if proposalHeight < hotStuffHeight {
+			proposalHeight = hotStuffHeight
+		}
+
+		var justifyQCMsg *messages.QC
+		if justifyQC != nil {
+			justifyQCMsg, err = convertToMessageQC(justifyQC)
+			if err != nil {
+				return nil, fmt.Errorf("failed to convert highest QC to message: %w", err)
+			}
+		}
+
+		var parentHash [32]byte
+		if justifyQCMsg != nil {
+			parentHash = justifyQCMsg.BlockHash
+		}
+
+		hs.logger.InfoContext(ctx, "[CREATE_PROPOSAL] fetched height from pacemaker",
+			"height", proposalHeight,
+			"view", currentView)
+
+		proposal := &messages.Proposal{
+			View:       currentView,
+			Height:     proposalHeight,
+			Round:      0, // Single round per view in HotStuff
+			BlockHash:  block.GetHash(),
+			ParentHash: parentHash,
+			ProposerID: hs.crypto.GetKeyID(),
+			Timestamp:  time.Now(),
+			JustifyQC:  justifyQCMsg, // Can be nil for genesis block or single-node mode
+			Block:      block,
+		}
+
+		signBytes := proposal.SignBytes()
+		signature, err := hs.crypto.SignWithContext(ctx, signBytes)
+		if err != nil {
+			hs.mu.Unlock()
+			return nil, fmt.Errorf("failed to sign proposal: %w", err)
+		}
+
+		proposal.Signature = messages.Signature{
+			Bytes:     signature,
+			KeyID:     hs.crypto.GetKeyID(),
+			Timestamp: time.Now(),
+		}
+
+		hs.logger.InfoContext(ctx, "[CREATE_PROPOSAL] storing proposal in storage",
+			"height", proposal.Height,
+			"view", proposal.View)
+		if err := hs.storage.StoreProposal(proposal); err != nil {
+			hs.logger.ErrorContext(ctx, "[CREATE_PROPOSAL] StoreProposal FAILED",
+				"error", err,
+				"height", proposal.Height,
+				"storage_last_committed", hs.storage.GetLastCommittedHeight())
+			return nil, fmt.Errorf("failed to store proposal: %w", err)
+		}
+
+		hs.logger.InfoContext(ctx, "[CREATE_PROPOSAL] proposal stored successfully",
+			"height", proposal.Height)
+
+		hs.logger.InfoContext(ctx, "proposal created",
+			"view", proposal.View,
+			"height", proposal.Height,
+			"block_hash", fmt.Sprintf("%x", proposal.BlockHash[:8]),
+		)
+
+		if hs.audit != nil {
+			hs.audit.Info("proposal_created", map[string]interface{}{
+				"view":       proposal.View,
+				"height":     proposal.Height,
+				"block_hash": fmt.Sprintf("%x", proposal.BlockHash[:]),
+			})
+		}
+		return proposal, nil
 	}
-
-	// Determine parent hash for proposal:
-	// - If we have a highest QC, its block becomes the parent for the next proposal
-	// - For genesis (height 1), allow zero parent
-	var parentHash [32]byte
-	if justifyQCMsg != nil {
-		parentHash = justifyQCMsg.BlockHash
-	} else {
-		// genesis/first block – keep zero parent
-		parentHash = [32]byte{}
-	}
-
-    // Align proposal height with pacemaker state to avoid stale-height rejections.
-    // Pacemaker is the single source of truth for liveness/view/height seen by validators.
-    proposal := &messages.Proposal{
-        View:       currentView,
-        Height:     hs.pacemaker.GetCurrentHeight(),
-		Round:      0, // Single round per view in HotStuff
-		BlockHash:  block.GetHash(),
-		ParentHash: parentHash,
-		ProposerID: hs.crypto.GetKeyID(),
-		Timestamp:  time.Now(),
-		JustifyQC:  justifyQCMsg, // Can be nil for genesis block or single-node mode
-		Block:      block,
-	}
-
-	// Sign proposal
-	signBytes := proposal.SignBytes()
-	signature, err := hs.crypto.SignWithContext(ctx, signBytes)
-	if err != nil {
-		return nil, fmt.Errorf("failed to sign proposal: %w", err)
-	}
-
-	proposal.Signature = messages.Signature{
-		Bytes:     signature,
-		KeyID:     hs.crypto.GetKeyID(),
-		Timestamp: time.Now(),
-	}
-
-	// Store proposal
-	if err := hs.storage.StoreProposal(proposal); err != nil {
-		return nil, fmt.Errorf("failed to store proposal: %w", err)
-	}
-
-	hs.logger.InfoContext(ctx, "proposal created",
-		"view", proposal.View,
-		"height", proposal.Height,
-		"block_hash", fmt.Sprintf("%x", proposal.BlockHash[:8]),
-	)
-
-	if hs.audit != nil {
-		hs.audit.Info("proposal_created", map[string]interface{}{
-			"view":       proposal.View,
-			"height":     proposal.Height,
-			"block_hash": fmt.Sprintf("%x", proposal.BlockHash[:]),
-		})
-	}
-
-	return proposal, nil
 }
 
 // convertToMessageQC converts any implementation of types.QC to the wire-format messages.QC.

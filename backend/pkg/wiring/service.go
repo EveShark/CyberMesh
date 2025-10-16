@@ -75,6 +75,7 @@ type Service struct {
 	lastParent          [32]byte
 	lastRoot            [32]byte // Last committed state root
 	lastCommittedHeight uint64   // Last successfully committed block height
+	commitStateSynced   bool     // Whether commit validator is aligned with consensus height
 	lastProposedView    uint64   // Last view we proposed in (debug visibility)
 	lastProposedHeight  uint64   // Last height we proposed (for cooldown logging)
 	lastProposalTime    time.Time
@@ -88,16 +89,16 @@ type Service struct {
 
 func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, builder *block.Builder, store state.StateStore, log *utils.Logger) (*Service, error) {
 	s := &Service{
-		cfg:                cfg,
-		eng:                eng,
-		mp:                 mp,
-		builder:            builder,
-		store:              store,
-		log:                log,
-		metrics:            &Metrics{},
-		lastParent:         cfg.GenesisHash, // Initialize with genesis instead of zero
-		stopCh:             make(chan struct{}),
-		blockTimeout:       cfg.BlockTimeout,
+		cfg:          cfg,
+		eng:          eng,
+		mp:           mp,
+		builder:      builder,
+		store:        store,
+		log:          log,
+		metrics:      &Metrics{},
+		lastParent:   cfg.GenesisHash, // Initialize with genesis instead of zero
+		stopCh:       make(chan struct{}),
+		blockTimeout: cfg.BlockTimeout,
 		// startTime will be set in Start() after genesis completes
 		genesisGracePeriod: 60 * time.Second, // Covers observed pod startup spread
 	}

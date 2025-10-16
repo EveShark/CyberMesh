@@ -15,7 +15,7 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 	s.log.InfoContext(ctx, "onCommit called",
 		utils.ZapUint64("height", b.GetHeight()),
 		utils.ZapBool("has_persistWorker", s.persistWorker != nil))
-	
+
 	start := time.Now()
 
 	// Validate block before committing
@@ -23,11 +23,7 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 	// but we need to validate against the actual committed height sequence.
 	// Since OnQC advances height before onCommit is called, we must check
 	// block.Height against lastCommitted+1 from storage, not currentHeight.
-	s.mu.Lock()
-	expectedHeight := s.lastCommittedHeight + 1
-	s.mu.Unlock()
-	
-	if err := s.validateBlock(b, expectedHeight); err != nil {
+	if err := s.validateBlock(b); err != nil {
 		s.metrics.IncrementValidationFailures()
 		s.log.ErrorContext(ctx, "block validation failed", utils.ZapError(err))
 		return fmt.Errorf("block validation failed: %w", err)
@@ -41,17 +37,24 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 			utils.ZapUint64("height", b.GetHeight()))
 		return nil
 	}
-	
+
 	s.log.InfoContext(ctx, "executing AppBlock in state machine",
 		utils.ZapInt("tx_count", ab.GetTransactionCount()))
 
-    // Execute deterministically against state store (use block timestamp, not wall clock)
-    now := ab.GetTimestamp()
+	// Execute deterministically against state store (use block timestamp, not wall clock)
+	blockTime := ab.GetTimestamp()
 	skew := s.cfg.TimestampSkew
 	if skew == 0 {
 		skew = 30 * time.Second // default skew tolerance
 	}
-	version, root, receipts, err := state.ApplyBlock(s.store, now, skew, ab.Transactions())
+	if delta := time.Since(blockTime); delta > skew {
+		s.log.Info("expanding timestamp skew for catchup block",
+			utils.ZapDuration("original_skew", skew),
+			utils.ZapDuration("block_age", delta),
+			utils.ZapUint64("height", ab.GetHeight()))
+		skew = delta
+	}
+	version, root, receipts, err := state.ApplyBlock(s.store, blockTime, skew, ab.Transactions())
 	if err != nil {
 		s.metrics.IncrementCommitErrors()
 		s.log.Error("apply block failed", utils.ZapError(err), utils.ZapUint64("version", version))
@@ -90,7 +93,7 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 	if s.persistWorker != nil {
 		s.log.InfoContext(ctx, "enqueueing persistence task",
 			utils.ZapUint64("height", ab.GetHeight()))
-		
+
 		task := &PersistenceTask{
 			Block:     ab,
 			Receipts:  receipts,

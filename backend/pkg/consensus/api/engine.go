@@ -547,6 +547,13 @@ func (e *ConsensusEngine) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start HotStuff: %w", err)
 	}
 
+	if e.pacemaker != nil {
+		hotstuffHeight := e.hotstuff.GetCurrentHeight()
+		e.pacemaker.SetCurrentHeight(hotstuffHeight)
+		e.logger.InfoContext(ctx, "pacemaker height synchronized with HotStuff",
+			"height", hotstuffHeight)
+	}
+
 	if e.genesis == nil {
 		e.MarkValidatorReady(e.config.NodeID)
 		if err := e.ActivateConsensus(ctx); err != nil {
@@ -667,17 +674,29 @@ func (e *ConsensusEngine) SubmitBlock(ctx context.Context, block Block) error {
 	}
 
 	h := block.GetHash()
-	e.logger.InfoContext(ctx, "submitting block for consensus",
-		"height", block.GetHeight(),
+	blockHeight := block.GetHeight()
+	pacemakerHeight := e.pacemaker.GetCurrentHeight()
+	e.logger.InfoContext(ctx, "[SUBMIT_BLOCK] starting block submission",
+		"block_height", blockHeight,
+		"pacemaker_height", pacemakerHeight,
 		"hash", fmt.Sprintf("%x", h[:8]),
 		"view", currentView,
 	)
 
 	// Create proposal
+	e.logger.InfoContext(ctx, "[SUBMIT_BLOCK] calling HotStuff.CreateProposal")
 	proposal, err := e.hotstuff.CreateProposal(ctx, block)
 	if err != nil {
+		e.logger.ErrorContext(ctx, "[SUBMIT_BLOCK] CreateProposal FAILED",
+			"error", err,
+			"block_height", blockHeight,
+			"pacemaker_height", pacemakerHeight)
 		return fmt.Errorf("failed to create proposal: %w", err)
 	}
+
+	e.logger.InfoContext(ctx, "[SUBMIT_BLOCK] CreateProposal SUCCESS",
+		"proposal_height", proposal.Height,
+		"proposal_view", proposal.View)
 
 	e.metrics.incrementProposalsSent()
 

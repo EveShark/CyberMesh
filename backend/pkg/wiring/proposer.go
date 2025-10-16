@@ -237,6 +237,16 @@ func (s *Service) tryPropose(ctx context.Context) {
 	// Submit block with retry
 	s.metrics.IncrementProposalsAttempted()
 	start := time.Now()
+	attemptTime := start
+	// Record attempt metadata immediately so cooldown/dedup logic suppresses repeated retries in the same view
+	s.mu.Lock()
+	s.lastProposedView = currentView
+	s.lastProposedHeight = height
+	s.lastProposalTime = attemptTime
+	s.mu.Unlock()
+	s.log.InfoContext(ctx, "[PROPOSER] submitting block to consensus engine",
+		utils.ZapUint64("height", height),
+		utils.ZapInt("tx_count", blk.GetTransactionCount()))
 	const maxRetries = 3
 	backoff := 50 * time.Millisecond
 	for attempt := 0; attempt < maxRetries; attempt++ {
@@ -260,15 +270,12 @@ func (s *Service) tryPropose(ctx context.Context) {
 		}
 		// Success
 		now := time.Now()
+		s.log.InfoContext(ctx, "[PROPOSER] block submission SUCCESS",
+			utils.ZapUint64("height", height),
+			utils.ZapDuration("elapsed", now.Sub(start)))
 		s.mu.Lock()
-		// Update last proposal metadata so cooldown logic has accurate view
-		s.lastProposedView = currentView
-		s.lastProposedHeight = height
+		// Update last proposal metadata with the success timestamp only; committed parent updates happen in onCommit.
 		s.lastProposalTime = now
-		// Optional consistency improvement: optimistically set lastParent to the
-		// just-submitted block hash so subsequent proposals reference it as parent
-		// even before commit (will be confirmed/overwritten on commit).
-		s.lastParent = blk.GetHash()
 		s.mu.Unlock()
 		s.metrics.IncrementProposalsSucceeded()
 		s.metrics.RecordProposalDuration(time.Since(start))

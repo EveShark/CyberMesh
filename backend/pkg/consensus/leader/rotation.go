@@ -287,48 +287,6 @@ func (r *Rotation) GetEligibleCount(ctx context.Context, view uint64) int {
 	return len(r.filterEligible(ctx, allValidators, view, enforceReadiness))
 }
 
-// IsLeaderEligibleToPropose reports whether the specified validator meets all
-// eligibility requirements to propose in the given view, along with the first
-// failure reason when ineligible.
-func (r *Rotation) IsLeaderEligibleToPropose(ctx context.Context, validatorID types.ValidatorID, view uint64) (bool, string) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	if r.validatorSet == nil {
-		return false, "validator set unavailable"
-	}
-
-	info, err := r.validatorSet.GetValidator(validatorID)
-	if err != nil || info == nil {
-		return false, "validator not found"
-	}
-
-	if !info.IsActive {
-		return false, "validator inactive"
-	}
-
-	if info.JoinedView > view {
-		return false, fmt.Sprintf("validator joins at view %d", info.JoinedView)
-	}
-
-	if r.config.EnableReputation && info.Reputation < r.config.MinReputation {
-		return false, fmt.Sprintf("reputation %.2f below threshold %.2f", info.Reputation, r.config.MinReputation)
-	}
-
-	if r.quarantine != nil && r.quarantine.IsQuarantined(validatorID) {
-		if expiry, ok := r.quarantine.GetQuarantineExpiry(validatorID); ok {
-			return false, fmt.Sprintf("validator quarantined until %s", expiry.UTC().Format(time.RFC3339))
-		}
-		return false, "validator quarantined"
-	}
-
-	if r.readiness != nil && view > 0 && !r.readiness.IsValidatorReady(validatorID) {
-		return false, "validator not marked ready"
-	}
-
-	return true, ""
-}
-
 // auditSelection logs leader selection for audit trail
 func (r *Rotation) auditSelection(ctx context.Context, view uint64, leader *ValidatorInfo, eligibleCount, totalCount int) {
 	// Check if quarantined (shouldn't happen, but defensive)

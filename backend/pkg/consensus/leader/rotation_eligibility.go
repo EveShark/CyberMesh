@@ -45,6 +45,11 @@ func (r *Rotation) IsLeaderEligibleToPropose(ctx context.Context, validatorID Va
 		return false, fmt.Sprintf("reputation %.2f below threshold %.2f", validator.Reputation, r.config.MinReputation)
 	}
 
+	// Check readiness (enforced after genesis view 0)
+	if r.readiness != nil && view > 0 && !r.readiness.IsValidatorReady(validator.ID) {
+		return false, "validator not marked ready"
+	}
+
 	return true, ""
 }
 

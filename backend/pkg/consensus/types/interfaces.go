@@ -180,6 +180,7 @@ type Pacemaker interface {
 	// View management
 	GetCurrentView() uint64
 	GetCurrentHeight() uint64
+	SetCurrentHeight(height uint64)
 	GetHighestQC() QC
 	GetCurrentTimeout() time.Duration
 

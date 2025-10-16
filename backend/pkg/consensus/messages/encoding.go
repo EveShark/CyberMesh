@@ -11,21 +11,90 @@ import (
 	"github.com/fxamacker/cbor/v2"
 	"github.com/hashicorp/golang-lru/v2/expirable"
 
+	"backend/pkg/block"
 	"backend/pkg/consensus/types"
 )
 
+type proposalWire struct {
+	View       uint64                 `cbor:"1,keyasint"`
+	Height     uint64                 `cbor:"2,keyasint"`
+	Round      uint64                 `cbor:"3,keyasint"`
+	BlockHash  types.BlockHash        `cbor:"4,keyasint"`
+	ParentHash types.BlockHash        `cbor:"5,keyasint"`
+	ProposerID types.ValidatorID      `cbor:"6,keyasint"`
+	Timestamp  time.Time              `cbor:"7,keyasint"`
+	JustifyQC  *QC                    `cbor:"8,keyasint,omitempty"`
+	Block      *block.AppBlockPayload `cbor:"9,keyasint,omitempty"`
+	Signature  Signature              `cbor:"10,keyasint"`
+}
+
+func newProposalWire(p *Proposal) (*proposalWire, error) {
+	var payload *block.AppBlockPayload
+	if p.Block != nil {
+		appBlock, ok := p.Block.(*block.AppBlock)
+		if !ok {
+			return nil, fmt.Errorf("unsupported block implementation %T", p.Block)
+		}
+		var err error
+		payload, err = appBlock.ToPayload()
+		if err != nil {
+			return nil, fmt.Errorf("serialize block: %w", err)
+		}
+	}
+
+	return &proposalWire{
+		View:       p.View,
+		Height:     p.Height,
+		Round:      p.Round,
+		BlockHash:  p.BlockHash,
+		ParentHash: p.ParentHash,
+		ProposerID: p.ProposerID,
+		Timestamp:  p.Timestamp,
+		JustifyQC:  p.JustifyQC,
+		Block:      payload,
+		Signature:  p.Signature,
+	}, nil
+}
+
+func (pw *proposalWire) toProposal() (*Proposal, error) {
+	p := &Proposal{
+		View:       pw.View,
+		Height:     pw.Height,
+		Round:      pw.Round,
+		BlockHash:  pw.BlockHash,
+		ParentHash: pw.ParentHash,
+		ProposerID: pw.ProposerID,
+		Timestamp:  pw.Timestamp,
+		JustifyQC:  pw.JustifyQC,
+		Signature:  pw.Signature,
+	}
+
+	if pw.Block != nil {
+		blk, err := pw.Block.ToAppBlock()
+		if err != nil {
+			return nil, fmt.Errorf("decode block payload: %w", err)
+		}
+		if blk.GetHash() != pw.BlockHash {
+			return nil, fmt.Errorf("block hash mismatch: payload %x vs proposal %x", blk.GetHash(), pw.BlockHash)
+		}
+		p.Block = blk
+	}
+
+	return p, nil
+}
+
 // Encoder handles secure message serialization
 type Encoder struct {
-	encMode         cbor.EncMode
-	decMode         cbor.DecMode
-	crypto          types.CryptoService
-	config          *EncoderConfig
-	verifyCache     *expirable.LRU[string, bool]
-    // verifySigCache caches successful signature verifications keyed by (signBytes|keyID)
-    // to make re-verification idempotent, especially during QC validation where
-    // only signatures are available (not full messages). This prevents replay
-    // detections on identical data/signature pairs that were already verified at ingress.
-    verifySigCache *expirable.LRU[string, bool]
+	encMode     cbor.EncMode
+	decMode     cbor.DecMode
+	crypto      types.CryptoService
+	config      *EncoderConfig
+	verifyCache *expirable.LRU[string, bool]
+	// verifySigCache caches successful signature verifications keyed by (signBytes|keyID)
+	// to make re-verification idempotent, especially during QC validation where
+	// only signatures are available (not full messages). This prevents replay
+	// detections on identical data/signature pairs that were already verified at ingress.
+	verifySigCache  *expirable.LRU[string, bool]
 	validatorSet    ValidatorSet
 	staticMinQuorum int
 	mu              sync.RWMutex
@@ -108,17 +177,17 @@ func NewEncoder(crypto types.CryptoService, config *EncoderConfig) (*Encoder, er
 	}
 
 	// LRU cache for verified signatures to skip redundant checks
-    verifyCache := expirable.NewLRU[string, bool](
+	verifyCache := expirable.NewLRU[string, bool](
 		config.VerifyCacheSize,
 		nil,
 		config.VerifyCacheTTL,
 	)
 
-    verifySigCache := expirable.NewLRU[string, bool](
-        config.VerifyCacheSize,
-        nil,
-        config.VerifyCacheTTL,
-    )
+	verifySigCache := expirable.NewLRU[string, bool](
+		config.VerifyCacheSize,
+		nil,
+		config.VerifyCacheTTL,
+	)
 
 	return &Encoder{
 		encMode:         encMode,
@@ -126,7 +195,7 @@ func NewEncoder(crypto types.CryptoService, config *EncoderConfig) (*Encoder, er
 		crypto:          crypto,
 		config:          config,
 		verifyCache:     verifyCache,
-        verifySigCache:  verifySigCache,
+		verifySigCache:  verifySigCache,
 		staticMinQuorum: config.MinQuorumSize,
 	}, nil
 }
@@ -171,13 +240,14 @@ func (e *Encoder) Encode(msg types.Message) ([]byte, error) {
 
 	var buf bytes.Buffer
 	encoder := e.encMode.NewEncoder(&buf)
-	// Avoid encoding non-CBOR-friendly fields (e.g., Proposal.Block is an interface)
+	// Encode message including Block payload (required for commits)
 	switch m := msg.(type) {
 	case *Proposal:
-		cp := *m
-		// Do not send full block over the wire; peers verify via hashes/headers
-		cp.Block = nil
-		if err := encoder.Encode(&cp); err != nil {
+		wire, err := newProposalWire(m)
+		if err != nil {
+			return nil, err
+		}
+		if err := encoder.Encode(wire); err != nil {
 			return nil, fmt.Errorf("CBOR encode failed: %w", err)
 		}
 	default:
@@ -228,11 +298,15 @@ func (e *Encoder) decode(data []byte, msgType MessageType) (types.Message, error
 
 	switch msgType {
 	case TypeProposal:
-		var p Proposal
-		if err := e.decMode.Unmarshal(data, &p); err != nil {
+		var wire proposalWire
+		if err := e.decMode.Unmarshal(data, &wire); err != nil {
 			return nil, err
 		}
-		msg = &p
+		p, err := wire.toProposal()
+		if err != nil {
+			return nil, err
+		}
+		msg = p
 
 	case TypeVote:
 		var v Vote
@@ -327,7 +401,7 @@ func (e *Encoder) verifyMessage(ctx context.Context, msg types.Message) error {
 	}
 	e.mu.RUnlock()
 
-    // Get public key for the signer
+	// Get public key for the signer
 	publicKey, err := e.crypto.GetPublicKey(keyID)
 	if err != nil {
 		return fmt.Errorf("failed to get public key: %w", err)
@@ -335,16 +409,16 @@ func (e *Encoder) verifyMessage(ctx context.Context, msg types.Message) error {
 
 	// Verify signature using constant-time comparison
 	signBytes := getSignBytes(msg)
-    // Fast-path: if we've already verified this exact (signBytes,keyID), skip crypto verify
-    if len(signBytes) > 0 {
-        sigKey := e.getSigCacheKey(signBytes, keyID)
-        e.mu.RLock()
-        if ok, cached := e.verifySigCache.Get(sigKey); cached && ok {
-            e.mu.RUnlock()
-            return nil
-        }
-        e.mu.RUnlock()
-    }
+	// Fast-path: if we've already verified this exact (signBytes,keyID), skip crypto verify
+	if len(signBytes) > 0 {
+		sigKey := e.getSigCacheKey(signBytes, keyID)
+		e.mu.RLock()
+		if ok, cached := e.verifySigCache.Get(sigKey); cached && ok {
+			e.mu.RUnlock()
+			return nil
+		}
+		e.mu.RUnlock()
+	}
 	if err := e.crypto.VerifyWithContext(ctx, signBytes, sig, publicKey); err != nil {
 		return fmt.Errorf("invalid signature: %w", err)
 	}
@@ -352,9 +426,9 @@ func (e *Encoder) verifyMessage(ctx context.Context, msg types.Message) error {
 	// Cache successful verification
 	e.mu.Lock()
 	e.verifyCache.Add(cacheKey, true)
-    if len(signBytes) > 0 {
-        e.verifySigCache.Add(e.getSigCacheKey(signBytes, keyID), true)
-    }
+	if len(signBytes) > 0 {
+		e.verifySigCache.Add(e.getSigCacheKey(signBytes, keyID), true)
+	}
 	e.mu.Unlock()
 
 	return nil
@@ -500,29 +574,29 @@ func (e *Encoder) VerifyQC(ctx context.Context, qc *QC) error {
 		}
 		seen[sig.KeyID] = struct{}{}
 
-        publicKey, err := e.crypto.GetPublicKey(sig.KeyID)
+		publicKey, err := e.crypto.GetPublicKey(sig.KeyID)
 		if err != nil {
 			return fmt.Errorf("QC signature %d failed to load public key for validator %x: %w", idx, sig.KeyID[:8], err)
 		}
 
-        voteBytes := buildVoteSignBytesFromQC(qc, sig.KeyID, sig.Timestamp)
-        // Idempotent path: if we've already verified this (signBytes,keyID), skip crypto verify
-        sigKey := e.getSigCacheKey(voteBytes, sig.KeyID)
-        e.mu.RLock()
-        if ok, cached := e.verifySigCache.Get(sigKey); cached && ok {
-            e.mu.RUnlock()
-            continue
-        }
-        e.mu.RUnlock()
+		voteBytes := buildVoteSignBytesFromQC(qc, sig.KeyID, sig.Timestamp)
+		// Idempotent path: if we've already verified this (signBytes,keyID), skip crypto verify
+		sigKey := e.getSigCacheKey(voteBytes, sig.KeyID)
+		e.mu.RLock()
+		if ok, cached := e.verifySigCache.Get(sigKey); cached && ok {
+			e.mu.RUnlock()
+			continue
+		}
+		e.mu.RUnlock()
 
-        if err := e.crypto.VerifyWithContext(ctx, voteBytes, sig.Bytes, publicKey); err != nil {
+		if err := e.crypto.VerifyWithContext(ctx, voteBytes, sig.Bytes, publicKey); err != nil {
 			return fmt.Errorf("QC signature %d invalid for validator %x: %w", idx, sig.KeyID[:8], err)
 		}
 
-        // Cache success for idempotence
-        e.mu.Lock()
-        e.verifySigCache.Add(sigKey, true)
-        e.mu.Unlock()
+		// Cache success for idempotence
+		e.mu.Lock()
+		e.verifySigCache.Add(sigKey, true)
+		e.mu.Unlock()
 	}
 
 	return nil
@@ -582,15 +656,15 @@ func (e *Encoder) getCacheKey(msgHash BlockHash, keyID ValidatorID) string {
 
 // getSigCacheKey generates a cache key from raw sign bytes and keyID.
 func (e *Encoder) getSigCacheKey(signBytes []byte, keyID ValidatorID) string {
-    combined := make([]byte, 32+len(signBytes))
-    copy(combined[:len(signBytes)], signBytes)
-    // Append keyID to strengthen uniqueness per signer
-    off := len(signBytes)
-    if len(combined) < off+32 {
-        combined = append(combined, make([]byte, off+32-len(combined))...)
-    }
-    copy(combined[off:off+32], keyID[:])
-    return string(combined)
+	combined := make([]byte, 32+len(signBytes))
+	copy(combined[:len(signBytes)], signBytes)
+	// Append keyID to strengthen uniqueness per signer
+	off := len(signBytes)
+	if len(combined) < off+32 {
+		combined = append(combined, make([]byte, off+32-len(combined))...)
+	}
+	copy(combined[off:off+32], keyID[:])
+	return string(combined)
 }
 
 // CompareSignatures performs constant-time signature comparison

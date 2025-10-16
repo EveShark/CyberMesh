@@ -328,28 +328,28 @@ func (pm *Pacemaker) OnViewChange(ctx context.Context, vcMsgInterface interface{
 		"my_current_view", pm.currentView)
 
 	// Validate view change
-    if vcMsg.NewView <= pm.currentView {
-        current := pm.currentView
-        if vcMsg.NewView < current {
-            // Truly stale peer – track for conditional catchup forcing and broadcast
-            pm.staleViewChanges[vcMsg.NewView] = time.Now()
-            pm.mu.Unlock()
-            pm.logger.InfoContext(ctx, "[CATCHUP-DEBUG] OnViewChange REJECTED - stale view",
-                "stale_view", vcMsg.NewView,
-                "current_view", current)
-            if current > 0 {
-                pm.broadcastCatchupViewChange(ctx, current-1, current, catchupReasonStalePeer, true)
-            }
-            return fmt.Errorf("view change for old view: %d < %d", vcMsg.NewView, current)
-        }
+	if vcMsg.NewView <= pm.currentView {
+		current := pm.currentView
+		if vcMsg.NewView < current {
+			// Truly stale peer – track for conditional catchup forcing and broadcast
+			pm.staleViewChanges[vcMsg.NewView] = time.Now()
+			pm.mu.Unlock()
+			pm.logger.InfoContext(ctx, "[CATCHUP-DEBUG] OnViewChange REJECTED - stale view",
+				"stale_view", vcMsg.NewView,
+				"current_view", current)
+			if current > 0 {
+				pm.broadcastCatchupViewChange(ctx, current-1, current, catchupReasonStalePeer, true)
+			}
+			return fmt.Errorf("view change for old view: %d < %d", vcMsg.NewView, current)
+		}
 
-        // Equal view – benign duplicate; ignore without triggering catchup storm
-        pm.mu.Unlock()
-        pm.logger.DebugContext(ctx, "[CATCHUP-DEBUG] OnViewChange ignored - equal view",
-            "view", vcMsg.NewView,
-            "current_view", current)
-        return nil
-    }
+		// Equal view – benign duplicate; ignore without triggering catchup storm
+		pm.mu.Unlock()
+		pm.logger.DebugContext(ctx, "[CATCHUP-DEBUG] OnViewChange ignored - equal view",
+			"view", vcMsg.NewView,
+			"current_view", current)
+		return nil
+	}
 
 	// Store view change
 	if pm.viewChanges[vcMsg.NewView] == nil {
@@ -1054,6 +1054,19 @@ func (pm *Pacemaker) GetCurrentHeight() uint64 {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 	return pm.currentHeight
+}
+
+// SetCurrentHeight updates the pacemaker's current height when recovering state.
+func (pm *Pacemaker) SetCurrentHeight(height uint64) {
+	pm.mu.Lock()
+	oldHeight := pm.currentHeight
+	if height > pm.currentHeight {
+		pm.currentHeight = height
+		pm.logger.InfoContext(context.Background(), "pacemaker height updated",
+			"old_height", oldHeight,
+			"new_height", height)
+	}
+	pm.mu.Unlock()
 }
 
 // GetHighestQC returns the highest known QC

@@ -153,3 +153,26 @@ coverage/
 
 # Local development directories
 .pytest_cache/
+
+# Additional backend build artifacts and loose files
+backend/cmd/cybermesh/cybermesh.exe
+backend/tests/integration/manual_e2e.test.exe
+backend/pkg/code fix.txt
+
+# Backend directories to ignore
+backend/Archive/
+backend/bin/
+backend/certs/
+backend/docs/
+backend/logs/
+backend/tests/
+
+# AI-Service directories and files to ignore
+ai-service/config/
+ai-service/data/
+ai-service/docs/
+ai-service/keys/
+ai-service/logs/
+ai-service/models/
+ai-service/tests/
+ai-service/.env
