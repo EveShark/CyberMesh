@@ -1,4 +1,4 @@
-apiVersion: apps/v1
+﻿apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: validator
@@ -46,7 +46,7 @@ spec:
 
       containers:
       - name: validator
-        image: us-central1-docker.pkg.dev/cybermesh-474414/cybermesh-repo/consensus-backend:latest
+        image: ap-mumbai-1.ocir.io/bmpajckmi4ss/cybermesh-repo/backend:arm64
         imagePullPolicy: Always
 
         securityContext:
@@ -133,6 +133,13 @@ spec:
               name: cybermesh-secrets
               key: CRYPTO_SIGNING_KEY_HEX_5
         
+        # Backend signing key from Secret (SECURITY FIX - was in ConfigMap)
+        - name: CONTROL_SIGNING_KEY_CONTENT
+          valueFrom:
+            secretKeyRef:
+              name: cybermesh-secrets
+              key: CONTROL_SIGNING_KEY_CONTENT
+        
         # Import all ConfigMap values
         envFrom:
         - configMapRef:
@@ -162,9 +169,12 @@ spec:
         - name: db-certs
           mountPath: /app/certs
           readOnly: true
-        # Logs (emptyDir for ephemeral logs)
+        # Logs (persistent)
         - name: logs
           mountPath: /app/logs
+        # Genesis state (persistent)
+        - name: genesis-state
+          mountPath: /app/data
         
         resources:
           requests:
@@ -215,7 +225,6 @@ spec:
         configMap:
           name: db-root-cert
           defaultMode: 0444
-      # Logs volume comes from volumeClaimTemplates (PVC)
       
       # Pod anti-affinity: Spread validators across nodes
       affinity:
@@ -240,7 +249,21 @@ spec:
         component: validator
     spec:
       accessModes: ["ReadWriteOnce"]
-      storageClassName: "premium-rwo"  # GKE SSD persistent disk (multi-zone)
+      storageClassName: "oci-bv"
       resources:
         requests:
           storage: 10Gi  # 10GB per validator node
+  # Genesis state storage (survives pod restarts)
+  - metadata:
+      name: genesis-state
+      labels:
+        app: consensus-backend
+        component: validator
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: "oci-bv"
+      resources:
+        requests:
+          storage: 5Gi  # 5GB for genesis certificates
+
+

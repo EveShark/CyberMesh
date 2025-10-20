@@ -1,0 +1,269 @@
+# CyberMesh AI Service - ConfigMap
+# All non-secret configuration from ai-service/.env
+# Separated from backend config for clean boundaries and independent updates
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ai-service-config
+  namespace: cybermesh
+  labels:
+    app: ai-service
+    component: ml-detection
+data:
+  # ============================================================
+  # NODE IDENTITY
+  # ============================================================
+  NODE_ID: "ai-1"
+  NODE_TYPE: "ai-service"
+  NODE_VERSION: "1.0.0"
+  ENVIRONMENT: "production"
+  REGION: "ap-mumbai-1"
+  BLOCKCHAIN_NETWORK_ID: "cybermesh-dev"
+  
+  # ============================================================
+  # KAFKA CONNECTION (Confluent Cloud)
+  # ============================================================
+  ENABLE_KAFKA: "true"
+  KAFKA_BOOTSTRAP_SERVERS: "pkc-ldvr1.asia-southeast1.gcp.confluent.cloud:9092"
+  KAFKA_BROKERS: "pkc-ldvr1.asia-southeast1.gcp.confluent.cloud:9092"
+  KAFKA_TLS_ENABLED: "true"
+  KAFKA_SASL_MECHANISM: "PLAIN"
+  
+  # Kafka Timing & Limits
+  KAFKA_TIMEOUT: "30s"
+  KAFKA_MAX_TIMESTAMP_SKEW: "5m"
+  KAFKA_MAX_MESSAGE_SIZE: "1048576"
+  
+  # Kafka Producer Settings
+  KAFKA_PRODUCER_ACKS: "all"
+  KAFKA_PRODUCER_RETRIES: "10"
+  KAFKA_PRODUCER_MAX_IN_FLIGHT: "5"
+  KAFKA_PRODUCER_IDEMPOTENCE: "true"
+  KAFKA_PRODUCER_COMPRESSION: "snappy"
+  KAFKA_PRODUCER_BATCH_SIZE: "16384"
+  KAFKA_PRODUCER_LINGER_MS: "10"
+  KAFKA_PRODUCER_BUFFER_MEMORY: "33554432"
+  KAFKA_PRODUCER_REQUEST_TIMEOUT_MS: "30000"
+  KAFKA_PRODUCER_IDEMPOTENT: "true"
+  KAFKA_PRODUCER_REQUIRED_ACKS: "-1"
+  
+  # Kafka Consumer Settings
+  KAFKA_CONSUMER_GROUP_ID: "ai-service-1"
+  KAFKA_CONSUMER_AUTO_OFFSET_RESET: "earliest"
+  KAFKA_CONSUMER_ENABLE_AUTO_COMMIT: "false"
+  KAFKA_CONSUMER_MAX_POLL_RECORDS: "500"
+  KAFKA_CONSUMER_MAX_POLL_INTERVAL_MS: "300000"
+  KAFKA_CONSUMER_SESSION_TIMEOUT_MS: "10000"
+  KAFKA_CONSUMER_HEARTBEAT_INTERVAL_MS: "3000"
+  KAFKA_CONSUMER_FETCH_MIN_BYTES: "1"
+  KAFKA_CONSUMER_FETCH_MAX_WAIT_MS: "500"
+  KAFKA_CONSUMER_OFFSET_INITIAL: "latest"
+  KAFKA_CONSUMER_MAX_PROCESSING_TIME: "30s"
+  KAFKA_CONSUMER_SESSION_TIMEOUT: "10s"
+  KAFKA_CONSUMER_HEARTBEAT: "3s"
+  
+  # ============================================================
+  # KAFKA TOPICS
+  # ============================================================
+  KAFKA_INPUT_TOPICS: "ai.anomalies.v1,ai.evidence.v1,ai.policy.v1"
+  KAFKA_OUTPUT_TOPIC_COMMITS: "control.commits.v1"
+  KAFKA_DLQ_TOPIC: "ai.anomalies.v1.dlq"
+  TOPIC_AI_ANOMALIES: "ai.anomalies.v1"
+  TOPIC_AI_EVIDENCE: "ai.evidence.v1"
+  TOPIC_AI_POLICY: "ai.policy.v1"
+  TOPIC_CONTROL_COMMITS: "control.commits.v1"
+  TOPIC_CONTROL_REPUTATION: "control.reputation.v1"
+  TOPIC_CONTROL_POLICY: "control.policy.v1"
+  TOPIC_CONTROL_EVIDENCE: "control.evidence.v1"
+  TOPIC_DLQ: "ai.dlq.v1"
+  
+  # ============================================================
+  # OCI OBJECT STORAGE (Models & Datasets)
+  # ============================================================
+  OCI_NAMESPACE: "bmpajckmi4ss"
+  OCI_REGION: "ap-mumbai-1"
+  OCI_BUCKET_MODELS: "ai-models"
+  OCI_BUCKET_DATASETS: "test-dataset"
+  # Model URLs: https://objectstorage.ap-mumbai-1.oraclecloud.com/n/bmpajckmi4ss/b/ai-models/o/ddos.pkl
+  # Dataset URLs: https://objectstorage.ap-mumbai-1.oraclecloud.com/n/bmpajckmi4ss/b/test-dataset/o/phase0_smoke_test_10k_50_50.csv
+  
+  # ============================================================
+  # REDIS CONNECTION (Upstash Cloud)
+  # ============================================================
+  REDIS_HOST: "merry-satyr-14777.upstash.io"
+  REDIS_PORT: "6379"
+  REDIS_DB: "0"
+  REDIS_TLS_ENABLED: "true"
+  REDIS_MAX_CONNECTIONS: "10"
+  
+  # Redis Pipeline Settings
+  FEEDBACK_REDIS_PIPELINE_SIZE: "1000"
+  FEEDBACK_REDIS_TRANSACTION_RETRY: "3"
+  FEEDBACK_CALIBRATION_REDIS_KEY: "calibration:model:current"
+  
+  # ============================================================
+  # ED25519 CRYPTOGRAPHY (AI Service Signing)
+  # ============================================================
+  # Key file mounted as volume from ai-service-secret at /app/keys/signing_key.pem
+  ED25519_SIGNING_KEY_PATH: "/app/keys/signing_key.pem"
+  ED25519_SIGNING_KEY_ID: "ai-node-1"
+  ED25519_DOMAIN_SEPARATION: "ai.v1"
+  ED25519_VERIFICATION_KEY_PATH: "/app/keys/signing_key.pem"
+  AI_SIGNING_KEY_PATH: "/app/keys/signing_key.pem"
+  AI_SIGNING_KEY_ID: "ai-node-1"
+  AI_DOMAIN_SEPARATION: "ai.v1"
+  
+  # ============================================================
+  # ML MODELS & DETECTION
+  # ============================================================
+  # Model paths point to OCI Object Storage mount (future)
+  # For now, models are in Docker image at /app/data/models/
+  MODEL_DDOS_PATH: "/app/data/models/ddos_lgbm_v1.0.0.pkl"
+  MODEL_MALWARE_PATH: "/app/data/models/malware_lgbm_v1.0.0.pkl"
+  MODEL_HOT_RELOAD_ENABLED: "true"
+  MODEL_RELOAD_CHECK_INTERVAL: "60"
+  
+  # Detection Settings
+  DETECTION_ENABLE_DDOS: "true"
+  DETECTION_ENABLE_MALWARE: "true"
+  DETECTION_DDOS_CONFIDENCE_THRESHOLD: "0.85"
+  DETECTION_MALWARE_CONFIDENCE_THRESHOLD: "0.90"
+  
+  # Detection Loop
+  DETECTION_INTERVAL: "5"
+  DETECTION_TIMEOUT: "30"
+  TELEMETRY_BATCH_SIZE: "1000"
+  MAX_DETECTIONS_PER_SECOND: "100"
+  
+  # Detection Thresholds
+  DDOS_THRESHOLD: "1000"
+  MALWARE_TIMEOUT: "30s"
+  
+  # ============================================================
+  # API SERVER (AI Service)
+  # ============================================================
+  API_LISTEN_ADDR_AI: ":8080"
+  API_HEALTH_PATH: "/health"
+  API_METRICS_PATH: "/metrics"
+  API_BASE_PATH: "/api/v1"
+  API_TLS_ENABLED: "false"
+  
+  # API Timeouts
+  API_READ_TIMEOUT: "10s"
+  API_WRITE_TIMEOUT: "30s"
+  API_IDLE_TIMEOUT: "60s"
+  API_SHUTDOWN_TIMEOUT: "30s"
+  API_REQUEST_TIMEOUT: "30s"
+  
+  # Rate Limiting
+  API_RATE_LIMIT_ENABLED: "true"
+  API_RATE_LIMIT_PER_MINUTE: "100"
+  API_RATE_LIMIT_BURST: "10"
+  RATE_LIMIT_GLOBAL_CAPACITY: "1000"
+  RATE_LIMIT_GLOBAL_REFILL_RATE: "100.0"
+  RATE_LIMIT_ANOMALY_CAPACITY: "500"
+  RATE_LIMIT_ANOMALY_REFILL_RATE: "50.0"
+  RATE_LIMIT_EVIDENCE_CAPACITY: "200"
+  RATE_LIMIT_EVIDENCE_REFILL_RATE: "20.0"
+  RATE_LIMIT_POLICY_CAPACITY: "100"
+  RATE_LIMIT_POLICY_REFILL_RATE: "10.0"
+  
+  # API Features
+  API_ENABLE_METRICS: "true"
+  API_ENABLE_AUDIT: "true"
+  API_MAX_REQUEST_SIZE: "1048576"
+  API_MAX_HEADER_SIZE: "1048576"
+  API_MAX_CONCURRENT_REQUESTS: "100"
+  
+  # ============================================================
+  # METRICS & MONITORING
+  # ============================================================
+  METRICS_ENABLED: "true"
+  METRICS_PORT: "10000"
+  METRICS_PATH: "/metrics"
+  
+  # ============================================================
+  # LOGGING
+  # ============================================================
+  LOG_LEVEL: "info"
+  LOG_DEVELOPMENT: "false"
+  LOG_FILE_PATH: "/app/logs/ai-service.log"
+  LOG_MAX_SIZE: "100"
+  LOG_MAX_BACKUPS: "10"
+  LOG_MAX_AGE: "30"
+  LOG_COMPRESS: "true"
+  
+  # ============================================================
+  # FEEDBACK LOOP SETTINGS
+  # ============================================================
+  # Feedback Lifecycle
+  FEEDBACK_LIFECYCLE_TTL_SECONDS: "2592000"
+  FEEDBACK_ADMIT_TIMEOUT_SECONDS: "30"
+  FEEDBACK_COMMIT_TIMEOUT_SECONDS: "300"
+  FEEDBACK_LIFECYCLE_BATCH_SIZE: "1000"
+  
+  # Feedback Metrics Windows
+  FEEDBACK_METRIC_WINDOW_REALTIME: "3600"
+  FEEDBACK_METRIC_WINDOW_SHORT: "86400"
+  FEEDBACK_METRIC_WINDOW_MEDIUM: "604800"
+  FEEDBACK_METRIC_WINDOW_LONG: "2592000"
+  FEEDBACK_MIN_SAMPLES_REALTIME: "100"
+  FEEDBACK_MIN_SAMPLES_SHORT: "1000"
+  FEEDBACK_MIN_SAMPLES_MEDIUM: "5000"
+  FEEDBACK_MIN_SAMPLES_LONG: "20000"
+  
+  # Feedback Rate Limiting
+  FEEDBACK_RATE_LIMIT_GLOBAL: "100000"
+  FEEDBACK_RATE_LIMIT_PER_NODE: "10000"
+  FEEDBACK_RATE_LIMIT_PER_ANOMALY: "10"
+  
+  # Feedback Decay
+  FEEDBACK_DECAY_HALF_LIFE_SECONDS: "86400"
+  FEEDBACK_CLOCK_SKEW_TOLERANCE_SECONDS: "300"
+  
+  # Feedback Acceptance Rates
+  FEEDBACK_ACCEPTANCE_RATE_TARGET_MIN: "0.70"
+  FEEDBACK_ACCEPTANCE_RATE_TARGET_MAX: "0.85"
+  FEEDBACK_ACCEPTANCE_RATE_LOW: "0.60"
+  FEEDBACK_ACCEPTANCE_RATE_HIGH: "0.90"
+  FEEDBACK_ACCEPTANCE_RATE_CRITICAL: "0.40"
+  
+  # Feedback Calibration
+  FEEDBACK_CALIBRATION_METHOD: "isotonic"
+  FEEDBACK_CALIBRATION_MIN_SAMPLES: "1000"
+  FEEDBACK_CALIBRATION_ACCEPTANCE_THRESHOLD: "0.60"
+  FEEDBACK_CALIBRATION_RETRAIN_INTERVAL: "3600"
+  FEEDBACK_CALIBRATION_MODEL_PATH: "data/models/calibration"
+  FEEDBACK_CALIBRATION_SAVE_TO_REDIS: "true"
+  
+  # Feedback Security
+  FEEDBACK_REQUIRE_SIGNATURE_FOR_BACKEND: "true"
+  FEEDBACK_AUDIT_ALL_STATE_CHANGES: "true"
+  
+  # ============================================================
+  # LIMITS & VALIDATION
+  # ============================================================
+  LIMITS_ANOMALY_MAX_SIZE: "262144"
+  LIMITS_EVIDENCE_MAX_SIZE: "2097152"
+  LIMITS_POLICY_MAX_SIZE: "131072"
+  LIMITS_NONCE_TTL_SECONDS: "900"
+  LIMITS_NONCE_CLEANUP_INTERVAL_SECONDS: "60"
+  LIMITS_TIMESTAMP_SKEW_SECONDS: "60"
+  
+  # ============================================================
+  # NONCE STATE MANAGEMENT
+  # ============================================================
+  NONCE_STATE_PATH: "/app/data/nonce_state.json"
+  
+  # ============================================================
+  # CIRCUIT BREAKER
+  # ============================================================
+  CIRCUIT_BREAKER_FAILURE_THRESHOLD: "5"
+  CIRCUIT_BREAKER_RECOVERY_THRESHOLD: "2"
+  CIRCUIT_BREAKER_TIMEOUT_SECONDS: "30"
+  
+  # ============================================================
+  # HEALTH CHECKS
+  # ============================================================
+  HEALTH_CHECK_INTERVAL: "30s"

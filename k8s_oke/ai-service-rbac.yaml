@@ -1,0 +1,53 @@
+# CyberMesh AI Service - RBAC Configuration
+# Dedicated ServiceAccount with minimal permissions (Kafka/Redis only, NO database access)
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ai-service-sa
+  namespace: cybermesh
+  labels:
+    app: ai-service
+    component: ml-detection
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ai-service-role
+  namespace: cybermesh
+  labels:
+    app: ai-service
+rules:
+# Allow reading own pods (for health checks and discovery)
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+# Allow reading services (for Kafka/Redis endpoints)
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list"]
+# Allow reading endpoints (for service discovery)
+- apiGroups: [""]
+  resources: ["endpoints"]
+  verbs: ["get", "list"]
+# NO database secrets access
+# NO validator secrets access
+# AI service only needs Kafka/Redis credentials
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ai-service-rolebinding
+  namespace: cybermesh
+  labels:
+    app: ai-service
+subjects:
+- kind: ServiceAccount
+  name: ai-service-sa
+  namespace: cybermesh
+roleRef:
+  kind: Role
+  name: ai-service-role
+  apiGroup: rbac.authorization.k8s.io

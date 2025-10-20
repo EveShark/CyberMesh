@@ -265,28 +265,28 @@ func VerifyEvidenceMsg(msg *EvidenceMsg, cfg VerifierConfig, log *utils.Logger) 
 		return nil, fmt.Errorf("content hash mismatch: expected %x, got %x", msg.ContentHash[:8], actualContentHash[:8])
 	}
 
-    // Build canonical sign bytes consistent with AI Signer.sign(domain + data)
-    // Layout: domainEvidence || ts(8B BE) || pid_len(2B BE) || producer_id || nonce(16B) || content_hash(32B)
-    payloadBytes := make([]byte, 0, 8+2+len(msg.ProducerID)+16+32)
+	// Build canonical sign bytes consistent with AI Signer.sign(domain + data)
+	// Layout: domainEvidence || ts(8B BE) || pid_len(2B BE) || producer_id || nonce(16B) || content_hash(32B)
+	payloadBytes := make([]byte, 0, 8+2+len(msg.ProducerID)+16+32)
 
-    var tsb [8]byte
-    binary.BigEndian.PutUint64(tsb[:], uint64(msg.TS))
-    payloadBytes = append(payloadBytes, tsb[:]...)
+	var tsb [8]byte
+	binary.BigEndian.PutUint64(tsb[:], uint64(msg.TS))
+	payloadBytes = append(payloadBytes, tsb[:]...)
 
-    var pidLen [2]byte
-    binary.BigEndian.PutUint16(pidLen[:], uint16(len(msg.ProducerID)))
-    payloadBytes = append(payloadBytes, pidLen[:]...)
-    payloadBytes = append(payloadBytes, msg.ProducerID...)
+	var pidLen [2]byte
+	binary.BigEndian.PutUint16(pidLen[:], uint16(len(msg.ProducerID)))
+	payloadBytes = append(payloadBytes, pidLen[:]...)
+	payloadBytes = append(payloadBytes, msg.ProducerID...)
 
-    payloadBytes = append(payloadBytes, msg.Nonce...)
-    payloadBytes = append(payloadBytes, msg.ContentHash[:]...)
+	payloadBytes = append(payloadBytes, msg.Nonce...)
+	payloadBytes = append(payloadBytes, msg.ContentHash[:]...)
 
-    signBytes := append([]byte(domainEvidence), payloadBytes...)
+	signBytes := append([]byte(domainEvidence), payloadBytes...)
 
-    // Verify Ed25519 signature
-    if !ed25519.Verify(msg.PubKey, signBytes, msg.Signature) {
-        return nil, fmt.Errorf("signature verification failed")
-    }
+	// Verify Ed25519 signature
+	if !ed25519.Verify(msg.PubKey, signBytes, msg.Signature) {
+		return nil, fmt.Errorf("signature verification failed")
+	}
 
 	// Convert CoC entries
 	var coc []state.CoCEntry

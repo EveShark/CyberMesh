@@ -125,6 +125,9 @@ func (s *Server) writePrometheusMetrics(w http.ResponseWriter) {
 		fmt.Fprintf(w, "# HELP consensus_genesis_ready_rejected_total Total genesis READY attestations rejected\n")
 		fmt.Fprintf(w, "# TYPE consensus_genesis_ready_rejected_total counter\n")
 		fmt.Fprintf(w, "consensus_genesis_ready_rejected_total %d\n", metrics.Rejected)
+		fmt.Fprintf(w, "# HELP consensus_genesis_certificate_discard_total Total persisted genesis certificates discarded\n")
+		fmt.Fprintf(w, "# TYPE consensus_genesis_certificate_discard_total counter\n")
+		fmt.Fprintf(w, "consensus_genesis_certificate_discard_total %d\n", metrics.Discarded)
 	}
 
 	// Timestamp of metrics scrape

@@ -113,7 +113,7 @@ func (s *Server) handleStateByKey(w http.ResponseWriter, r *http.Request, keyHex
 		Value:   encodeHex(value),
 		Version: version,
 		// Proof is optional and not implemented in current state store
-		// Proof: "", 
+		// Proof: "",
 	}
 
 	s.logger.InfoContext(ctx, "state query",

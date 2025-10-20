@@ -93,6 +93,9 @@ keys/
 # Kubernetes Secrets (contains sensitive credentials)
 k8s/secret.yaml
 k8s/sealed-secret.yaml
+k8s_gke/secret.yaml
+k8s_oke/secret.yaml
+k8s_oke/ai-service-secret.yaml
 
 # Database
 *.db

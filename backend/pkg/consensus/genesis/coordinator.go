@@ -11,11 +11,13 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"backend/pkg/consensus/messages"
 	"backend/pkg/consensus/types"
 	"backend/pkg/utils"
+	"github.com/fxamacker/cbor/v2"
 )
 
 // ReadyEvent enumerates lifecycle events for genesis readiness telemetry.
@@ -36,6 +38,7 @@ type Host interface {
 	IsConsensusActive() bool
 	MarkValidatorReady(id types.ValidatorID)
 	RecordGenesisReady(ctx context.Context, event ReadyEvent, id types.ValidatorID, hash [32]byte, reason string)
+	RecordGenesisCertificateDiscard(ctx context.Context)
 }
 
 // PeerHasher provides a deterministic cluster peer fingerprint.
@@ -72,6 +75,7 @@ type Coordinator struct {
 	peerHasher   PeerHasher
 	logger       types.Logger
 	audit        types.AuditLogger
+	backend      types.StorageBackend
 
 	mu                   sync.Mutex
 	attestations         map[types.ValidatorID]*messages.GenesisReady
@@ -96,6 +100,7 @@ type Coordinator struct {
 
 	certificateOnce sync.Once
 	startOnce       sync.Once
+	discardCount    atomic.Uint32
 }
 
 // NewCoordinator constructs a genesis ceremony coordinator.
@@ -109,6 +114,7 @@ func NewCoordinator(
 	peerHasher PeerHasher,
 	logger types.Logger,
 	audit types.AuditLogger,
+	backend types.StorageBackend,
 ) (*Coordinator, error) {
 	if validatorSet == nil || rotation == nil || crypto == nil || host == nil || logger == nil {
 		return nil, fmt.Errorf("genesis coordinator: missing dependencies")
@@ -123,7 +129,7 @@ func NewCoordinator(
 		cfg.ClockSkewTolerance = 5 * time.Second
 	}
 	if cfg.GenesisClockSkewTolerance <= 0 {
-		cfg.GenesisClockSkewTolerance = 15 * time.Minute
+		cfg.GenesisClockSkewTolerance = 24 * time.Hour
 	}
 	if cfg.ReadyRefreshInterval < 0 {
 		cfg.ReadyRefreshInterval = 0
@@ -139,6 +145,7 @@ func NewCoordinator(
 		peerHasher:   peerHasher,
 		logger:       logger,
 		audit:        audit,
+		backend:      backend,
 		attestations: make(map[types.ValidatorID]*messages.GenesisReady),
 		verifying:    make(map[types.ValidatorID][32]byte),
 		doneCh:       make(chan struct{}),
@@ -201,9 +208,21 @@ func (c *Coordinator) initialize(ctx context.Context) error {
 		"config_hash", shortHash(c.cfg.ConfigHash),
 		"peer_hash", shortHash(c.cfg.PeerHash))
 
-	restored, err := c.restoreFromDisk(ctx)
+	var restored bool
+	if c.backend != nil {
+		var err error
+		restored, err = c.restoreFromDatabase(ctx)
+		if err != nil {
+			return fmt.Errorf("restore genesis state from database: %w", err)
+		}
+		if restored {
+			return nil
+		}
+	}
+
+	restored, err = c.restoreFromDisk(ctx)
 	if err != nil {
-		return fmt.Errorf("restore genesis state: %w", err)
+		return fmt.Errorf("restore genesis state from disk: %w", err)
 	}
 	if restored {
 		return nil
@@ -511,7 +530,7 @@ func (c *Coordinator) OnGenesisReady(ctx context.Context, ready *messages.Genesi
 		"validator", validatorLabel,
 		"hash", hashLabel)
 
-	if err := c.crypto.VerifyWithContext(ctx, ready.SignBytes(), ready.Signature.Bytes, info.PublicKey); err != nil {
+	if err := c.crypto.VerifyWithContext(ctx, ready.SignBytes(), ready.Signature.Bytes, info.PublicKey, false); err != nil {
 		c.logger.WarnContext(ctx, "ready attestation signature verification failed",
 			"validator", validatorLabel,
 			"error", err)
@@ -591,7 +610,7 @@ func (c *Coordinator) OnGenesisCertificate(ctx context.Context, cert *messages.G
 	}
 	c.mu.Unlock()
 
-	if err := c.validateCertificate(ctx, cert); err != nil {
+	if err := c.validateCertificate(ctx, cert, false); err != nil {
 		c.logger.ErrorContext(ctx, "invalid genesis certificate", "error", err)
 		return
 	}
@@ -710,7 +729,8 @@ func (c *Coordinator) publishCertificate(ctx context.Context, cert *messages.Gen
 	}
 }
 
-func (c *Coordinator) validateCertificate(ctx context.Context, cert *messages.GenesisCertificate) error {
+func (c *Coordinator) validateCertificate(ctx context.Context, cert *messages.GenesisCertificate, fromDisk bool) error {
+	allowOldTimestamps := fromDisk
 	if cert == nil {
 		return fmt.Errorf("nil certificate")
 	}
@@ -731,8 +751,10 @@ func (c *Coordinator) validateCertificate(ctx context.Context, cert *messages.Ge
 	if tolerance <= 0 {
 		tolerance = c.cfg.ClockSkewTolerance
 	}
-	if skew := time.Since(cert.Timestamp); skew > tolerance || skew < -tolerance {
-		return fmt.Errorf("certificate timestamp skew %s exceeds tolerance %s", skew, tolerance)
+	if !allowOldTimestamps {
+		if skew := time.Since(cert.Timestamp); skew > tolerance || skew < -tolerance {
+			return fmt.Errorf("certificate timestamp skew %s exceeds tolerance %s", skew, tolerance)
+		}
 	}
 
 	c.logger.InfoContext(ctx, "validating genesis certificate",
@@ -755,8 +777,10 @@ func (c *Coordinator) validateCertificate(ctx context.Context, cert *messages.Ge
 		if !bytesEqual32(att.PeerHash, c.cfg.PeerHash) {
 			return fmt.Errorf("attestation peer hash mismatch for %x", att.ValidatorID[:4])
 		}
-		if skew := time.Since(att.Timestamp); skew > tolerance || skew < -tolerance {
-			return fmt.Errorf("attestation timestamp skew %s exceeds tolerance %s for %x", skew, tolerance, att.ValidatorID[:4])
+		if !allowOldTimestamps {
+			if skew := time.Since(att.Timestamp); skew > tolerance || skew < -tolerance {
+				return fmt.Errorf("attestation timestamp skew %s exceeds tolerance %s for %x", skew, tolerance, att.ValidatorID[:4])
+			}
 		}
 
 		attHash := att.Hash()
@@ -825,7 +849,7 @@ func (c *Coordinator) validateCertificate(ctx context.Context, cert *messages.Ge
 			c.recordReadyEvent(ctx, ReadyEventRejected, att.ValidatorID, attHash, fmt.Sprintf("cert_key_mismatch msg_nonce=%s sig_nonce=%s", nonceLabel, sigNonceLabel))
 			return fmt.Errorf("attestation signature key mismatch for %x", att.ValidatorID[:4])
 		}
-		if err := c.crypto.VerifyWithContext(ctx, att.SignBytes(), att.Signature.Bytes, info.PublicKey); err != nil {
+		if err := c.crypto.VerifyWithContext(ctx, att.SignBytes(), att.Signature.Bytes, info.PublicKey, allowOldTimestamps); err != nil {
 			c.mu.Lock()
 			delete(c.verifying, att.ValidatorID)
 			c.mu.Unlock()
@@ -973,13 +997,61 @@ func (c *Coordinator) restoreFromDisk(ctx context.Context) (bool, error) {
 	if state.Certificate == nil {
 		return false, fmt.Errorf("persisted genesis state missing certificate")
 	}
-	if err := c.validateCertificate(ctx, state.Certificate); err != nil {
-		return false, fmt.Errorf("persisted certificate invalid: %w", err)
+	if err := c.validateCertificate(ctx, state.Certificate, true); err != nil {
+		if c.logger != nil {
+			c.logger.WarnContext(ctx, "discarding persisted genesis certificate from disk",
+				"error", err,
+				"path", c.cfg.StatePath)
+		}
+		if remErr := os.Remove(c.cfg.StatePath); remErr != nil && !errors.Is(remErr, os.ErrNotExist) {
+			if c.logger != nil {
+				c.logger.WarnContext(ctx, "failed to remove stale genesis state file", "error", remErr, "path", c.cfg.StatePath)
+			}
+		}
+		if c.host != nil {
+			c.host.RecordGenesisCertificateDiscard(ctx)
+		}
+		return false, nil
+	}
+	meta := map[string]interface{}{
+		"path":     c.cfg.StatePath,
+		"saved_at": state.SavedAt,
+	}
+	c.applyRestoredCertificate(ctx, state.Certificate, "disk", meta)
+	return true, nil
+}
+
+func (c *Coordinator) restoreFromDatabase(ctx context.Context) (bool, error) {
+	if c.backend == nil {
+		return false, nil
+	}
+	data, found, err := c.backend.LoadGenesisCertificate(ctx)
+	if err != nil {
+		return false, fmt.Errorf("load persisted genesis certificate: %w", err)
+	}
+	if !found || len(data) == 0 {
+		return false, nil
+	}
+	var cert messages.GenesisCertificate
+	if err := cbor.Unmarshal(data, &cert); err != nil {
+		return false, fmt.Errorf("decode persisted genesis certificate: %w", err)
+	}
+	if err := c.validateCertificate(ctx, &cert, true); err != nil {
+		c.handleInvalidPersistedCertificate(ctx, err, &cert)
+		return false, nil
+	}
+	c.applyRestoredCertificate(ctx, &cert, "cockroachdb", nil)
+	return true, nil
+}
+
+func (c *Coordinator) applyRestoredCertificate(ctx context.Context, cert *messages.GenesisCertificate, source string, meta map[string]interface{}) {
+	if cert == nil {
+		return
 	}
 	c.mu.Lock()
-	c.attestations = make(map[types.ValidatorID]*messages.GenesisReady, len(state.Certificate.Attestations))
-	for i := range state.Certificate.Attestations {
-		attCopy := state.Certificate.Attestations[i]
+	c.attestations = make(map[types.ValidatorID]*messages.GenesisReady, len(cert.Attestations))
+	for i := range cert.Attestations {
+		attCopy := cert.Attestations[i]
 		attPtr := &attCopy
 		c.attestations[attCopy.ValidatorID] = attPtr
 		if attCopy.ValidatorID == c.localID {
@@ -989,15 +1061,26 @@ func (c *Coordinator) restoreFromDisk(ctx context.Context) (bool, error) {
 		}
 	}
 	c.mu.Unlock()
-	c.logger.InfoContext(ctx, "restored genesis certificate from disk",
-		"path", c.cfg.StatePath,
-		"attestations", len(state.Certificate.Attestations),
-		"saved_at", state.SavedAt)
-	c.setCertificate(ctx, state.Certificate)
+
+	if c.logger != nil {
+		fields := []interface{}{
+			"source", source,
+			"attestations", len(cert.Attestations),
+		}
+		if meta != nil {
+			for k, v := range meta {
+				fields = append(fields, k, v)
+			}
+		}
+		c.logger.InfoContext(ctx, "restored genesis certificate", fields...)
+	}
+
+	c.setCertificate(ctx, cert)
+
 	c.readyMu.Lock()
 	readyCopy := c.localReady
 	c.readyMu.Unlock()
-	if readyCopy != nil {
+	if readyCopy != nil && c.host != nil {
 		if err := c.host.PublishGenesisMessage(ctx, readyCopy); err != nil {
 			c.logger.WarnContext(ctx, "failed to rebroadcast restored genesis ready", "error", err)
 		} else {
@@ -1009,44 +1092,78 @@ func (c *Coordinator) restoreFromDisk(ctx context.Context) (bool, error) {
 		}
 	}
 	if c.aggregator == c.localID {
-		go c.publishCertificate(ctx, state.Certificate)
+		go c.publishCertificate(ctx, cert)
 	}
-	return true, nil
+}
+
+func (c *Coordinator) handleInvalidPersistedCertificate(ctx context.Context, cause error, cert *messages.GenesisCertificate) {
+	count := c.discardCount.Add(1)
+	if c.logger != nil {
+		fields := []interface{}{
+			"reason", cause.Error(),
+			"discard_count", count,
+		}
+		if cert != nil {
+			fields = append(fields,
+				"aggregator", shortValidator(cert.Aggregator),
+				"attestations", len(cert.Attestations),
+			)
+		}
+		c.logger.WarnContext(ctx, "discarding persisted genesis certificate", fields...)
+	}
 }
 
 func (c *Coordinator) persistCertificate(ctx context.Context, cert *messages.GenesisCertificate) {
-	if c.cfg.StatePath == "" || cert == nil {
+	if cert == nil {
 		return
 	}
-	dir := filepath.Dir(c.cfg.StatePath)
-	if dir != "." && dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			c.logger.ErrorContext(ctx, "failed to create genesis state directory", "error", err, "path", dir)
+
+	if c.backend != nil {
+		bytes, err := cbor.Marshal(cert)
+		if err != nil {
+			c.logger.WarnContext(ctx, "failed to marshal genesis certificate for database persistence", "error", err)
+			return
+		}
+		if err := c.backend.SaveGenesisCertificate(ctx, bytes); err != nil {
+			c.logger.WarnContext(ctx, "failed to persist genesis certificate to database", "error", err)
 			return
 		}
 	}
-	state := persistedGenesisState{
-		Certificate: cert,
-		SavedAt:     time.Now().UTC(),
+
+	if c.cfg.StatePath != "" {
+		dir := filepath.Dir(c.cfg.StatePath)
+		if dir != "." && dir != "" {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				c.logger.ErrorContext(ctx, "failed to create genesis state directory", "error", err, "path", dir)
+				return
+			}
+		}
+		state := persistedGenesisState{
+			Certificate: cert,
+			SavedAt:     time.Now().UTC(),
+		}
+		data, err := json.MarshalIndent(state, "", "  ")
+		if err != nil {
+			c.logger.ErrorContext(ctx, "failed to encode persisted genesis state", "error", err)
+			return
+		}
+		tmpPath := c.cfg.StatePath + ".tmp"
+		if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
+			c.logger.ErrorContext(ctx, "failed to write temporary genesis state", "error", err, "path", tmpPath)
+			_ = os.Remove(tmpPath)
+			return
+		}
+		if err := os.Rename(tmpPath, c.cfg.StatePath); err != nil {
+			c.logger.ErrorContext(ctx, "failed to finalize genesis state file", "error", err, "from", tmpPath, "to", c.cfg.StatePath)
+			_ = os.Remove(tmpPath)
+			return
+		}
 	}
-	data, err := json.MarshalIndent(state, "", "  ")
-	if err != nil {
-		c.logger.ErrorContext(ctx, "failed to encode persisted genesis state", "error", err)
-		return
-	}
-	tmpPath := c.cfg.StatePath + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
-		c.logger.ErrorContext(ctx, "failed to write temporary genesis state", "error", err, "path", tmpPath)
-		return
-	}
-	if err := os.Rename(tmpPath, c.cfg.StatePath); err != nil {
-		c.logger.ErrorContext(ctx, "failed to finalize genesis state file", "error", err, "from", tmpPath, "to", c.cfg.StatePath)
-		_ = os.Remove(tmpPath)
-		return
-	}
+
 	c.logger.InfoContext(ctx, "persisted genesis certificate",
 		"path", c.cfg.StatePath,
 		"attestations", len(cert.Attestations))
+
 }
 
 func (c *Coordinator) recordReadyEvent(ctx context.Context, event ReadyEvent, id types.ValidatorID, hash [32]byte, reason string) {

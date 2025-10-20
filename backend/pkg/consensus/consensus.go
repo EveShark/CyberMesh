@@ -73,6 +73,7 @@ type Config struct {
 	IPAllowlist    IPAllowlist
 	ValidatorSet   ValidatorSet
 	StorageBackend StorageBackend
+	Persistence    types.StorageBackend
 
 	// Optional overrides (if nil, loaded from ConfigManager)
 	EncoderConfig    *messages.EncoderConfig
@@ -127,6 +128,7 @@ func NewConsensus(ctx context.Context, cfg *Config) (*Consensus, error) {
 		cfg.IPAllowlist,
 		cfg.ValidatorSet,
 		engineConfig,
+		cfg.Persistence,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create consensus engine: %w", err)

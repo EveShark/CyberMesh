@@ -110,12 +110,12 @@ func (p *Producer) PublishCommit(ctx context.Context, height uint64, hash [32]by
 	// Build protobuf CommitEvent
 	// Fix: Gap 2 - Include anomaly IDs for individual tracking
 	evt := &pb.CommitEvent{
-		Height:      int64(height),
-		BlockHash:   blockHash,
-		StateRoot:   stateRootCopy,
-		TxCount:     uint32(txCount),
-		AnomalyIds:  anomalyIDs,  // New field
-		Timestamp:   ts,
+		Height:     int64(height),
+		BlockHash:  blockHash,
+		StateRoot:  stateRootCopy,
+		TxCount:    uint32(txCount),
+		AnomalyIds: anomalyIDs, // New field
+		Timestamp:  ts,
 	}
 
 	if err := p.signer.Sign(evt); err != nil {

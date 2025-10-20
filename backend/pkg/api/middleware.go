@@ -30,7 +30,7 @@ func (s *Server) middlewareRequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Check if client provided request ID
 		requestID := r.Header.Get(HeaderRequestID)
-		
+
 		// Generate if not provided or invalid
 		if requestID == "" || !isValidRequestID(requestID) {
 			requestID = generateRequestID()
@@ -128,8 +128,8 @@ func (s *Server) middlewarePanicRecovery(next http.Handler) http.Handler {
 					})
 				}
 
-                // Return 500 with JSON body
-                writeErrorResponse(w, r, "INTERNAL_ERROR", "internal server error", http.StatusInternalServerError)
+				// Return 500 with JSON body
+				writeErrorResponse(w, r, "INTERNAL_ERROR", "internal server error", http.StatusInternalServerError)
 			}
 		}()
 
@@ -146,7 +146,7 @@ func (s *Server) middlewareIPAllowlist(next http.Handler) http.Handler {
 		if ip == nil {
 			s.logger.Warn("invalid client IP",
 				utils.ZapString("client_ip", clientIP))
-            writeErrorResponse(w, r, "INVALID_IP", "invalid client IP", http.StatusUnauthorized)
+			writeErrorResponse(w, r, "INVALID_IP", "invalid client IP", http.StatusUnauthorized)
 			return
 		}
 
@@ -162,7 +162,7 @@ func (s *Server) middlewareIPAllowlist(next http.Handler) http.Handler {
 				})
 			}
 
-            writeErrorResponse(w, r, "IP_NOT_ALLOWED", "IP not allowed", http.StatusForbidden)
+			writeErrorResponse(w, r, "IP_NOT_ALLOWED", "IP not allowed", http.StatusForbidden)
 			return
 		}
 
@@ -182,7 +182,7 @@ func (s *Server) middlewareRateLimit(next http.Handler) http.Handler {
 		w.Header().Set(HeaderRateLimitLimit, fmt.Sprintf("%d", s.config.RateLimitPerMinute))
 		w.Header().Set(HeaderRateLimitReset, fmt.Sprintf("%d", resetTime))
 
-        if !allowed {
+		if !allowed {
 			w.Header().Set(HeaderRateLimitRemaining, "0")
 
 			s.logger.Warn("rate limit exceeded",
@@ -197,7 +197,7 @@ func (s *Server) middlewareRateLimit(next http.Handler) http.Handler {
 				})
 			}
 
-            writeErrorResponse(w, r, "RATE_LIMIT_EXCEEDED", "rate limit exceeded", http.StatusTooManyRequests)
+			writeErrorResponse(w, r, "RATE_LIMIT_EXCEEDED", "rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}
 
@@ -231,18 +231,18 @@ func (s *Server) middlewareSecurityHeaders(next http.Handler) http.Handler {
 
 // middlewareConcurrencyLimit limits concurrent in-flight requests
 func (s *Server) middlewareConcurrencyLimit(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        if s.sem != nil {
-            select {
-            case s.sem <- struct{}{}:
-                defer func() { <-s.sem }()
-            default:
-                writeErrorResponse(w, r, "SERVICE_UNAVAILABLE", "too many concurrent requests", http.StatusServiceUnavailable)
-                return
-            }
-        }
-        next.ServeHTTP(w, r)
-    })
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.sem != nil {
+			select {
+			case s.sem <- struct{}{}:
+				defer func() { <-s.sem }()
+			default:
+				writeErrorResponse(w, r, "SERVICE_UNAVAILABLE", "too many concurrent requests", http.StatusServiceUnavailable)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Helper functions

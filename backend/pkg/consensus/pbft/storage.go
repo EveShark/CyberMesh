@@ -3,6 +3,7 @@ package pbft
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -35,11 +36,17 @@ type Storage struct {
 	decMode cbor.DecMode
 	limits  *messages.EncoderConfig
 
+	backgroundCtx context.Context
+
 	mu sync.RWMutex
 }
 
 type voteBackend interface {
-	SaveVote(view uint64, key []byte, data []byte) error
+	SaveVote(ctx context.Context, view uint64, height uint64, voter []byte, blockHash []byte, voteHash []byte, data []byte) error
+}
+
+type evidenceBackend interface {
+	SaveEvidence(ctx context.Context, hash []byte, height uint64, data []byte) error
 }
 
 // StorageConfig contains storage parameters
@@ -105,6 +112,8 @@ func NewStorage(
 
 	limits := messages.DefaultEncoderConfig()
 
+	backgroundCtx := context.Background()
+
 	return &Storage{
 		config:          config,
 		audit:           audit,
@@ -119,6 +128,7 @@ func NewStorage(
 		encMode:         encMode,
 		decMode:         decMode,
 		limits:          limits,
+		backgroundCtx:   backgroundCtx,
 	}
 }
 
@@ -127,24 +137,13 @@ func (s *Storage) Start(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Load last committed state from backend
+	// Load persisted state from backend
 	if s.config.EnablePersistence && s.backend != nil {
-		lastHeight, qcData, err := s.backend.LoadLastCommitted()
-		if err != nil {
-			s.logger.WarnContext(ctx, "failed to load last committed state", "error", err)
-		} else {
-			s.lastCommitted = lastHeight
-			if len(qcData) > 0 {
-				qc, decodeErr := s.decodeQC(qcData)
-				if decodeErr != nil {
-					s.logger.WarnContext(ctx, "failed to decode last committed QC", "error", decodeErr)
-				} else {
-					s.lastQC = qc
-				}
-			}
-			s.logger.InfoContext(ctx, "loaded committed state",
-				"height", lastHeight,
-			)
+		if err := s.restoreCommittedState(ctx); err != nil {
+			s.logger.WarnContext(ctx, "failed to restore committed state", "error", err)
+		}
+		if err := s.restoreReplayWindow(ctx); err != nil {
+			s.logger.WarnContext(ctx, "failed to restore replay window", "error", err)
 		}
 	}
 
@@ -158,6 +157,193 @@ func (s *Storage) Start(ctx context.Context) error {
 		"last_committed", s.lastCommitted,
 	)
 
+	return nil
+}
+
+func (s *Storage) restoreCommittedState(ctx context.Context) error {
+	lastHeight, blockHashBytes, qcData, err := s.backend.LoadLastCommitted(ctx)
+	if err != nil {
+		return fmt.Errorf("load last committed: %w", err)
+	}
+
+	s.lastCommitted = lastHeight
+
+	if len(blockHashBytes) == 32 {
+		var bh BlockHash
+		copy(bh[:], blockHashBytes)
+		s.committedBlocks[lastHeight] = bh
+	}
+
+	if len(qcData) > 0 {
+		qc, decodeErr := s.decodeQC(qcData)
+		if decodeErr != nil {
+			s.logger.WarnContext(ctx, "failed to decode last committed qc", "error", decodeErr)
+		} else {
+			s.lastQC = qc
+		}
+	}
+
+	s.logger.InfoContext(ctx, "committed state restored",
+		"height", lastHeight,
+	)
+	return nil
+}
+
+func (s *Storage) restoreReplayWindow(ctx context.Context) error {
+	minHeight := uint64(0)
+	if s.lastCommitted >= uint64(s.config.ReplayWindowSize) {
+		minHeight = s.lastCommitted - uint64(s.config.ReplayWindowSize) + 1
+	}
+
+	if err := s.restoreProposals(ctx, minHeight); err != nil {
+		return err
+	}
+	if err := s.restoreQCs(ctx, minHeight); err != nil {
+		return err
+	}
+	if err := s.restoreVotes(ctx, minHeight); err != nil {
+		return err
+	}
+	if err := s.restoreEvidence(ctx, minHeight); err != nil {
+		return err
+	}
+
+	s.logger.InfoContext(ctx, "replay window restored",
+		"min_height", minHeight,
+		"proposal_count", len(s.proposals),
+		"vote_views", len(s.votes),
+		"qc_count", len(s.qcs),
+		"evidence_count", len(s.evidence),
+	)
+	return nil
+}
+
+func (s *Storage) restoreProposals(ctx context.Context, minHeight uint64) error {
+	const pageSize = 256
+	for offset := minHeight; ; offset += pageSize {
+		records, err := s.backend.ListProposals(ctx, offset, pageSize)
+		if err != nil {
+			return fmt.Errorf("list proposals: %w", err)
+		}
+		if len(records) == 0 {
+			break
+		}
+		for _, rec := range records {
+			if len(rec.Hash) != 32 {
+				s.logger.WarnContext(ctx, "skipping proposal with invalid hash length", "length", len(rec.Hash))
+				continue
+			}
+			proposal, err := s.decodeProposal(rec.Data)
+			if err != nil {
+				s.logger.WarnContext(ctx, "failed to decode persisted proposal", "error", err)
+				continue
+			}
+			var hash BlockHash
+			copy(hash[:], rec.Hash)
+			s.proposals[hash] = proposal
+		}
+		if len(records) < pageSize {
+			break
+		}
+	}
+	return nil
+}
+
+func (s *Storage) restoreQCs(ctx context.Context, minHeight uint64) error {
+	const pageSize = 256
+	for offset := minHeight; ; offset += pageSize {
+		records, err := s.backend.ListQCs(ctx, offset, pageSize)
+		if err != nil {
+			return fmt.Errorf("list qcs: %w", err)
+		}
+		if len(records) == 0 {
+			break
+		}
+		for _, rec := range records {
+			if len(rec.Hash) != 32 {
+				s.logger.WarnContext(ctx, "skipping qc with invalid hash length", "length", len(rec.Hash))
+				continue
+			}
+			qc, err := s.decodeQC(rec.Data)
+			if err != nil {
+				s.logger.WarnContext(ctx, "failed to decode persisted qc", "error", err)
+				continue
+			}
+			var hash BlockHash
+			copy(hash[:], rec.Hash)
+			s.qcs[hash] = qc
+		}
+		if len(records) < pageSize {
+			break
+		}
+	}
+	return nil
+}
+
+func (s *Storage) restoreVotes(ctx context.Context, minHeight uint64) error {
+	const pageSize = 512
+	for offset := minHeight; ; offset += pageSize {
+		records, err := s.backend.ListVotes(ctx, offset, pageSize)
+		if err != nil {
+			return fmt.Errorf("list votes: %w", err)
+		}
+		if len(records) == 0 {
+			break
+		}
+		for _, rec := range records {
+			vote, err := s.decodeVote(rec.Data)
+			if err != nil {
+				s.logger.WarnContext(ctx, "failed to decode persisted vote", "error", err)
+				continue
+			}
+			s.votes[rec.View] = append(s.votes[rec.View], vote)
+		}
+		if len(records) < pageSize {
+			break
+		}
+	}
+	for view := range s.votes {
+		s.sortVotesByTimestamp(view)
+	}
+	return nil
+}
+
+func (s *Storage) sortVotesByTimestamp(view uint64) {
+	votes := s.votes[view]
+	sort.SliceStable(votes, func(i, j int) bool {
+		return votes[i].Timestamp.Before(votes[j].Timestamp)
+	})
+	s.votes[view] = votes
+}
+
+func (s *Storage) restoreEvidence(ctx context.Context, minHeight uint64) error {
+	const pageSize = 256
+	for offset := minHeight; ; offset += pageSize {
+		records, err := s.backend.ListEvidence(ctx, offset, pageSize)
+		if err != nil {
+			return fmt.Errorf("list evidence: %w", err)
+		}
+		if len(records) == 0 {
+			break
+		}
+		for _, rec := range records {
+			if len(rec.Hash) != 32 {
+				s.logger.WarnContext(ctx, "skipping evidence with invalid hash length", "length", len(rec.Hash))
+				continue
+			}
+			ev, err := s.decodeEvidence(rec.Data)
+			if err != nil {
+				s.logger.WarnContext(ctx, "failed to decode persisted evidence", "error", err)
+				continue
+			}
+			var hash BlockHash
+			copy(hash[:], rec.Hash)
+			s.evidence[hash] = ev
+		}
+		if len(records) < pageSize {
+			break
+		}
+	}
 	return nil
 }
 
@@ -195,7 +381,7 @@ func (s *Storage) StoreProposal(p *messages.Proposal) error {
 		if err != nil {
 			return fmt.Errorf("encode proposal: %w", err)
 		}
-		if err := s.backend.SaveProposal(p.BlockHash[:], data); err != nil {
+		if err := s.backend.SaveProposal(s.backgroundCtx, p.BlockHash[:], p.Height, p.View, p.ProposerID[:], data); err != nil {
 			return fmt.Errorf("persist proposal: %w", err)
 		}
 		if s.audit != nil {
@@ -239,7 +425,7 @@ func (s *Storage) StoreVote(v *messages.Vote) error {
 				return fmt.Errorf("encode vote: %w", err)
 			}
 			hash := v.Hash()
-			if err := vb.SaveVote(v.View, hash[:], data); err != nil {
+			if err := vb.SaveVote(s.backgroundCtx, v.View, v.Height, v.VoterID[:], v.BlockHash[:], hash[:], data); err != nil {
 				return fmt.Errorf("persist vote: %w", err)
 			}
 			if s.audit != nil {
@@ -288,7 +474,7 @@ func (s *Storage) StoreQC(qc QC) error {
 		if err != nil {
 			return fmt.Errorf("encode qc: %w", err)
 		}
-		if err := s.backend.SaveQC(qcHash[:], data); err != nil {
+		if err := s.backend.SaveQC(s.backgroundCtx, qcHash[:], qc.GetHeight(), qc.GetView(), data); err != nil {
 			return fmt.Errorf("persist qc: %w", err)
 		}
 		if s.audit != nil {
@@ -327,7 +513,15 @@ func (s *Storage) StoreEvidence(e *messages.Evidence) error {
 
 	// Persist if enabled
 	if s.config.EnablePersistence && s.backend != nil {
-		// Would serialize and save
+		if eb, ok := s.backend.(evidenceBackend); ok {
+			data, err := s.encodeEvidence(e)
+			if err != nil {
+				return fmt.Errorf("encode evidence: %w", err)
+			}
+			if err := eb.SaveEvidence(s.backgroundCtx, evidenceHash[:], e.Height, data); err != nil {
+				return fmt.Errorf("persist evidence: %w", err)
+			}
+		}
 	}
 
 	s.audit.Security("evidence_stored", map[string]interface{}{
@@ -368,7 +562,24 @@ func (s *Storage) CommitBlock(hash BlockHash, height uint64) error {
 
 	// Persist if enabled
 	if s.config.EnablePersistence && s.backend != nil {
-		if err := s.backend.SaveCommittedBlock(height, hash); err != nil {
+		ctxPersist := context.Background()
+		var qcData []byte
+		if qc, exists := s.qcs[hash]; exists && qc != nil {
+			encoded, err := s.encodeQC(qc)
+			if err != nil {
+				s.logger.WarnContext(ctxPersist, "commit block: failed to encode qc", "error", err)
+			} else {
+				qcData = encoded
+			}
+		} else if s.lastQC != nil {
+			encoded, err := s.encodeQC(s.lastQC)
+			if err != nil {
+				s.logger.WarnContext(ctxPersist, "commit block: failed to encode last qc", "error", err)
+			} else {
+				qcData = encoded
+			}
+		}
+		if err := s.backend.SaveCommittedBlock(s.backgroundCtx, height, hash[:], qcData); err != nil {
 			return fmt.Errorf("failed to persist committed block: %w", err)
 		}
 	}
@@ -434,6 +645,17 @@ func (s *Storage) encodeProposal(p *messages.Proposal) ([]byte, error) {
 	return data, nil
 }
 
+func (s *Storage) decodeProposal(data []byte) (*messages.Proposal, error) {
+	if s.decMode == nil {
+		return nil, fmt.Errorf("cbor decoder not initialized")
+	}
+	var proposal messages.Proposal
+	if err := s.decMode.Unmarshal(data, &proposal); err != nil {
+		return nil, err
+	}
+	return &proposal, nil
+}
+
 func (s *Storage) encodeVote(v *messages.Vote) ([]byte, error) {
 	if s.encMode == nil {
 		return nil, fmt.Errorf("cbor encoder not initialized")
@@ -446,6 +668,17 @@ func (s *Storage) encodeVote(v *messages.Vote) ([]byte, error) {
 		return nil, fmt.Errorf("vote size %d exceeds limit %d", len(data), s.limits.MaxVoteSize)
 	}
 	return data, nil
+}
+
+func (s *Storage) decodeVote(data []byte) (*messages.Vote, error) {
+	if s.decMode == nil {
+		return nil, fmt.Errorf("cbor decoder not initialized")
+	}
+	var vote messages.Vote
+	if err := s.decMode.Unmarshal(data, &vote); err != nil {
+		return nil, err
+	}
+	return &vote, nil
 }
 
 func (s *Storage) encodeQC(qc QC) ([]byte, error) {
@@ -478,6 +711,17 @@ func (s *Storage) encodeEvidence(e *messages.Evidence) ([]byte, error) {
 		return nil, fmt.Errorf("evidence size %d exceeds limit %d", len(data), s.limits.MaxEvidenceSize)
 	}
 	return data, nil
+}
+
+func (s *Storage) decodeEvidence(data []byte) (*messages.Evidence, error) {
+	if s.decMode == nil {
+		return nil, fmt.Errorf("cbor decoder not initialized")
+	}
+	var evidence messages.Evidence
+	if err := s.decMode.Unmarshal(data, &evidence); err != nil {
+		return nil, err
+	}
+	return &evidence, nil
 }
 
 func (s *Storage) decodeQC(data []byte) (QC, error) {
@@ -536,7 +780,7 @@ func (s *Storage) pruneOldDataUnsafe(currentHeight uint64) {
 
 	// Persist pruning
 	if s.config.EnablePersistence && s.backend != nil {
-		if err := s.backend.DeleteBefore(pruneHeight); err != nil {
+		if err := s.backend.DeleteBefore(context.Background(), pruneHeight); err != nil {
 			s.logger.WarnContext(context.Background(), "failed to prune backend", "error", err)
 		}
 	}
@@ -575,10 +819,21 @@ func (s *Storage) persistState(ctx context.Context) {
 	}
 
 	// Persist last committed state
+	var qcData []byte
+	var blockHash BlockHash
 	if s.lastQC != nil {
-		if err := s.backend.SaveCommittedBlock(s.lastCommitted, s.lastQC.GetBlockHash()); err != nil {
-			s.logger.ErrorContext(ctx, "failed to persist state", "error", err)
+		encoded, err := s.encodeQC(s.lastQC)
+		if err != nil {
+			s.logger.WarnContext(ctx, "persist state: failed to encode qc", "error", err)
+		} else {
+			qcData = encoded
 		}
+		blockHash = s.lastQC.GetBlockHash()
+	} else if hash, exists := s.committedBlocks[s.lastCommitted]; exists {
+		blockHash = hash
+	}
+	if err := s.backend.SaveCommittedBlock(ctx, s.lastCommitted, blockHash[:], qcData); err != nil {
+		s.logger.ErrorContext(ctx, "failed to persist state", "error", err)
 	}
 }
 

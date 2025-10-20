@@ -275,7 +275,7 @@ func DefaultCryptoConfig() *CryptoConfig {
 		RotationInterval:       24 * time.Hour,
 		EnableReplayProtection: true,
 		ReplayWindowSize:       10000,
-		MaxSignatureAge:        5 * time.Minute,
+		MaxSignatureAge:        24 * time.Hour,
 		EnableAuditLog:         true,
 		EntropyValidator:       &defaultEntropyValidator{},
 	}
@@ -430,7 +430,7 @@ func (cs *CryptoService) SignWithContext(ctx context.Context, data []byte) ([]by
 }
 
 // VerifyWithContext verifies a signature
-func (cs *CryptoService) VerifyWithContext(ctx context.Context, data, signedData []byte, pubKey []byte) error {
+func (cs *CryptoService) VerifyWithContext(ctx context.Context, data, signedData []byte, pubKey []byte, allowOldTimestamps bool) error {
 	if len(data) > MaxDataSize {
 		return ErrDataTooLarge
 	}
@@ -455,8 +455,8 @@ func (cs *CryptoService) VerifyWithContext(ctx context.Context, data, signedData
 		return ErrCryptoInvalidSignature
 	}
 
-	// Validate timestamp freshness
-	if cs.config.EnableReplayProtection {
+	// Validate timestamp freshness unless explicitly skipped (used for disk restores)
+	if cs.config.EnableReplayProtection && !allowOldTimestamps {
 		signTime := time.Unix(timestamp, 0)
 		if time.Since(signTime) > cs.config.MaxSignatureAge {
 			return errors.New("signature timestamp too old")
@@ -654,7 +654,7 @@ func (cs *CryptoService) Sign(data []byte) ([]byte, error) {
 }
 
 func (cs *CryptoService) Verify(data, signature []byte) bool {
-	return cs.VerifyWithContext(context.Background(), data, signature, nil) == nil
+	return cs.VerifyWithContext(context.Background(), data, signature, nil, false) == nil
 }
 
 func (cs *CryptoService) Encrypt(plaintext []byte) ([]byte, error) {

@@ -25,23 +25,27 @@ type ActivationStatus struct {
 	RequiredReady   int
 	ConnectedPeers  int
 	ActivePeers     int
+	PeersSeen       int
 	RequiredPeers   int
 	HasPeerObserver bool
 	HasQuorum       bool
+	SeenQuorum      bool
+	GenesisPhase    bool
 }
 
 // ConsensusEngine orchestrates all consensus components
 type ConsensusEngine struct {
 	// Core components
-	encoder   *messages.Encoder
-	validator *messages.Validator
-	rotation  *leader.Rotation
-	pacemaker *leader.Pacemaker
-	heartbeat *leader.HeartbeatManager
-	quorum    *pbft.QuorumVerifier
-	storage   *pbft.Storage
-	hotstuff  *pbft.HotStuff
-	genesis   *genesis.Coordinator
+	encoder             *messages.Encoder
+	validator           *messages.Validator
+	rotation            *leader.Rotation
+	pacemaker           *leader.Pacemaker
+	heartbeat           *leader.HeartbeatManager
+	heartbeatController *activationHeartbeatController
+	quorum              *pbft.QuorumVerifier
+	storage             *pbft.Storage
+	hotstuff            *pbft.HotStuff
+	genesis             *genesis.Coordinator
 
 	// Infrastructure
 	crypto    CryptoService
@@ -51,8 +55,9 @@ type ConsensusEngine struct {
 	allowlist IPAllowlist
 
 	// Configuration
-	config       *EngineConfig
-	validatorSet ValidatorSet
+	config         *EngineConfig
+	validatorSet   ValidatorSet
+	genesisBackend ctypes.StorageBackend
 
 	// State
 	running         bool
@@ -62,6 +67,7 @@ type ConsensusEngine struct {
 	metrics             *EngineMetrics
 	genesisReadyMetrics genesisReadyMetrics
 	genesisReadyTrace   genesisReadyTrace
+	genesisDiscarded    atomic.Uint64
 
 	readyMu         sync.RWMutex
 	readyValidators map[ctypes.ValidatorID]time.Time
@@ -78,6 +84,9 @@ type ConsensusEngine struct {
 
 	peerObserver ctypes.PeerObserver
 
+	// Persistence worker (optional)
+	persistence PersistenceWorker
+
 	handshake struct {
 		leader   leaderHandshakeState
 		follower followerHandshakeState
@@ -88,6 +97,7 @@ type ConsensusEngine struct {
 	activationMaxWait       time.Duration
 	activationActiveWindow  time.Duration
 	activationForce         bool
+	activationSeenGates     bool
 }
 
 type leaderHandshakeState struct {
@@ -173,6 +183,7 @@ type GenesisReadyMetricsSnapshot struct {
 	Duplicate     uint64
 	ReplayBlocked uint64
 	Rejected      uint64
+	Discarded     uint64
 }
 
 type genesisReadyMetrics struct {
@@ -265,6 +276,15 @@ type NetworkPublisher interface {
 	Publish(ctx context.Context, topic string, data []byte) error
 }
 
+// PersistenceWorker provides access to the consensus storage backend.
+type PersistenceWorker interface {
+	GetStorageBackend() pbft.StorageBackend
+}
+
+func (e *ConsensusEngine) SetPersistence(worker PersistenceWorker) {
+	e.persistence = worker
+}
+
 // DefaultEngineConfig returns secure defaults
 func DefaultEngineConfig() *EngineConfig {
 	return &EngineConfig{
@@ -285,6 +305,7 @@ func NewConsensusEngine(
 	allowlist IPAllowlist,
 	validatorSet ValidatorSet,
 	config *EngineConfig,
+	genesisBackend ctypes.StorageBackend,
 ) (*ConsensusEngine, error) {
 	if config == nil {
 		config = DefaultEngineConfig()
@@ -307,6 +328,7 @@ func NewConsensusEngine(
 		genesisReadyTrace: genesisReadyTrace{limit: 200},
 		stopCh:            make(chan struct{}),
 		readyValidators:   make(map[ctypes.ValidatorID]time.Time),
+		genesisBackend:    genesisBackend,
 	}
 
 	// Initialize components
@@ -333,7 +355,7 @@ func (e *ConsensusEngine) initializeComponents() error {
 		MaxProposalIntentSize:     e.configMgr.GetInt("CONSENSUS_MAX_PROPOSAL_INTENT_SIZE", 4<<10),
 		MaxReadyToVoteSize:        e.configMgr.GetInt("CONSENSUS_MAX_READY_TO_VOTE_SIZE", 4<<10),
 		ClockSkewTolerance:        e.configMgr.GetDuration("CONSENSUS_CLOCK_SKEW_TOLERANCE", 10*time.Second),
-		GenesisClockSkewTolerance: e.configMgr.GetDuration("CONSENSUS_GENESIS_CLOCK_SKEW_TOLERANCE", 15*time.Minute),
+		GenesisClockSkewTolerance: e.configMgr.GetDuration("CONSENSUS_GENESIS_CLOCK_SKEW_TOLERANCE", 24*time.Hour),
 		VerifyCacheSize:           e.configMgr.GetInt("CONSENSUS_VERIFY_CACHE_SIZE", 10000),
 		VerifyCacheTTL:            e.configMgr.GetDuration("CONSENSUS_VERIFY_CACHE_TTL", 5*time.Minute),
 		RejectFutureMessages:      e.configMgr.GetBool("CONSENSUS_REJECT_FUTURE_MESSAGES", true),
@@ -369,7 +391,14 @@ func (e *ConsensusEngine) initializeComponents() error {
 		AutoPrune:         e.configMgr.GetBool("CONSENSUS_AUTO_PRUNE", true),
 		MinRetainBlocks:   e.configMgr.GetInt("CONSENSUS_MIN_RETAIN_BLOCKS", 10),
 	}
-	e.storage = pbft.NewStorage(nil, e.audit, e.logger, storageConfig)
+	var storageBackend pbft.StorageBackend
+	if e.genesisBackend != nil {
+		storageBackend = e.genesisBackend
+	}
+	if storageBackend == nil && e.persistence != nil {
+		storageBackend = e.persistence.GetStorageBackend()
+	}
+	e.storage = pbft.NewStorage(storageBackend, e.audit, e.logger, storageConfig)
 
 	// 4. Initialize message validator (requires consensus state and validator-set adapter)
 	// HotStuff requires leaders to vote their own proposals; force-enable self voting regardless of env
@@ -427,7 +456,8 @@ func (e *ConsensusEngine) initializeComponents() error {
 		JitterPercent:    e.configMgr.GetFloat64("CONSENSUS_HEARTBEAT_JITTER", 0.05),
 	}
 
-	e.heartbeat = leader.NewHeartbeatManager(e.rotation, e.pacemaker, e.crypto, e.audit, e.logger, heartbeatConfig, e, newHeartbeatPublisherAdapter(e))
+	e.heartbeatController = &activationHeartbeatController{}
+	e.heartbeat = leader.NewHeartbeatManager(e.rotation, e.pacemaker, e.crypto, e.audit, e.logger, heartbeatConfig, e, newHeartbeatPublisherAdapter(e), e.heartbeatController)
 
 	// 8. Initialize HotStuff engine
 	hotstuffConfig := &pbft.HotStuffConfig{
@@ -533,6 +563,10 @@ func (e *ConsensusEngine) Start(ctx context.Context) error {
 	e.consensusActive = false
 	e.handshake.leader = leaderHandshakeState{}
 	e.handshake.follower = followerHandshakeState{}
+	e.activationSeenGates = false
+	if e.heartbeatController != nil {
+		e.heartbeatController.Reset()
+	}
 	e.readyMu.Lock()
 	e.readyValidators = make(map[ctypes.ValidatorID]time.Time)
 	e.localReady = false
@@ -602,6 +636,9 @@ func (e *ConsensusEngine) Stop() error {
 	// Stop components in reverse order
 	if err := e.heartbeat.Stop(); err != nil {
 		e.logger.ErrorContext(context.Background(), "failed to stop heartbeat", "error", err)
+	}
+	if e.heartbeatController != nil {
+		e.heartbeatController.Reset()
 	}
 
 	if err := e.pacemaker.Stop(); err != nil {
@@ -1131,7 +1168,9 @@ func (e *ConsensusEngine) GetMetrics() MetricsSnapshot {
 
 // GetGenesisReadyMetrics returns aggregated genesis readiness telemetry counters.
 func (e *ConsensusEngine) GetGenesisReadyMetrics() GenesisReadyMetricsSnapshot {
-	return e.genesisReadyMetrics.snapshot()
+	snapshot := e.genesisReadyMetrics.snapshot()
+	snapshot.Discarded = e.genesisDiscarded.Load()
+	return snapshot
 }
 
 // GetGenesisReadyTrace returns the most recent genesis readiness telemetry records (up to limit; zero for all).
@@ -1253,6 +1292,7 @@ func (e *ConsensusEngine) startConsensusComponents(ctx context.Context) error {
 func (e *ConsensusEngine) SetPeerObserver(observer ctypes.PeerObserver) {
 	e.mu.Lock()
 	e.peerObserver = observer
+	e.activationSeenGates = false
 	e.mu.Unlock()
 }
 
@@ -1320,7 +1360,12 @@ func (e *ConsensusEngine) GetActivationStatus() ActivationStatus {
 
 	e.mu.RLock()
 	observer := e.peerObserver
+	seenQuorum := e.activationSeenGates
 	e.mu.RUnlock()
+
+	if seenQuorum {
+		status.SeenQuorum = true
+	}
 
 	if observer != nil {
 		status.HasPeerObserver = true
@@ -1330,10 +1375,34 @@ func (e *ConsensusEngine) GetActivationStatus() ActivationStatus {
 		}
 		status.ConnectedPeers = observer.GetConnectedPeerCount()
 		status.ActivePeers = observer.GetActivePeerCount(window)
+		status.PeersSeen = observer.GetPeersSeenSinceStartup()
+		if status.PeersSeen >= status.RequiredPeers && !seenQuorum {
+			e.mu.Lock()
+			if !e.activationSeenGates {
+				e.activationSeenGates = true
+				e.logger.InfoContext(context.Background(), "seen quorum reached, disabling active-peer timing gate",
+					"peers_seen", status.PeersSeen,
+					"required", status.RequiredPeers)
+			}
+			e.mu.Unlock()
+			seenQuorum = true
+		}
 	}
+	status.SeenQuorum = seenQuorum
 
+	status.GenesisPhase = !e.IsConsensusActive()
 	status.HasQuorum = e.activationQuorumSatisfied(status)
 	return status
+}
+
+// PrivateGetActivationStatus exposes activation metrics to external packages that
+// cannot import the full consensus API due to dependency cycles. It intentionally
+// returns a copy to preserve encapsulation.
+func PrivateGetActivationStatus(engine interface{}) ActivationStatus {
+	if ce, ok := engine.(*ConsensusEngine); ok && ce != nil {
+		return ce.GetActivationStatus()
+	}
+	return ActivationStatus{}
 }
 
 // HasActivationQuorum reports whether activation requirements are currently satisfied.
@@ -1353,8 +1422,15 @@ func (e *ConsensusEngine) activationQuorumSatisfied(status ActivationStatus) boo
 		if status.ConnectedPeers < status.RequiredPeers {
 			return false
 		}
-		if status.ActivePeers < status.RequiredPeers {
-			return false
+		// Two-phase gate: require active peers until we've seen all required peers at least once.
+		// After that, trust P2P connectivity checks alone. Avoids blocking on message timing at restart.
+		if !status.SeenQuorum {
+			if status.PeersSeen < status.RequiredPeers {
+				return false
+			}
+			if status.ActivePeers < status.RequiredPeers {
+				return false
+			}
 		}
 	}
 	return true
@@ -1478,6 +1554,14 @@ func (e *ConsensusEngine) RecordGenesisReady(ctx context.Context, event genesis.
 	e.logger.DebugContext(ctx, "genesis ready event observed", fields...)
 }
 
+// RecordGenesisCertificateDiscard increments the discard counter for persisted genesis certificates.
+func (e *ConsensusEngine) RecordGenesisCertificateDiscard(ctx context.Context) {
+	e.genesisDiscarded.Add(1)
+	if e.logger != nil {
+		e.logger.WarnContext(ctx, "persisted genesis certificate discarded")
+	}
+}
+
 // OnGenesisCertificate is invoked when the genesis ceremony completes.
 func (e *ConsensusEngine) OnGenesisCertificate(ctx context.Context, cert *messages.GenesisCertificate) error {
 	for i := range cert.Attestations {
@@ -1591,6 +1675,9 @@ func (e *ConsensusEngine) ActivateConsensus(ctx context.Context) error {
 
 	e.mu.Lock()
 	e.consensusActive = true
+	if e.heartbeatController != nil {
+		e.heartbeatController.EnableSender()
+	}
 	e.mu.Unlock()
 
 	e.logger.InfoContext(ctx, "consensus activation complete")

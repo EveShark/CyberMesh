@@ -75,13 +75,13 @@ const (
 
 // Domain separators for signature security
 const (
-	DomainProposal   = "CONSENSUS_PROPOSAL_V1"
-	DomainVote       = "CONSENSUS_VOTE_V1"
-	DomainQC         = "CONSENSUS_QC_V1"
-	DomainViewChange = "CONSENSUS_VIEWCHANGE_V1"
-	DomainNewView    = "CONSENSUS_NEWVIEW_V1"
-	DomainHeartbeat  = "CONSENSUS_HEARTBEAT_V1"
-	DomainEvidence   = "CONSENSUS_EVIDENCE_V1"
+	DomainProposal           = "CONSENSUS_PROPOSAL_V1"
+	DomainVote               = "CONSENSUS_VOTE_V1"
+	DomainQC                 = "CONSENSUS_QC_V1"
+	DomainViewChange         = "CONSENSUS_VIEWCHANGE_V1"
+	DomainNewView            = "CONSENSUS_NEWVIEW_V1"
+	DomainHeartbeat          = "CONSENSUS_HEARTBEAT_V1"
+	DomainEvidence           = "CONSENSUS_EVIDENCE_V1"
 	DomainGenesisReady       = "CONSENSUS_GENESIS_READY_V1"
 	DomainGenesisCertificate = "CONSENSUS_GENESIS_CERT_V1"
 	DomainProposalIntent     = "CONSENSUS_PROPOSAL_INTENT_V1"

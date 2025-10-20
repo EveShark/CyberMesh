@@ -72,9 +72,9 @@ func (s *Server) getMempoolStats(ctx context.Context) *MempoolStats {
 	stats := &MempoolStats{}
 
 	if s.mempool != nil {
-        count, bytes := s.mempool.Stats()
-        stats.PendingTransactions = count
-        stats.SizeBytes = int64(bytes)
+		count, bytes := s.mempool.Stats()
+		stats.PendingTransactions = count
+		stats.SizeBytes = int64(bytes)
 	}
 
 	return stats
@@ -84,7 +84,7 @@ func (s *Server) getMempoolStats(ctx context.Context) *MempoolStats {
 func (s *Server) getNetworkStats(ctx context.Context) *NetworkStats {
 	// Network stats are optional and may not be available
 	// In production, this would come from P2P layer
-	
+
 	stats := &NetworkStats{
 		PeerCount:     0,
 		InboundPeers:  0,

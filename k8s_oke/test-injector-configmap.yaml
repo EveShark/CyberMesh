@@ -1,0 +1,25 @@
+# Test Injector ConfigMap
+# Controls which dataset to inject and injection parameters
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test-injector-config
+  namespace: cybermesh
+  labels:
+    app: test-injector
+data:
+  # Dataset Selection (change this to switch tests)
+  DATASET: "phase0_smoke_test_10k_50_50.csv"
+  
+  # Injection Parameters
+  BATCH_SIZE: "100"
+  INTERVAL_SECONDS: "1"
+  LOOP: "false"
+  MAX_ROWS: "0"
+  
+  # AI Service Target
+  AI_SERVICE_URL: "http://ai-service.cybermesh.svc.cluster.local:8080"
+  
+  # OCI Object Storage (test datasets location)
+  DATASET_BASE_URL: "https://objectstorage.ap-mumbai-1.oraclecloud.com/n/bmpajckmi4ss/b/test-dataset/o/"

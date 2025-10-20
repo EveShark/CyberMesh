@@ -10,7 +10,7 @@ import (
 type CryptoService interface {
 	// Signing operations
 	SignWithContext(ctx context.Context, data []byte) ([]byte, error)
-	VerifyWithContext(ctx context.Context, data, signature, publicKey []byte) error
+	VerifyWithContext(ctx context.Context, data, signature, publicKey []byte, allowOldTimestamps bool) error
 
 	// Key management
 	GetKeyID() ValidatorID
@@ -108,26 +108,72 @@ type QuarantineManager interface {
 	Release(id ValidatorID) error
 }
 
+// ProposalRecord represents a persisted proposal entry
+type ProposalRecord struct {
+	Hash     []byte
+	Height   uint64
+	View     uint64
+	Proposer []byte
+	Data     []byte
+}
+
+// QCRecord represents a persisted quorum certificate entry
+type QCRecord struct {
+	Hash   []byte
+	Height uint64
+	View   uint64
+	Data   []byte
+}
+
+// VoteRecord represents a persisted vote entry
+type VoteRecord struct {
+	Hash      []byte
+	View      uint64
+	Height    uint64
+	Voter     []byte
+	BlockHash []byte
+	Data      []byte
+}
+
+// EvidenceRecord represents a persisted evidence entry
+type EvidenceRecord struct {
+	Hash   []byte
+	Height uint64
+	Data   []byte
+}
+
 // StorageBackend defines the interface for persistent storage
 type StorageBackend interface {
 	// Proposal operations
-	SaveProposal(key []byte, data []byte) error
-	LoadProposal(key []byte) ([]byte, error)
+	SaveProposal(ctx context.Context, hash []byte, height uint64, view uint64, proposer []byte, data []byte) error
+	LoadProposal(ctx context.Context, hash []byte) ([]byte, error)
+	ListProposals(ctx context.Context, minHeight uint64, limit int) ([]ProposalRecord, error)
 
 	// QC operations
-	SaveQC(key []byte, data []byte) error
-	LoadQC(key []byte) ([]byte, error)
+	SaveQC(ctx context.Context, hash []byte, height uint64, view uint64, data []byte) error
+	LoadQC(ctx context.Context, hash []byte) ([]byte, error)
+	ListQCs(ctx context.Context, minHeight uint64, limit int) ([]QCRecord, error)
+
+	// Vote operations
+	SaveVote(ctx context.Context, view uint64, height uint64, voter []byte, blockHash []byte, voteHash []byte, data []byte) error
+	ListVotes(ctx context.Context, minHeight uint64, limit int) ([]VoteRecord, error)
 
 	// Committed block operations
-	SaveCommittedBlock(height uint64, hash BlockHash) error
-	LoadLastCommitted() (uint64, []byte, error)
+	SaveCommittedBlock(ctx context.Context, height uint64, hash []byte, qcData []byte) error
+	LoadLastCommitted(ctx context.Context) (uint64, []byte, []byte, error)
 
 	// Evidence operations
-	SaveEvidence(key []byte, data []byte) error
-	LoadEvidence(key []byte) ([]byte, error)
+	SaveEvidence(ctx context.Context, hash []byte, height uint64, data []byte) error
+	LoadEvidence(ctx context.Context, hash []byte) ([]byte, error)
+	ListEvidence(ctx context.Context, minHeight uint64, limit int) ([]EvidenceRecord, error)
+
+	// Genesis certificate operations
+	LoadGenesisCertificate(ctx context.Context) ([]byte, bool, error)
+	SaveGenesisCertificate(ctx context.Context, data []byte) error
+	DeleteGenesisCertificate(ctx context.Context) error
 
 	// Cleanup operations
-	DeleteBefore(height uint64) error
+	DeleteBefore(ctx context.Context, height uint64) error
 	Close() error
 }
 
@@ -170,6 +216,7 @@ type ReadinessOracle interface {
 type PeerObserver interface {
 	GetConnectedPeerCount() int
 	GetActivePeerCount(since time.Duration) int
+	GetPeersSeenSinceStartup() int
 }
 
 // Pacemaker manages view timing and synchronization

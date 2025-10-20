@@ -1,0 +1,191 @@
+# CyberMesh AI Service - Deployment
+# Stateless ML detection service (Deployment, not StatefulSet)
+# 1 replica initially, scale to 2-3 after validation
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-service
+  namespace: cybermesh
+  labels:
+    app: ai-service
+    component: ml-detection
+    version: v1.0.0
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0  # Zero downtime deployments
+  selector:
+    matchLabels:
+      app: ai-service
+      component: ml-detection
+  template:
+    metadata:
+      labels:
+        app: ai-service
+        component: ml-detection
+        version: v1.0.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "10000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: ai-service-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      
+      # No init containers needed - models in image for now
+      # When OCI Object Storage ready, add download init container here
+      
+      containers:
+      - name: ai-service
+        image: ap-mumbai-1.ocir.io/bmpajckmi4ss/cybermesh-repo/ai-service:arm64
+        imagePullPolicy: Always
+        
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          runAsNonRoot: true
+          capabilities:
+            drop:
+            - ALL
+        
+        # Import all AI config from ConfigMap
+        envFrom:
+        - configMapRef:
+            name: ai-service-config
+        
+        # Kafka/Redis credentials from existing backend secret
+        env:
+        - name: KAFKA_SASL_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: cybermesh-secrets
+              key: KAFKA_SASL_USERNAME
+        - name: KAFKA_SASL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: cybermesh-secrets
+              key: KAFKA_SASL_PASSWORD
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: cybermesh-secrets
+              key: REDIS_PASSWORD
+        
+        ports:
+        - name: api
+          containerPort: 8080
+          protocol: TCP
+        - name: metrics
+          containerPort: 10000
+          protocol: TCP
+        
+        volumeMounts:
+        # AI signing key (Ed25519) mounted as volume (more secure than env var)
+        - name: ai-signing-key
+          mountPath: /app/keys
+          readOnly: true
+        
+        # Models directory - OCI Object Storage PVC (placeholder for now)
+        # TODO: After uploading models to OCI bucket, uncomment and configure PVC
+        # - name: models
+        #   mountPath: /app/data/models
+        #   readOnly: true
+        
+        # Logs (ephemeral)
+        - name: logs
+          mountPath: /app/logs
+        
+        # Nonce state (ephemeral - Redis is source of truth)
+        - name: data
+          mountPath: /app/data
+        
+        # Explicit CPU requests (at least 500m per feedback)
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        
+        # Liveness probe on port 8080 (prevents hung inference loops)
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+          successThreshold: 1
+        
+        # Readiness probe on port 8080 (GKE routing control)
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 15
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
+          successThreshold: 1
+        
+        # Startup probe (allow time for model loading)
+        startupProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 12  # 60s max startup time (12 * 5s)
+      
+      volumes:
+      # AI signing key from Secret (volume mount, not env var)
+      - name: ai-signing-key
+        secret:
+          secretName: ai-service-secret
+          defaultMode: 0400  # Read-only for user
+          items:
+          - key: signing_key.pem
+            path: signing_key.pem
+      
+      # OCI Object Storage for models (PLACEHOLDER - uncomment when ready)
+      # - name: models
+      #   persistentVolumeClaim:
+      #     claimName: oci-models-pvc
+      
+      # Logs (emptyDir)
+      - name: logs
+        emptyDir: {}
+      
+      # Data directory for nonce state (emptyDir)
+      - name: data
+        emptyDir: {}
+      
+      # Pod anti-affinity: Prefer spreading AI pods across nodes (when scaling to 2+)
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - ai-service
+              topologyKey: topology.kubernetes.io/zone

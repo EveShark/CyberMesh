@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	consensusapi "backend/pkg/consensus/api"
 	"backend/pkg/utils"
 )
 
@@ -43,6 +44,9 @@ func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 	checks := make(map[string]string)
 	details := make(map[string]interface{})
 	allReady := true
+	phase := ""
+	var activation consensusapi.ActivationStatus
+	var haveActivation bool
 
 	// Check storage
 	if s.storage != nil {
@@ -83,13 +87,22 @@ func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 	// Check consensus engine
 	if s.engine != nil {
 		status := s.engine.GetStatus()
-		activation := s.engine.GetActivationStatus()
+		activation = consensusapi.PrivateGetActivationStatus(s.engine)
+		haveActivation = true
 		details["consensus_ready_validators"] = activation.ReadyValidators
 		details["consensus_required_ready"] = activation.RequiredReady
-		if status.Running && s.engine.IsConsensusActive() && activation.HasQuorum {
+		details["consensus_peers_seen"] = activation.PeersSeen
+		details["consensus_seen_quorum"] = activation.SeenQuorum
+		if activation.GenesisPhase {
+			checks["consensus"] = "genesis"
+			phase = "genesis"
+			details["consensus_phase"] = "genesis"
+		} else if status.Running && s.engine.IsConsensusActive() && activation.HasQuorum {
 			checks["consensus"] = "ok"
+			phase = "active"
 		} else {
 			checks["consensus"] = "not ready"
+			phase = "inactive"
 			allReady = false
 			if !status.Running {
 				details["consensus_error"] = "engine not running"
@@ -106,7 +119,10 @@ func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 
 	// Check P2P peer connectivity for multi-node deployments
 	if s.p2pRouter != nil && s.engine != nil {
-		activation := s.engine.GetActivationStatus()
+		if !haveActivation {
+			activation = consensusapi.PrivateGetActivationStatus(s.engine)
+			haveActivation = true
+		}
 		details["p2p_connected_peers"] = activation.ConnectedPeers
 		details["p2p_active_peers"] = activation.ActivePeers
 		totalValidators := len(s.engine.ListValidators())
@@ -114,7 +130,9 @@ func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 		details["p2p_required_peers"] = activation.RequiredPeers
 		details["p2p_quorum_2f+1"] = activation.RequiredReady
 
-		if totalValidators <= 1 {
+		if activation.GenesisPhase {
+			checks["p2p_quorum"] = "genesis"
+		} else if totalValidators <= 1 {
 			// Single validator deployment (dev/test)
 			checks["p2p_quorum"] = "single_node"
 		} else if activation.ConnectedPeers >= activation.RequiredPeers {
@@ -140,6 +158,15 @@ func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 		Checks:    checks,
 		Timestamp: time.Now().Unix(),
 		Details:   details,
+		Phase:     phase,
+	}
+
+	if response.Phase == "" && s.engine != nil {
+		if s.engine.IsConsensusActive() {
+			response.Phase = "active"
+		} else {
+			response.Phase = "genesis"
+		}
 	}
 
 	statusCode := http.StatusOK

@@ -56,7 +56,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 // middlewareChain applies middleware in order
 func (s *Server) middlewareChain(handler http.Handler) http.Handler {
 	// Apply middleware in reverse order (outermost first)
-	
+
 	// 1. Panic recovery (outermost - catches all panics)
 	handler = s.middlewarePanicRecovery(handler)
 
@@ -66,10 +66,10 @@ func (s *Server) middlewareChain(handler http.Handler) http.Handler {
 	// 3. Request ID
 	handler = s.middlewareRequestID(handler)
 
-    // 3.5 Concurrency limit (if configured)
-    if s.sem != nil {
-        handler = s.middlewareConcurrencyLimit(handler)
-    }
+	// 3.5 Concurrency limit (if configured)
+	if s.sem != nil {
+		handler = s.middlewareConcurrencyLimit(handler)
+	}
 
 	// 4. IP allowlist (if configured)
 	if s.ipAllowlist != nil {

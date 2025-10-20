@@ -294,6 +294,10 @@ func NewRouter(parent context.Context, nodeCfg *config.NodeConfig, secCfg *confi
 		opts:      opts,
 	}
 
+	if r.state != nil {
+		r.state.ResetPeersSeen()
+	}
+
 	// Create semaphore for bounded handler concurrency
 	maxHandlers := configMgr.GetIntRange("P2P_MAX_HANDLER_GOROUTINES", 200, 10, 1000)
 	r.handlerSem = make(chan struct{}, maxHandlers)
@@ -479,6 +483,14 @@ func (r *Router) GetActivePeerCount(since time.Duration) int {
 		return 0
 	}
 	return r.state.GetActivePeerCount(since)
+}
+
+// GetPeersSeenSinceStartup returns the count of peers observed since startup.
+func (r *Router) GetPeersSeenSinceStartup() int {
+	if r.state == nil {
+		return 0
+	}
+	return r.state.GetPeersSeenSinceStartup()
 }
 
 // PeerHash returns a deterministic fingerprint over the currently known peers (including self).

@@ -1,17 +1,17 @@
 package kafka
 
 import (
-    "context"
-    "errors"
-    "fmt"
-    "sync"
-    "time"
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
 
-    "backend/pkg/mempool"
-    "backend/pkg/state"
-    "backend/pkg/utils"
+	"backend/pkg/mempool"
+	"backend/pkg/state"
+	"backend/pkg/utils"
 
-    "github.com/IBM/sarama"
+	"github.com/IBM/sarama"
 )
 
 // Consumer handles consuming messages from Kafka ai.* topics and submitting to mempool
@@ -40,11 +40,11 @@ type Consumer struct {
 
 // ConsumerConfig holds configuration for creating a consumer
 type ConsumerConfig struct {
-	Brokers       []string
-	GroupID       string
-	Topics        []string        // ai.anomalies.v1, ai.evidence.v1, ai.policy.v1
-	DLQTopic      string          // DLQ topic for failed messages (optional)
-	VerifierCfg   VerifierConfig  // Timestamp skew configuration
+	Brokers     []string
+	GroupID     string
+	Topics      []string       // ai.anomalies.v1, ai.evidence.v1, ai.policy.v1
+	DLQTopic    string         // DLQ topic for failed messages (optional)
+	VerifierCfg VerifierConfig // Timestamp skew configuration
 }
 
 // NewConsumer creates a new Kafka consumer for ai.* topics
@@ -107,17 +107,17 @@ func NewConsumer(ctx context.Context, cfg ConsumerConfig, saramaCfg *sarama.Conf
 		})
 	}
 
-    if logger != nil {
-        offsetMode := "newest"
-        if saramaCfg != nil && saramaCfg.Consumer.Offsets.Initial == sarama.OffsetOldest {
-            offsetMode = "earliest"
-        }
-        logger.InfoContext(ctx, "Kafka consumer created",
-            utils.ZapString("group_id", cfg.GroupID),
-            utils.ZapStringArray("topics", cfg.Topics),
-            utils.ZapString("offset_initial", offsetMode),
-            utils.ZapBool("dlq_enabled", cfg.DLQTopic != ""))
-    }
+	if logger != nil {
+		offsetMode := "newest"
+		if saramaCfg != nil && saramaCfg.Consumer.Offsets.Initial == sarama.OffsetOldest {
+			offsetMode = "earliest"
+		}
+		logger.InfoContext(ctx, "Kafka consumer created",
+			utils.ZapString("group_id", cfg.GroupID),
+			utils.ZapStringArray("topics", cfg.Topics),
+			utils.ZapString("offset_initial", offsetMode),
+			utils.ZapBool("dlq_enabled", cfg.DLQTopic != ""))
+	}
 
 	return c, nil
 }
@@ -217,31 +217,31 @@ func (c *Consumer) consumeLoop() {
 
 // consumerGroupHandler implements sarama.ConsumerGroupHandler
 type consumerGroupHandler struct {
-    consumer *Consumer
+	consumer *Consumer
 }
 
 // Setup is called at the beginning of a new session, before ConsumeClaim
 func (h *consumerGroupHandler) Setup(session sarama.ConsumerGroupSession) error {
-    if h.consumer.logger != nil {
-        claims := session.Claims()
-        totalPartitions := 0
-        // Log partition assignments per topic
-        for topic, partitions := range claims {
-            totalPartitions += len(partitions)
-            // Convert []int32 -> []int for logging helper
-            ints := make([]int, len(partitions))
-            for i, p := range partitions {
-                ints[i] = int(p)
-            }
-            h.consumer.logger.Info("Kafka partitions assigned",
-                utils.ZapString("topic", topic),
-                utils.ZapInts("partitions", ints))
-        }
-        h.consumer.logger.Info("Kafka consumer session ready",
-            utils.ZapInt("topics", len(claims)),
-            utils.ZapInt("total_partitions", totalPartitions))
-    }
-    return nil
+	if h.consumer.logger != nil {
+		claims := session.Claims()
+		totalPartitions := 0
+		// Log partition assignments per topic
+		for topic, partitions := range claims {
+			totalPartitions += len(partitions)
+			// Convert []int32 -> []int for logging helper
+			ints := make([]int, len(partitions))
+			for i, p := range partitions {
+				ints[i] = int(p)
+			}
+			h.consumer.logger.Info("Kafka partitions assigned",
+				utils.ZapString("topic", topic),
+				utils.ZapInts("partitions", ints))
+		}
+		h.consumer.logger.Info("Kafka consumer session ready",
+			utils.ZapInt("topics", len(claims)),
+			utils.ZapInt("total_partitions", totalPartitions))
+	}
+	return nil
 }
 
 // Cleanup is called at the end of a session, once all ConsumeClaim goroutines have exited

@@ -24,6 +24,7 @@ type State struct {
 
 	mu    sync.RWMutex
 	peers map[peer.ID]*PeerState
+	seen  map[peer.ID]time.Time
 
 	// Configuration (loaded from configMgr, no hardcoded values)
 	heartbeatInterval time.Duration
@@ -40,6 +41,7 @@ type State struct {
 
 	// Metrics hooks (optional)
 	metrics Metrics
+	startup time.Time
 }
 
 // Metrics is a narrow interface to decouple from any metrics backend.
@@ -86,6 +88,7 @@ func NewState(parentCtx context.Context, log *utils.Logger, cfg *config.NodeConf
 		cfg:               cfg,
 		configMgr:         configMgr,
 		peers:             make(map[peer.ID]*PeerState),
+		seen:              make(map[peer.ID]time.Time),
 		heartbeatInterval: hb,
 		livenessTimeout:   live,
 		decayInterval:     decay,
@@ -95,6 +98,7 @@ func NewState(parentCtx context.Context, log *utils.Logger, cfg *config.NodeConf
 		metrics:           metrics,
 		ctx:               ctx,
 		cancel:            cancel,
+		startup:           time.Now(),
 	}
 
 	log.Info("P2P state manager created",
@@ -110,6 +114,7 @@ func NewState(parentCtx context.Context, log *utils.Logger, cfg *config.NodeConf
 
 // Start begins background maintenance loops (decay, liveness).
 func (s *State) Start() {
+	s.ResetPeersSeen()
 	s.wg.Add(1)
 	go s.decayLoop()
 
@@ -133,6 +138,7 @@ func (s *State) OnConnect(pid peer.ID, labels map[string]string) {
 	ps := s.ensure(pid)
 	ps.LastSeen = time.Now()
 	ps.LastDecay = time.Now()
+	s.seen[pid] = ps.LastSeen
 	if labels != nil {
 		ps.Labels = labels
 	}
@@ -165,6 +171,7 @@ func (s *State) OnMessage(topic string, from peer.ID, n int) {
 	ps.LastSeen = time.Now()
 	ps.MsgIn++
 	ps.BytesIn += uint64(n)
+	s.seen[from] = ps.LastSeen
 
 	// Positive reinforcement for participation; capped to avoid runaway
 	ps.Score = clamp(ps.Score+0.05, -100, 100)
@@ -277,6 +284,31 @@ func (s *State) GetActivePeerCount(since time.Duration) int {
 		}
 	}
 	return count
+}
+
+// GetPeersSeenSinceStartup returns the count of peers that have exchanged at least one message
+// with this node since the latest startup/reset.
+func (s *State) GetPeersSeenSinceStartup() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	count := 0
+	for pid, ts := range s.seen {
+		if ts.Before(s.startup) {
+			continue
+		}
+		if ps, ok := s.peers[pid]; ok && !ps.Quarantined {
+			count++
+		}
+	}
+	return count
+}
+
+// ResetPeersSeen clears the seen tracker and resets the startup timestamp.
+func (s *State) ResetPeersSeen() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.seen = make(map[peer.ID]time.Time)
+	s.startup = time.Now()
 }
 
 // GetQuarantinedCount returns the number of quarantined peers

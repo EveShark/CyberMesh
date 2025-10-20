@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-    "backend/pkg/block"
+	"backend/pkg/block"
 	"backend/pkg/storage/cockroach"
 	"backend/pkg/utils"
 )
@@ -95,8 +95,8 @@ func (s *Server) handleBlockByHeight(w http.ResponseWriter, r *http.Request, hei
 		return
 	}
 
-    // Check if client wants transaction details
-    includeTxs := parseBool(r.URL.Query().Get("include_txs"))
+	// Check if client wants transaction details
+	includeTxs := parseBool(r.URL.Query().Get("include_txs"))
 
 	// Get block from storage
 	block, err := s.storage.GetBlock(ctx, height)
@@ -114,27 +114,27 @@ func (s *Server) handleBlockByHeight(w http.ResponseWriter, r *http.Request, hei
 		return
 	}
 
-    // Convert to response DTO
-    response := s.blockToResponse(block)
-    if includeTxs {
-        metas, err := s.storage.ListTransactionsByBlock(ctx, height)
-        if err != nil {
-            s.logger.WarnContext(ctx, "failed to list transactions for block",
-                utils.ZapUint64("height", height), utils.ZapError(err))
-            writeErrorFromUtils(w, r, NewInternalError("failed to list transactions"))
-            return
-        }
-        txs := make([]TransactionResponse, 0, len(metas))
-        for _, m := range metas {
-            // m.TxHash may be []byte (expected 32 bytes)
-            txs = append(txs, TransactionResponse{
-                Hash:      encodeHex(m.TxHash),
-                Type:      m.TxType,
-                SizeBytes: m.SizeBytes,
-            })
-        }
-        response.Transactions = txs
-    }
+	// Convert to response DTO
+	response := s.blockToResponse(block)
+	if includeTxs {
+		metas, err := s.storage.ListTransactionsByBlock(ctx, height)
+		if err != nil {
+			s.logger.WarnContext(ctx, "failed to list transactions for block",
+				utils.ZapUint64("height", height), utils.ZapError(err))
+			writeErrorFromUtils(w, r, NewInternalError("failed to list transactions"))
+			return
+		}
+		txs := make([]TransactionResponse, 0, len(metas))
+		for _, m := range metas {
+			// m.TxHash may be []byte (expected 32 bytes)
+			txs = append(txs, TransactionResponse{
+				Hash:      encodeHex(m.TxHash),
+				Type:      m.TxType,
+				SizeBytes: m.SizeBytes,
+			})
+		}
+		response.Transactions = txs
+	}
 
 	writeJSONResponse(w, r, NewSuccessResponse(response), http.StatusOK)
 }
@@ -225,22 +225,22 @@ func (s *Server) handleBlockList(w http.ResponseWriter, r *http.Request) {
 
 // blockToResponse converts a block to BlockResponse DTO
 func (s *Server) blockToResponse(b *block.AppBlock) BlockResponse {
-    // Map real fields from AppBlock; no payloads are exposed
-    h := b.GetHash()
-    ph := b.GetParentHash()
-    sr := b.StateRootHint()
-    proposer := b.Proposer()
+	// Map real fields from AppBlock; no payloads are exposed
+	h := b.GetHash()
+	ph := b.GetParentHash()
+	sr := b.StateRootHint()
+	proposer := b.Proposer()
 
-    resp := BlockResponse{
-        Height:           b.GetHeight(),
-        Hash:             encodeHex(h[:]),
-        ParentHash:       encodeHex(ph[:]),
-        StateRoot:        encodeHex(sr[:]),
-        Timestamp:        b.GetTimestamp().Unix(),
-        Proposer:         encodeHex(proposer[:]),
-        TransactionCount: b.GetTransactionCount(),
-        SizeBytes:        0, // unknown without full serialization; keep 0
-    }
+	resp := BlockResponse{
+		Height:           b.GetHeight(),
+		Hash:             encodeHex(h[:]),
+		ParentHash:       encodeHex(ph[:]),
+		StateRoot:        encodeHex(sr[:]),
+		Timestamp:        b.GetTimestamp().Unix(),
+		Proposer:         encodeHex(proposer[:]),
+		TransactionCount: b.GetTransactionCount(),
+		SizeBytes:        0, // unknown without full serialization; keep 0
+	}
 
-    return resp
+	return resp
 }

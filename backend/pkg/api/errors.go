@@ -7,26 +7,26 @@ import (
 // API-specific error codes (extending utils.ErrorCode)
 const (
 	// Request errors
-	ErrCodeInvalidRequest   utils.ErrorCode = "INVALID_REQUEST"
-	ErrCodeInvalidHeight    utils.ErrorCode = "INVALID_HEIGHT"
-	ErrCodeInvalidKey       utils.ErrorCode = "INVALID_KEY"
-	ErrCodeInvalidParams    utils.ErrorCode = "INVALID_PARAMS"
-	ErrCodeMalformedJSON    utils.ErrorCode = "MALFORMED_JSON"
-	
+	ErrCodeInvalidRequest utils.ErrorCode = "INVALID_REQUEST"
+	ErrCodeInvalidHeight  utils.ErrorCode = "INVALID_HEIGHT"
+	ErrCodeInvalidKey     utils.ErrorCode = "INVALID_KEY"
+	ErrCodeInvalidParams  utils.ErrorCode = "INVALID_PARAMS"
+	ErrCodeMalformedJSON  utils.ErrorCode = "MALFORMED_JSON"
+
 	// Resource errors
 	ErrCodeBlockNotFound     utils.ErrorCode = "BLOCK_NOT_FOUND"
 	ErrCodeStateNotFound     utils.ErrorCode = "STATE_NOT_FOUND"
 	ErrCodeValidatorNotFound utils.ErrorCode = "VALIDATOR_NOT_FOUND"
-	
+
 	// Security errors (reuse from utils where possible)
 	ErrCodeUnauthorized = utils.CodeUnauthorized
 	ErrCodeForbidden    = utils.CodeForbidden
 	ErrCodeRateLimited  = utils.CodeRateLimited
-	
+
 	// Server errors
-	ErrCodeInternal      = utils.CodeInternal
-	ErrCodeUnavailable   = utils.CodeUnavailable
-	ErrCodeTimeout       = utils.CodeTimeout
+	ErrCodeInternal    = utils.CodeInternal
+	ErrCodeUnavailable = utils.CodeUnavailable
+	ErrCodeTimeout     = utils.CodeTimeout
 )
 
 // NewInvalidRequestError creates an invalid request error

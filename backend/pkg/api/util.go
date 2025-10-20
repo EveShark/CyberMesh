@@ -125,7 +125,7 @@ func validatePaginationLimit(limit int) (int, error) {
 func sanitizeString(s string) string {
 	// Remove null bytes
 	s = strings.ReplaceAll(s, "\x00", "")
-	
+
 	// Remove control characters (except tab, newline, carriage return)
 	var result strings.Builder
 	for _, r := range s {
@@ -133,7 +133,7 @@ func sanitizeString(s string) string {
 			result.WriteRune(r)
 		}
 	}
-	
+
 	return result.String()
 }
 
@@ -195,10 +195,10 @@ func extractPathParam(path string, prefix string, index int) (string, error) {
 
 	// Remove prefix
 	rest := strings.TrimPrefix(path, prefix)
-	
+
 	// Split by /
 	parts := strings.Split(rest, "/")
-	
+
 	if index >= len(parts) {
 		return "", fmt.Errorf("path parameter index %d out of range", index)
 	}
@@ -215,7 +215,7 @@ func extractPathParam(path string, prefix string, index int) (string, error) {
 func getQueryParam(queryString, param string) string {
 	// Simple query parameter extraction
 	// In production, use url.Parse() but this avoids external deps in example
-	
+
 	params := strings.Split(queryString, "&")
 	for _, p := range params {
 		kv := strings.SplitN(p, "=", 2)
@@ -223,7 +223,7 @@ func getQueryParam(queryString, param string) string {
 			return kv[1]
 		}
 	}
-	
+
 	return ""
 }
 
@@ -248,8 +248,8 @@ func isValidRequestID(id string) bool {
 
 	// Allow alphanumeric, hyphens, underscores
 	for _, c := range id {
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || 
-		     (c >= '0' && c <= '9') || c == '-' || c == '_') {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '-' || c == '_') {
 			return false
 		}
 	}

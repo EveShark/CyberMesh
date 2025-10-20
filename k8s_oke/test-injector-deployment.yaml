@@ -1,0 +1,81 @@
+# Test Injector Deployment
+# Reads test datasets and injects into AI service for OKE testing
+# Scale to 0 when not testing, scale to 1 to run tests
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-injector
+  namespace: cybermesh
+  labels:
+    app: test-injector
+spec:
+  replicas: 0  # Start at 0, scale to 1 to run tests
+  selector:
+    matchLabels:
+      app: test-injector
+  template:
+    metadata:
+      labels:
+        app: test-injector
+    spec:
+      serviceAccountName: ai-service-sa  # Reuse AI service account
+      # No nodeSelector; rely on default scheduling in OKE
+      
+      initContainers:
+      # Download test dataset from OCI Object Storage
+      - name: download-dataset
+        image: python:3.11-slim
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          pip install --no-cache-dir requests
+          python /scripts/download.py
+        envFrom:
+        - configMapRef:
+            name: test-injector-config
+        volumeMounts:
+        - name: test-data
+          mountPath: /data
+        - name: scripts
+          mountPath: /scripts
+      
+      containers:
+      - name: injector
+        image: python:3.11-slim
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          # Install dependencies
+          pip install --no-cache-dir pandas requests
+          
+          # Run injector script (will be created at runtime)
+          python /scripts/inject.py
+        
+        envFrom:
+        - configMapRef:
+            name: test-injector-config
+        
+        volumeMounts:
+        - name: test-data
+          mountPath: /data
+          readOnly: true
+        - name: scripts
+          mountPath: /scripts
+        
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+      
+      volumes:
+      - name: test-data
+        emptyDir: {}
+      
+      - name: scripts
+        configMap:
+          name: test-injector-script
+          defaultMode: 0755

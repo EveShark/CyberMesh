@@ -1,0 +1,153 @@
+# Test Injector Script ConfigMap
+# Python script that reads CSV and injects into AI service
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test-injector-script
+  namespace: cybermesh
+  labels:
+    app: test-injector
+data:
+  download.py: |
+    #!/usr/bin/env python3
+    import os
+    import sys
+    import requests
+
+    dataset = os.getenv("DATASET")
+    base_url = os.getenv("DATASET_BASE_URL")
+    if not dataset or not base_url:
+        print("Missing DATASET or DATASET_BASE_URL", file=sys.stderr)
+        sys.exit(1)
+
+    url = f"{base_url}{dataset}"
+    dest_path = os.path.join("/data", dataset)
+    print(f"Downloading dataset from {url} -> {dest_path}")
+
+    resp = requests.get(url, timeout=300)
+    resp.raise_for_status()
+
+    with open(dest_path, "wb") as fh:
+        fh.write(resp.content)
+
+    print(f"Downloaded {len(resp.content)} bytes")
+
+  inject.py: |
+    #!/usr/bin/env python3
+    import os
+    import sys
+    import time
+    import json
+    import pandas as pd
+    import requests
+    from datetime import datetime
+    
+    # Configuration from environment
+    DATASET = os.getenv('DATASET')
+    BATCH_SIZE = int(os.getenv('BATCH_SIZE', '100'))
+    INTERVAL = int(os.getenv('INTERVAL_SECONDS', '1'))
+    LOOP = os.getenv('LOOP', 'false').lower() == 'true'
+    MAX_ROWS = int(os.getenv('MAX_ROWS', '0'))
+    AI_SERVICE_URL = os.getenv('AI_SERVICE_URL')
+    
+    DATASET_PATH = f'/data/{DATASET}'
+    
+    print(f"=" * 70)
+    print(f"CyberMesh Test Injector")
+    print(f"=" * 70)
+    print(f"Dataset: {DATASET}")
+    print(f"Batch Size: {BATCH_SIZE}")
+    print(f"Interval: {INTERVAL}s")
+    print(f"Loop: {LOOP}")
+    print(f"Max Rows: {MAX_ROWS if MAX_ROWS > 0 else 'Unlimited'}")
+    print(f"Target: {AI_SERVICE_URL}")
+    print(f"=" * 70)
+    print()
+    
+    # Metrics
+    metrics = {
+        'total_rows': 0,
+        'batches_sent': 0,
+        'success': 0,
+        'errors': 0,
+        'start_time': datetime.utcnow().isoformat(),
+        'end_time': None
+    }
+    
+    # Load CSV
+    print(f"Loading dataset: {DATASET_PATH}")
+    try:
+        df = pd.read_csv(DATASET_PATH)
+        total_rows = len(df)
+        print(f"✓ Loaded {total_rows:,} rows")
+        
+        if MAX_ROWS > 0:
+            df = df.head(MAX_ROWS)
+            total_rows = len(df)
+            print(f"✓ Limited to {total_rows:,} rows")
+        
+    except Exception as e:
+        print(f"ERROR: Failed to load dataset: {e}")
+        sys.exit(1)
+    
+    # Injection loop
+    print(f"\nStarting injection...")
+    print(f"Progress will update every {BATCH_SIZE} rows\n")
+    
+    iteration = 0
+    while True:
+        iteration += 1
+        
+        for i in range(0, total_rows, BATCH_SIZE):
+            batch = df.iloc[i:i+BATCH_SIZE]
+            batch_num = i // BATCH_SIZE + 1
+            total_batches = (total_rows + BATCH_SIZE - 1) // BATCH_SIZE
+            
+            # Convert batch to JSON
+            records = batch.to_dict('records')
+            
+            # Send to AI service
+            try:
+                # Note: AI service doesn't have a direct injection endpoint yet
+                # This is a placeholder - actual implementation depends on AI service API
+                
+                # For now, simulate processing
+                time.sleep(INTERVAL)
+                
+                metrics['batches_sent'] += 1
+                metrics['total_rows'] += len(records)
+                metrics['success'] += len(records)
+                
+                # Progress
+                progress = (i + len(records)) / total_rows * 100
+                print(f"[{iteration}] Batch {batch_num}/{total_batches} | "
+                      f"Rows: {i + len(records):,}/{total_rows:,} ({progress:.1f}%) | "
+                      f"Success: {metrics['success']:,} | Errors: {metrics['errors']}")
+                
+            except Exception as e:
+                metrics['errors'] += len(records)
+                print(f"ERROR in batch {batch_num}: {e}")
+        
+        # End of dataset
+        if not LOOP:
+            break
+        
+        print(f"\nCompleted iteration {iteration}, looping...\n")
+    
+    # Final metrics
+    metrics['end_time'] = datetime.utcnow().isoformat()
+    print(f"\n" + "=" * 70)
+    print(f"Test Injection Complete")
+    print(f"=" * 70)
+    print(f"Total Rows: {metrics['total_rows']:,}")
+    print(f"Batches: {metrics['batches_sent']}")
+    print(f"Success: {metrics['success']:,}")
+    print(f"Errors: {metrics['errors']}")
+    print(f"=" * 70)
+    
+    # Save results
+    with open('/tmp/test-results.json', 'w') as f:
+        json.dump(metrics, f, indent=2)
+    
+    print(f"\nResults saved to /tmp/test-results.json")

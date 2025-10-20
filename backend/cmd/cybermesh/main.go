@@ -234,6 +234,7 @@ func main() {
 		allowlistAdapter,
 		vSet,
 		engineConfig,
+		nil, // genesisBackend will be set later after persistence worker is initialized
 	)
 	if err != nil {
 		log.Fatalf("consensus engine init failed: %v", err)
@@ -275,11 +276,10 @@ func main() {
 	validatorsSnapshot := vSet.GetValidators()
 	configHash := computeGenesisConfigHash(engineConfig, cfgMgr, validatorsSnapshot)
 	peerHash := computeValidatorSetHash(validatorsSnapshot)
-	statePath := cfgMgr.GetString("GENESIS_STATE_PATH", "")
-	if statePath == "" {
-		statePath = filepath.Join(cfgMgr.GetString("DATA_DIR", "data"), "genesis_state.json")
+	statePath := cfgMgr.GetString("GENESIS_STATE_PATH", "/app/data/genesis_state.json")
+	if statePath != "" {
+		statePath = filepath.Clean(statePath)
 	}
-	statePath = filepath.Clean(statePath)
 	runtimeSkew := cfgMgr.GetDuration("CONSENSUS_CLOCK_SKEW_TOLERANCE", 5*time.Second)
 	if runtimeSkew <= 0 {
 		runtimeSkew = 5 * time.Second
@@ -298,7 +298,11 @@ func main() {
 		PeerHash:                  peerHash,
 		StatePath:                 statePath,
 	}
-	genesisCoord, err := genesis.NewCoordinator(genesisCfg, localValidatorID, vSet, consensusEngine.LeaderRotation(), cryptoAdapter, consensusEngine, p2pRouter, loggerAdapter, auditAdapter)
+	var genesisBackend ctypes.StorageBackend
+	if persistenceWorker := service.PersistenceWorker(); persistenceWorker != nil {
+		genesisBackend = persistenceWorker.GetStorageBackend()
+	}
+	genesisCoord, err := genesis.NewCoordinator(genesisCfg, localValidatorID, vSet, consensusEngine.LeaderRotation(), cryptoAdapter, consensusEngine, p2pRouter, loggerAdapter, auditAdapter, genesisBackend)
 	if err != nil {
 		log.Fatalf("genesis coordinator init failed: %v", err)
 	}
@@ -326,7 +330,7 @@ func main() {
 	if err := genesisCoord.Start(ctx); err != nil {
 		log.Fatalf("genesis ceremony start failed: %v", err)
 	}
-	
+
 	// Wait for genesis asynchronously - don't block proposer
 	go func() {
 		for {
@@ -635,6 +639,10 @@ func loadValidatorInfos(cfgMgr *utils.ConfigManager, consensusNodes []int, local
 		return nil, fmt.Errorf("consensus node list is empty")
 	}
 
+	if err := ensureValidatorEnvCompleteness(cfgMgr, len(consensusNodes)); err != nil {
+		return nil, err
+	}
+
 	infos := make([]ctypes.ValidatorInfo, 0, len(consensusNodes))
 	seen := make(map[ctypes.ValidatorID]struct{})
 
@@ -642,6 +650,11 @@ func loadValidatorInfos(cfgMgr *utils.ConfigManager, consensusNodes []int, local
 		pubKey, err := resolveValidatorPublicKey(cfgMgr, node, localNodeID, localPublicKey)
 		if err != nil {
 			return nil, err
+		}
+		if node == localNodeID {
+			if err := ensureLocalPublicKeyConsistency(cfgMgr, node, pubKey); err != nil {
+				return nil, err
+			}
 		}
 		id := deriveValidatorID(pubKey)
 		if _, exists := seen[id]; exists {
@@ -658,6 +671,40 @@ func loadValidatorInfos(cfgMgr *utils.ConfigManager, consensusNodes []int, local
 	}
 
 	return infos, nil
+}
+
+func ensureLocalPublicKeyConsistency(cfgMgr *utils.ConfigManager, node int, pubKey []byte) error {
+	envKey := fmt.Sprintf("VALIDATOR_%d_PUBKEY_HEX", node)
+	raw := strings.TrimSpace(cfgMgr.GetString(envKey, ""))
+	if raw == "" {
+		return nil
+	}
+	decoded, err := hex.DecodeString(raw)
+	if err != nil {
+		return fmt.Errorf("invalid hex in %s: %w", envKey, err)
+	}
+	if !bytes.Equal(decoded, pubKey) {
+		derived := hex.EncodeToString(pubKey)
+		return fmt.Errorf("FATAL: Public key mismatch for NODE_ID=%d\n  Derived from CRYPTO_SIGNING_KEY_HEX_%d: %s\n  Expected from %s:   %s\nACTION: Regenerate validator-pubkeys Secret or fix CRYPTO_SIGNING_KEY_HEX_%d",
+			node,
+			node,
+			strings.ToUpper(derived),
+			envKey,
+			strings.ToUpper(raw),
+			node,
+		)
+	}
+	return nil
+}
+
+func ensureValidatorEnvCompleteness(cfgMgr *utils.ConfigManager, validatorCount int) error {
+	for i := 1; i <= validatorCount; i++ {
+		envKey := fmt.Sprintf("VALIDATOR_%d_PUBKEY_HEX", i)
+		if strings.TrimSpace(cfgMgr.GetString(envKey, "")) == "" {
+			return fmt.Errorf("missing required %s environment variable", envKey)
+		}
+	}
+	return nil
 }
 
 func resolveValidatorPublicKey(cfgMgr *utils.ConfigManager, node int, localNodeID int, localPublicKey ed25519.PublicKey) ([]byte, error) {

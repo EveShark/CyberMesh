@@ -1,7 +1,6 @@
 package p2p
 
 import (
-	
 	"backend/pkg/utils"
 	"github.com/libp2p/go-libp2p-pubsub"
 )
@@ -18,7 +17,7 @@ func (r *Router) DebugConsume(topic string, sub *pubsub.Subscription) {
 			continue
 		}
 		r.log.Info("MESSAGE RECEIVED!!!", utils.ZapString("topic", topic), utils.ZapString("from", msg.ReceivedFrom.String()), utils.ZapInt("bytes", len(msg.Data)))
-		
+
 		// Call original handler logic
 		from := msg.ReceivedFrom
 		if r.state != nil {

@@ -17,11 +17,11 @@ func (a *pacemakerPublisherAdapter) PublishViewChange(ctx context.Context, vc *l
 	if a.e == nil || a.e.net == nil || a.e.encoder == nil || vc == nil {
 		return nil
 	}
-    m := &messages.ViewChange{
+	m := &messages.ViewChange{
 		OldView:   vc.OldView,
 		NewView:   vc.NewView,
-        Height:    0,
-        HighestQC: nil,
+		Height:    0,
+		HighestQC: nil,
 		SenderID:  vc.SenderID,
 		Timestamp: vc.Timestamp,
 		Signature: messages.Signature{Bytes: vc.Signature, KeyID: vc.SenderID, Timestamp: vc.Timestamp},
@@ -39,11 +39,11 @@ func (a *pacemakerPublisherAdapter) PublishNewView(ctx context.Context, nv *lead
 	}
 	vcl := make([]messages.ViewChange, 0, len(nv.ViewChanges))
 	for _, lvc := range nv.ViewChanges {
-        vcl = append(vcl, messages.ViewChange{
+		vcl = append(vcl, messages.ViewChange{
 			OldView:   lvc.OldView,
 			NewView:   lvc.NewView,
-            Height:    0,
-            HighestQC: nil,
+			Height:    0,
+			HighestQC: nil,
 			SenderID:  lvc.SenderID,
 			Timestamp: lvc.Timestamp,
 			Signature: messages.Signature{Bytes: lvc.Signature, KeyID: lvc.SenderID, Timestamp: lvc.Timestamp},

@@ -106,6 +106,12 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 		s.blockTimeout = 5 * time.Second
 	}
 
+	if cfg.DBAdapter != nil {
+		if persistenceWorker := s.persistWorker; persistenceWorker != nil {
+			eng.SetPersistence(persistenceWorker)
+		}
+	}
+
 	// Ensure first proposal in view 0 isn't suppressed by cooldown guard
 	s.lastProposedView = ^uint64(0)
 	s.lastProposedHeight = ^uint64(0)
@@ -447,6 +453,13 @@ func (s *Service) Stop() {
 	// This service just needs to stop its proposer loop
 
 	s.log.Info("wiring service stopped gracefully")
+}
+
+// PersistenceWorker returns the active persistence worker (if any).
+func (s *Service) PersistenceWorker() *PersistenceWorker {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.persistWorker
 }
 
 // StopWithTimeout stops the service with a timeout for graceful shutdown

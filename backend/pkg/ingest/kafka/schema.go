@@ -1,23 +1,23 @@
 package kafka
 
 import (
-    "encoding/binary"
-    "fmt"
-    "io"
+	"encoding/binary"
+	"fmt"
+	"io"
 
-    pb "backend/proto"
-    "google.golang.org/protobuf/proto"
+	pb "backend/proto"
+	"google.golang.org/protobuf/proto"
 )
 
 // Message size limits (DoS protection)
 const (
-	MaxMessageSize  = 1 * 1024 * 1024  // 1MB total message
-	MaxPayloadSize  = 512 * 1024        // 512KB payload
-	MaxProofSize    = 256 * 1024        // 256KB proof blob
-	MaxIDLength     = 128               // Max ID string length
-	MaxStringLength = 256               // Max string field length
-	MaxRefsCount    = 1000              // Max evidence references
-	MaxCoCEntries   = 100               // Max chain-of-custody entries
+	MaxMessageSize  = 1 * 1024 * 1024 // 1MB total message
+	MaxPayloadSize  = 512 * 1024      // 512KB payload
+	MaxProofSize    = 256 * 1024      // 256KB proof blob
+	MaxIDLength     = 128             // Max ID string length
+	MaxStringLength = 256             // Max string field length
+	MaxRefsCount    = 1000            // Max evidence references
+	MaxCoCEntries   = 100             // Max chain-of-custody entries
 )
 
 // AnomalyMsg represents ai.anomalies.v1 message from AI service
@@ -40,18 +40,18 @@ type AnomalyMsg struct {
 
 // EvidenceMsg represents ai.evidence.v1 message from AI service
 type EvidenceMsg struct {
-	ID           string      // Evidence unique identifier
-	EvidenceType string      // Evidence type (e.g., "pcap", "log")
-	Refs         [][32]byte  // References to related anomalies/evidence
-	ProofBlob    []byte      // Binary proof data (PCAP, logs, etc.)
-	TS           int64       // Unix timestamp (seconds)
-	ProducerID   []byte      // AI node public key (32 bytes Ed25519)
-	Nonce        []byte      // Unique nonce (16 bytes - state.NonceSize)
-	Signature    []byte      // Ed25519 signature (64 bytes)
-	PubKey       []byte      // Public key (32 bytes Ed25519)
-	Alg          string      // "Ed25519"
-	ContentHash  [32]byte    // SHA-256 of canonical content
-	CoC          []CoCEntry  // Chain-of-custody trail
+	ID           string     // Evidence unique identifier
+	EvidenceType string     // Evidence type (e.g., "pcap", "log")
+	Refs         [][32]byte // References to related anomalies/evidence
+	ProofBlob    []byte     // Binary proof data (PCAP, logs, etc.)
+	TS           int64      // Unix timestamp (seconds)
+	ProducerID   []byte     // AI node public key (32 bytes Ed25519)
+	Nonce        []byte     // Unique nonce (16 bytes - state.NonceSize)
+	Signature    []byte     // Ed25519 signature (64 bytes)
+	PubKey       []byte     // Public key (32 bytes Ed25519)
+	Alg          string     // "Ed25519"
+	ContentHash  [32]byte   // SHA-256 of canonical content
+	CoC          []CoCEntry // Chain-of-custody trail
 }
 
 // PolicyMsg represents ai.policy.v1 message from AI service
@@ -247,10 +247,10 @@ func readString(r io.Reader, maxSize int) (string, error) {
 // TODO: AI TEAM - PROTOBUF SCHEMA REQUIRED
 // ============================================================================
 // The decode functions below require .proto schema files from the AI team.
-// 
+//
 // Required files:
 //   1. ai_anomaly.proto   - Defines AnomalyEvent message structure
-//   2. ai_evidence.proto  - Defines EvidenceEvent message structure  
+//   2. ai_evidence.proto  - Defines EvidenceEvent message structure
 //   3. ai_policy.proto    - Defines PolicyEvent message structure
 //
 // Schema must include ALL fields from the structs above:
@@ -269,122 +269,122 @@ func readString(r io.Reader, maxSize int) (string, error) {
 
 // DecodeAnomalyMsg decodes ai.anomalies.v1 message from bytes
 func DecodeAnomalyMsg(data []byte) (*AnomalyMsg, error) {
-    if len(data) > MaxMessageSize {
-        return nil, fmt.Errorf("message too large: %d (max: %d)", len(data), MaxMessageSize)
-    }
+	if len(data) > MaxMessageSize {
+		return nil, fmt.Errorf("message too large: %d (max: %d)", len(data), MaxMessageSize)
+	}
 
-    p := &pb.AnomalyEvent{}
-    if err := proto.Unmarshal(data, p); err != nil {
-        return nil, fmt.Errorf("protobuf unmarshal failed: %w", err)
-    }
+	p := &pb.AnomalyEvent{}
+	if err := proto.Unmarshal(data, p); err != nil {
+		return nil, fmt.Errorf("protobuf unmarshal failed: %w", err)
+	}
 
-    var contentHash [32]byte
-    if len(p.ContentHash) == 32 {
-        copy(contentHash[:], p.ContentHash)
-    }
+	var contentHash [32]byte
+	if len(p.ContentHash) == 32 {
+		copy(contentHash[:], p.ContentHash)
+	}
 
-    msg := &AnomalyMsg{
-        ID:           p.Id,
-        Type:         p.Type,
-        Source:       p.Source,
-        Severity:     uint8(p.Severity),
-        Confidence:   p.Confidence,
-        TS:           p.Ts,
-        Payload:      p.Payload,
-        ModelVersion: p.ModelVersion,
-        ProducerID:   p.ProducerId,
-        Nonce:        p.Nonce,
-        Signature:    p.Signature,
-        PubKey:       p.Pubkey,
-        Alg:          p.Alg,
-        ContentHash:  contentHash,
-    }
-    return msg, nil
+	msg := &AnomalyMsg{
+		ID:           p.Id,
+		Type:         p.Type,
+		Source:       p.Source,
+		Severity:     uint8(p.Severity),
+		Confidence:   p.Confidence,
+		TS:           p.Ts,
+		Payload:      p.Payload,
+		ModelVersion: p.ModelVersion,
+		ProducerID:   p.ProducerId,
+		Nonce:        p.Nonce,
+		Signature:    p.Signature,
+		PubKey:       p.Pubkey,
+		Alg:          p.Alg,
+		ContentHash:  contentHash,
+	}
+	return msg, nil
 }
 
 // DecodeEvidenceMsg decodes ai.evidence.v1 message from bytes
 func DecodeEvidenceMsg(data []byte) (*EvidenceMsg, error) {
-    if len(data) > MaxMessageSize {
-        return nil, fmt.Errorf("message too large: %d (max: %d)", len(data), MaxMessageSize)
-    }
+	if len(data) > MaxMessageSize {
+		return nil, fmt.Errorf("message too large: %d (max: %d)", len(data), MaxMessageSize)
+	}
 
-    p := &pb.EvidenceEvent{}
-    if err := proto.Unmarshal(data, p); err != nil {
-        return nil, fmt.Errorf("protobuf unmarshal failed: %w", err)
-    }
+	p := &pb.EvidenceEvent{}
+	if err := proto.Unmarshal(data, p); err != nil {
+		return nil, fmt.Errorf("protobuf unmarshal failed: %w", err)
+	}
 
-    refs := make([][32]byte, len(p.Refs))
-    for i, r := range p.Refs {
-        if len(r) != 32 {
-            return nil, fmt.Errorf("invalid ref[%d] size: %d", i, len(r))
-        }
-        copy(refs[i][:], r)
-    }
+	refs := make([][32]byte, len(p.Refs))
+	for i, r := range p.Refs {
+		if len(r) != 32 {
+			return nil, fmt.Errorf("invalid ref[%d] size: %d", i, len(r))
+		}
+		copy(refs[i][:], r)
+	}
 
-    coc := make([]CoCEntry, len(p.Coc))
-    for i, e := range p.Coc {
-        var refHash [32]byte
-        if len(e.RefHash) == 32 {
-            copy(refHash[:], e.RefHash)
-        }
-        coc[i] = CoCEntry{
-            RefHash:   refHash,
-            ActorID:   e.ActorId,
-            TS:        e.Ts,
-            Signature: e.Signature,
-        }
-    }
+	coc := make([]CoCEntry, len(p.Coc))
+	for i, e := range p.Coc {
+		var refHash [32]byte
+		if len(e.RefHash) == 32 {
+			copy(refHash[:], e.RefHash)
+		}
+		coc[i] = CoCEntry{
+			RefHash:   refHash,
+			ActorID:   e.ActorId,
+			TS:        e.Ts,
+			Signature: e.Signature,
+		}
+	}
 
-    var contentHash [32]byte
-    if len(p.ContentHash) == 32 {
-        copy(contentHash[:], p.ContentHash)
-    }
+	var contentHash [32]byte
+	if len(p.ContentHash) == 32 {
+		copy(contentHash[:], p.ContentHash)
+	}
 
-    msg := &EvidenceMsg{
-        ID:           p.Id,
-        EvidenceType: p.EvidenceType,
-        Refs:         refs,
-        ProofBlob:    p.ProofBlob,
-        TS:           p.Ts,
-        ProducerID:   p.ProducerId,
-        Nonce:        p.Nonce,
-        Signature:    p.Signature,
-        PubKey:       p.Pubkey,
-        Alg:          p.Alg,
-        ContentHash:  contentHash,
-        CoC:          coc,
-    }
-    return msg, nil
+	msg := &EvidenceMsg{
+		ID:           p.Id,
+		EvidenceType: p.EvidenceType,
+		Refs:         refs,
+		ProofBlob:    p.ProofBlob,
+		TS:           p.Ts,
+		ProducerID:   p.ProducerId,
+		Nonce:        p.Nonce,
+		Signature:    p.Signature,
+		PubKey:       p.Pubkey,
+		Alg:          p.Alg,
+		ContentHash:  contentHash,
+		CoC:          coc,
+	}
+	return msg, nil
 }
 
 // DecodePolicyMsg decodes ai.policy.v1 message from bytes
 func DecodePolicyMsg(data []byte) (*PolicyMsg, error) {
-    if len(data) > MaxMessageSize {
-        return nil, fmt.Errorf("message too large: %d (max: %d)", len(data), MaxMessageSize)
-    }
+	if len(data) > MaxMessageSize {
+		return nil, fmt.Errorf("message too large: %d (max: %d)", len(data), MaxMessageSize)
+	}
 
-    p := &pb.PolicyEvent{}
-    if err := proto.Unmarshal(data, p); err != nil {
-        return nil, fmt.Errorf("protobuf unmarshal failed: %w", err)
-    }
+	p := &pb.PolicyEvent{}
+	if err := proto.Unmarshal(data, p); err != nil {
+		return nil, fmt.Errorf("protobuf unmarshal failed: %w", err)
+	}
 
-    var contentHash [32]byte
-    if len(p.ContentHash) == 32 {
-        copy(contentHash[:], p.ContentHash)
-    }
+	var contentHash [32]byte
+	if len(p.ContentHash) == 32 {
+		copy(contentHash[:], p.ContentHash)
+	}
 
-    msg := &PolicyMsg{
-        ID:          p.Id,
-        Action:      p.Action,
-        Rule:        p.Rule,
-        Params:      p.Params,
-        TS:          p.Ts,
-        ProducerID:  p.ProducerId,
-        Nonce:       p.Nonce,
-        Signature:   p.Signature,
-        PubKey:      p.Pubkey,
-        Alg:         p.Alg,
-        ContentHash: contentHash,
-    }
-    return msg, nil
+	msg := &PolicyMsg{
+		ID:          p.Id,
+		Action:      p.Action,
+		Rule:        p.Rule,
+		Params:      p.Params,
+		TS:          p.Ts,
+		ProducerID:  p.ProducerId,
+		Nonce:       p.Nonce,
+		Signature:   p.Signature,
+		PubKey:      p.Pubkey,
+		Alg:         p.Alg,
+		ContentHash: contentHash,
+	}
+	return msg, nil
 }

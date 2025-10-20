@@ -55,8 +55,8 @@ type PersistenceWorker struct {
 	wg         sync.WaitGroup
 	mu         sync.RWMutex
 	running    bool
-	taskCount  uint64 // Total tasks received
-	errorCount uint64 // Total errors
+	taskCount  uint64                     // Total tasks received
+	errorCount uint64                     // Total errors
 	onSuccess  PersistenceSuccessCallback // Callback after successful persistence
 }
 
@@ -196,43 +196,43 @@ func (pw *PersistenceWorker) workerLoop(ctx context.Context, workerID int) {
 			utils.ZapInt("worker_id", workerID))
 	}
 
-    for {
-        select {
-        case <-pw.stopCh:
-            if pw.logger != nil {
-                pw.logger.InfoContext(ctx, "persistence worker draining queue before stop",
-                    utils.ZapInt("worker_id", workerID))
-            }
-            // Best-effort drain without blocking
-            drainStart := time.Now()
-            drained := 0
-            for {
-                select {
-                case task := <-pw.queue:
-                    if task == nil {
-                        if pw.logger != nil {
-                            pw.logger.WarnContext(ctx, "persistence worker queue closed during drain",
-                                utils.ZapInt("worker_id", workerID))
-                        }
-                        return
-                    }
-                    pw.processTask(ctx, task)
-                    drained++
-                default:
-                    if pw.logger != nil {
-                        pw.logger.InfoContext(ctx, "persistence worker drained queue",
-                            utils.ZapInt("worker_id", workerID),
-                            utils.ZapInt("drained", drained),
-                            utils.ZapDuration("duration", time.Since(drainStart)))
-                    }
-                    return
-                }
-            }
+	for {
+		select {
+		case <-pw.stopCh:
+			if pw.logger != nil {
+				pw.logger.InfoContext(ctx, "persistence worker draining queue before stop",
+					utils.ZapInt("worker_id", workerID))
+			}
+			// Best-effort drain without blocking
+			drainStart := time.Now()
+			drained := 0
+			for {
+				select {
+				case task := <-pw.queue:
+					if task == nil {
+						if pw.logger != nil {
+							pw.logger.WarnContext(ctx, "persistence worker queue closed during drain",
+								utils.ZapInt("worker_id", workerID))
+						}
+						return
+					}
+					pw.processTask(ctx, task)
+					drained++
+				default:
+					if pw.logger != nil {
+						pw.logger.InfoContext(ctx, "persistence worker drained queue",
+							utils.ZapInt("worker_id", workerID),
+							utils.ZapInt("drained", drained),
+							utils.ZapDuration("duration", time.Since(drainStart)))
+					}
+					return
+				}
+			}
 
-        case task := <-pw.queue:
-            pw.processTask(ctx, task)
-        }
-    }
+		case task := <-pw.queue:
+			pw.processTask(ctx, task)
+		}
+	}
 }
 
 // processTask processes a single persistence task with exponential backoff retry

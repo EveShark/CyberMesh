@@ -520,7 +520,7 @@ func (c *ConsensusConfig) VerifyHeartbeat(ctx context.Context, heartbeatData, si
 	if c.CryptoService == nil {
 		return utils.NewError(utils.CodeInternal, "crypto service not configured")
 	}
-	return c.CryptoService.VerifyWithContext(ctx, heartbeatData, signature, peerPubKey)
+	return c.CryptoService.VerifyWithContext(ctx, heartbeatData, signature, peerPubKey, false)
 }
 
 // AuditByzantineDetection logs Byzantine behavior detection

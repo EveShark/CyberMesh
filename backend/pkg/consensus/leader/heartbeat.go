@@ -11,13 +11,15 @@ import (
 
 // HeartbeatManager handles leader liveness via periodic heartbeats
 type HeartbeatManager struct {
-	rotation  *Rotation
-	pacemaker *Pacemaker
-	crypto    CryptoService
-	config    *HeartbeatConfig
-	audit     AuditLogger
-	logger    Logger
-	publisher HeartbeatPublisher
+	rotation        *Rotation
+	pacemaker       *Pacemaker
+	crypto          CryptoService
+	config          *HeartbeatConfig
+	audit           AuditLogger
+	logger          Logger
+	publisher       HeartbeatPublisher
+	controller      HeartbeatController
+	listenerStarted bool
 
 	// Liveness tracking
 	lastHeartbeat time.Time
@@ -33,6 +35,17 @@ type HeartbeatManager struct {
 	stopCh    chan struct{}
 	callbacks HeartbeatCallbacks
 }
+
+// HeartbeatController allows external control over heartbeat behavior lifecycle.
+type HeartbeatController interface {
+	ShouldStartListener() bool
+	ShouldStartSender() bool
+}
+
+type noopHeartbeatController struct{}
+
+func (noopHeartbeatController) ShouldStartListener() bool { return true }
+func (noopHeartbeatController) ShouldStartSender() bool   { return true }
 
 // HeartbeatConfig contains heartbeat parameters
 type HeartbeatConfig struct {
@@ -80,9 +93,13 @@ func NewHeartbeatManager(
 	config *HeartbeatConfig,
 	callbacks HeartbeatCallbacks,
 	publisher HeartbeatPublisher,
+	controller HeartbeatController,
 ) *HeartbeatManager {
 	if config == nil {
 		config = DefaultHeartbeatConfig()
+	}
+	if controller == nil {
+		controller = noopHeartbeatController{}
 	}
 
 	return &HeartbeatManager{
@@ -93,6 +110,7 @@ func NewHeartbeatManager(
 		audit:         audit,
 		logger:        logger,
 		publisher:     publisher,
+		controller:    controller,
 		lastHeartbeat: time.Now(),
 		lastProposal:  time.Time{},
 		stopCh:        make(chan struct{}),
@@ -105,12 +123,24 @@ func (hm *HeartbeatManager) Start(ctx context.Context) error {
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
 
+	if hm.controller != nil && !hm.controller.ShouldStartListener() {
+		hm.logger.InfoContext(ctx, "heartbeat listener disabled by controller")
+		return nil
+	}
+
+	if hm.listenerStarted {
+		hm.logger.DebugContext(ctx, "heartbeat manager already started")
+		return nil
+	}
+
+	hm.stopCh = make(chan struct{})
+
 	hm.logger.InfoContext(ctx, "starting heartbeat manager",
 		"send_interval", hm.config.SendInterval,
 		"max_idle_time", hm.config.MaxIdleTime,
 	)
 
-	// Start sender if enabled (for leaders)
+	// Start sender ticker if enabled (controller decides when to emit)
 	if hm.config.EnableSending {
 		hm.sendTicker = time.NewTicker(hm.config.SendInterval)
 		go hm.runSender(ctx)
@@ -122,6 +152,8 @@ func (hm *HeartbeatManager) Start(ctx context.Context) error {
 		go hm.runChecker(ctx)
 	}
 
+	hm.listenerStarted = true
+
 	return nil
 }
 
@@ -130,7 +162,9 @@ func (hm *HeartbeatManager) Stop() error {
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
 
-	close(hm.stopCh)
+	if hm.stopCh != nil {
+		close(hm.stopCh)
+	}
 
 	if hm.sendTicker != nil {
 		hm.sendTicker.Stop()
@@ -138,6 +172,11 @@ func (hm *HeartbeatManager) Stop() error {
 	if hm.checkTicker != nil {
 		hm.checkTicker.Stop()
 	}
+
+	hm.listenerStarted = false
+	hm.sendTicker = nil
+	hm.checkTicker = nil
+	hm.stopCh = nil
 
 	return nil
 }
@@ -149,6 +188,9 @@ func (hm *HeartbeatManager) runSender(ctx context.Context) {
 		case <-hm.stopCh:
 			return
 		case <-hm.sendTicker.C:
+			if hm.controller != nil && !hm.controller.ShouldStartSender() {
+				continue
+			}
 			if err := hm.sendHeartbeat(ctx); err != nil {
 				hm.logger.ErrorContext(ctx, "failed to send heartbeat",
 					"error", err,

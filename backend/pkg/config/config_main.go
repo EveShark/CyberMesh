@@ -214,7 +214,7 @@ func NewSecureTokenManager(ctx context.Context) (*SecureTokenManager, error) {
 		AutoRotate:             false,
 		EnableReplayProtection: true,
 		ReplayWindowSize:       10000,
-		MaxSignatureAge:        5 * time.Minute,
+		MaxSignatureAge:        24 * time.Hour,
 		EnableAuditLog:         auditLogger != nil,
 	}
 

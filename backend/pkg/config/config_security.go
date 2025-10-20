@@ -576,7 +576,7 @@ func (c *SecurityConfig) VerifySignature(ctx context.Context, data, signature []
 	if c.CryptoService == nil {
 		return utils.NewError(utils.CodeInternal, "crypto service not configured")
 	}
-	return c.CryptoService.VerifyWithContext(ctx, data, signature, pubKey)
+	return c.CryptoService.VerifyWithContext(ctx, data, signature, pubKey, false)
 }
 
 // ValidateAddress validates an address against the IP allowlist

@@ -136,7 +136,7 @@ func DefaultEncoderConfig() *EncoderConfig {
 		MaxProposalIntentSize:     4 << 10,   // 4 KB
 		MaxReadyToVoteSize:        4 << 10,   // 4 KB
 		ClockSkewTolerance:        5 * time.Second,
-		GenesisClockSkewTolerance: 15 * time.Minute,
+		GenesisClockSkewTolerance: 24 * time.Hour,
 		VerifyCacheSize:           10000,
 		VerifyCacheTTL:            5 * time.Minute,
 		RejectFutureMessages:      true,
@@ -419,7 +419,7 @@ func (e *Encoder) verifyMessage(ctx context.Context, msg types.Message) error {
 		}
 		e.mu.RUnlock()
 	}
-	if err := e.crypto.VerifyWithContext(ctx, signBytes, sig, publicKey); err != nil {
+	if err := e.crypto.VerifyWithContext(ctx, signBytes, sig, publicKey, false); err != nil {
 		return fmt.Errorf("invalid signature: %w", err)
 	}
 
@@ -589,7 +589,7 @@ func (e *Encoder) VerifyQC(ctx context.Context, qc *QC) error {
 		}
 		e.mu.RUnlock()
 
-		if err := e.crypto.VerifyWithContext(ctx, voteBytes, sig.Bytes, publicKey); err != nil {
+		if err := e.crypto.VerifyWithContext(ctx, voteBytes, sig.Bytes, publicKey, false); err != nil {
 			return fmt.Errorf("QC signature %d invalid for validator %x: %w", idx, sig.KeyID[:8], err)
 		}
 

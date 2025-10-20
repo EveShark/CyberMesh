@@ -1,19 +1,20 @@
 package cockroach
 
 import (
-    "context"
-    "database/sql"
-    "encoding/json"
-    "errors"
-    "fmt"
-    "strings"
-    "time"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
 
-    "backend/pkg/block"
-    "backend/pkg/state"
-    "backend/pkg/utils"
-    "github.com/jackc/pgconn"
-    "github.com/lib/pq"
+	"backend/pkg/block"
+	"backend/pkg/consensus/types"
+	"backend/pkg/state"
+	"backend/pkg/utils"
+	"github.com/jackc/pgconn"
+	"github.com/lib/pq"
 )
 
 // Storage errors
@@ -45,6 +46,25 @@ type Adapter interface {
 	// ListTransactionsByBlock returns lightweight transaction metadata for a block
 	ListTransactionsByBlock(ctx context.Context, height uint64) ([]TxMeta, error)
 
+	// Consensus persistence operations (adapter satisfies types.StorageBackend)
+	SaveProposal(ctx context.Context, hash []byte, height uint64, view uint64, proposer []byte, data []byte) error
+	LoadProposal(ctx context.Context, hash []byte) ([]byte, error)
+	ListProposals(ctx context.Context, minHeight uint64, limit int) ([]types.ProposalRecord, error)
+	SaveQC(ctx context.Context, hash []byte, height uint64, view uint64, data []byte) error
+	LoadQC(ctx context.Context, hash []byte) ([]byte, error)
+	ListQCs(ctx context.Context, minHeight uint64, limit int) ([]types.QCRecord, error)
+	SaveVote(ctx context.Context, view uint64, height uint64, voter []byte, blockHash []byte, voteHash []byte, data []byte) error
+	ListVotes(ctx context.Context, minHeight uint64, limit int) ([]types.VoteRecord, error)
+	SaveEvidence(ctx context.Context, hash []byte, height uint64, data []byte) error
+	LoadEvidence(ctx context.Context, hash []byte) ([]byte, error)
+	ListEvidence(ctx context.Context, minHeight uint64, limit int) ([]types.EvidenceRecord, error)
+	SaveCommittedBlock(ctx context.Context, height uint64, hash []byte, qc []byte) error
+	LoadLastCommitted(ctx context.Context) (uint64, []byte, []byte, error)
+	LoadGenesisCertificate(ctx context.Context) ([]byte, bool, error)
+	SaveGenesisCertificate(ctx context.Context, data []byte) error
+	DeleteGenesisCertificate(ctx context.Context) error
+	DeleteBefore(ctx context.Context, height uint64) error
+
 	// Ping checks database liveness
 	Ping(ctx context.Context) error
 
@@ -53,37 +73,37 @@ type Adapter interface {
 }
 
 func isUniqueViolation(err error, constraint string) bool {
-    // lib/pq error
-    var pqErr *pq.Error
-    if errors.As(err, &pqErr) {
-        if string(pqErr.Code) != "23505" {
-            return false
-        }
-        if constraint == "" {
-            return true
-        }
-        return pqErr.Constraint == constraint
-    }
-    // pgx/pgconn error
-    var pgErr *pgconn.PgError
-    if errors.As(err, &pgErr) {
-        if pgErr.Code != "23505" {
-            return false
-        }
-        if constraint == "" {
-            return true
-        }
-        return pgErr.ConstraintName == constraint
-    }
-    // Fallback: message contains SQLSTATE 23505 or duplicate key text
-    msg := err.Error()
-    if strings.Contains(msg, "SQLSTATE 23505") || strings.Contains(strings.ToLower(msg), "duplicate key value violates unique constraint") {
-        if constraint == "" {
-            return true
-        }
-        return strings.Contains(msg, constraint)
-    }
-    return false
+	// lib/pq error
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		if string(pqErr.Code) != "23505" {
+			return false
+		}
+		if constraint == "" {
+			return true
+		}
+		return pqErr.Constraint == constraint
+	}
+	// pgx/pgconn error
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		if pgErr.Code != "23505" {
+			return false
+		}
+		if constraint == "" {
+			return true
+		}
+		return pgErr.ConstraintName == constraint
+	}
+	// Fallback: message contains SQLSTATE 23505 or duplicate key text
+	msg := err.Error()
+	if strings.Contains(msg, "SQLSTATE 23505") || strings.Contains(strings.ToLower(msg), "duplicate key value violates unique constraint") {
+		if constraint == "" {
+			return true
+		}
+		return strings.Contains(msg, constraint)
+	}
+	return false
 }
 
 // adapter implements the Adapter interface
@@ -97,6 +117,29 @@ type adapter struct {
 	stmtGetTxByHash *sql.Stmt
 	stmtGetSnapshot *sql.Stmt
 	stmtListTxByBlk *sql.Stmt
+
+	// Consensus persistence prepared statements
+	stmtUpsertProposal        *sql.Stmt
+	stmtGetProposal           *sql.Stmt
+	stmtListProposals         *sql.Stmt
+	stmtUpsertQC              *sql.Stmt
+	stmtGetQC                 *sql.Stmt
+	stmtListQCs               *sql.Stmt
+	stmtUpsertVote            *sql.Stmt
+	stmtListVotes             *sql.Stmt
+	stmtUpsertEvidence        *sql.Stmt
+	stmtGetEvidence           *sql.Stmt
+	stmtListEvidence          *sql.Stmt
+	stmtUpsertMeta            *sql.Stmt
+	stmtGetMeta               *sql.Stmt
+	stmtGetCommitted          *sql.Stmt
+	stmtLoadGenesisCert       *sql.Stmt
+	stmtUpsertGenesisCert     *sql.Stmt
+	stmtDeleteGenesisCert     *sql.Stmt
+	stmtDeleteProposalsBefore *sql.Stmt
+	stmtDeleteVotesBefore     *sql.Stmt
+	stmtDeleteQCsBefore       *sql.Stmt
+	stmtDeleteEvidenceBefore  *sql.Stmt
 }
 
 // AdapterConfig holds configuration for the adapter
@@ -177,6 +220,193 @@ func (a *adapter) prepareStatements(ctx context.Context) error {
 	`)
 	if err != nil {
 		return fmt.Errorf("prepare list tx by block: %w", err)
+	}
+
+	// Consensus persistence statements
+	a.stmtUpsertProposal, err = a.db.PrepareContext(ctx, `
+		UPSERT INTO consensus_proposals (block_hash, height, view_number, proposer_id, proposal_cbor)
+		VALUES ($1, $2, $3, $4, $5)
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare upsert proposal: %w", err)
+	}
+
+	a.stmtGetProposal, err = a.db.PrepareContext(ctx, `
+		SELECT proposal_cbor
+		FROM consensus_proposals
+		WHERE block_hash = $1
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare get proposal: %w", err)
+	}
+
+	a.stmtListProposals, err = a.db.PrepareContext(ctx, `
+		SELECT block_hash, height, view_number, proposer_id, proposal_cbor
+		FROM consensus_proposals
+		WHERE height >= $1
+		ORDER BY height ASC
+		LIMIT $2
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare list proposals: %w", err)
+	}
+
+	a.stmtUpsertQC, err = a.db.PrepareContext(ctx, `
+		UPSERT INTO consensus_qcs (block_hash, height, view_number, qc_cbor)
+		VALUES ($1, $2, $3, $4)
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare upsert qc: %w", err)
+	}
+
+	a.stmtGetQC, err = a.db.PrepareContext(ctx, `
+		SELECT qc_cbor
+		FROM consensus_qcs
+		WHERE block_hash = $1
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare get qc: %w", err)
+	}
+
+	a.stmtListQCs, err = a.db.PrepareContext(ctx, `
+		SELECT block_hash, height, view_number, qc_cbor
+		FROM consensus_qcs
+		WHERE height >= $1
+		ORDER BY height ASC
+		LIMIT $2
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare list qcs: %w", err)
+	}
+
+	a.stmtUpsertVote, err = a.db.PrepareContext(ctx, `
+		UPSERT INTO consensus_votes (vote_hash, view_number, height, voter_id, block_hash, vote_cbor)
+		VALUES ($1, $2, $3, $4, $5, $6)
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare upsert vote: %w", err)
+	}
+
+	a.stmtListVotes, err = a.db.PrepareContext(ctx, `
+		SELECT vote_hash, view_number, height, voter_id, block_hash, vote_cbor
+		FROM consensus_votes
+		WHERE height >= $1
+		ORDER BY height ASC
+		LIMIT $2
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare list votes: %w", err)
+	}
+
+	a.stmtUpsertEvidence, err = a.db.PrepareContext(ctx, `
+		UPSERT INTO consensus_evidence (evidence_hash, height, evidence_cbor)
+		VALUES ($1, $2, $3)
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare upsert evidence: %w", err)
+	}
+
+	a.stmtGetEvidence, err = a.db.PrepareContext(ctx, `
+		SELECT evidence_cbor
+		FROM consensus_evidence
+		WHERE evidence_hash = $1
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare get evidence: %w", err)
+	}
+
+	a.stmtListEvidence, err = a.db.PrepareContext(ctx, `
+		SELECT evidence_hash, height, evidence_cbor
+		FROM consensus_evidence
+		WHERE height >= $1
+		ORDER BY height ASC
+		LIMIT $2
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare list evidence: %w", err)
+	}
+
+	a.stmtLoadGenesisCert, err = a.db.PrepareContext(ctx, `
+		SELECT certificate
+		FROM genesis_certificates
+		ORDER BY created_at DESC
+		LIMIT 1
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare load genesis certificate: %w", err)
+	}
+
+	a.stmtUpsertGenesisCert, err = a.db.PrepareContext(ctx, `
+		UPSERT INTO genesis_certificates (id, certificate)
+		VALUES (1, $1)
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare upsert genesis certificate: %w", err)
+	}
+
+	a.stmtDeleteGenesisCert, err = a.db.PrepareContext(ctx, `
+		DELETE FROM genesis_certificates WHERE id = 1
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare delete genesis certificate: %w", err)
+	}
+
+	a.stmtUpsertMeta, err = a.db.PrepareContext(ctx, `
+		UPSERT INTO consensus_metadata (key, height, block_hash, qc_cbor, updated_at)
+		VALUES ('last_committed', $1, $2, $3, NOW())
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare upsert metadata: %w", err)
+	}
+
+	a.stmtGetMeta, err = a.db.PrepareContext(ctx, `
+		SELECT height, block_hash, qc_cbor
+		FROM consensus_metadata
+		WHERE key = 'last_committed'
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare get metadata: %w", err)
+	}
+
+	a.stmtGetCommitted, err = a.db.PrepareContext(ctx, `
+		SELECT block_hash
+		FROM consensus_metadata
+		WHERE key = 'committed_' || $1::TEXT
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare get committed hash: %w", err)
+	}
+
+	a.stmtDeleteProposalsBefore, err = a.db.PrepareContext(ctx, `
+		DELETE FROM consensus_proposals
+		WHERE height < $1
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare delete proposals before: %w", err)
+	}
+
+	a.stmtDeleteVotesBefore, err = a.db.PrepareContext(ctx, `
+		DELETE FROM consensus_votes
+		WHERE height < $1
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare delete votes before: %w", err)
+	}
+
+	a.stmtDeleteQCsBefore, err = a.db.PrepareContext(ctx, `
+		DELETE FROM consensus_qcs
+		WHERE height < $1
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare delete qcs before: %w", err)
+	}
+
+	a.stmtDeleteEvidenceBefore, err = a.db.PrepareContext(ctx, `
+		DELETE FROM consensus_evidence
+		WHERE height < $1
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare delete evidence before: %w", err)
 	}
 
 	return nil
@@ -390,7 +620,7 @@ func (a *adapter) upsertTransactions(ctx context.Context, tx *sql.Tx, blk *block
 			}
 		}
 
-        // Determine status from receipt
+		// Determine status from receipt
 		status := "success"
 		errorMsg := ""
 		if receipt.Error != "" {
@@ -398,26 +628,26 @@ func (a *adapter) upsertTransactions(ctx context.Context, tx *sql.Tx, blk *block
 			errorMsg = receipt.Error
 		}
 
-        // Compute stable transaction ID from envelope sign-bytes (prevents collisions on identical payloads)
-        contentHash := envelope.ContentHash
-        var domain string
-        switch stateTx.Type() {
-        case state.TxEvent:
-            domain = state.DomainEventTx
-        case state.TxEvidence:
-            domain = state.DomainEvidenceTx
-        case state.TxPolicy:
-            domain = state.DomainPolicyTx
-        default:
-            return fmt.Errorf("%w: unknown tx type %q", ErrInvalidData, stateTx.Type())
-        }
-        signBytes, err := state.BuildSignBytes(domain, stateTx.Timestamp(), envelope.ProducerID, envelope.Nonce, contentHash)
-        if err != nil {
-            return fmt.Errorf("build tx id: %w", err)
-        }
-        txHash := state.HashBytes(signBytes)
+		// Compute stable transaction ID from envelope sign-bytes (prevents collisions on identical payloads)
+		contentHash := envelope.ContentHash
+		var domain string
+		switch stateTx.Type() {
+		case state.TxEvent:
+			domain = state.DomainEventTx
+		case state.TxEvidence:
+			domain = state.DomainEvidenceTx
+		case state.TxPolicy:
+			domain = state.DomainPolicyTx
+		default:
+			return fmt.Errorf("%w: unknown tx type %q", ErrInvalidData, stateTx.Type())
+		}
+		signBytes, err := state.BuildSignBytes(domain, stateTx.Timestamp(), envelope.ProducerID, envelope.Nonce, contentHash)
+		if err != nil {
+			return fmt.Errorf("build tx id: %w", err)
+		}
+		txHash := state.HashBytes(signBytes)
 
-        // Try INSERT with conflict-avoidance to keep transaction alive
+		// Try INSERT with conflict-avoidance to keep transaction alive
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO transactions (
 				tx_hash, block_height, tx_index, tx_type, producer_id, nonce, content_hash,
@@ -426,7 +656,7 @@ func (a *adapter) upsertTransactions(ctx context.Context, tx *sql.Tx, blk *block
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW())
 			ON CONFLICT (tx_hash) DO NOTHING
 		`,
-            txHash[:],
+			txHash[:],
 			blk.GetHeight(),
 			i,
 			string(stateTx.Type()),
@@ -737,6 +967,69 @@ func (a *adapter) Close() error {
 	}
 	if a.stmtListTxByBlk != nil {
 		a.stmtListTxByBlk.Close()
+	}
+	if a.stmtUpsertProposal != nil {
+		a.stmtUpsertProposal.Close()
+	}
+	if a.stmtGetProposal != nil {
+		a.stmtGetProposal.Close()
+	}
+	if a.stmtListProposals != nil {
+		a.stmtListProposals.Close()
+	}
+	if a.stmtUpsertQC != nil {
+		a.stmtUpsertQC.Close()
+	}
+	if a.stmtGetQC != nil {
+		a.stmtGetQC.Close()
+	}
+	if a.stmtListQCs != nil {
+		a.stmtListQCs.Close()
+	}
+	if a.stmtUpsertVote != nil {
+		a.stmtUpsertVote.Close()
+	}
+	if a.stmtListVotes != nil {
+		a.stmtListVotes.Close()
+	}
+	if a.stmtUpsertEvidence != nil {
+		a.stmtUpsertEvidence.Close()
+	}
+	if a.stmtGetEvidence != nil {
+		a.stmtGetEvidence.Close()
+	}
+	if a.stmtListEvidence != nil {
+		a.stmtListEvidence.Close()
+	}
+	if a.stmtUpsertMeta != nil {
+		a.stmtUpsertMeta.Close()
+	}
+	if a.stmtGetMeta != nil {
+		a.stmtGetMeta.Close()
+	}
+	if a.stmtGetCommitted != nil {
+		a.stmtGetCommitted.Close()
+	}
+	if a.stmtLoadGenesisCert != nil {
+		a.stmtLoadGenesisCert.Close()
+	}
+	if a.stmtUpsertGenesisCert != nil {
+		a.stmtUpsertGenesisCert.Close()
+	}
+	if a.stmtDeleteGenesisCert != nil {
+		a.stmtDeleteGenesisCert.Close()
+	}
+	if a.stmtDeleteProposalsBefore != nil {
+		a.stmtDeleteProposalsBefore.Close()
+	}
+	if a.stmtDeleteVotesBefore != nil {
+		a.stmtDeleteVotesBefore.Close()
+	}
+	if a.stmtDeleteQCsBefore != nil {
+		a.stmtDeleteQCsBefore.Close()
+	}
+	if a.stmtDeleteEvidenceBefore != nil {
+		a.stmtDeleteEvidenceBefore.Close()
 	}
 
 	// Close database connection

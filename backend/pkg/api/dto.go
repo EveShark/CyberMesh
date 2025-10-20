@@ -53,6 +53,7 @@ type ReadinessResponse struct {
 	Checks    map[string]string      `json:"checks"`
 	Timestamp int64                  `json:"timestamp"`
 	Details   map[string]interface{} `json:"details,omitempty"`
+	Phase     string                 `json:"phase,omitempty"`
 }
 
 // Block DTOs
@@ -108,14 +109,14 @@ type StateRootResponse struct {
 
 // ValidatorResponse represents a validator
 type ValidatorResponse struct {
-	ID                string  `json:"id"`
-	PublicKey         string  `json:"public_key"`
-	VotingPower       int64   `json:"voting_power"`
-	Status            string  `json:"status"`
-	ProposedBlocks    uint64  `json:"proposed_blocks,omitempty"`
-	UptimePercentage  float64 `json:"uptime_percentage,omitempty"`
-	LastActiveHeight  uint64  `json:"last_active_height,omitempty"`
-	JoinedAtHeight    uint64  `json:"joined_at_height,omitempty"`
+	ID               string  `json:"id"`
+	PublicKey        string  `json:"public_key"`
+	VotingPower      int64   `json:"voting_power"`
+	Status           string  `json:"status"`
+	ProposedBlocks   uint64  `json:"proposed_blocks,omitempty"`
+	UptimePercentage float64 `json:"uptime_percentage,omitempty"`
+	LastActiveHeight uint64  `json:"last_active_height,omitempty"`
+	JoinedAtHeight   uint64  `json:"joined_at_height,omitempty"`
 }
 
 // ValidatorListResponse represents a list of validators
@@ -161,22 +162,22 @@ type MempoolStats struct {
 
 // NetworkStats represents network statistics
 type NetworkStats struct {
-	PeerCount      int     `json:"peer_count"`
-	InboundPeers   int     `json:"inbound_peers"`
-	OutboundPeers  int     `json:"outbound_peers"`
-	BytesReceived  uint64  `json:"bytes_received"`
-	BytesSent      uint64  `json:"bytes_sent"`
-	AvgLatencyMs   float64 `json:"avg_latency_ms,omitempty"`
+	PeerCount     int     `json:"peer_count"`
+	InboundPeers  int     `json:"inbound_peers"`
+	OutboundPeers int     `json:"outbound_peers"`
+	BytesReceived uint64  `json:"bytes_received"`
+	BytesSent     uint64  `json:"bytes_sent"`
+	AvgLatencyMs  float64 `json:"avg_latency_ms,omitempty"`
 }
 
 // Request parameter DTOs
 
 // BlockQueryParams represents block query parameters
 type BlockQueryParams struct {
-	Height      *uint64 // specific height
-	IncludeTxs  bool    // include transaction details
-	Start       uint64  // range query start
-	Limit       int     // range query limit (max 100)
+	Height     *uint64 // specific height
+	IncludeTxs bool    // include transaction details
+	Start      uint64  // range query start
+	Limit      int     // range query limit (max 100)
 }
 
 // StateQueryParams represents state query parameters

@@ -68,10 +68,10 @@ type TxRow struct {
 
 // TxMeta is a lightweight projection for transaction listings
 type TxMeta struct {
-    TxHash    []byte
-    TxIndex   int
-    TxType    string
-    SizeBytes int
+	TxHash    []byte
+	TxIndex   int
+	TxType    string
+	SizeBytes int
 }
 
 // SnapshotRow represents a row in the state_versions table

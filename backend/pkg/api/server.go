@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
-    consapi "backend/pkg/consensus/api"
 	"backend/pkg/config"
+	consapi "backend/pkg/consensus/api"
 	"backend/pkg/mempool"
 	"backend/pkg/p2p"
 	"backend/pkg/state"
@@ -23,23 +23,23 @@ import (
 
 // Server provides read-only API access to backend state
 type Server struct {
-	config      *config.APIConfig
-	logger      *utils.Logger
-	audit       *utils.AuditLogger
-	httpServer  *http.Server
-	
+	config     *config.APIConfig
+	logger     *utils.Logger
+	audit      *utils.AuditLogger
+	httpServer *http.Server
+
 	// Backend components
 	storage    cockroach.Adapter
 	stateStore state.StateStore
 	mempool    *mempool.Mempool
-    engine     *consapi.ConsensusEngine
+	engine     *consapi.ConsensusEngine
 	p2pRouter  *p2p.Router
 
 	// Middleware components
 	rateLimiter *RateLimiter
 	ipAllowlist *utils.IPAllowlist
-    sem         chan struct{}
-	
+	sem         chan struct{}
+
 	// State
 	running   atomic.Bool
 	closeOnce sync.Once
@@ -55,7 +55,7 @@ type Dependencies struct {
 	Storage     cockroach.Adapter
 	StateStore  state.StateStore
 	Mempool     *mempool.Mempool
-    Engine      *consapi.ConsensusEngine
+	Engine      *consapi.ConsensusEngine
 	P2PRouter   *p2p.Router
 }
 
@@ -86,15 +86,15 @@ func NewServer(deps Dependencies) (*Server, error) {
 	}
 
 	s := &Server{
-		config:      deps.Config,
-		logger:      deps.Logger,
-		audit:       deps.AuditLogger,
-		storage:     deps.Storage,
-		stateStore:  deps.StateStore,
-		mempool:     deps.Mempool,
-        engine:      deps.Engine,
-		p2pRouter:   deps.P2PRouter,
-		stopCh:      make(chan struct{}),
+		config:     deps.Config,
+		logger:     deps.Logger,
+		audit:      deps.AuditLogger,
+		storage:    deps.Storage,
+		stateStore: deps.StateStore,
+		mempool:    deps.Mempool,
+		engine:     deps.Engine,
+		p2pRouter:  deps.P2PRouter,
+		stopCh:     make(chan struct{}),
 	}
 
 	// Initialize rate limiter if enabled
@@ -111,7 +111,7 @@ func NewServer(deps Dependencies) (*Server, error) {
 		allowlistCfg := utils.DefaultIPAllowlistConfig()
 		allowlistCfg.AllowedCIDRs = deps.Config.IPAllowlist
 		allowlistCfg.Logger = deps.Logger
-		
+
 		var err error
 		s.ipAllowlist, err = utils.NewIPAllowlist(allowlistCfg)
 		if err != nil {
@@ -124,10 +124,10 @@ func NewServer(deps Dependencies) (*Server, error) {
 				utils.ZapBool("dns_disabled", allowlistCfg.DisableDNS))
 		}
 
-    // Initialize concurrency limiter
-    if deps.Config.MaxConcurrentReqs > 0 {
-        s.sem = make(chan struct{}, deps.Config.MaxConcurrentReqs)
-    }
+		// Initialize concurrency limiter
+		if deps.Config.MaxConcurrentReqs > 0 {
+			s.sem = make(chan struct{}, deps.Config.MaxConcurrentReqs)
+		}
 	}
 
 	// Create HTTP server
@@ -162,7 +162,7 @@ func (s *Server) createHTTPServer() error {
 		WriteTimeout:   s.config.WriteTimeout,
 		IdleTimeout:    s.config.IdleTimeout,
 		MaxHeaderBytes: s.config.MaxHeaderSize,
-		
+
 		// Security settings
 		ReadHeaderTimeout: 10 * time.Second,
 	}
@@ -203,7 +203,7 @@ func (s *Server) buildTLSConfig() (*tls.Config, error) {
 		}
 
 		tlsConfig.ClientCAs = clientCAPool
-		
+
 		// Require client certificates if RBAC enabled
 		if s.config.RBACEnabled {
 			tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
@@ -230,7 +230,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		
+
 		var err error
 		if s.config.TLSEnabled {
 			s.logger.Info("starting HTTPS server",
@@ -258,10 +258,10 @@ func (s *Server) Start(ctx context.Context) error {
 	// Audit server start
 	if s.audit != nil {
 		s.audit.Log("api.server.started", utils.AuditInfo, map[string]interface{}{
-			"listen_addr":   s.config.ListenAddr,
-			"tls_enabled":   s.config.TLSEnabled,
-			"rbac_enabled":  s.config.RBACEnabled,
-			"environment":   s.config.Environment,
+			"listen_addr":  s.config.ListenAddr,
+			"tls_enabled":  s.config.TLSEnabled,
+			"rbac_enabled": s.config.RBACEnabled,
+			"environment":  s.config.Environment,
 		})
 	}
 
@@ -271,7 +271,7 @@ func (s *Server) Start(ctx context.Context) error {
 // Stop gracefully stops the API server
 func (s *Server) Stop() error {
 	var stopErr error
-	
+
 	s.closeOnce.Do(func() {
 		if !s.running.Load() {
 			return
@@ -317,7 +317,7 @@ func (s *Server) IsRunning() bool {
 // GetMetrics returns server metrics
 func (s *Server) GetMetrics() map[string]interface{} {
 	metrics := make(map[string]interface{})
-	
+
 	metrics["running"] = s.running.Load()
 	metrics["listen_addr"] = s.config.ListenAddr
 

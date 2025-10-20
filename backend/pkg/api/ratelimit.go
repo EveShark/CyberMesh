@@ -67,11 +67,11 @@ func (rl *RateLimiter) Allow(clientID string) (bool, int64) {
 	// Check if request allowed
 	if bucket.tokens >= 1.0 {
 		bucket.tokens -= 1.0
-		
+
 		// Calculate reset time (when bucket will be full)
 		secondsUntilFull := (bucket.capacity - bucket.tokens) / bucket.refill
 		resetTime := now.Add(time.Duration(secondsUntilFull) * time.Second).Unix()
-		
+
 		return true, resetTime
 	}
 
@@ -88,9 +88,9 @@ func (rl *RateLimiter) GetMetrics() map[string]interface{} {
 	defer rl.mu.RUnlock()
 
 	return map[string]interface{}{
-		"tracked_clients": len(rl.buckets),
+		"tracked_clients":     len(rl.buckets),
 		"requests_per_minute": rl.config.RequestsPerMinute,
-		"burst": rl.config.Burst,
+		"burst":               rl.config.Burst,
 	}
 }
 

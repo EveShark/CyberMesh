@@ -29,8 +29,8 @@ type APIConfig struct {
 	ShutdownTimeout time.Duration
 
 	// Security
-	RBACEnabled bool              // Role-based access control
-	IPAllowlist []string          // Allowed client IPs/CIDRs
+	RBACEnabled  bool                // Role-based access control
+	IPAllowlist  []string            // Allowed client IPs/CIDRs
 	AllowedRoles map[string][]string // Role -> allowed endpoints mapping
 
 	// Rate limiting
@@ -44,8 +44,8 @@ type APIConfig struct {
 	EnablePprof   bool // Debug only, never in production
 
 	// Request limits
-	MaxRequestSize    int64         // bytes
-	MaxHeaderSize     int           // bytes
+	MaxRequestSize    int64 // bytes
+	MaxHeaderSize     int   // bytes
 	MaxConcurrentReqs int
 	RequestTimeout    time.Duration
 
@@ -71,8 +71,8 @@ func DefaultAPIConfig() *APIConfig {
 		EnableMetrics:      true,
 		EnableAudit:        true,
 		EnablePprof:        false,
-		MaxRequestSize:     1024 * 1024,      // 1MB
-		MaxHeaderSize:      1024 * 1024,      // 1MB
+		MaxRequestSize:     1024 * 1024, // 1MB
+		MaxHeaderSize:      1024 * 1024, // 1MB
 		MaxConcurrentReqs:  100,
 		RequestTimeout:     30 * time.Second,
 		Environment:        "production",
@@ -129,7 +129,7 @@ func LoadAPIConfig(cm *utils.ConfigManager) (*APIConfig, error) {
 
 	// Security
 	cfg.RBACEnabled = cm.GetBool("API_RBAC_ENABLED", true)
-	
+
 	if allowlist := cm.GetString("API_IP_ALLOWLIST", ""); allowlist != "" {
 		cfg.IPAllowlist = parseCommaSeparated(allowlist)
 	}
@@ -380,7 +380,7 @@ func split(s, sep string) []string {
 	if s == "" {
 		return nil
 	}
-	
+
 	var result []string
 	start := 0
 	for i := 0; i < len(s); i++ {
@@ -396,14 +396,14 @@ func split(s, sep string) []string {
 func trim(s string) string {
 	start := 0
 	end := len(s)
-	
+
 	for start < end && (s[start] == ' ' || s[start] == '\t' || s[start] == '\n' || s[start] == '\r') {
 		start++
 	}
-	
+
 	for end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\n' || s[end-1] == '\r') {
 		end--
 	}
-	
+
 	return s[start:end]
 }

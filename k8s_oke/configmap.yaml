@@ -8,9 +8,9 @@ metadata:
 data:
   # Global Settings
   NODE_VERSION: "1.0.0"
-  ENVIRONMENT: "development"
+  ENVIRONMENT: "production"
   NODE_TYPE: "validator"
-  REGION: "gke"
+  REGION: "ap-mumbai-1"
   BLOCKCHAIN_NETWORK_ID: "cybermesh-dev"
 
   # Cluster Topology - All 5 Nodes
@@ -46,7 +46,7 @@ data:
   DYNAMIC_PEER_DISCOVERY: "true"
 
   # Database Connection (CockroachDB Cloud)
-  DB_DSN: "postgresql://cybermesh_user:nO0wBjVYVSPPbUJQOqYstw@cybermesh-threats-8958.jxf.gcp-asia-southeast1.cockroachlabs.cloud:26257/cybermesh_threats?sslmode=require&sslrootcert=./certs/root.crt"
+  DB_DSN: "postgresql://cybermesh_user:nO0wBjVYVSPPbUJQOqYstw@cybermesh-threats-8958.jxf.gcp-asia-southeast1.cockroachlabs.cloud:26257/cybermesh_threats?sslmode=require&sslrootcert=/app/certs/root.crt"
   DB_MAX_OPEN: "50"
   DB_MAX_IDLE: "10"
   DB_MAX_LIFETIME: "30m"
@@ -64,6 +64,9 @@ data:
   PERSIST_MAX_BACKOFF_MS: "5000"
   PERSIST_WORKERS: "1"
   PERSIST_SHUTDOWN_TIMEOUT: "30s"
+
+  # Genesis persistence location (PVC mounted at /app/data)
+  GENESIS_STATE_PATH: "/app/data/genesis_state.json"
 
   # Kafka (Confluent Cloud)
   ENABLE_KAFKA: "true"
@@ -158,10 +161,9 @@ data:
   CRYPTO_STATIC_KEY_TTL: "8760h"
   CONTROL_SIGNING_DOMAIN: "control.commits.v1"
   CONTROL_SIGNING_KEY_ID: "node-1"
-  CONTROL_SIGNING_KEY_CONTENT: |
-    -----BEGIN PRIVATE KEY-----
-    MC4CAQAwBQYDK2VwBCIEIJ9+Tzvc8NRF+rcWmUCwAC6HCLEtvc/I4FhvxcpyYXCR
-    -----END PRIVATE KEY-----
+  # CONTROL_SIGNING_KEY_CONTENT removed - SECURITY FIX
+  # Private key moved to secret.yaml (ConfigMaps are world-readable)
+  # Reference via secretKeyRef in statefulset.yaml
   ED25519_DOMAIN_SEPARATION: "ai.v1"
   AI_DOMAIN_SEPARATION: "ai.v1"
 

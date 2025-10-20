@@ -47,12 +47,27 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 	if skew == 0 {
 		skew = 30 * time.Second // default skew tolerance
 	}
-	if delta := time.Since(blockTime); delta > skew {
-		s.log.Info("expanding timestamp skew for catchup block",
+
+	oldest := blockTime
+	for _, tx := range ab.Transactions() {
+		ts := time.Unix(tx.Timestamp(), 0)
+		if ts.Before(oldest) {
+			oldest = ts
+		}
+	}
+
+	if delta := blockTime.Sub(oldest); delta > skew {
+		s.log.Info("expanding timestamp skew for backlog block",
 			utils.ZapDuration("original_skew", skew),
-			utils.ZapDuration("block_age", delta),
+			utils.ZapDuration("backlog_age", delta),
 			utils.ZapUint64("height", ab.GetHeight()))
 		skew = delta
+	} else if blockLag := time.Since(blockTime); blockLag > skew {
+		s.log.Info("expanding timestamp skew for catchup block",
+			utils.ZapDuration("original_skew", skew),
+			utils.ZapDuration("block_age", blockLag),
+			utils.ZapUint64("height", ab.GetHeight()))
+		skew = blockLag
 	}
 	version, root, receipts, err := state.ApplyBlock(s.store, blockTime, skew, ab.Transactions())
 	if err != nil {
