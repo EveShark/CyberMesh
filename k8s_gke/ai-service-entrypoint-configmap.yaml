@@ -1,0 +1,225 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ai-service-entrypoint
+  namespace: cybermesh
+  labels:
+    app: ai-service
+    component: ml-detection
+data:
+  entrypoint.sh: |-
+    #!/bin/bash
+    set -e
+
+    # ============================================================
+    # CyberMesh AI Service - Entrypoint Script
+    # ============================================================
+    # Pre-flight validation and secret injection before starting Python service
+    #
+    # This script:
+    # 1. Validates required environment variables
+    # 2. Creates signing key file from K8s secret
+    # 3. Checks external service connectivity
+    # 4. Starts the AI service
+    # ============================================================
+
+    echo "============================================================"
+    echo "CyberMesh AI Service - Starting..."
+    echo "============================================================"
+
+    # ============================================================
+    # 1. VALIDATE CRITICAL ENVIRONMENT VARIABLES
+    # ============================================================
+    echo "→ Validating environment configuration..."
+
+    REQUIRED_VARS=(
+        "NODE_ID"
+        "ENVIRONMENT"
+        "KAFKA_BOOTSTRAP_SERVERS"
+        "REDIS_HOST"
+        "REDIS_PORT"
+        "ED25519_SIGNING_KEY_ID"
+        "ED25519_DOMAIN_SEPARATION"
+    )
+
+    for var in "${REQUIRED_VARS[@]}"; do
+        if [ -z "${!var}" ]; then
+            echo "ERROR: Required environment variable $var is not set"
+            echo "Check your ConfigMap/Secret in K8s deployment"
+            exit 1
+        fi
+    done
+
+    echo "  ✓ All required environment variables present"
+
+    # ============================================================
+    # 2. CREATE SIGNING KEY FROM K8S SECRET
+    # ============================================================
+    echo "→ Setting up cryptographic keys..."
+
+    # Create keys directory
+    mkdir -p /tmp/keys
+    chmod 700 /tmp/keys
+
+    # Check if signing key content is provided via environment variable
+    if [ -n "$AI_SIGNING_KEY_CONTENT" ]; then
+        echo "  ✓ Creating signing key from K8s secret..."
+        echo "$AI_SIGNING_KEY_CONTENT" > /tmp/keys/signing_key.pem
+        chmod 600 /tmp/keys/signing_key.pem
+        export ED25519_SIGNING_KEY_PATH=/tmp/keys/signing_key.pem
+        echo "  ✓ Signing key created at $ED25519_SIGNING_KEY_PATH"
+    elif [ -f "/app/keys/signing_key.pem" ]; then
+        # Key mounted as file (K8s secret). Copy to writable location.
+        echo "  ✓ Using mounted signing key at /app/keys/signing_key.pem"
+        cp /app/keys/signing_key.pem /tmp/keys/signing_key.pem
+        chmod 600 /tmp/keys/signing_key.pem
+        export ED25519_SIGNING_KEY_PATH=/tmp/keys/signing_key.pem
+    else
+        echo "ERROR: No signing key available!"
+        echo "Provide either:"
+        echo "  - AI_SIGNING_KEY_CONTENT environment variable (K8s Secret), OR"
+        echo "  - Mount signing_key.pem at /app/keys/signing_key.pem"
+        exit 1
+    fi
+
+    # Validate key file exists and is readable
+    if [ ! -f "$ED25519_SIGNING_KEY_PATH" ]; then
+        echo "ERROR: Signing key file not found at $ED25519_SIGNING_KEY_PATH"
+        exit 1
+    fi
+
+    if [ ! -r "$ED25519_SIGNING_KEY_PATH" ]; then
+        echo "ERROR: Signing key file at $ED25519_SIGNING_KEY_PATH is not readable"
+        exit 1
+    fi
+
+    # ============================================================
+    # 3. VALIDATE MODEL STORAGE (OCI Object Storage Mount)
+    # ============================================================
+    echo "→ Checking model storage..."
+
+    MODEL_DIR="/app/data/models"
+    MODEL_REGISTRY="$MODEL_DIR/model_registry.json"
+
+    if [ ! -d "$MODEL_DIR" ]; then
+        echo "ERROR: Model directory not found at $MODEL_DIR"
+        echo "Ensure OCI Object Storage bucket is mounted at /app/data/models/"
+        exit 1
+    fi
+
+    if [ ! -f "$MODEL_REGISTRY" ]; then
+        echo "ERROR: model_registry.json not found at $MODEL_REGISTRY"
+        echo "Verify the init container completed the GCS sync."
+        exit 1
+    fi
+
+    echo "  ✓ Model registry found"
+    MODEL_COUNT=$(find "$MODEL_DIR" -type f -name '*.pkl' 2>/dev/null | wc -l)
+    echo "  ✓ Found $MODEL_COUNT model files in $MODEL_DIR"
+    if [ "$MODEL_COUNT" -lt 6 ]; then
+        echo "ERROR: Expected 6 signed models (ddos, anomaly, and malware variants); only $MODEL_COUNT present"
+        exit 1
+    fi
+
+    # ============================================================
+    # 4. PRE-FLIGHT CONNECTIVITY CHECKS
+    # ============================================================
+    echo "→ Checking external service connectivity..."
+
+    # Check Redis (critical for state management)
+    if command -v nc >/dev/null 2>&1; then
+        echo -n "  Checking Redis at $REDIS_HOST:$REDIS_PORT... "
+        if nc -z -w 5 "$REDIS_HOST" "$REDIS_PORT" 2>/dev/null; then
+            echo "✓"
+        else
+            echo "FAILED"
+            echo "ERROR: Cannot connect to Redis at $REDIS_HOST:$REDIS_PORT"
+            echo "Check network connectivity and Redis service status"
+            exit 1
+        fi
+
+        # Basic Kafka reachability (TCP only)
+        # Extract first broker from comma-separated list (e.g., "broker1:9092,broker2:9092" -> "broker1:9092")
+        KAFKA_FIRST_BROKER="${KAFKA_BOOTSTRAP_SERVERS%%,*}"
+        KAFKA_HOST="${KAFKA_FIRST_BROKER%%:*}"
+        KAFKA_PORT="${KAFKA_FIRST_BROKER##*:}"
+        
+        if [ -n "$KAFKA_HOST" ] && [ -n "$KAFKA_PORT" ] && [ "$KAFKA_HOST" != "$KAFKA_FIRST_BROKER" ]; then
+            echo -n "  Checking Kafka at $KAFKA_HOST:$KAFKA_PORT... "
+            if nc -z -w 5 "$KAFKA_HOST" "$KAFKA_PORT" 2>/dev/null; then
+                echo "✓"
+            else
+                echo "FAILED"
+                echo "ERROR: Cannot reach Kafka broker at $KAFKA_HOST:$KAFKA_PORT"
+                echo "Verify bootstrap server configuration and network access"
+                exit 1
+            fi
+        else
+            echo "  Skipping Kafka TCP check (could not parse host:port format)"
+        fi
+    fi
+
+    # Note: Can't easily check Kafka TLS connection with nc
+    # Let Python service handle Kafka connection validation
+
+    # ============================================================
+    # 5. PREPARE RUNTIME DIRECTORIES
+    # ============================================================
+    echo "→ Preparing runtime directories..."
+
+    # Create data directory for nonce_state.json, service.pid
+    mkdir -p /app/data
+    chmod 755 /app/data 2>/dev/null || echo "  Note: /app/data permissions managed by K8s fsGroup"
+
+    # Create logs directory
+    mkdir -p /app/logs
+    chmod 755 /app/logs 2>/dev/null || echo "  Note: /app/logs permissions managed by K8s fsGroup"
+
+    echo "  ✓ Runtime directories ready"
+
+    # ============================================================
+    # 6. INSTALL RUNTIME PYTHON DEPENDENCIES (GUARD RUNTIME MISSING PACKAGES)
+    # ============================================================
+    echo "→ Verifying Python dependencies..."
+    declare -A PYTHON_DEPS=(
+        [redis]=redis==5.0.1
+        [psycopg2]=psycopg2-binary==2.9.9
+    )
+
+    for module in "${!PYTHON_DEPS[@]}"; do
+        if ! python3 -c "import ${module}" >/dev/null 2>&1; then
+            package="${PYTHON_DEPS[$module]}"
+            echo "  Installing python package: $package"
+            pip3 install --no-cache-dir "$package"
+        else
+            echo "  ✓ Python module '${module}' already present"
+        fi
+    done
+
+    # ============================================================
+    # 7. DISPLAY STARTUP INFORMATION
+    # ============================================================
+    echo "→ Configuration Summary:"
+    echo "  Environment:      $ENVIRONMENT"
+    echo "  Node ID:          $NODE_ID"
+    echo "  Signing Key:      $ED25519_SIGNING_KEY_PATH"
+    echo "  Signing Key ID:   $ED25519_SIGNING_KEY_ID"
+    echo "  Domain:           $ED25519_DOMAIN_SEPARATION"
+    echo "  Kafka Brokers:    $KAFKA_BOOTSTRAP_SERVERS"
+    echo "  Redis:            $REDIS_HOST:$REDIS_PORT"
+    echo "  Model Directory:  $MODEL_DIR"
+
+    # ============================================================
+    # 8. START AI SERVICE
+    # ============================================================
+    echo "============================================================"
+    echo "Starting AI Detection Service..."
+    echo "============================================================"
+
+    RUNTIME_ENV_PATH=${AI_ENV_FILE_PATH:-/tmp/runtime.env}
+    if [ ! -f "$RUNTIME_ENV_PATH" ]; then
+        echo "# Generated runtime env - real configuration supplied via Kubernetes" > "$RUNTIME_ENV_PATH"
+    fi
+
+    # Pass all arguments to Python (allows --log-level, etc.)
+    exec python3 /app/cmd/main.py --config "$RUNTIME_ENV_PATH" "$@"
