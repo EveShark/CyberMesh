@@ -51,6 +51,15 @@ next-env.d.ts
 # archives (old implementations - not needed in git)
 /.archive/
 
+# test files
+test-imports.mjs
+
+# deployment scripts (optional - keep if team uses them)
+deploy-cloudrun.sh
+
+# duplicate configs
+.eslintrc.cjs
+
 # temporary files
 *.tmp
 *.temp
