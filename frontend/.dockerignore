@@ -1,0 +1,19 @@
+node_modules
+.next
+.git
+.env*
+!.env.example
+*.md
+.vscode
+.idea
+.DS_Store
+npm-debug.log*
+
+# Exclude unused/archive directories
+Archive
+src/Archive
+p2p
+src/p2p
+consensus
+src/consensus
+p2p and consensus dashboard

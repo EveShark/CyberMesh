@@ -4,10 +4,10 @@ Real-time detection loop - continuously polls telemetry and detects anomalies.
 Runs in background thread, publishes detections to Kafka.
 """
 
+import logging
 import threading
 import time
-import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Callable, List
 
 
 class DetectionLoop:
@@ -34,7 +34,10 @@ class DetectionLoop:
         publisher,
         rate_limiter,
         config: Dict[str, Any],
-        logger: Optional[logging.Logger] = None
+        logger: Optional[logging.Logger] = None,
+        metrics=None,
+        event_recorder: Optional[Callable[..., None]] = None,
+        engine_metrics_callback: Optional[Callable[[List[Dict[str, Any]], List[Dict[str, Any]]], None]] = None,
     ):
         """
         Initialize detection loop.
@@ -51,6 +54,9 @@ class DetectionLoop:
         self.rate_limiter = rate_limiter
         self.config = config
         self.logger = logger or logging.getLogger(__name__)
+        self._metrics_collector = metrics
+        self._event_recorder = event_recorder
+        self._engine_metrics_callback = engine_metrics_callback
         
         # Thread control
         self._running = False
@@ -68,8 +74,10 @@ class DetectionLoop:
             "detections_rate_limited": 0,
             "errors": 0,
             "last_detection_time": None,
+            "last_iteration_time": None,
             "loop_iterations": 0,
-            "avg_latency_ms": 0.0
+            "avg_latency_ms": 0.0,
+            "last_latency_ms": 0.0,
         }
         self._metrics_lock = threading.Lock()
         
@@ -102,6 +110,12 @@ class DetectionLoop:
             )
             self._thread.start()
             
+            if self._metrics_collector is not None:
+                try:
+                    self._metrics_collector.set_detection_loop_running(True)
+                except Exception:
+                    self.logger.debug("Failed to set detection loop running metric", exc_info=True)
+
             self.logger.info("Detection loop started")
     
     def stop(self, timeout: int = 30) -> None:
@@ -133,6 +147,12 @@ class DetectionLoop:
                     )
                 else:
                     self.logger.info("Detection loop stopped")
+
+            if self._metrics_collector is not None:
+                try:
+                    self._metrics_collector.set_detection_loop_running(False)
+                except Exception:
+                    self.logger.debug("Failed to clear detection loop running metric", exc_info=True)
     
     def _run_loop(self) -> None:
         """
@@ -149,6 +169,7 @@ class DetectionLoop:
         
         while self._running:
             iteration_start = time.time()
+            rate_limited = False
             
             try:
                 # 1. Run detection pipeline
@@ -156,8 +177,56 @@ class DetectionLoop:
                 result = self.pipeline.process()
                 detection_latency = (time.time() - detection_start) * 1000  # ms
                 
+                # Record pipeline metrics if available
+                if self._metrics_collector is not None:
+                    try:
+                        self._metrics_collector.record_pipeline_result(
+                            decision=result.decision,
+                            latencies=result.latency_ms,
+                            total_latency=result.total_latency_ms,
+                            feature_count=result.feature_count,
+                            candidate_count=result.candidate_count,
+                        )
+                    except Exception as metrics_err:
+                        self.logger.debug(
+                            "Failed to record pipeline metrics",
+                            exc_info=True,
+                            extra={"error": str(metrics_err)},
+                        )
+
                 # 2. Check if we should publish
-                if result.decision and result.decision.should_publish:
+                decision = result.decision
+
+                if decision and self._event_recorder is not None:
+                    try:
+                        validator_id = None
+                        if decision.metadata:
+                            validator_id = decision.metadata.get("validator_id")
+
+                        severity = max(1, min(10, int(decision.final_score * 10)))
+
+                        self._event_recorder(
+                            source="detection_loop",
+                            validator_id=validator_id,
+                            threat_type=decision.threat_type.value if decision.threat_type else "unknown",
+                            severity=severity,
+                            confidence=float(decision.confidence),
+                            final_score=float(decision.final_score),
+                            should_publish=decision.should_publish,
+                            metadata={
+                                "candidate_count": result.candidate_count,
+                                "latency_ms": round(result.total_latency_ms, 2),
+                                "abstention_reason": decision.abstention_reason,
+                            },
+                        )
+                    except Exception as record_err:
+                        self.logger.debug(
+                            "Failed to record detection event",
+                            exc_info=True,
+                            extra={"error": str(record_err)},
+                        )
+
+                if decision and decision.should_publish:
                     self._increment_metric("detections_total")
                     
                     # Check rate limit
@@ -167,17 +236,17 @@ class DetectionLoop:
                         import json
                         
                         anomaly_id = str(uuid.uuid4())
-                        anomaly_type = result.decision.threat_type.value
-                        severity = max(1, min(10, int(result.decision.final_score * 10)))
-                        confidence = result.decision.confidence
+                        anomaly_type = decision.threat_type.value
+                        severity = max(1, min(10, int(decision.final_score * 10)))
+                        confidence = decision.confidence
                         
                         # Build JSON payload with FULL security context
                         
                         # Extract network context from metadata/candidates
                         network_context = {}
-                        if result.decision.candidates:
+                        if decision.candidates:
                             # Get features from first candidate
-                            features = result.decision.candidates[0].features
+                            features = decision.candidates[0].features
                             network_context = {
                                 'src_ip': features.get('src_ip', 'unknown'),
                                 'dst_ip': features.get('dst_ip', 'unknown'),
@@ -197,13 +266,13 @@ class DetectionLoop:
                             'severity': severity,
                             'confidence': float(confidence),
                             'threat_type': anomaly_type,
-                            'final_score': float(result.decision.final_score),
-                            'llr': float(result.decision.llr),
+                            'final_score': float(decision.final_score),
+                            'llr': float(decision.llr),
                             # Network context
                             **network_context,
                             # Model info
                             'model_version': 'v1.0.0',
-                            'contributing_engines': [c.engine_name for c in result.decision.candidates[:3]],
+                            'contributing_engines': [c.engine_name for c in decision.candidates[:3]],
                         }
                         payload_bytes = json.dumps(payload_obj, separators=(",", ":")).encode('utf-8')
                         
@@ -227,8 +296,8 @@ class DetectionLoop:
                         # Publish supporting evidence (Fix: Gap 1)
                         self.logger.info(f"[EVIDENCE_DEBUG] Starting evidence publishing attempt for anomaly {anomaly_id}")
                         try:
-                            ev_bytes = result.decision.metadata.get('evidence')
-                            self.logger.info(f"[EVIDENCE_DEBUG] ev_bytes={'PRESENT' if ev_bytes else 'MISSING'}, metadata_keys={list(result.decision.metadata.keys())}")
+                            ev_bytes = decision.metadata.get('evidence')
+                            self.logger.info(f"[EVIDENCE_DEBUG] ev_bytes={'PRESENT' if ev_bytes else 'MISSING'}, metadata_keys={list(decision.metadata.keys())}")
                             if ev_bytes:
                                 # Evidence is already a signed, serialized protobuf EvidenceMessage
                                 # Send it directly to Kafka
@@ -252,6 +321,7 @@ class DetectionLoop:
                             )
                     else:
                         self._increment_metric("detections_rate_limited")
+                        rate_limited = True
                         self.logger.warning("Rate limited detection")
                     
                     # Update last detection time
@@ -267,6 +337,9 @@ class DetectionLoop:
                 # 3. Update metrics
                 self._increment_metric("loop_iterations")
                 self._update_avg_latency(detection_latency)
+                with self._metrics_lock:
+                    self._metrics["last_iteration_time"] = time.time()
+                    self._metrics["last_latency_ms"] = detection_latency
                 
                 # INFO-level iteration summary to make pipeline activity visible without DEBUG
                 self.logger.info(
@@ -290,6 +363,102 @@ class DetectionLoop:
                     f"published={result.decision.should_publish if result.decision else False}, "
                     f"{detection_latency:.1f}ms"
                 )
+
+                if self._metrics_collector is not None:
+                    try:
+                        self._metrics_collector.record_detection_iteration(
+                            latency_ms=detection_latency,
+                            published=bool(result.decision and result.decision.should_publish),
+                            rate_limited=rate_limited,
+                        )
+                    except Exception:
+                        self.logger.debug("Failed to record detection iteration metrics", exc_info=True)
+
+                # Record engine-level metrics
+                engine_snapshots: List[Dict[str, Any]] = []
+                variant_snapshots: List[Dict[str, Any]] = []
+                if result.decision:
+                    now = time.time()
+                    engine_aggregate: Dict[str, Dict[str, Any]] = {}
+                    variant_aggregate: Dict[str, Dict[str, Any]] = {}
+
+                    for candidate in result.decision.candidates:
+                        engine_key = candidate.engine_type.value
+                        engine_entry = engine_aggregate.setdefault(
+                            engine_key,
+                            {
+                                "engine": engine_key,
+                                "candidates": 0,
+                                "published": 0,
+                                "confidence_sum": 0.0,
+                                "threat_types": set(),
+                            },
+                        )
+                        engine_entry["candidates"] += 1
+                        engine_entry["confidence_sum"] += float(candidate.confidence)
+                        engine_entry["threat_types"].add(candidate.threat_type.value)
+                        if result.decision.should_publish:
+                            engine_entry["published"] += 1
+
+                        variant = candidate.metadata.get("variant") if candidate.metadata else None
+                        if variant:
+                            variant_entry = variant_aggregate.setdefault(
+                                variant,
+                                {
+                                    "variant": variant,
+                                    "engine": engine_key,
+                                    "total": 0,
+                                    "published": 0,
+                                    "confidence_sum": 0.0,
+                                    "threat_types": set(),
+                                },
+                            )
+                            variant_entry["total"] += 1
+                            variant_entry["confidence_sum"] += float(candidate.confidence)
+                            variant_entry["threat_types"].add(candidate.threat_type.value)
+                            if result.decision.should_publish:
+                                variant_entry["published"] += 1
+
+                    for engine_key, data in engine_aggregate.items():
+                        snapshot = {
+                            "engine": engine_key,
+                            "candidates": data["candidates"],
+                            "published": data["published"],
+                            "confidence_sum": data["confidence_sum"],
+                            "threat_types": sorted(data["threat_types"]),
+                            "timestamp": now,
+                            "iteration_latency_ms": detection_latency,
+                        }
+                        engine_snapshots.append(snapshot)
+                        if self._metrics_collector is not None:
+                            try:
+                                self._metrics_collector.record_engine_iteration(
+                                    engine_type=engine_key,
+                                    candidates=data["candidates"],
+                                    published=data["published"],
+                                    confidence_sum=data["confidence_sum"],
+                                )
+                            except Exception:
+                                self.logger.debug("Failed to record engine metrics", exc_info=True)
+
+                    for variant_key, data in variant_aggregate.items():
+                        variant_snapshots.append(
+                            {
+                                "variant": variant_key,
+                                "engine": data["engine"],
+                                "total": data["total"],
+                                "published": data["published"],
+                                "confidence_sum": data["confidence_sum"],
+                                "threat_types": sorted(data["threat_types"]),
+                                "timestamp": now,
+                            }
+                        )
+
+                if self._engine_metrics_callback and (engine_snapshots or variant_snapshots):
+                    try:
+                        self._engine_metrics_callback(engine_snapshots, variant_snapshots)
+                    except Exception:
+                        self.logger.debug("Failed to record engine analytics", exc_info=True)
                 
             except Exception as e:
                 self._increment_metric("errors")
@@ -298,6 +467,11 @@ class DetectionLoop:
                     exc_info=True,
                     extra={"error": str(e)}
                 )
+                if self._metrics_collector is not None:
+                    try:
+                        self._metrics_collector.record_detection_error()
+                    except Exception:
+                        self.logger.debug("Failed to record detection error metric", exc_info=True)
             
             # 5. Sleep until next interval
             iteration_time = time.time() - iteration_start
@@ -307,6 +481,11 @@ class DetectionLoop:
                 time.sleep(sleep_time)
         
         self.logger.info("Detection loop exited")
+        if self._metrics_collector is not None:
+            try:
+                self._metrics_collector.set_detection_loop_running(False)
+            except Exception:
+                self.logger.debug("Failed to clear detection loop running metric", exc_info=True)
     
     def _increment_metric(self, key: str, value: int = 1) -> None:
         """Increment metric counter (thread-safe)."""

@@ -11,9 +11,12 @@ from .telemetry import TelemetrySource
 class PostgresTelemetrySource(TelemetrySource):
     """Pull real network flows from PostgreSQL."""
     
-    def __init__(self, db_config: dict, sample_size: int = 100):
+    def __init__(self, db_config: dict, sample_size: int = 100, table_name: str = 'test_ddos_binary', schema: str = 'curated'):
         self.db_config = db_config
         self.sample_size = sample_size
+        self.table_name = table_name
+        self.schema = schema
+        self.full_table = f"{schema}.{table_name}"
         self.logger = get_logger(__name__)
         self._test_connection()
     
@@ -21,8 +24,11 @@ class PostgresTelemetrySource(TelemetrySource):
         """Test database connection."""
         try:
             conn = psycopg2.connect(**self.db_config)
+            cur = conn.cursor()
+            cur.execute(f"SELECT COUNT(*) FROM {self.full_table} WHERE label='ddos'")
+            count = cur.fetchone()[0]
             conn.close()
-            self.logger.info("PostgreSQL connection OK")
+            self.logger.info(f"PostgreSQL connection OK: {count:,} DDoS rows in {self.full_table}")
         except Exception as e:
             self.logger.error(f"PostgreSQL connection failed: {e}")
             raise
@@ -38,7 +44,7 @@ class PostgresTelemetrySource(TelemetrySource):
             cur = conn.cursor()
             
             # Pull random DDoS samples with ALL 79 features
-            query = """
+            query = f"""
                 SELECT 
                     src_port, dst_port, protocol, flow_duration,
                     tot_fwd_pkts, tot_bwd_pkts, totlen_fwd_pkts, totlen_bwd_pkts,
@@ -61,7 +67,7 @@ class PostgresTelemetrySource(TelemetrySource):
                     active_mean, active_std, active_max, active_min,
                     idle_mean, idle_std, idle_max, idle_min,
                     label, src_ip, dst_ip, flow_id
-                FROM curated.test_ddos_binary
+                FROM {self.full_table}
                 WHERE label = 'ddos'
                 ORDER BY RANDOM()
                 LIMIT %s
@@ -134,7 +140,7 @@ class PostgresTelemetrySource(TelemetrySource):
         try:
             conn = psycopg2.connect(**self.db_config)
             cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM curated.test_ddos_binary WHERE label='ddos'")
+            cur.execute(f"SELECT COUNT(*) FROM {self.full_table} WHERE label='ddos'")
             count = cur.fetchone()[0]
             conn.close()
             return count > 0

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -32,10 +33,19 @@ type Consumer struct {
 	closed bool
 
 	// Stats
-	messagesConsumed uint64
-	messagesVerified uint64
-	messagesAdmitted uint64
-	messagesFailed   uint64
+	messagesConsumed   uint64
+	messagesVerified   uint64
+	messagesAdmitted   uint64
+	messagesFailed     uint64
+	groupID            string
+	partitionOffsets   map[string]int64
+	partitionLag       map[string]int64
+	partitionHighwater map[string]int64
+	topicPartitions    map[string]int
+	assignedParts      int
+	lastMessageUnix    int64
+	ingestLatencyHist  *utils.LatencyHistogram
+	processLatencyHist *utils.LatencyHistogram
 }
 
 // ConsumerConfig holds configuration for creating a consumer
@@ -86,18 +96,25 @@ func NewConsumer(ctx context.Context, cfg ConsumerConfig, saramaCfg *sarama.Conf
 	consumerCtx, cancel := context.WithCancel(ctx)
 
 	c := &Consumer{
-		consumerGroup: consumerGroup,
-		topics:        cfg.Topics,
-		mempool:       mp,
-		verifierCfg:   cfg.VerifierCfg,
-		logger:        logger,
-		audit:         audit,
-		dlqProducer:   dlqProducer,
-		dlqTopic:      cfg.DLQTopic,
-		ctx:           consumerCtx,
-		cancel:        cancel,
-		closed:        false,
+		consumerGroup:      consumerGroup,
+		topics:             cfg.Topics,
+		mempool:            mp,
+		verifierCfg:        cfg.VerifierCfg,
+		logger:             logger,
+		audit:              audit,
+		dlqProducer:        dlqProducer,
+		dlqTopic:           cfg.DLQTopic,
+		ctx:                consumerCtx,
+		cancel:             cancel,
+		closed:             false,
+		groupID:            cfg.GroupID,
+		partitionOffsets:   make(map[string]int64),
+		partitionLag:       make(map[string]int64),
+		partitionHighwater: make(map[string]int64),
+		topicPartitions:    make(map[string]int),
 	}
+	c.ingestLatencyHist = utils.NewLatencyHistogram([]float64{5, 20, 50, 100, 250, 500, 1000, math.Inf(1)})
+	c.processLatencyHist = utils.NewLatencyHistogram([]float64{1, 5, 20, 50, 100, 250, 500, math.Inf(1)})
 
 	if audit != nil {
 		_ = audit.Info("kafka_consumer_created", map[string]interface{}{
@@ -222,13 +239,12 @@ type consumerGroupHandler struct {
 
 // Setup is called at the beginning of a new session, before ConsumeClaim
 func (h *consumerGroupHandler) Setup(session sarama.ConsumerGroupSession) error {
+	h.consumer.resetPartitionTracking()
+	claims := session.Claims()
 	if h.consumer.logger != nil {
-		claims := session.Claims()
 		totalPartitions := 0
-		// Log partition assignments per topic
 		for topic, partitions := range claims {
 			totalPartitions += len(partitions)
-			// Convert []int32 -> []int for logging helper
 			ints := make([]int, len(partitions))
 			for i, p := range partitions {
 				ints[i] = int(p)
@@ -241,6 +257,17 @@ func (h *consumerGroupHandler) Setup(session sarama.ConsumerGroupSession) error 
 			utils.ZapInt("topics", len(claims)),
 			utils.ZapInt("total_partitions", totalPartitions))
 	}
+	if len(claims) == 0 {
+		h.consumer.setAssignedPartitions(0)
+		return nil
+	}
+
+	total := 0
+	for topic, partitions := range claims {
+		total += len(partitions)
+		h.consumer.setTopicPartitionCount(topic, len(partitions))
+	}
+	h.consumer.setAssignedPartitions(total)
 	return nil
 }
 
@@ -290,9 +317,33 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 					utils.ZapInt64("offset", message.Offset))
 			}
 
+			hw := claim.HighWaterMarkOffset()
+			lag := hw - message.Offset - 1
+			if hw == 0 {
+				lag = 0
+			}
+			if lag < 0 {
+				lag = 0
+			}
+			highwater := hw
+			if highwater < message.Offset {
+				highwater = message.Offset
+			}
+			h.consumer.trackPartitionStats(message.Topic, message.Partition, message.Offset, lag, highwater)
+
 			// Process message
 			h.consumer.incrementConsumed()
-			if err := h.consumer.processMessage(ctx, session, message); err != nil {
+			if !message.Timestamp.IsZero() {
+				latency := time.Since(message.Timestamp)
+				if latency < 0 {
+					latency = 0
+				}
+				h.consumer.observeIngestLatency(latency)
+			}
+			startProcess := time.Now()
+			err := h.consumer.processMessage(ctx, session, message)
+			h.consumer.observeProcessLatency(time.Since(startProcess))
+			if err != nil {
 				// Message processing failed (already logged)
 				h.consumer.incrementFailed()
 				// Mark message to advance offset (prevents infinite reprocessing)
@@ -390,6 +441,7 @@ func (c *Consumer) processMessage(ctx context.Context, session sarama.ConsumerGr
 	}
 
 	c.incrementVerified()
+	c.setLastMessageTime(time.Now())
 
 	// Submit to mempool
 	if c.logger != nil {
@@ -641,15 +693,130 @@ func (c *Consumer) incrementFailed() {
 	c.mu.Unlock()
 }
 
-// GetStats returns consumer statistics
-func (c *Consumer) GetStats() map[string]interface{} {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	return map[string]interface{}{
-		"consumed": c.messagesConsumed,
-		"verified": c.messagesVerified,
-		"admitted": c.messagesAdmitted,
-		"failed":   c.messagesFailed,
+func (c *Consumer) observeIngestLatency(d time.Duration) {
+	if c.ingestLatencyHist == nil {
+		return
 	}
+	c.ingestLatencyHist.Observe(float64(d) / float64(time.Millisecond))
+}
+
+func (c *Consumer) observeProcessLatency(d time.Duration) {
+	if c.processLatencyHist == nil {
+		return
+	}
+	c.processLatencyHist.Observe(float64(d) / float64(time.Millisecond))
+}
+
+func (c *Consumer) Stats() ConsumerStats {
+	stats := ConsumerStats{}
+	c.mu.RLock()
+	stats.GroupID = c.groupID
+	stats.Topics = append([]string(nil), c.topics...)
+	stats.TopicPartitions = copyIntMap(c.topicPartitions)
+	stats.PartitionOffsets = copyInt64Map(c.partitionOffsets)
+	stats.PartitionLag = copyInt64Map(c.partitionLag)
+	stats.PartitionHighwater = copyInt64Map(c.partitionHighwater)
+	stats.AssignedPartitions = c.assignedParts
+	stats.MessagesConsumed = c.messagesConsumed
+	stats.MessagesVerified = c.messagesVerified
+	stats.MessagesAdmitted = c.messagesAdmitted
+	stats.MessagesFailed = c.messagesFailed
+	stats.LastMessageUnix = c.lastMessageUnix
+	c.mu.RUnlock()
+	buckets, total, sum := c.ingestLatencyHist.Snapshot()
+	if total > 0 {
+		stats.IngestLatencyBuckets = buckets
+		stats.IngestLatencyP95Ms = c.ingestLatencyHist.Quantile(0.95)
+		stats.IngestLatencyCount = total
+		stats.IngestLatencySumMs = sum
+	}
+	procBuckets, procTotal, procSum := c.processLatencyHist.Snapshot()
+	if procTotal > 0 {
+		stats.ProcessLatencyBuckets = procBuckets
+		stats.ProcessLatencyP95Ms = c.processLatencyHist.Quantile(0.95)
+		stats.ProcessLatencyCount = procTotal
+		stats.ProcessLatencySumMs = procSum
+	}
+	return stats
+}
+
+func (c *Consumer) resetPartitionTracking() {
+	c.mu.Lock()
+	c.partitionOffsets = make(map[string]int64)
+	c.partitionLag = make(map[string]int64)
+	c.partitionHighwater = make(map[string]int64)
+	c.topicPartitions = make(map[string]int)
+	c.mu.Unlock()
+}
+
+func (c *Consumer) setAssignedPartitions(n int) {
+	c.mu.Lock()
+	c.assignedParts = n
+	c.mu.Unlock()
+}
+
+func (c *Consumer) trackPartitionStats(topic string, partition int32, offset int64, lag int64, highwater int64) {
+	c.mu.Lock()
+	key := fmt.Sprintf("%s-%d", topic, partition)
+	c.partitionOffsets[key] = offset
+	c.partitionLag[key] = lag
+	c.partitionHighwater[key] = highwater
+	c.mu.Unlock()
+}
+
+func (c *Consumer) setTopicPartitionCount(topic string, count int) {
+	c.mu.Lock()
+	c.topicPartitions[topic] = count
+	c.mu.Unlock()
+}
+
+func (c *Consumer) setLastMessageTime(t time.Time) {
+	c.mu.Lock()
+	c.lastMessageUnix = t.Unix()
+	c.mu.Unlock()
+}
+
+func copyInt64Map(src map[string]int64) map[string]int64 {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]int64, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func copyIntMap(src map[string]int) map[string]int {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]int, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+type ConsumerStats struct {
+	GroupID               string
+	Topics                []string
+	TopicPartitions       map[string]int
+	PartitionOffsets      map[string]int64
+	PartitionLag          map[string]int64
+	PartitionHighwater    map[string]int64
+	AssignedPartitions    int
+	MessagesConsumed      uint64
+	MessagesVerified      uint64
+	MessagesAdmitted      uint64
+	MessagesFailed        uint64
+	LastMessageUnix       int64
+	IngestLatencyBuckets  []utils.HistogramBucket
+	IngestLatencyP95Ms    float64
+	ProcessLatencyBuckets []utils.HistogramBucket
+	ProcessLatencyP95Ms   float64
+	IngestLatencyCount    uint64
+	IngestLatencySumMs    float64
+	ProcessLatencyCount   uint64
+	ProcessLatencySumMs   float64
 }

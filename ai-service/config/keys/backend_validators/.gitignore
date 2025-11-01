@@ -1,0 +1,4 @@
+# Protect Ed25519 private keys
+*_private.pem
+# Public keys are OK to commit
+!*_public.pem

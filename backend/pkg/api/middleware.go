@@ -91,6 +91,8 @@ func (s *Server) middlewareLogging(next http.Handler) http.Handler {
 				utils.ZapInt64("duration_ms", duration.Milliseconds()))
 		}
 
+		s.recordAPIRequest(wrapped.statusCode)
+
 		// Audit logging for sensitive endpoints
 		if s.audit != nil && !s.isPublicEndpoint(r.URL.Path) {
 			s.audit.Log("api.request", utils.AuditInfo, map[string]interface{}{
@@ -317,6 +319,116 @@ func generateRequestID() string {
 		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b)
+}
+
+// middlewareGlobalAuth enforces authentication for all non-public endpoints
+// SECURITY: Single point of authentication control
+func (s *Server) middlewareGlobalAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Check if endpoint is public (doesn't require auth)
+		if s.isPublicEndpoint(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// SECURITY: Authentication required for this endpoint
+		authenticated := false
+		clientRole := "anonymous"
+
+		// Method 1: mTLS Certificate Authentication (production)
+		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+			cert := r.TLS.PeerCertificates[0]
+			// Extract role from certificate CN or SAN
+			clientRole = extractRoleFromCert(cert.Subject.CommonName)
+			authenticated = true
+
+			s.logger.InfoContext(r.Context(), "client authenticated via mTLS",
+				utils.ZapString("role", clientRole),
+				utils.ZapString("cn", cert.Subject.CommonName))
+		}
+
+		// Method 2: JWT Token Authentication (fallback)
+		if !authenticated {
+			authHeader := r.Header.Get("Authorization")
+			if strings.HasPrefix(authHeader, "Bearer ") {
+				_ = strings.TrimPrefix(authHeader, "Bearer ") // token for future JWT validation
+				// TODO: Implement JWT validation with token
+				// For now, accept any token in development mode
+				if s.config.Environment != "production" {
+					authenticated = true
+					clientRole = "developer"
+					s.logger.WarnContext(r.Context(), "JWT auth not fully implemented, accepting token in dev mode")
+				}
+			}
+		}
+
+		// Method 3: API Key Authentication (fallback)
+		if !authenticated {
+			apiKey := r.Header.Get("X-API-Key")
+			if apiKey != "" {
+				// TODO: Implement API key validation
+				// For now, accept any key in development mode
+				if s.config.Environment != "production" {
+					authenticated = true
+					clientRole = "api_client"
+					s.logger.WarnContext(r.Context(), "API key auth not fully implemented, accepting key in dev mode")
+				}
+			}
+		}
+
+		// SECURITY: Block unauthenticated requests in production
+		if !authenticated {
+			if s.config.Environment == "production" {
+				s.logger.WarnContext(r.Context(), "unauthenticated request blocked",
+					utils.ZapString("path", r.URL.Path),
+					utils.ZapString("client_ip", getClientIP(r)))
+
+				writeErrorFromUtils(w, r, NewUnauthorizedError("authentication required"))
+				return
+			} else {
+				// Development mode: Allow but log warning
+				s.logger.WarnContext(r.Context(), "unauthenticated request allowed in dev mode",
+					utils.ZapString("path", r.URL.Path))
+				authenticated = true
+				clientRole = "developer"
+			}
+		}
+
+		// Check role-based access control
+		// In development mode, skip RBAC checks (allow all authenticated requests)
+		if s.config.Environment != "production" {
+			// Development mode: Allow all roles
+			ctx := context.WithValue(r.Context(), ctxKeyClientRole, clientRole)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
+
+		// Production mode: Enforce RBAC
+		requiredRole := s.getRequiredRole(r.URL.Path)
+		if requiredRole != "" && !s.hasRole(clientRole, requiredRole) {
+			s.logger.WarnContext(r.Context(), "access denied - insufficient role",
+				utils.ZapString("path", r.URL.Path),
+				utils.ZapString("client_role", clientRole),
+				utils.ZapString("required_role", requiredRole))
+
+			writeErrorFromUtils(w, r, NewForbiddenError("insufficient permissions"))
+			return
+		}
+
+		// Add role to context
+		ctx := context.WithValue(r.Context(), ctxKeyClientRole, clientRole)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// extractRoleFromCert extracts role from certificate CN
+func extractRoleFromCert(cn string) string {
+	// Parse CN format: "role:validator" or "service:api" or just "admin"
+	parts := strings.Split(cn, ":")
+	if len(parts) == 2 {
+		return parts[1]
+	}
+	return cn
 }
 
 // writeJSON writes a JSON response

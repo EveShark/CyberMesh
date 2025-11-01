@@ -169,7 +169,7 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 		}
 	}
 
-	// Initialize persistence worker if enabled
+    // Initialize persistence worker if enabled
 	if cfg.EnablePersistence && cfg.DBAdapter != nil {
 		// Wire Kafka producer as onSuccess callback
 		// Fix: Gap 2 - Updated to pass anomaly IDs for COMMITTED state tracking
@@ -199,7 +199,11 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 			}
 			return nil, fmt.Errorf("failed to create persistence worker: %w", err)
 		}
-		s.persistWorker = worker
+        s.persistWorker = worker
+        // Wire persistence into consensus engine now that worker exists
+        if eng != nil {
+            eng.AttachPersistence(worker)
+        }
 	}
 
 	// Initialize Kafka consumer if enabled (after mempool is set)
@@ -256,14 +260,18 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 	// Initialize API server if enabled
 	if cfg.EnableAPI && cfg.APIConfig != nil {
 		apiDeps := apiserver.Dependencies{
-			Config:      cfg.APIConfig,
-			Logger:      log,
-			AuditLogger: cfg.AuditLogger,
-			Storage:     cfg.DBAdapter,
-			StateStore:  store,
-			Mempool:     mp,
-			Engine:      eng,
-			P2PRouter:   cfg.P2PRouter,
+			Config:        cfg.APIConfig,
+			Logger:        log,
+			AuditLogger:   cfg.AuditLogger,
+			Storage:       cfg.DBAdapter,
+			StateStore:    store,
+			Mempool:       mp,
+			Engine:        eng,
+			P2PRouter:     cfg.P2PRouter,
+			KafkaProd:     s.kafkaProducer,
+			KafkaCons:     s.kafkaConsumer,
+			NodeAliases:   cfg.APIConfig.NodeAliasMap,
+			NodeAliasList: cfg.APIConfig.NodeAliasList,
 		}
 
 		apiSrv, err := apiserver.NewServer(apiDeps)

@@ -34,6 +34,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// Block endpoints
 	mux.HandleFunc(basePath+"/blocks/latest", s.handleBlockLatest)
 	mux.HandleFunc(basePath+"/blocks", s.handleBlocks)
+	mux.HandleFunc(basePath+"/blocks/", s.handleBlocks)
 
 	// State endpoints
 	mux.HandleFunc(basePath+"/state/root", s.handleStateRoot)
@@ -45,12 +46,27 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// Statistics
 	mux.HandleFunc(basePath+"/stats", s.handleStats)
 
+	// Network & consensus overviews
+	mux.HandleFunc(basePath+"/network/overview", s.handleNetworkOverview)
+	mux.HandleFunc(basePath+"/consensus/overview", s.handleConsensusOverview)
+
+	// Anomaly endpoints
+	mux.HandleFunc(basePath+"/anomalies/stats", s.handleAnomalyStats)
+	mux.HandleFunc(basePath+"/anomalies", s.handleAnomalies)
+	mux.HandleFunc(basePath+"/anomalies/suspicious-nodes", s.handleSuspiciousNodes)
+
+	// AI telemetry endpoints
+	mux.HandleFunc(basePath+"/ai/metrics", s.handleAIMetrics)
+	mux.HandleFunc(basePath+"/ai/variants", s.handleAIVariants)
+	mux.HandleFunc(basePath+"/ai/history", s.handleAIDetectionHistory)
+	mux.HandleFunc(basePath+"/ai/suspicious-nodes", s.handleAISuspiciousNodes)
+
 	// P2P info (for peer discovery) - DISABLED: handler method missing
 	// mux.HandleFunc(basePath+"/p2p/info", s.handleP2PInfo)
 
 	s.logger.Info("routes registered",
 		utils.ZapString("base_path", basePath),
-		utils.ZapInt("endpoint_count", 9))
+		utils.ZapInt("endpoint_count", 18))
 }
 
 // middlewareChain applies middleware in order
@@ -81,10 +97,9 @@ func (s *Server) middlewareChain(handler http.Handler) http.Handler {
 		handler = s.middlewareRateLimit(handler)
 	}
 
-	// 6. Authentication & RBAC (if enabled) - TODO: implement in auth.go
-	// if s.config.RBACEnabled && s.config.TLSEnabled {
-	//	handler = s.middlewareAuth(handler)
-	// }
+	// 6. SECURITY: Global authentication for all non-public endpoints
+	// This middleware checks if endpoint requires auth and validates credentials
+	handler = s.middlewareGlobalAuth(handler)
 
 	// 7. CORS headers (if needed)
 	handler = s.middlewareCORS(handler)
@@ -184,6 +199,18 @@ func (s *Server) getRequiredRole(path string) string {
 	}
 	if strings.HasPrefix(path, basePath+"/metrics") {
 		return "metrics_reader"
+	}
+	if strings.HasPrefix(path, basePath+"/network/overview") {
+		return "network_reader"
+	}
+	if strings.HasPrefix(path, basePath+"/consensus/overview") {
+		return "consensus_reader"
+	}
+	if strings.HasPrefix(path, basePath+"/ai/") {
+		return "ai_reader"
+	}
+	if strings.HasPrefix(path, basePath+"/anomalies/suspicious-nodes") {
+		return "anomaly_reader"
 	}
 
 	// Default: no specific role required (public endpoint)

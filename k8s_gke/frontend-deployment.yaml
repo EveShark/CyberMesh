@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: cybermesh
+  labels:
+    app: frontend
+    component: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend
+      component: web
+  template:
+    metadata:
+      labels:
+        app: frontend
+        component: web
+    spec:
+      # Prefer stateless node for better distribution
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: workload-type
+                operator: In
+                values:
+                - stateless
+      
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      
+      containers:
+      - name: frontend
+        image: asia-southeast1-docker.pkg.dev/cybermesh-476310/cybermesh-repo/cybermesh-frontend:latest
+        imagePullPolicy: Always
+        
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          runAsNonRoot: true
+          capabilities:
+            drop:
+            - ALL
+        
+        ports:
+        - name: http
+          containerPort: 3000
+          protocol: TCP
+        
+        envFrom:
+        - configMapRef:
+            name: frontend-config
+        
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 3000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 3000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2

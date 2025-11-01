@@ -272,3 +272,19 @@ func (m *Mempool) Stats() (count int, bytes int) {
 	defer m.mu.RUnlock()
 	return len(m.entries), m.total
 }
+
+// StatsDetailed returns count, total bytes, and the oldest transaction timestamp (unix seconds).
+func (m *Mempool) StatsDetailed() (count int, bytes int, oldestTimestamp int64) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	count = len(m.entries)
+	bytes = m.total
+	oldestTimestamp = 0
+	for _, e := range m.entries {
+		if oldestTimestamp == 0 || e.Ts < oldestTimestamp {
+			oldestTimestamp = e.Ts
+		}
+	}
+	return
+}

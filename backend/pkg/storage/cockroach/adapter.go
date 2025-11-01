@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"backend/pkg/block"
@@ -36,6 +38,12 @@ type Adapter interface {
 
 	// GetBlock retrieves a block by height
 	GetBlock(ctx context.Context, height uint64) (*block.AppBlock, error)
+
+	// GetLatestHeight returns the maximum block height from the database
+	GetLatestHeight(ctx context.Context) (uint64, error)
+
+	// GetMinHeight returns the minimum block height from the database
+	GetMinHeight(ctx context.Context) (uint64, error)
 
 	// GetTransactionByContentHash retrieves a transaction by its content hash
 	GetTransactionByContentHash(ctx context.Context, contentHash [32]byte) (*TxRow, error)
@@ -70,6 +78,9 @@ type Adapter interface {
 
 	// Close closes the database connection
 	Close() error
+
+	// Metrics returns aggregated latency metrics for diagnostics
+	Metrics() MetricsSnapshot
 }
 
 func isUniqueViolation(err error, constraint string) bool {
@@ -111,6 +122,7 @@ type adapter struct {
 	db          *sql.DB
 	logger      *utils.Logger
 	auditLogger *utils.AuditLogger
+	metrics     *dbMetrics
 
 	// Prepared statements for queries
 	stmtGetBlock    *sql.Stmt
@@ -159,6 +171,7 @@ func NewAdapter(ctx context.Context, cfg *AdapterConfig) (Adapter, error) {
 		db:          cfg.DB,
 		logger:      cfg.Logger,
 		auditLogger: cfg.AuditLogger,
+		metrics:     newDBMetrics(),
 	}
 
 	// Prepare statements
@@ -414,6 +427,8 @@ func (a *adapter) prepareStatements(ctx context.Context) error {
 
 // PersistBlock atomically persists block, transactions, and state snapshot
 func (a *adapter) PersistBlock(ctx context.Context, blk *block.AppBlock, receipts []state.Receipt, stateRoot [32]byte) error {
+	stop := a.recordTxn("persist_block")
+	defer stop()
 	if blk == nil {
 		return fmt.Errorf("%w: block is nil", ErrInvalidData)
 	}
@@ -793,6 +808,8 @@ func (a *adapter) upsertSnapshot(ctx context.Context, tx *sql.Tx, blk *block.App
 
 // GetBlock retrieves a block by height
 func (a *adapter) GetBlock(ctx context.Context, height uint64) (*block.AppBlock, error) {
+	stop := a.recordQuery("get_block")
+	defer stop()
 	var row BlockRow
 
 	// Use prepared statement
@@ -853,8 +870,60 @@ func (a *adapter) GetBlock(ctx context.Context, height uint64) (*block.AppBlock,
 	return blkHeader, nil
 }
 
+// GetLatestHeight returns the maximum block height from the database
+// Returns 0 if no blocks exist
+func (a *adapter) GetLatestHeight(ctx context.Context) (uint64, error) {
+	stop := a.recordQuery("get_latest_height")
+	defer stop()
+	var maxHeight sql.NullInt64
+
+	query := `SELECT MAX(height) FROM blocks`
+	err := a.db.QueryRowContext(ctx, query).Scan(&maxHeight)
+
+	if err != nil {
+		if a.logger != nil {
+			a.logger.ErrorContext(ctx, "failed to get latest height", utils.ZapError(err))
+		}
+		return 0, fmt.Errorf("query latest height: %w", err)
+	}
+
+	// If no blocks exist, return 0
+	if !maxHeight.Valid {
+		return 0, nil
+	}
+
+	return uint64(maxHeight.Int64), nil
+}
+
+// GetMinHeight returns the minimum block height in the database
+// Returns 0 if no blocks exist
+func (a *adapter) GetMinHeight(ctx context.Context) (uint64, error) {
+	stop := a.recordQuery("get_min_height")
+	defer stop()
+	var minHeight sql.NullInt64
+
+	query := `SELECT MIN(height) FROM blocks`
+	err := a.db.QueryRowContext(ctx, query).Scan(&minHeight)
+
+	if err != nil {
+		if a.logger != nil {
+			a.logger.ErrorContext(ctx, "failed to get min height", utils.ZapError(err))
+		}
+		return 0, fmt.Errorf("query min height: %w", err)
+	}
+
+	// If no blocks exist, return 0
+	if !minHeight.Valid {
+		return 0, nil
+	}
+
+	return uint64(minHeight.Int64), nil
+}
+
 // GetTransactionByContentHash retrieves a transaction by content hash
 func (a *adapter) GetTransactionByContentHash(ctx context.Context, contentHash [32]byte) (*TxRow, error) {
+	stop := a.recordQuery("get_tx_by_hash")
+	defer stop()
 	var row TxRow
 
 	// Use prepared statement
@@ -895,6 +964,8 @@ func (a *adapter) GetTransactionByContentHash(ctx context.Context, contentHash [
 
 // GetSnapshot retrieves a state snapshot by version
 func (a *adapter) GetSnapshot(ctx context.Context, version uint64) (*SnapshotRow, error) {
+	stop := a.recordQuery("get_snapshot")
+	defer stop()
 	var row SnapshotRow
 
 	// Use prepared statement
@@ -928,6 +999,8 @@ func (a *adapter) GetSnapshot(ctx context.Context, version uint64) (*SnapshotRow
 
 // ListTransactionsByBlock returns minimal transaction metadata for a block
 func (a *adapter) ListTransactionsByBlock(ctx context.Context, height uint64) ([]TxMeta, error) {
+	stop := a.recordQuery("list_transactions_by_block")
+	defer stop()
 	rows, err := a.stmtListTxByBlk.QueryContext(ctx, height)
 	if err != nil {
 		return nil, fmt.Errorf("query tx by block: %w", err)
@@ -950,6 +1023,8 @@ func (a *adapter) ListTransactionsByBlock(ctx context.Context, height uint64) ([
 
 // Ping checks database liveness
 func (a *adapter) Ping(ctx context.Context) error {
+	stop := a.recordQuery("ping")
+	defer stop()
 	return a.db.PingContext(ctx)
 }
 
@@ -1038,4 +1113,154 @@ func (a *adapter) Close() error {
 	}
 
 	return nil
+}
+
+// GetDB returns the underlying database connection for direct queries
+// This is used by the API layer for statistics calculations
+func (a *adapter) GetDB() *sql.DB {
+	return a.db
+}
+
+// Metrics returns a snapshot of CockroachDB latency metrics.
+func (a *adapter) Metrics() MetricsSnapshot {
+	if a == nil || a.metrics == nil {
+		return MetricsSnapshot{}
+	}
+	return a.metrics.snapshot()
+}
+
+func (a *adapter) recordQuery(label string) func() {
+	if a == nil || a.metrics == nil {
+		return func() {}
+	}
+	start := time.Now()
+	return func() {
+		a.metrics.observeQuery(label, time.Since(start))
+	}
+}
+
+func (a *adapter) recordTxn(label string) func() {
+	if a == nil || a.metrics == nil {
+		return func() {}
+	}
+	start := time.Now()
+	return func() {
+		a.metrics.observeTxn(label, time.Since(start))
+	}
+}
+
+// MetricsSnapshot contains aggregated latency and slow operation counters.
+type MetricsSnapshot struct {
+	QueryBuckets         []utils.HistogramBucket
+	QueryCount           uint64
+	QuerySumMs           float64
+	QueryP95Ms           float64
+	TxnBuckets           []utils.HistogramBucket
+	TxnCount             uint64
+	TxnSumMs             float64
+	TxnP95Ms             float64
+	SlowQueryCount       uint64
+	SlowTransactionCount uint64
+	SlowQueries          map[string]uint64
+	SlowTransactions     map[string]uint64
+}
+
+type dbMetrics struct {
+	queryLatency         *utils.LatencyHistogram
+	txnLatency           *utils.LatencyHistogram
+	slowQueryThresholdMs float64
+	slowTxnThresholdMs   float64
+	slowQueryCount       atomic.Uint64
+	slowTxnCount         atomic.Uint64
+	slowQueryLabels      sync.Map
+	slowTxnLabels        sync.Map
+}
+
+func newDBMetrics() *dbMetrics {
+	return &dbMetrics{
+		queryLatency:         utils.NewLatencyHistogram([]float64{1, 5, 20, 50, 100, 250, 500, 1000, 2500, 5000}),
+		txnLatency:           utils.NewLatencyHistogram([]float64{5, 20, 50, 100, 250, 500, 1000, 2500, 5000, 10000}),
+		slowQueryThresholdMs: 250,
+		slowTxnThresholdMs:   500,
+	}
+}
+
+func (m *dbMetrics) observeQuery(label string, d time.Duration) {
+	if m == nil {
+		return
+	}
+	ms := float64(d) / float64(time.Millisecond)
+	m.queryLatency.Observe(ms)
+	if ms > m.slowQueryThresholdMs {
+		m.slowQueryCount.Add(1)
+		incrementLabel(&m.slowQueryLabels, label)
+	}
+}
+
+func (m *dbMetrics) observeTxn(label string, d time.Duration) {
+	if m == nil {
+		return
+	}
+	ms := float64(d) / float64(time.Millisecond)
+	m.txnLatency.Observe(ms)
+	if ms > m.slowTxnThresholdMs {
+		m.slowTxnCount.Add(1)
+		incrementLabel(&m.slowTxnLabels, label)
+	}
+}
+
+func (m *dbMetrics) snapshot() MetricsSnapshot {
+	if m == nil {
+		return MetricsSnapshot{}
+	}
+	queryBuckets, qCount, qSum := m.queryLatency.Snapshot()
+	txnBuckets, tCount, tSum := m.txnLatency.Snapshot()
+	snapshot := MetricsSnapshot{
+		QueryBuckets:         queryBuckets,
+		QueryCount:           qCount,
+		QuerySumMs:           qSum,
+		QueryP95Ms:           m.queryLatency.Quantile(0.95),
+		TxnBuckets:           txnBuckets,
+		TxnCount:             tCount,
+		TxnSumMs:             tSum,
+		TxnP95Ms:             m.txnLatency.Quantile(0.95),
+		SlowQueryCount:       m.slowQueryCount.Load(),
+		SlowTransactionCount: m.slowTxnCount.Load(),
+		SlowQueries:          make(map[string]uint64),
+		SlowTransactions:     make(map[string]uint64),
+	}
+	m.slowQueryLabels.Range(func(key, value any) bool {
+		if counter, ok := value.(*atomic.Uint64); ok {
+			snapshot.SlowQueries[key.(string)] = counter.Load()
+		}
+		return true
+	})
+	m.slowTxnLabels.Range(func(key, value any) bool {
+		if counter, ok := value.(*atomic.Uint64); ok {
+			snapshot.SlowTransactions[key.(string)] = counter.Load()
+		}
+		return true
+	})
+	return snapshot
+}
+
+func incrementLabel(store *sync.Map, label string) {
+	if label == "" {
+		label = "unknown"
+	}
+	if val, ok := store.Load(label); ok {
+		if counter, ok2 := val.(*atomic.Uint64); ok2 {
+			counter.Add(1)
+			return
+		}
+	}
+	counter := &atomic.Uint64{}
+	existing, loaded := store.LoadOrStore(label, counter)
+	if loaded {
+		if c, ok := existing.(*atomic.Uint64); ok {
+			c.Add(1)
+			return
+		}
+	}
+	counter.Add(1)
 }

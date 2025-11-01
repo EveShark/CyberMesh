@@ -2,9 +2,13 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	consensusapi "backend/pkg/consensus/api"
@@ -41,116 +45,93 @@ func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	checks := make(map[string]string)
+	checks := make(map[string]ReadinessCheckResult)
 	details := make(map[string]interface{})
-	allReady := true
 	phase := ""
-	var activation consensusapi.ActivationStatus
-	var haveActivation bool
+	allReady := true
 
-	// Check storage
-	if s.storage != nil {
-		if err := s.checkStorage(ctx); err != nil {
-			checks["storage"] = "not ready"
-			details["storage_error"] = err.Error()
-			allReady = false
-		} else {
-			checks["storage"] = "ok"
+	mergeDetail := func(key string, val interface{}) {
+		if val == nil {
+			return
 		}
-	} else {
-		checks["storage"] = "not configured"
-		allReady = false
-	}
-
-	// Check state store
-	if s.stateStore != nil {
-		if err := s.checkStateStore(ctx); err != nil {
-			checks["state"] = "not ready"
-			details["state_error"] = err.Error()
-			allReady = false
-		} else {
-			checks["state"] = "ok"
-			details["state_version"] = s.stateStore.Latest()
+		if key == "" {
+			if m, ok := val.(map[string]interface{}); ok {
+				for k, v := range m {
+					details[k] = v
+				}
+			}
+			return
 		}
-	} else {
-		checks["state"] = "not configured"
-		allReady = false
+		details[key] = val
 	}
 
-	// Check mempool
-	if s.mempool != nil {
-		checks["mempool"] = "ok"
-	} else {
-		checks["mempool"] = "not configured"
+	mark := func(name string, res ReadinessCheckResult, detailKey string, detailVal interface{}) {
+		checks[name] = res
+		if !isReadinessPassing(res.Status) {
+			allReady = false
+		}
+		if detailVal != nil {
+			mergeDetail(detailKey, detailVal)
+		} else if detailKey != "" && res.Message != "" {
+			mergeDetail(detailKey, res.Message)
+		}
+		if res.Message != "" && detailKey == "" {
+			mergeDetail(name+"_message", res.Message)
+		}
 	}
 
-	// Check consensus engine
-	if s.engine != nil {
-		status := s.engine.GetStatus()
-		activation = consensusapi.PrivateGetActivationStatus(s.engine)
-		haveActivation = true
-		details["consensus_ready_validators"] = activation.ReadyValidators
-		details["consensus_required_ready"] = activation.RequiredReady
-		details["consensus_peers_seen"] = activation.PeersSeen
-		details["consensus_seen_quorum"] = activation.SeenQuorum
-		if activation.GenesisPhase {
-			checks["consensus"] = "genesis"
-			phase = "genesis"
-			details["consensus_phase"] = "genesis"
-		} else if status.Running && s.engine.IsConsensusActive() && activation.HasQuorum {
-			checks["consensus"] = "ok"
+	storageResult, storageDetail := s.runStorageCheck(ctx)
+	mark("storage", storageResult, "storage_error", nil)
+	checks["cockroach"] = storageResult
+	if storageDetail != nil {
+		details["storage"] = storageDetail
+		details["cockroach"] = storageDetail
+	}
+	if storageResult.Message != "" {
+		details["cockroach_message"] = storageResult.Message
+	}
+
+	stateResult, stateDetail := s.runStateStoreCheck(ctx)
+	mark("state", stateResult, "state_error", stateDetail)
+	if stateResult.Status == "ok" && s.stateStore != nil {
+		details["state_version"] = s.stateStore.Latest()
+	}
+
+	mark("mempool", s.runMempoolCheck(ctx), "", nil)
+
+	consensusResult, consensusDetails, consensusPhase := s.runConsensusCheck(ctx)
+	mark("consensus", consensusResult, "", consensusDetails)
+	if consensusResult.Message != "" {
+		details["consensus_error"] = consensusResult.Message
+	}
+	if consensusPhase != "" {
+		phase = consensusPhase
+	}
+
+	p2pResult, p2pDetails := s.runP2PCheck(ctx)
+	mark("p2p_quorum", p2pResult, "", p2pDetails)
+	if p2pResult.Message != "" {
+		details["p2p_quorum_error"] = p2pResult.Message
+	}
+
+	kafkaResult := s.runKafkaCheck(ctx)
+	mark("kafka", kafkaResult, "kafka_error", nil)
+
+	redisResult, redisDetail := s.runRedisCheck(ctx)
+	mark("redis", redisResult, "redis_error", nil)
+	if redisDetail != nil {
+		details["redis"] = redisDetail
+	}
+
+	aiResult := s.runAIServiceCheck(ctx)
+	mark("ai_service", aiResult, "ai_error", nil)
+
+	if phase == "" && s.engine != nil {
+		if s.engine.IsConsensusActive() {
 			phase = "active"
 		} else {
-			checks["consensus"] = "not ready"
-			phase = "inactive"
-			allReady = false
-			if !status.Running {
-				details["consensus_error"] = "engine not running"
-			} else if !s.engine.IsConsensusActive() {
-				details["consensus_error"] = "consensus not active"
-			} else if !activation.HasQuorum {
-				details["consensus_error"] = "activation quorum not met"
-			}
+			phase = "genesis"
 		}
-	} else {
-		checks["consensus"] = "not configured"
-		// Not strictly fatal if API can serve historical data; do not flip allReady here
-	}
-
-	// Check P2P peer connectivity for multi-node deployments
-	if s.p2pRouter != nil && s.engine != nil {
-		if !haveActivation {
-			activation = consensusapi.PrivateGetActivationStatus(s.engine)
-			haveActivation = true
-		}
-		details["p2p_connected_peers"] = activation.ConnectedPeers
-		details["p2p_active_peers"] = activation.ActivePeers
-		totalValidators := len(s.engine.ListValidators())
-		details["p2p_total_validators"] = totalValidators
-		details["p2p_required_peers"] = activation.RequiredPeers
-		details["p2p_quorum_2f+1"] = activation.RequiredReady
-
-		if activation.GenesisPhase {
-			checks["p2p_quorum"] = "genesis"
-		} else if totalValidators <= 1 {
-			// Single validator deployment (dev/test)
-			checks["p2p_quorum"] = "single_node"
-		} else if activation.ConnectedPeers >= activation.RequiredPeers {
-			checks["p2p_quorum"] = "ok"
-		} else if activation.ConnectedPeers == 0 {
-			// No peers - cluster not formed yet
-			checks["p2p_quorum"] = "no_peers"
-			details["p2p_quorum_error"] = fmt.Sprintf("need %d peers, have 0", activation.RequiredPeers)
-			allReady = false
-		} else {
-			// Some peers but below quorum threshold
-			checks["p2p_quorum"] = "insufficient"
-			details["p2p_quorum_error"] = fmt.Sprintf("connected %d, need %d (quorum %d/%d validators)",
-				activation.ConnectedPeers, activation.RequiredPeers, activation.RequiredReady, totalValidators)
-			allReady = false
-		}
-	} else {
-		checks["p2p"] = "not configured"
 	}
 
 	response := ReadinessResponse{
@@ -161,20 +142,399 @@ func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 		Phase:     phase,
 	}
 
-	if response.Phase == "" && s.engine != nil {
-		if s.engine.IsConsensusActive() {
-			response.Phase = "active"
-		} else {
-			response.Phase = "genesis"
-		}
-	}
-
 	statusCode := http.StatusOK
 	if !allReady {
 		statusCode = http.StatusServiceUnavailable
 	}
 
 	writeJSONResponse(w, r, NewSuccessResponse(response), statusCode)
+}
+
+func isReadinessPassing(status string) bool {
+	switch status {
+	case "ok", "single_node":
+		return true
+	case "genesis":
+		// Treat genesis as transitional (not fatal) for readiness signal.
+		return true
+	case "not configured":
+		return false
+	default:
+		return false
+	}
+}
+
+func buildCheckResult(start time.Time, status string, err error) ReadinessCheckResult {
+	res := ReadinessCheckResult{
+		Status:    status,
+		LatencyMs: float64(time.Since(start).Milliseconds()),
+	}
+	if err != nil {
+		res.Message = err.Error()
+	}
+	return res
+}
+
+func (s *Server) runStorageCheck(ctx context.Context) (ReadinessCheckResult, map[string]interface{}) {
+	start := time.Now()
+	if s.storage == nil {
+		return ReadinessCheckResult{Status: "not configured", LatencyMs: 0, Message: "storage adapter not initialized"}, nil
+	}
+
+	err := s.checkStorage(ctx)
+	status := "ok"
+	if err != nil {
+		status = "not ready"
+	}
+
+	res := buildCheckResult(start, status, err)
+	s.recordStorageLatency(res.LatencyMs)
+
+	if err != nil {
+		return res, map[string]interface{}{"error": err.Error()}
+	}
+
+	info := s.collectCockroachInfo(ctx)
+	if len(info) == 0 {
+		return res, nil
+	}
+	return res, info
+}
+
+func (s *Server) collectCockroachInfo(parentCtx context.Context) map[string]interface{} {
+	provider, ok := s.storage.(interface{ GetDB() *sql.DB })
+	if !ok {
+		return nil
+	}
+
+	db := provider.GetDB()
+	if db == nil {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(parentCtx, 2*time.Second)
+	defer cancel()
+
+	info := make(map[string]interface{})
+
+	var dbName sql.NullString
+	if err := db.QueryRowContext(ctx, "SELECT current_database()").Scan(&dbName); err == nil && dbName.Valid {
+		info["database"] = dbName.String
+	} else if err != nil && s.logger != nil {
+		s.logger.Debug("Failed to fetch current database for readiness detail", utils.ZapError(err))
+	}
+
+	var version sql.NullString
+	if err := db.QueryRowContext(ctx, "SELECT version()").Scan(&version); err == nil && version.Valid {
+		parts := strings.Fields(version.String)
+		if len(parts) >= 2 {
+			info["version"] = parts[1]
+		}
+		info["version_full"] = version.String
+	} else if err != nil && s.logger != nil {
+		s.logger.Debug("Failed to fetch Cockroach version", utils.ZapError(err))
+	}
+
+	var nodeID sql.NullInt64
+	if err := db.QueryRowContext(ctx, "SELECT node_id FROM crdb_internal.node_id()").Scan(&nodeID); err == nil && nodeID.Valid {
+		info["node_id"] = nodeID.Int64
+	} else if err != nil && s.logger != nil {
+		s.logger.Debug("Failed to fetch Cockroach node id", utils.ZapError(err))
+	}
+
+	if len(info) == 0 {
+		return nil
+	}
+
+	return info
+}
+
+func (s *Server) runStateStoreCheck(ctx context.Context) (ReadinessCheckResult, interface{}) {
+	start := time.Now()
+	if s.stateStore == nil {
+		return ReadinessCheckResult{Status: "not configured", LatencyMs: 0, Message: "state store not initialized"}, nil
+	}
+
+	err := s.checkStateStore(ctx)
+	status := "ok"
+	var detail interface{}
+	if err != nil {
+		status = "not ready"
+		detail = err.Error()
+	}
+
+	return buildCheckResult(start, status, err), detail
+}
+
+func (s *Server) runMempoolCheck(ctx context.Context) ReadinessCheckResult {
+	start := time.Now()
+	if s.mempool == nil {
+		return ReadinessCheckResult{Status: "not configured", LatencyMs: 0, Message: "mempool disabled"}
+	}
+	return buildCheckResult(start, "ok", nil)
+}
+
+func (s *Server) runConsensusCheck(ctx context.Context) (ReadinessCheckResult, interface{}, string) {
+	start := time.Now()
+	if s.engine == nil {
+		return ReadinessCheckResult{Status: "not configured", LatencyMs: 0, Message: "consensus engine not attached"}, nil, ""
+	}
+
+	status := s.engine.GetStatus()
+	activation := consensusapi.PrivateGetActivationStatus(s.engine)
+
+	details := map[string]interface{}{
+		"consensus_ready_validators": activation.ReadyValidators,
+		"consensus_required_ready":   activation.RequiredReady,
+		"consensus_peers_seen":       activation.PeersSeen,
+		"consensus_seen_quorum":      activation.SeenQuorum,
+	}
+
+	var message string
+	var phase string
+
+	switch {
+	case activation.GenesisPhase:
+		phase = "genesis"
+		details["consensus_phase"] = "genesis"
+		return buildCheckResult(start, "genesis", nil), details, phase
+	case status.Running && s.engine.IsConsensusActive() && activation.HasQuorum:
+		phase = "active"
+		return buildCheckResult(start, "ok", nil), details, phase
+	default:
+		phase = "inactive"
+		switch {
+		case !status.Running:
+			message = "engine not running"
+		case !s.engine.IsConsensusActive():
+			message = "consensus not active"
+		case !activation.HasQuorum:
+			message = "activation quorum not met"
+		default:
+			message = "unknown consensus degradation"
+		}
+		res := buildCheckResult(start, "not ready", errors.New(message))
+		return res, details, phase
+	}
+}
+
+func (s *Server) runP2PCheck(ctx context.Context) (ReadinessCheckResult, interface{}) {
+	start := time.Now()
+	if s.p2pRouter == nil || s.engine == nil {
+		return ReadinessCheckResult{Status: "not configured", LatencyMs: 0, Message: "p2p router unavailable"}, nil
+	}
+
+	activation := consensusapi.PrivateGetActivationStatus(s.engine)
+	details := map[string]interface{}{
+		"p2p_connected_peers": activation.ConnectedPeers,
+		"p2p_active_peers":    activation.ActivePeers,
+		"p2p_required_peers":  activation.RequiredPeers,
+		"p2p_quorum_2f+1":     activation.RequiredReady,
+	}
+	totalValidators := len(s.engine.ListValidators())
+	details["p2p_total_validators"] = totalValidators
+
+	switch {
+	case activation.GenesisPhase:
+		return buildCheckResult(start, "genesis", nil), details
+	case totalValidators <= 1:
+		return buildCheckResult(start, "single_node", nil), details
+	case activation.ConnectedPeers >= activation.RequiredPeers:
+		return buildCheckResult(start, "ok", nil), details
+	case activation.ConnectedPeers == 0:
+		msg := fmt.Sprintf("need %d peers, have 0", activation.RequiredPeers)
+		return buildCheckResult(start, "no_peers", errors.New(msg)), details
+	default:
+		msg := fmt.Sprintf("connected %d, need %d (quorum %d/%d validators)", activation.ConnectedPeers, activation.RequiredPeers, activation.RequiredReady, totalValidators)
+		return buildCheckResult(start, "insufficient", errors.New(msg)), details
+	}
+}
+
+func (s *Server) runKafkaCheck(ctx context.Context) ReadinessCheckResult {
+	start := time.Now()
+	if s.kafkaProd == nil {
+		return ReadinessCheckResult{Status: "not configured", LatencyMs: 0, Message: "kafka integration disabled"}
+	}
+	err := s.kafkaProd.HealthCheck(ctx)
+	status := "ok"
+	if err != nil {
+		status = "not ready"
+	}
+	res := buildCheckResult(start, status, err)
+	s.recordKafkaLatency(res.LatencyMs)
+	return res
+}
+
+func (s *Server) runRedisCheck(ctx context.Context) (ReadinessCheckResult, map[string]interface{}) {
+	start := time.Now()
+	if s.redisClient == nil {
+		return ReadinessCheckResult{Status: "not configured", LatencyMs: 0, Message: "redis client not initialized"}, nil
+	}
+
+	err := s.redisClient.Ping(ctx).Err()
+	status := "ok"
+	if err != nil {
+		status = "not ready"
+	}
+
+	res := buildCheckResult(start, status, err)
+	if err != nil {
+		return res, map[string]interface{}{"error": err.Error()}
+	}
+
+	info := s.collectRedisInfo(ctx)
+	if len(info) == 0 {
+		return res, nil
+	}
+	return res, info
+}
+
+func (s *Server) collectRedisInfo(parentCtx context.Context) map[string]interface{} {
+	ctx, cancel := context.WithTimeout(parentCtx, 2*time.Second)
+	defer cancel()
+
+	infoStr, err := s.redisClient.Info(ctx, "server").Result()
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Debug("Failed to fetch Redis INFO", utils.ZapError(err))
+		}
+		return nil
+	}
+
+	info := make(map[string]interface{})
+	for _, line := range strings.Split(infoStr, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := parts[0]
+		value := parts[1]
+		switch key {
+		case "redis_version":
+			info["version"] = value
+		case "redis_mode":
+			info["mode"] = value
+		case "role":
+			info["role"] = value
+		case "connected_clients":
+			if v, err := strconv.Atoi(value); err == nil {
+				info["connected_clients"] = v
+			}
+		case "uptime_in_seconds":
+			if v, err := strconv.ParseInt(value, 10, 64); err == nil {
+				info["uptime_seconds"] = v
+			}
+		}
+	}
+
+	statsStr, err := s.redisClient.Info(ctx, "stats").Result()
+	if err == nil {
+		for _, line := range strings.Split(statsStr, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			switch parts[0] {
+			case "total_connections_received":
+				if v, err := strconv.ParseInt(parts[1], 10, 64); err == nil {
+					info["total_connections_received"] = v
+				}
+			case "total_commands_processed":
+				if v, err := strconv.ParseInt(parts[1], 10, 64); err == nil {
+					info["total_commands_processed"] = v
+				}
+			case "instantaneous_ops_per_sec":
+				if v, err := strconv.Atoi(parts[1]); err == nil {
+					info["ops_per_sec"] = v
+				}
+			}
+		}
+	} else if s.logger != nil {
+		s.logger.Debug("Failed to fetch Redis stats INFO", utils.ZapError(err))
+	}
+
+	if len(info) == 0 {
+		return nil
+	}
+
+	return info
+}
+
+func (s *Server) runAIServiceCheck(ctx context.Context) ReadinessCheckResult {
+	start := time.Now()
+	if s.aiClient == nil || s.aiBaseURL == "" {
+		return ReadinessCheckResult{Status: "not configured", LatencyMs: 0, Message: "ai service integration disabled"}
+	}
+
+	ready, msg, err := s.pingAIService(ctx)
+	status := "ok"
+	var finalErr error
+	if err != nil {
+		status = "not ready"
+		finalErr = err
+	} else if !ready {
+		status = "not ready"
+		if msg == "" {
+			msg = "ai service not ready"
+		}
+		finalErr = errors.New(msg)
+	}
+
+	res := buildCheckResult(start, status, finalErr)
+	if finalErr == nil && msg != "" {
+		res.Message = msg
+	}
+	return res
+}
+
+func (s *Server) pingAIService(ctx context.Context) (bool, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/ready", s.aiBaseURL), nil)
+	if err != nil {
+		return false, "", err
+	}
+	if s.aiAuthToken != "" {
+		req.Header.Set("Authorization", "Bearer "+s.aiAuthToken)
+	}
+
+	resp, err := s.aiClient.Do(req)
+	if err != nil {
+		return false, "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Sprintf("ai ready status %d", resp.StatusCode), nil
+	}
+
+	var payload struct {
+		Ready bool   `json:"ready"`
+		State string `json:"state"`
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return false, "", fmt.Errorf("invalid ai readiness response: %w", err)
+	}
+
+	if !payload.Ready {
+		msg := payload.State
+		if msg == "" {
+			msg = payload.Error
+		}
+		if msg == "" {
+			msg = "ai service not ready"
+		}
+		return false, msg, nil
+	}
+
+	return true, "", nil
 }
 
 // checkStorage verifies storage is accessible
@@ -210,22 +570,30 @@ func (s *Server) checkStateStore(ctx context.Context) error {
 
 // writeJSONResponse writes a successful JSON response
 func writeJSONResponse(w http.ResponseWriter, r *http.Request, response *Response, statusCode int) {
-	w.Header().Set(HeaderContentType, ContentTypeJSON)
-	w.WriteHeader(statusCode)
-
-	// Add request ID to response if available
-	if requestID := getRequestID(r.Context()); requestID != "" {
+	requestID := getRequestID(r.Context())
+	if requestID != "" {
 		if response.Meta == nil {
 			response.Meta = &MetaDTO{}
 		}
 		response.Meta.RequestID = requestID
 	}
 
-	encoder := json.NewEncoder(w)
-	if err := encoder.Encode(response); err != nil {
-		// Log encoding error but response already started
-		// Can't change status code at this point
+	payload, err := json.Marshal(response)
+	if err != nil {
+		fallback := NewErrorResponseSimple("ENCODING_ERROR", fmt.Sprintf("failed to encode response: %v", err), requestID)
+		fallbackPayload, marshalErr := json.Marshal(fallback)
+		if marshalErr != nil {
+			fallbackPayload = []byte("{\"success\":false,\"error\":{\"code\":\"ENCODING_ERROR\",\"message\":\"failed to encode response\"}}")
+		}
+		w.Header().Set(HeaderContentType, ContentTypeJSON)
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write(fallbackPayload)
+		return
 	}
+
+	w.Header().Set(HeaderContentType, ContentTypeJSON)
+	w.WriteHeader(statusCode)
+	w.Write(payload)
 }
 
 // writeErrorResponse writes an error JSON response

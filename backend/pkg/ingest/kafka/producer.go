@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"backend/pkg/utils"
 	pb "backend/proto"
@@ -15,13 +18,24 @@ import (
 
 // Producer handles publishing control messages to Kafka
 type Producer struct {
-	producer sarama.SyncProducer
-	topics   ProducerTopics
-	logger   *utils.Logger
-	audit    *utils.AuditLogger
-	signer   *CommitSigner
-	mu       sync.RWMutex
-	closed   bool
+	producer                  sarama.SyncProducer
+	topics                    ProducerTopics
+	logger                    *utils.Logger
+	audit                     *utils.AuditLogger
+	signer                    *CommitSigner
+	mu                        sync.RWMutex
+	closed                    bool
+	brokers                   []string
+	config                    *sarama.Config
+	publishSuccesses          atomic.Uint64
+	publishFailures           atomic.Uint64
+	publishLatencyTotalMicros atomic.Uint64
+	publishLatencySamples     atomic.Uint64
+	lastPartition             atomic.Int32
+	lastOffset                atomic.Int64
+	lastPublishUnix           atomic.Int64
+	lastPublishErr            atomic.Pointer[string]
+	publishLatencyHist        *utils.LatencyHistogram
 }
 
 // ProducerTopics holds Kafka topic names for producer
@@ -69,7 +83,14 @@ func NewProducer(ctx context.Context, cfg ProducerConfig, saramaCfg *sarama.Conf
 		audit:    audit,
 		signer:   cfg.Signer,
 		closed:   false,
+		brokers:  append([]string(nil), cfg.Brokers...),
+		config:   saramaCfg,
 	}
+	p.publishLatencyHist = utils.NewLatencyHistogram([]float64{1, 5, 20, 100, 500, 1000, math.Inf(1)})
+	p.lastPartition.Store(-1)
+	p.lastOffset.Store(-1)
+	p.lastPublishUnix.Store(0)
+	p.lastPublishErr.Store(nil)
 
 	if audit != nil {
 		_ = audit.Info("kafka_producer_created", map[string]interface{}{
@@ -85,6 +106,39 @@ func NewProducer(ctx context.Context, cfg ProducerConfig, saramaCfg *sarama.Conf
 	}
 
 	return p, nil
+}
+
+// HealthCheck validates broker connectivity by opening a lightweight client.
+func (p *Producer) HealthCheck(ctx context.Context) error {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if p.closed {
+		return fmt.Errorf("kafka producer: closed")
+	}
+
+	if len(p.brokers) == 0 || p.config == nil {
+		return fmt.Errorf("kafka producer: configuration incomplete")
+	}
+
+	client, err := sarama.NewClient(p.brokers, p.config)
+	if err != nil {
+		return fmt.Errorf("kafka producer: client create failed: %w", err)
+	}
+	defer client.Close() //nolint:errcheck // close best-effort
+
+	// Perform a lightweight metadata request by listing brokers.
+	brokers := client.Brokers()
+	if len(brokers) == 0 {
+		return fmt.Errorf("kafka producer: no brokers returned")
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return nil
+	}
 }
 
 // PublishCommit publishes a block commit event to control.commits.v1
@@ -144,8 +198,12 @@ func (p *Producer) PublishCommit(ctx context.Context, height uint64, hash [32]by
 	}
 
 	// Send message (blocking with idempotent producer)
+	start := time.Now()
 	partition, offset, err := p.producer.SendMessage(kafkaMsg)
 	if err != nil {
+		p.publishFailures.Add(1)
+		errStr := err.Error()
+		p.lastPublishErr.Store(&errStr)
 		if p.audit != nil {
 			_ = p.audit.Error("kafka_publish_commit_failed", map[string]interface{}{
 				"height": height,
@@ -159,6 +217,18 @@ func (p *Producer) PublishCommit(ctx context.Context, height uint64, hash [32]by
 		}
 		return fmt.Errorf("kafka producer: publish failed: %w", err)
 	}
+
+	p.publishSuccesses.Add(1)
+	elapsed := time.Since(start)
+	if elapsed > 0 {
+		p.publishLatencyTotalMicros.Add(uint64(elapsed.Microseconds()))
+		p.publishLatencySamples.Add(1)
+		p.publishLatencyHist.Observe(float64(elapsed) / float64(time.Millisecond))
+	}
+	p.lastPartition.Store(partition)
+	p.lastOffset.Store(offset)
+	p.lastPublishUnix.Store(time.Now().Unix())
+	p.lastPublishErr.Store(nil)
 
 	// Success
 	if p.audit != nil {
@@ -181,6 +251,62 @@ func (p *Producer) PublishCommit(ctx context.Context, height uint64, hash [32]by
 	}
 
 	return nil
+}
+
+// ProducerStats captures operational telemetry for the Kafka producer.
+type ProducerStats struct {
+	BrokerCount      int
+	PublishSuccesses uint64
+	PublishFailures  uint64
+	PublishLatencyMs float64
+	LastPartition    *int32
+	LastOffset       *int64
+	LastPublishUnix  *int64
+	LastError        string
+	LatencyBuckets   []utils.HistogramBucket
+	LatencyP50Ms     float64
+	LatencyP95Ms     float64
+	LatencyCount     uint64
+	LatencySumMs     float64
+}
+
+// Stats returns a snapshot of producer telemetry counters.
+func (p *Producer) Stats() ProducerStats {
+	var stats ProducerStats
+	p.mu.RLock()
+	stats.BrokerCount = len(p.brokers)
+	p.mu.RUnlock()
+	stats.PublishSuccesses = p.publishSuccesses.Load()
+	stats.PublishFailures = p.publishFailures.Load()
+	samples := p.publishLatencySamples.Load()
+	if samples > 0 {
+		totalMicros := p.publishLatencyTotalMicros.Load()
+		stats.PublishLatencyMs = (float64(totalMicros) / float64(samples)) / 1000.0
+	}
+	if partition := p.lastPartition.Load(); partition >= 0 {
+		val := partition
+		stats.LastPartition = &val
+	}
+	if offset := p.lastOffset.Load(); offset >= 0 {
+		val := offset
+		stats.LastOffset = &val
+	}
+	if unix := p.lastPublishUnix.Load(); unix > 0 {
+		val := unix
+		stats.LastPublishUnix = &val
+	}
+	if ptr := p.lastPublishErr.Load(); ptr != nil {
+		stats.LastError = *ptr
+	}
+	buckets, total, sum := p.publishLatencyHist.Snapshot()
+	if total > 0 {
+		stats.LatencyBuckets = buckets
+		stats.LatencyP50Ms = p.publishLatencyHist.Quantile(0.50)
+		stats.LatencyP95Ms = p.publishLatencyHist.Quantile(0.95)
+		stats.LatencyCount = total
+		stats.LatencySumMs = sum
+	}
+	return stats
 }
 
 // Close gracefully closes the producer

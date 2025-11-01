@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-config
+  namespace: cybermesh
+  labels:
+    app: frontend
+data:
+  # Backend API - External LoadBalancer IP (used by browser AND server-side API routes)
+  NEXT_PUBLIC_BACKEND_API_BASE: "http://35.187.249.43:9441/api/v1"
+  
+  # AI Service API - Internal ClusterIP (server-side Next.js API routes only)
+  # NOT prefixed with NEXT_PUBLIC_ because browser can't resolve cluster.local DNS
+  AI_API_BASE: "http://ai-service.cybermesh.svc.cluster.local:8080"
+  
+  # Node environment
+  NODE_ENV: "production"
+  
+  # Next.js configuration
+  HOSTNAME: "0.0.0.0"
+  PORT: "3000"

@@ -25,7 +25,7 @@ Quick reference for deploying the CyberMesh consensus backend to Google Kubernet
 
 ## Prerequisites
 
-1. **GCP Project**: `cybermesh-474414`
+1. **GCP Project**: `cybermesh-476310`
 2. **gcloud CLI** authenticated
 3. **Docker Desktop** (for building images)
 4. **kubectl** installed
@@ -39,17 +39,17 @@ Quick reference for deploying the CyberMesh consensus backend to Google Kubernet
 ```bash
 # Build image (182MB)
 cd /path/to/CyberMesh
-docker build -t cybermesh/consensus-backend:latest .
+docker build -t cybermesh/cybermesh-backend:latest .
 
 # Verify build
-docker images | grep consensus-backend
+docker images | grep cybermesh-backend
 ```
 
 ### Tag & Push to Artifact Registry
 
 ```bash
 # Set project
-gcloud config set project cybermesh-474414
+gcloud config set project cybermesh-476310
 
 # Enable APIs
 gcloud services enable artifactregistry.googleapis.com container.googleapis.com
@@ -60,15 +60,15 @@ gcloud artifacts repositories create cybermesh-repo \
   --location=us-central1
 
 # Configure Docker auth
-gcloud auth configure-docker us-central1-docker.pkg.dev
+gcloud auth configure-docker asia-southeast1-docker.pkg.dev
 
 # Tag for Artifact Registry
-docker tag cybermesh/consensus-backend:latest \
-  us-central1-docker.pkg.dev/cybermesh-474414/cybermesh-repo/consensus-backend:latest
+docker tag cybermesh/cybermesh-backend:latest \
+  asia-southeast1-docker.pkg.dev/cybermesh-476310/cybermesh-repo/cybermesh-backend:latest
 
 # Push (using Docker Desktop context)
 export DOCKER_HOST=''
-docker push us-central1-docker.pkg.dev/cybermesh-474414/cybermesh-repo/consensus-backend:latest
+docker push asia-southeast1-docker.pkg.dev/cybermesh-476310/cybermesh-repo/cybermesh-backend:latest
 ```
 
 **Why Docker Desktop?** Rancher Desktop has network routing issues with GCR/Artifact Registry.
@@ -81,11 +81,11 @@ docker push us-central1-docker.pkg.dev/cybermesh-474414/cybermesh-repo/consensus
 # Create regional cluster (3 zones)
 gcloud container clusters create-auto cybermesh-cluster \
   --region=asia-southeast1 \
-  --project=cybermesh-474414
+  --project=cybermesh-476310
 
 # Verify kubectl context
 kubectl config current-context
-# Should show: gke_cybermesh-474414_asia-southeast1_cybermesh-cluster
+# Should show: gke_cybermesh-476310_asia-southeast1_cybermesh-cluster
 ```
 
 **Cluster details:**
@@ -244,11 +244,11 @@ kubectl describe pod validator-0 -n cybermesh | grep -A 10 Events
 ```bash
 # Verify image exists
 gcloud artifacts docker images list \
-  us-central1-docker.pkg.dev/cybermesh-474414/cybermesh-repo
+  asia-southeast1-docker.pkg.dev/cybermesh-476310/cybermesh-repo
 
 # GKE should auto-configure Artifact Registry access, but if needed:
 kubectl create secret docker-registry gcr-secret \
-  --docker-server=us-central1-docker.pkg.dev \
+  --docker-server=asia-southeast1-docker.pkg.dev \
   --docker-username=_json_key \
   --docker-password="$(gcloud auth print-access-token)" \
   -n cybermesh
@@ -299,13 +299,13 @@ kubectl rollout status statefulset/validator -n cybermesh
 ### Update image
 ```bash
 # Push new image with tag
-docker tag cybermesh/consensus-backend:latest \
-  us-central1-docker.pkg.dev/cybermesh-474414/cybermesh-repo/consensus-backend:v1.1.0
-docker push us-central1-docker.pkg.dev/cybermesh-474414/cybermesh-repo/consensus-backend:v1.1.0
+docker tag cybermesh/cybermesh-backend:latest \
+  asia-southeast1-docker.pkg.dev/cybermesh-476310/cybermesh-repo/cybermesh-backend:v1.1.0
+docker push asia-southeast1-docker.pkg.dev/cybermesh-476310/cybermesh-repo/cybermesh-backend:v1.1.0
 
 # Update StatefulSet
 kubectl set image statefulset/validator \
-  validator=us-central1-docker.pkg.dev/cybermesh-474414/cybermesh-repo/consensus-backend:v1.1.0 \
+  validator=asia-southeast1-docker.pkg.dev/cybermesh-476310/cybermesh-repo/cybermesh-backend:v1.1.0 \
   -n cybermesh
 
 # Watch rolling update
@@ -330,7 +330,7 @@ kubectl delete namespace cybermesh
 ```bash
 gcloud container clusters delete cybermesh-cluster \
   --region=asia-southeast1 \
-  --project=cybermesh-474414 \
+  --project=cybermesh-476310 \
   --quiet
 ```
 
@@ -338,7 +338,7 @@ gcloud container clusters delete cybermesh-cluster \
 ```bash
 gcloud artifacts repositories delete cybermesh-repo \
   --location=us-central1 \
-  --project=cybermesh-474414 \
+  --project=cybermesh-476310 \
   --quiet
 ```
 
@@ -354,7 +354,7 @@ gcloud artifacts repositories delete cybermesh-repo \
 
 **Pods:**
 - validator-0 to validator-4: ✅ Running (1/1)
-- Image: `us-central1-docker.pkg.dev/cybermesh-474414/cybermesh-repo/consensus-backend:latest`
+- Image: `asia-southeast1-docker.pkg.dev/cybermesh-476310/cybermesh-repo/cybermesh-backend:latest`
 - Size: 182MB
 
 **Services:**
@@ -410,11 +410,11 @@ gcloud artifacts repositories delete cybermesh-repo \
 ## Support
 
 **GCP Console:**
-https://console.cloud.google.com/kubernetes/workload_/gcloud/asia-southeast1/cybermesh-cluster?project=cybermesh-474414
+https://console.cloud.google.com/kubernetes/workload_/gcloud/asia-southeast1/cybermesh-cluster?project=cybermesh-476310
 
 **Logs:**
 ```bash
-kubectl logs -n cybermesh -l app=consensus-backend --tail=100 -f
+kubectl logs -n cybermesh -l app=cybermesh-backend --tail=100 -f
 ```
 
 **Monitoring:**

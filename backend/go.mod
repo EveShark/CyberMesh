@@ -1,6 +1,6 @@
 module backend
 
-go 1.24.0
+go 1.25.1
 
 require (
 	github.com/IBM/sarama v1.46.1
@@ -14,6 +14,7 @@ require (
 	github.com/libp2p/go-libp2p-kad-dht v0.25.1
 	github.com/libp2p/go-libp2p-pubsub v0.10.0
 	github.com/multiformats/go-multiaddr v0.12.0
+	github.com/redis/go-redis/v9 v9.5.1
 	github.com/stretchr/testify v1.11.1
 	github.com/xdg-go/scram v1.1.2
 	go.uber.org/zap v1.26.0
@@ -30,6 +31,7 @@ require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/davidlazar/go-crypto v0.0.0-20200604182044-b73af7476f6c // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.2.0 // indirect
+	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/eapache/go-resiliency v1.7.0 // indirect
 	github.com/eapache/go-xerial-snappy v0.0.0-20230731223053-c322873962e3 // indirect

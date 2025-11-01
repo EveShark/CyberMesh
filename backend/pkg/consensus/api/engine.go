@@ -285,6 +285,21 @@ func (e *ConsensusEngine) SetPersistence(worker PersistenceWorker) {
 	e.persistence = worker
 }
 
+// AttachPersistence sets the persistence worker and wires its backend into the
+// consensus storage if available. Intended for wiring scenarios where the
+// persistence worker is constructed after the engine.
+func (e *ConsensusEngine) AttachPersistence(worker PersistenceWorker) {
+    e.mu.Lock()
+    defer e.mu.Unlock()
+    e.persistence = worker
+    if e.storage != nil && worker != nil {
+        backend := worker.GetStorageBackend()
+        if backend != nil {
+            e.storage.SetBackend(backend)
+        }
+    }
+}
+
 // DefaultEngineConfig returns secure defaults
 func DefaultEngineConfig() *EngineConfig {
 	return &EngineConfig{

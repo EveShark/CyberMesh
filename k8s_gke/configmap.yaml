@@ -46,7 +46,7 @@ data:
   DYNAMIC_PEER_DISCOVERY: "true"
 
   # Database Connection (CockroachDB Cloud)
-  DB_DSN: "postgresql://cybermesh_user:nO0wBjVYVSPPbUJQOqYstw@cybermesh-threats-8958.jxf.gcp-asia-southeast1.cockroachlabs.cloud:26257/cybermesh_threats?sslmode=require&sslrootcert=./certs/root.crt"
+  DB_DSN: "postgresql://lenny:VnF_SqShUO-rcYx0VmnJ9w@cybermesh-threats-9633.jxf.gcp-asia-southeast1.cockroachlabs.cloud:26257/defaultdb?sslmode=require&sslrootcert=./certs/root.crt"
   DB_MAX_OPEN: "50"
   DB_MAX_IDLE: "10"
   DB_MAX_LIFETIME: "30m"
@@ -118,6 +118,8 @@ data:
   API_CORS_ENABLED: "true"
   API_CORS_ALLOWED_ORIGINS: "*"
   API_REQUEST_TIMEOUT: "30s"
+  AI_SERVICE_API_BASE: "http://ai-service.cybermesh.svc.cluster.local:8080"
+  AI_SERVICE_API_TIMEOUT: "2s"
 
   # Mempool (consolidated - duplicates removed)
   MEMPOOL_MAX_TXS: "1000"

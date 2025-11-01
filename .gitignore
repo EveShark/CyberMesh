@@ -1,30 +1,89 @@
-# Claude Code
-.claude/
+# ============================================================
+# CyberMesh - Comprehensive .gitignore
+# ============================================================
 
-# Environment files - Keep structure but ignore sensitive data
+# ============================================================
+# 1. ENVIRONMENT & SECRETS (CRITICAL - NEVER COMMIT)
+# ============================================================
+
+# Environment files
 .env
-.env.*
+.env.local
+.env.*.local
+.env.node*
+.env.cluster
+.env.consolidated
+.env.active
+
+# KEEP these for reference
 !.env.example
-*.env
-*.env.*
+!.env.template
 
-# Logs and runtime data
-*.log
-logs/
-*.log.*
-backend_stdout.log
-backend_stderr.log
-logs.txt
+# Security - Keys and Certificates
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+*.jks
+!certs/root.crt
 
-# Python
+# Kubernetes Secrets
+**/secret.yaml
+**/sealed-secret.yaml
+**/*-secret.yaml
+
+# Test keys (should use example keys instead)
+test_integration_key.pem
+
+# ============================================================
+# 2. BUILD OUTPUTS & BINARIES
+# ============================================================
+
+# Go binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Compiled Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-.Python
+
+# Backend build artifacts
+/bin/
+backend/bin/
+backend/*.exe
+backend/logs/*.exe
+backend/tests/**/*.exe
+
+# Frontend build outputs
+frontend/.next/
+frontend/out/
+frontend/build/
+frontend/dist/
+
+# ============================================================
+# 3. DEPENDENCIES & PACKAGE MANAGERS
+# ============================================================
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Python
 env/
 venv/
 ENV/
+.Python
 build/
 develop-eggs/
 dist/
@@ -40,14 +99,38 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-.pytest_cache/
-.coverage
-htmlcov/
-*.cover
-.hypothesis/
 
-# AI/ML Model files and checkpoints
-ai-service/models/
+# Go
+/pkg/
+vendor/
+
+# ============================================================
+# 4. LOGS & RUNTIME DATA
+# ============================================================
+
+# Log files
+*.log
+*.log.*
+logs/
+backend/logs/
+ai-service/logs/
+frontend/logs/
+audit.log
+backend_stdout.log
+backend_stderr.log
+
+# Runtime state
+*.pid
+*.seed
+*.pid.lock
+ai-service/data/service.pid
+ai-service/data/nonce_state.json
+
+# ============================================================
+# 5. AI/ML MODELS & DATA (LARGE FILES)
+# ============================================================
+
+# Model files
 *.joblib
 *.joblib.backup
 *.pkl
@@ -55,127 +138,153 @@ ai-service/models/
 *.pt
 *.pth
 checkpoint_*
-*.metadata.json
+*.ckpt
 
-# Go
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
-*.test
-*.out
-/bin/
-/pkg/
-vendor/
+# Large test datasets
+ai-service/data/datasets-test/*.csv
 
-# IDE and Editor files
+# Training outputs
+training_output/
+runs/
+wandb/
+
+# ============================================================
+# 6. TEST & COVERAGE
+# ============================================================
+
+# Test cache
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+.hypothesis/
+coverage/
+.nyc_output/
+junit.xml
+
+# Test results
+test_results/
+test_*.json
+*_results.json
+
+# ============================================================
+# 7. IDE & EDITOR FILES
+# ============================================================
+
+# VS Code
 .vscode/
+*.code-workspace
+
+# JetBrains IDEs
 .idea/
+*.iml
+*.iws
+*.ipr
+
+# Vim
 *.swp
 *.swo
 *~
-.DS_Store
+
+# Sublime Text
 *.sublime-project
 *.sublime-workspace
 
-# Security - Keys and Certificates
-keys/
-/keys/
-*.key
-*.pem
-*.crt
-!certs/root.crt
-*.p12
-*.pfx
-*.jks
+# ============================================================
+# 8. OS FILES
+# ============================================================
 
-# Kubernetes Secrets (contains sensitive credentials)
-k8s/secret.yaml
-k8s/sealed-secret.yaml
-k8s_gke/secret.yaml
-k8s_oke/secret.yaml
-k8s_oke/ai-service-secret.yaml
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
 
-# Database
-*.db
-*.sqlite
-*.sqlite3
+# Windows
+Thumbs.db
+desktop.ini
+ehthumbs.db
 
-# Node.js (if applicable)
-node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-package-lock.json
-yarn.lock
+# Linux
+*~
 
-# Temporary files
+# ============================================================
+# 9. TEMPORARY & BACKUP FILES
+# ============================================================
+
 tmp/
 temp/
 *.tmp
 *.bak
 *.backup
 *.swp
-
-# OS files
-Thumbs.db
-.DS_Store
-desktop.ini
-
-# Audit and security reports
-security_audit_*.json
-
-# Old backups
-Old env/
-/Old env/
 *.old
+*.orig
 
-# Tests
-ai-service/tests/
-backend/tests/
+# ============================================================
+# 10. PROJECT-SPECIFIC ARCHIVES & OLD FILES
+# ============================================================
 
-# Documentation
-/docs/
-AGENTS.md
+# Archive directory (moved files)
+Archive/
+backend/Archive/
+frontend/Archive/
 
-# Tools
-/tools/
+# Old/backup directories
+Old env/
+backup files/
 
-# Scripts
-/scripts/
+# Old configs
+.dockerignore.backup
+.dockerignore.ai-backup
+.dockerignore.frontend
 
-# Protobuf generated files (optional - uncomment if you want to ignore)
+# ============================================================
+# 11. DATABASE FILES
+# ============================================================
+
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+
+# ============================================================
+# 12. GENERATED/COMPILED PROTOBUF (OPTIONAL)
+# ============================================================
+
+# Uncomment if you want to ignore generated protobuf files
 # *_pb2.py
 # *_pb2_grpc.py
 # *.pb.go
 
-# Test coverage
-coverage/
-.nyc_output/
+# ============================================================
+# 13. CLAUDE AI
+# ============================================================
 
-# Local development directories
-.pytest_cache/
+.claude/
 
-# Additional backend build artifacts and loose files
-backend/cmd/cybermesh/cybermesh.exe
-backend/tests/integration/manual_e2e.test.exe
-backend/pkg/code fix.txt
+# ============================================================
+# 14. PROJECT-SPECIFIC FILES & DIRECTORIES TO IGNORE
+# ============================================================
 
-# Backend directories to ignore
-backend/Archive/
-backend/bin/
-backend/certs/
-backend/docs/
-backend/logs/
-backend/tests/
+# Coding guidelines (generated by AI)
+AGENTS.md
 
-# AI-Service directories and files to ignore
-ai-service/config/
-ai-service/data/
-ai-service/docs/
-ai-service/keys/
-ai-service/logs/
-ai-service/models/
+# Test directories (contain test scripts, not production tests)
 ai-service/tests/
-ai-service/.env
+backend/tests/
+frontend/tests/
+
+# Documentation directories (contain old/archived docs)
+backend/docs/
+/docs/
+
+# Root data directory (runtime state)
+/data/
+
+# Node.js artifacts for archived Excel scripts
+package.json
+package-lock.json
+
+# Temporary gitignore files
+.gitignore.old
+.gitignore.proposed

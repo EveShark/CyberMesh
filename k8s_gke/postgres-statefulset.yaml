@@ -1,0 +1,258 @@
+# PostgreSQL for AI Service Telemetry Data
+# Single replica for dev/test, can scale for production
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: cybermesh
+  labels:
+    app: postgres
+spec:
+  ports:
+  - port: 5432
+    name: postgres
+  clusterIP: None
+  selector:
+    app: postgres
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: cybermesh
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      # Prefer stateless node for better distribution
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: workload-type
+                operator: In
+                values:
+                - stateless
+      
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        ports:
+        - containerPort: 5432
+          name: postgres
+        env:
+        - name: POSTGRES_DB
+          value: "telemetry"
+        - name: POSTGRES_USER
+          value: "aiservice"
+        - name: POSTGRES_PASSWORD
+          value: "changeme123"  # Use Secret in production
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "150m"
+          limits:
+            memory: "1Gi"
+            cpu: "400m"
+        livenessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - aiservice
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - aiservice
+          initialDelaySeconds: 5
+          periodSeconds: 5
+  volumeClaimTemplates:
+  - metadata:
+      name: postgres-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: "standard-rwo"  # Use standard (HDD) for cost savings
+      resources:
+        requests:
+          storage: 10Gi
+
+---
+# Job to load CSV data into Postgres
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: postgres-load-csv
+  namespace: cybermesh
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      initContainers:
+      - name: wait-for-postgres
+        image: postgres:15-alpine
+        command:
+        - sh
+        - -c
+        - |
+          until pg_isready -h postgres.cybermesh.svc.cluster.local -U aiservice; do
+            echo "Waiting for postgres..."
+            sleep 2
+          done
+          echo "Postgres is ready!"
+      - name: sync-csv
+        image: google/cloud-sdk:alpine
+        command:
+        - sh
+        - -c
+        - |
+          echo "Downloading CSV from GCS..."
+          gsutil cp gs://cybermesh-test-datasets-476310/phase1_balanced_500k_50_50.csv /data/dataset.csv
+          echo "CSV downloaded: $(du -h /data/dataset.csv)"
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      containers:
+      - name: load-data
+        image: postgres:15-alpine
+        command:
+        - sh
+        - -c
+        - |
+          set -e
+          echo "Creating table..."
+          psql -h postgres.cybermesh.svc.cluster.local -U aiservice -d telemetry << 'EOF'
+          CREATE TABLE IF NOT EXISTS flows (
+            col INTEGER,
+            flow_id TEXT,
+            src_ip TEXT,
+            src_port FLOAT,
+            dst_ip TEXT,
+            dst_port FLOAT,
+            protocol FLOAT,
+            timestamp TEXT,
+            flow_duration FLOAT,
+            tot_fwd_pkts FLOAT,
+            tot_bwd_pkts FLOAT,
+            totlen_fwd_pkts FLOAT,
+            totlen_bwd_pkts FLOAT,
+            fwd_pkt_len_max FLOAT,
+            fwd_pkt_len_min FLOAT,
+            fwd_pkt_len_mean FLOAT,
+            fwd_pkt_len_std FLOAT,
+            bwd_pkt_len_max FLOAT,
+            bwd_pkt_len_min FLOAT,
+            bwd_pkt_len_mean FLOAT,
+            bwd_pkt_len_std FLOAT,
+            flow_byts_s FLOAT,
+            flow_pkts_s FLOAT,
+            flow_iat_mean FLOAT,
+            flow_iat_std FLOAT,
+            flow_iat_max FLOAT,
+            flow_iat_min FLOAT,
+            fwd_iat_tot FLOAT,
+            fwd_iat_mean FLOAT,
+            fwd_iat_std FLOAT,
+            fwd_iat_max FLOAT,
+            fwd_iat_min FLOAT,
+            bwd_iat_tot FLOAT,
+            bwd_iat_mean FLOAT,
+            bwd_iat_std FLOAT,
+            bwd_iat_max FLOAT,
+            bwd_iat_min FLOAT,
+            fwd_psh_flags FLOAT,
+            bwd_psh_flags FLOAT,
+            fwd_urg_flags FLOAT,
+            bwd_urg_flags FLOAT,
+            fwd_header_len FLOAT,
+            bwd_header_len FLOAT,
+            fwd_pkts_s FLOAT,
+            bwd_pkts_s FLOAT,
+            pkt_len_min FLOAT,
+            pkt_len_max FLOAT,
+            pkt_len_mean FLOAT,
+            pkt_len_std FLOAT,
+            pkt_len_var FLOAT,
+            fin_flag_cnt FLOAT,
+            syn_flag_cnt FLOAT,
+            rst_flag_cnt FLOAT,
+            psh_flag_cnt FLOAT,
+            ack_flag_cnt FLOAT,
+            urg_flag_cnt FLOAT,
+            cwe_flag_count FLOAT,
+            ece_flag_cnt FLOAT,
+            down_up_ratio FLOAT,
+            pkt_size_avg FLOAT,
+            fwd_seg_size_avg FLOAT,
+            bwd_seg_size_avg FLOAT,
+            fwd_byts_b_avg FLOAT,
+            fwd_pkts_b_avg FLOAT,
+            fwd_blk_rate_avg FLOAT,
+            bwd_byts_b_avg FLOAT,
+            bwd_pkts_b_avg FLOAT,
+            bwd_blk_rate_avg FLOAT,
+            subflow_fwd_pkts FLOAT,
+            subflow_fwd_byts FLOAT,
+            subflow_bwd_pkts FLOAT,
+            subflow_bwd_byts FLOAT,
+            init_fwd_win_byts FLOAT,
+            init_bwd_win_byts FLOAT,
+            fwd_act_data_pkts FLOAT,
+            fwd_seg_size_min FLOAT,
+            active_mean FLOAT,
+            active_std FLOAT,
+            active_max FLOAT,
+            active_min FLOAT,
+            idle_mean FLOAT,
+            idle_std FLOAT,
+            idle_max FLOAT,
+            idle_min FLOAT,
+            label TEXT,
+            source_file TEXT,
+            load_ts TEXT
+          );
+          EOF
+          
+          echo "Loading CSV data..."
+          psql -h postgres.cybermesh.svc.cluster.local -U aiservice -d telemetry -c "\COPY flows FROM '/data/dataset.csv' CSV HEADER"
+          
+          echo "Verifying data..."
+          COUNT=$(psql -h postgres.cybermesh.svc.cluster.local -U aiservice -d telemetry -t -c "SELECT COUNT(*) FROM flows")
+          echo "Loaded $COUNT rows"
+          
+          echo "Creating curated schema and AI service view..."
+          psql -h postgres.cybermesh.svc.cluster.local -U aiservice -d telemetry << 'EOF'
+          CREATE SCHEMA IF NOT EXISTS curated;
+          CREATE OR REPLACE VIEW curated.test_ddos_binary AS SELECT * FROM flows;
+          EOF
+
+          echo "Sample data (from curated.test_ddos_binary):"
+          psql -h postgres.cybermesh.svc.cluster.local -U aiservice -d telemetry -c "SELECT src_ip, dst_ip, label FROM curated.test_ddos_binary LIMIT 5"
+        env:
+        - name: PGPASSWORD
+          value: "changeme123"
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: data
+        emptyDir: {}

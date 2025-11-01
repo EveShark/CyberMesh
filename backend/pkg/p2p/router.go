@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	libp2p "github.com/libp2p/go-libp2p"
@@ -30,6 +31,7 @@ import (
 	mdns "github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	drouting "github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	connmgr "github.com/libp2p/go-libp2p/p2p/net/connmgr"
+	ping "github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	noise "github.com/libp2p/go-libp2p/p2p/security/noise"
 	tlsp2p "github.com/libp2p/go-libp2p/p2p/security/tls"
 	multiaddr "github.com/multiformats/go-multiaddr"
@@ -68,6 +70,85 @@ type Router struct {
 
 	// default topic validator used for all subscriptions
 	topicValidator func(ctx context.Context, id peer.ID, msg *pubsub.Message) pubsub.ValidationResult
+
+	bytesPublished atomic.Uint64
+
+	trendMu              sync.RWMutex
+	trendSamples         []RouterTrendSample
+	trendWindow          time.Duration
+	trendMaxSamples      int
+	pingService          *ping.PingService
+	latencyMu            sync.RWMutex
+	peerLatency          map[peer.ID]time.Duration
+	latencyProbeInterval time.Duration
+	latencyProbeTimeout  time.Duration
+	throughputMu         sync.Mutex
+	lastBytesReceived    uint64
+	lastBytesSent        uint64
+	lastSampleTime       time.Time
+	peerRateSnapshots    map[peer.ID]peerRateSample
+	reportedAdjacency    map[peer.ID]reportedEdges
+	reportedExpiry       time.Duration
+}
+
+// RouterStats summarizes live network telemetry for API exposure.
+type RouterStats struct {
+	PeerCount       int
+	InboundPeers    int
+	OutboundPeers   int
+	BytesReceived   uint64
+	BytesSent       uint64
+	AvgLatencyMs    float64
+	Timestamp       time.Time
+	History         []RouterTrendSample
+	Peers           []RouterPeerStats
+	InboundRateBps  float64
+	OutboundRateBps float64
+	Edges           []RouterEdge
+	Self            peer.ID
+}
+
+// RouterTrendSample captures a historical snapshot of router telemetry.
+type RouterTrendSample struct {
+	Timestamp     time.Time
+	PeerCount     int
+	InboundPeers  int
+	OutboundPeers int
+	AvgLatencyMs  float64
+	BytesReceived uint64
+	BytesSent     uint64
+}
+
+// RouterPeerStats captures per-peer transport metrics for diagnostics.
+type RouterPeerStats struct {
+	ID        peer.ID
+	LatencyMs float64
+	BytesIn   uint64
+	BytesOut  uint64
+	LastSeen  time.Time
+	Status    string
+	Labels    map[string]string
+	RateBps   float64
+}
+
+// RouterEdge represents an adjacency between the local node and a peer.
+type RouterEdge struct {
+	Source     peer.ID
+	Target     peer.ID
+	Direction  string
+	Status     string
+	Confidence string
+	ReportedBy peer.ID
+	UpdatedAt  time.Time
+}
+
+type peerRateSample struct {
+	bytesIn uint64
+}
+
+type reportedEdges struct {
+	Edges     []RouterEdge
+	Collected time.Time
 }
 
 // RouterOptions allows fine-grained tuning without hardcoding.
@@ -277,21 +358,35 @@ func NewRouter(parent context.Context, nodeCfg *config.NodeConfig, secCfg *confi
 	}
 
 	r := &Router{
-		ctx:       ctx,
-		cancel:    cancel,
-		log:       log,
-		Host:      host,
-		DHT:       ipfsDHT,
-		Gossip:    ps,
-		Topics:    map[string]*pubsub.Topic{},
-		Subs:      map[string]*pubsub.Subscription{},
-		Handlers:  map[string][]Handler{},
-		Discovery: rd,
-		nodeCfg:   nodeCfg,
-		secCfg:    secCfg,
-		configMgr: configMgr,
-		state:     st,
-		opts:      opts,
+		ctx:               ctx,
+		cancel:            cancel,
+		log:               log,
+		Host:              host,
+		DHT:               ipfsDHT,
+		Gossip:            ps,
+		Topics:            map[string]*pubsub.Topic{},
+		Subs:              map[string]*pubsub.Subscription{},
+		Handlers:          map[string][]Handler{},
+		Discovery:         rd,
+		nodeCfg:           nodeCfg,
+		secCfg:            secCfg,
+		configMgr:         configMgr,
+		state:             st,
+		opts:              opts,
+		peerLatency:       make(map[peer.ID]time.Duration),
+		peerRateSnapshots: make(map[peer.ID]peerRateSample),
+		reportedAdjacency: make(map[peer.ID]reportedEdges),
+		reportedExpiry:    configMgr.GetDuration("P2P_REPORTED_EDGE_TTL", 60*time.Second),
+	}
+	r.reportedExpiry = clampDuration(r.reportedExpiry, 10*time.Second, 5*time.Minute)
+	r.pingService = ping.NewPingService(host)
+	r.latencyProbeInterval = configMgr.GetDuration("P2P_LATENCY_PROBE_INTERVAL", 30*time.Second)
+	if r.latencyProbeInterval <= 0 {
+		r.latencyProbeInterval = 30 * time.Second
+	}
+	r.latencyProbeTimeout = configMgr.GetDuration("P2P_LATENCY_PROBE_TIMEOUT", 5*time.Second)
+	if r.latencyProbeTimeout <= 0 {
+		r.latencyProbeTimeout = 5 * time.Second
 	}
 
 	if r.state != nil {
@@ -301,6 +396,8 @@ func NewRouter(parent context.Context, nodeCfg *config.NodeConfig, secCfg *confi
 	// Create semaphore for bounded handler concurrency
 	maxHandlers := configMgr.GetIntRange("P2P_MAX_HANDLER_GOROUTINES", 200, 10, 1000)
 	r.handlerSem = make(chan struct{}, maxHandlers)
+	r.trendWindow = configMgr.GetDuration("P2P_TREND_WINDOW", 10*time.Minute)
+	r.trendMaxSamples = configMgr.GetIntRange("P2P_TREND_SAMPLES", 360, 10, 5000)
 
 	// ---- Network notifiee → update State on conn events ----
 	host.Network().Notify(&netNotifiee{r: r})
@@ -359,6 +456,10 @@ func NewRouter(parent context.Context, nodeCfg *config.NodeConfig, secCfg *confi
 			"peer_id":     pid.String(),
 			"listen_port": listenPort,
 		})
+	}
+
+	if r.pingService != nil {
+		go r.monitorPeerLatency()
 	}
 
 	return r, nil
@@ -453,6 +554,7 @@ func (r *Router) Publish(topic string, data []byte) error {
 				utils.ZapInt("bytes", len(data)),
 				utils.ZapInt("connected_peers", len(r.Host.Network().Peers())))
 		}
+		r.bytesPublished.Add(uint64(len(data)))
 	}
 
 	// Audit message publication
@@ -465,6 +567,278 @@ func (r *Router) Publish(topic string, data []byte) error {
 	}
 
 	return err
+}
+
+func (r *Router) monitorPeerLatency() {
+	interval := r.latencyProbeInterval
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			r.probePeerLatencies()
+		case <-r.ctx.Done():
+			return
+		}
+	}
+}
+
+func (r *Router) probePeerLatencies() {
+	if r.pingService == nil || r.Host == nil {
+		return
+	}
+	peers := r.Host.Network().Peers()
+	if len(peers) == 0 {
+		return
+	}
+	timeout := r.latencyProbeTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	for _, pid := range peers {
+		if len(r.Host.Network().ConnsToPeer(pid)) == 0 {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(r.ctx, timeout)
+		resultCh := r.pingService.Ping(ctx, pid)
+		select {
+		case res, ok := <-resultCh:
+			if ok && res.Error == nil && res.RTT > 0 {
+				r.storePeerLatency(pid, res.RTT)
+			}
+		case <-ctx.Done():
+		case <-r.ctx.Done():
+		}
+		cancel()
+	}
+}
+
+func (r *Router) storePeerLatency(pid peer.ID, rtt time.Duration) {
+	r.latencyMu.Lock()
+	r.peerLatency[pid] = rtt
+	r.latencyMu.Unlock()
+	if r.state != nil {
+		r.state.RecordLatencySample(pid, rtt)
+	}
+}
+
+func (r *Router) getPeerLatency(pid peer.ID) (time.Duration, bool) {
+	r.latencyMu.RLock()
+	defer r.latencyMu.RUnlock()
+	rtt, ok := r.peerLatency[pid]
+	return rtt, ok
+}
+
+func derivePeerStatus(ps PeerState, now time.Time) string {
+	if ps.Quarantined {
+		return "critical"
+	}
+	if ps.LastSeen.IsZero() {
+		return "unknown"
+	}
+	elapsed := now.Sub(ps.LastSeen)
+	switch {
+	case elapsed > 2*time.Minute:
+		return "critical"
+	case elapsed > 30*time.Second:
+		return "warning"
+	default:
+		return "healthy"
+	}
+}
+
+func clampDuration(v, min, max time.Duration) time.Duration {
+	if v <= 0 {
+		return min
+	}
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
+// GetNetworkStats returns aggregate transport telemetry for diagnostics.
+func (r *Router) GetNetworkStats() RouterStats {
+	var out RouterStats
+	if r == nil {
+		return out
+	}
+
+	sampleTime := time.Now()
+	out.Timestamp = sampleTime
+
+	if r.Host != nil {
+		out.Self = r.Host.ID()
+		out.PeerCount = len(r.Host.Network().Peers())
+		edgeFlags := make(map[peer.ID]struct {
+			inbound  bool
+			outbound bool
+		})
+		for _, conn := range r.Host.Network().Conns() {
+			stat := conn.Stat().Direction
+			remote := conn.RemotePeer()
+			flags := edgeFlags[remote]
+			switch stat {
+			case network.DirInbound:
+				out.InboundPeers++
+				flags.inbound = true
+			case network.DirOutbound:
+				out.OutboundPeers++
+				flags.outbound = true
+			}
+			edgeFlags[remote] = flags
+		}
+		if len(edgeFlags) > 0 {
+			edges := make([]RouterEdge, 0, len(edgeFlags))
+			for pid, flags := range edgeFlags {
+				direction := "unknown"
+				switch {
+				case flags.inbound && flags.outbound:
+					direction = "bidirectional"
+				case flags.inbound:
+					direction = "inbound"
+				case flags.outbound:
+					direction = "outbound"
+				}
+				edges = append(edges, RouterEdge{
+					Source:     out.Self,
+					Target:     pid,
+					Direction:  direction,
+					Status:     "live",
+					Confidence: "observed",
+					ReportedBy: out.Self,
+					UpdatedAt:  sampleTime,
+				})
+			}
+			sort.Slice(edges, func(i, j int) bool {
+				return edges[i].Target.String() < edges[j].Target.String()
+			})
+			out.Edges = edges
+		}
+	}
+
+	var elapsed time.Duration
+	r.throughputMu.Lock()
+	if !r.lastSampleTime.IsZero() {
+		elapsed = sampleTime.Sub(r.lastSampleTime)
+	}
+
+	if r.state != nil {
+		snapshot := r.state.Snapshot()
+		peers := make([]RouterPeerStats, 0, len(snapshot))
+		var latencySum float64
+		var latencyCount int
+		for pid, ps := range snapshot {
+			out.BytesReceived += ps.BytesIn
+			peerMetric := RouterPeerStats{
+				ID:       pid,
+				BytesIn:  ps.BytesIn,
+				BytesOut: 0,
+				LastSeen: ps.LastSeen,
+				Labels:   ps.Labels,
+				Status:   derivePeerStatus(ps, sampleTime),
+			}
+			if ps.LatencyEMA > 0 {
+				peerMetric.LatencyMs = ps.LatencyEMA * 1000
+				latencySum += ps.LatencyEMA
+				latencyCount++
+			} else if rtt, ok := r.getPeerLatency(pid); ok && rtt > 0 {
+				peerMetric.LatencyMs = rtt.Seconds() * 1000
+				latencySum += rtt.Seconds()
+				latencyCount++
+			}
+			if elapsed > 0 {
+				if prev, ok := r.peerRateSnapshots[pid]; ok {
+					delta := int64(ps.BytesIn) - int64(prev.bytesIn)
+					if delta < 0 {
+						delta = 0
+					}
+					peerMetric.RateBps = float64(delta) / elapsed.Seconds()
+				}
+			}
+			r.peerRateSnapshots[pid] = peerRateSample{bytesIn: ps.BytesIn}
+			peers = append(peers, peerMetric)
+		}
+		if latencyCount > 0 {
+			out.AvgLatencyMs = (latencySum / float64(latencyCount)) * 1000
+		}
+		out.Peers = peers
+	}
+
+	out.BytesSent = r.bytesPublished.Load()
+
+	if elapsed > 0 {
+		inDelta := int64(out.BytesReceived) - int64(r.lastBytesReceived)
+		if inDelta < 0 {
+			inDelta = 0
+		}
+		outDelta := int64(out.BytesSent) - int64(r.lastBytesSent)
+		if outDelta < 0 {
+			outDelta = 0
+		}
+		if elapsed.Seconds() > 0 {
+			out.InboundRateBps = float64(inDelta) / elapsed.Seconds()
+			out.OutboundRateBps = float64(outDelta) / elapsed.Seconds()
+		}
+	}
+
+	r.lastBytesReceived = out.BytesReceived
+	r.lastBytesSent = out.BytesSent
+	r.lastSampleTime = sampleTime
+	r.throughputMu.Unlock()
+
+	r.recordTrend(out)
+	out.History = r.trendSnapshot()
+	return out
+}
+
+func (r *Router) recordTrend(sample RouterStats) {
+	if r == nil {
+		return
+	}
+	entry := RouterTrendSample{
+		Timestamp:     sample.Timestamp,
+		PeerCount:     sample.PeerCount,
+		InboundPeers:  sample.InboundPeers,
+		OutboundPeers: sample.OutboundPeers,
+		AvgLatencyMs:  sample.AvgLatencyMs,
+		BytesReceived: sample.BytesReceived,
+		BytesSent:     sample.BytesSent,
+	}
+	r.trendMu.Lock()
+	defer r.trendMu.Unlock()
+	r.trendSamples = append(r.trendSamples, entry)
+	if r.trendWindow > 0 {
+		cutoff := sample.Timestamp.Add(-r.trendWindow)
+		idx := 0
+		for idx < len(r.trendSamples) && r.trendSamples[idx].Timestamp.Before(cutoff) {
+			idx++
+		}
+		if idx > 0 {
+			r.trendSamples = append([]RouterTrendSample(nil), r.trendSamples[idx:]...)
+		}
+	}
+	if r.trendMaxSamples > 0 && len(r.trendSamples) > r.trendMaxSamples {
+		r.trendSamples = append([]RouterTrendSample(nil), r.trendSamples[len(r.trendSamples)-r.trendMaxSamples:]...)
+	}
+}
+
+func (r *Router) trendSnapshot() []RouterTrendSample {
+	r.trendMu.RLock()
+	defer r.trendMu.RUnlock()
+	if len(r.trendSamples) == 0 {
+		return nil
+	}
+	out := make([]RouterTrendSample, len(r.trendSamples))
+	copy(out, r.trendSamples)
+	return out
 }
 
 // GetConnectedPeerCount returns the number of connected, non-quarantined peers
@@ -482,7 +856,25 @@ func (r *Router) GetActivePeerCount(since time.Duration) int {
 	if r.state == nil {
 		return 0
 	}
+	r.refreshConnectionActivity()
 	return r.state.GetActivePeerCount(since)
+}
+
+func (r *Router) refreshConnectionActivity() {
+	if r.Host == nil || r.state == nil {
+		return
+	}
+	now := time.Now()
+	peers := r.Host.Network().Peers()
+	if len(peers) == 0 {
+		return
+	}
+	for _, pid := range peers {
+		if len(r.Host.Network().ConnsToPeer(pid)) == 0 {
+			continue
+		}
+		r.state.TouchPeer(pid, now)
+	}
 }
 
 // GetPeersSeenSinceStartup returns the count of peers observed since startup.

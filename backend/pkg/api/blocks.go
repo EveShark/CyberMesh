@@ -2,13 +2,18 @@ package api
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"backend/pkg/block"
 	"backend/pkg/storage/cockroach"
 	"backend/pkg/utils"
+	"github.com/lib/pq"
 )
 
 // handleBlocks handles GET /blocks and GET /blocks/:height
@@ -42,18 +47,18 @@ func (s *Server) handleBlockLatest(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
 	defer cancel()
 
-	// Get latest block height from state store
-	if s.stateStore == nil {
-		writeErrorFromUtils(w, r, NewUnavailableError("state store"))
+	// Get latest block height from storage (database)
+	latestHeight, err := s.storage.GetLatestHeight(ctx)
+	if err != nil {
+		s.logger.ErrorContext(ctx, "failed to get latest height", utils.ZapError(err))
+		writeErrorFromUtils(w, r, NewInternalError("failed to get latest height"))
 		return
 	}
-
-	latestHeight := s.stateStore.Latest()
 
 	// Get block from storage
 	block, err := s.storage.GetBlock(ctx, latestHeight)
 	if err != nil {
-		if err == cockroach.ErrBlockNotFound {
+		if errors.Is(err, cockroach.ErrBlockNotFound) {
 			writeErrorFromUtils(w, r, NewBlockNotFoundError(latestHeight))
 			return
 		}
@@ -80,12 +85,19 @@ func (s *Server) handleBlockByHeight(w http.ResponseWriter, r *http.Request, hei
 	// Parse height
 	height, err := parseUint64(heightStr)
 	if err != nil {
-		writeErrorFromUtils(w, r, NewInvalidHeightError(0, s.stateStore.Latest()))
+		// For parse errors, use 0 as placeholder for current height in error message
+		latestHeight, _ := s.storage.GetLatestHeight(ctx)
+		writeErrorFromUtils(w, r, NewInvalidHeightError(0, latestHeight))
 		return
 	}
 
-	// Validate height
-	currentHeight := s.stateStore.Latest()
+	// Validate height - get current height from storage
+	currentHeight, err := s.storage.GetLatestHeight(ctx)
+	if err != nil {
+		s.logger.ErrorContext(ctx, "failed to get latest height", utils.ZapError(err))
+		writeErrorFromUtils(w, r, NewInternalError("failed to get latest height"))
+		return
+	}
 	if validationErr := validateBlockHeight(height, currentHeight); validationErr != nil {
 		if apiErr, ok := validationErr.(*utils.Error); ok {
 			writeErrorFromUtils(w, r, apiErr)
@@ -101,7 +113,7 @@ func (s *Server) handleBlockByHeight(w http.ResponseWriter, r *http.Request, hei
 	// Get block from storage
 	block, err := s.storage.GetBlock(ctx, height)
 	if err != nil {
-		if err == cockroach.ErrBlockNotFound {
+		if errors.Is(err, cockroach.ErrBlockNotFound) {
 			writeErrorFromUtils(w, r, NewBlockNotFoundError(height))
 			return
 		}
@@ -146,20 +158,7 @@ func (s *Server) handleBlockList(w http.ResponseWriter, r *http.Request) {
 
 	query := r.URL.Query()
 
-	// Parse start parameter
-	startStr := query.Get("start")
-	if startStr == "" {
-		writeErrorFromUtils(w, r, NewInvalidParamsError("start", "required parameter"))
-		return
-	}
-
-	start, err := parseUint64(startStr)
-	if err != nil {
-		writeErrorFromUtils(w, r, NewInvalidParamsError("start", "must be valid uint64"))
-		return
-	}
-
-	// Parse limit parameter
+	// Parse limit parameter first to apply sane defaults
 	limitStr := query.Get("limit")
 	limit := 10 // default
 	if limitStr != "" {
@@ -171,21 +170,60 @@ func (s *Server) handleBlockList(w http.ResponseWriter, r *http.Request) {
 		limit, _ = validatePaginationLimit(parsedLimit)
 	}
 
-	// Validate start height
-	currentHeight := s.stateStore.Latest()
+	// Get current height from storage (database)
+	currentHeight, err := s.storage.GetLatestHeight(ctx)
+	if err != nil {
+		s.logger.ErrorContext(ctx, "failed to get latest height", utils.ZapError(err))
+		writeErrorFromUtils(w, r, NewInternalError("failed to get latest height"))
+		return
+	}
+
+	// Parse start parameter (optional). If missing, default to latest window.
+	startStr := query.Get("start")
+	var start uint64
+	if startStr == "" {
+		if currentHeight+1 <= uint64(limit) {
+			start = 0
+		} else {
+			start = currentHeight - uint64(limit) + 1
+		}
+	} else {
+		parsedStart, err := parseUint64(startStr)
+		if err != nil {
+			writeErrorFromUtils(w, r, NewInvalidParamsError("start", "must be valid uint64"))
+			return
+		}
+		start = parsedStart
+	}
+
 	if start > currentHeight {
 		writeErrorFromUtils(w, r, NewInvalidHeightError(start, currentHeight))
 		return
 	}
 
+	// Get minimum height from database to handle gaps in block heights
+	minHeight, err := s.storage.GetMinHeight(ctx)
+	if err != nil {
+		s.logger.ErrorContext(ctx, "failed to get min height", utils.ZapError(err))
+		// Don't fail entirely, just use start as-is
+		minHeight = start
+	}
+
+	// If requested start is before minimum height, adjust to first available block
+	effectiveStart := start
+	if start < minHeight {
+		effectiveStart = minHeight
+	}
+
 	// Fetch blocks
 	blocks := make([]BlockResponse, 0, limit)
+	blockHeights := make([]uint64, 0, limit)
 	fetchedCount := 0
 
-	for height := start; height <= currentHeight && fetchedCount < limit; height++ {
+	for height := effectiveStart; height <= currentHeight && fetchedCount < limit; height++ {
 		block, err := s.storage.GetBlock(ctx, height)
 		if err != nil {
-			if err == cockroach.ErrBlockNotFound {
+			if errors.Is(err, cockroach.ErrBlockNotFound) {
 				// Skip missing blocks (shouldn't happen but handle gracefully)
 				continue
 			}
@@ -199,7 +237,21 @@ func (s *Server) handleBlockList(w http.ResponseWriter, r *http.Request) {
 		}
 
 		blocks = append(blocks, s.blockToResponse(block))
+		blockHeights = append(blockHeights, height)
 		fetchedCount++
+	}
+
+	// SECURITY FIX: Batch query for anomaly counts (prevents N+1 DoS attack)
+	anomalyCounts, err := s.batchGetAnomalyCounts(ctx, blockHeights)
+	if err != nil {
+		s.logger.ErrorContext(ctx, "failed to get anomaly counts", utils.ZapError(err))
+		// Don't fail - continue with 0 counts
+		anomalyCounts = make(map[uint64]int)
+	}
+
+	// Apply anomaly counts to blocks
+	for i := range blocks {
+		blocks[i].AnomalyCount = anomalyCounts[blocks[i].Height]
 	}
 
 	// Build pagination info
@@ -224,6 +276,7 @@ func (s *Server) handleBlockList(w http.ResponseWriter, r *http.Request) {
 }
 
 // blockToResponse converts a block to BlockResponse DTO
+// Note: AnomalyCount should be set separately via batch query for performance
 func (s *Server) blockToResponse(b *block.AppBlock) BlockResponse {
 	// Map real fields from AppBlock; no payloads are exposed
 	h := b.GetHash()
@@ -239,8 +292,66 @@ func (s *Server) blockToResponse(b *block.AppBlock) BlockResponse {
 		Timestamp:        b.GetTimestamp().Unix(),
 		Proposer:         encodeHex(proposer[:]),
 		TransactionCount: b.GetTransactionCount(),
+		AnomalyCount:     0, // Set separately via batchGetAnomalyCounts
 		SizeBytes:        0, // unknown without full serialization; keep 0
 	}
 
 	return resp
+}
+
+// batchGetAnomalyCounts retrieves anomaly counts for multiple blocks in a single query
+// SECURITY: Prevents N+1 query DoS attack
+func (s *Server) batchGetAnomalyCounts(ctx context.Context, heights []uint64) (map[uint64]int, error) {
+	if len(heights) == 0 {
+		return make(map[uint64]int), nil
+	}
+
+	// SECURITY: Add timeout protection
+	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	// Get concrete adapter to access database
+	adapter, ok := s.storage.(interface {
+		GetDB() *sql.DB
+	})
+	if !ok {
+		return nil, fmt.Errorf("storage adapter does not support GetDB()")
+	}
+
+	// SECURITY: Use parameterized query with ANY clause to prevent SQL injection
+	query := `
+        SELECT block_height, COUNT(*)
+        FROM transactions
+        WHERE block_height = ANY($1::bigint[]) AND tx_type = 'evidence'
+        GROUP BY block_height
+    `
+
+	// Convert []uint64 to []int64 for postgres array
+	heightsInt64 := make([]int64, len(heights))
+	for i, h := range heights {
+		heightsInt64[i] = int64(h)
+	}
+
+	rows, err := adapter.GetDB().QueryContext(queryCtx, query, pq.Array(heightsInt64))
+	if err != nil {
+		return nil, fmt.Errorf("failed to query anomaly counts: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[uint64]int)
+	for rows.Next() {
+		var height uint64
+		var count int
+		if err := rows.Scan(&height, &count); err != nil {
+			s.logger.WarnContext(ctx, "failed to scan anomaly count row", utils.ZapError(err))
+			continue
+		}
+		result[height] = count
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating anomaly count rows: %w", err)
+	}
+
+	return result, nil
 }

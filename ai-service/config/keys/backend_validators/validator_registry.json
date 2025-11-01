@@ -1,0 +1,32 @@
+{
+  "description": "Backend validator public keys for signature verification",
+  "generated_at": "2025-10-20T16:45:00Z",
+  "key_algorithm": "Ed25519",
+  "bft_config": {
+    "total_validators": 4,
+    "fault_tolerance": 1,
+    "quorum_size": 3
+  },
+  "validators": [
+    {
+      "node_id": 1,
+      "public_key_path": "validator_1_public.pem",
+      "public_key_hex": "8bf26c134a9660e6387ab4b436f0c65325ab91d7d0643124b6748e9f69d6cb7b"
+    },
+    {
+      "node_id": 2,
+      "public_key_path": "validator_2_public.pem",
+      "public_key_hex": "b2ee493b0c10b3bc4b69575607b5e7cd3964c0e0a4063596d2fe9ca9abd3366d"
+    },
+    {
+      "node_id": 3,
+      "public_key_path": "validator_3_public.pem",
+      "public_key_hex": "ba5054d8786332dd13356401a4647b933931e29c5da8a0f9bbbb187d17261b67"
+    },
+    {
+      "node_id": 4,
+      "public_key_path": "validator_4_public.pem",
+      "public_key_hex": "d1d7a29f0afe601e3f47eb07cd71e4187821cfd269df4205ba7087372d1f6966"
+    }
+  ]
+}

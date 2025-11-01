@@ -2,8 +2,11 @@ package config
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"backend/pkg/utils"
@@ -51,6 +54,23 @@ type APIConfig struct {
 
 	// Environment
 	Environment string // "development", "staging", "production"
+
+	// AI service integration
+	AIServiceBaseURL string
+	AIServiceTimeout time.Duration
+	AIServiceToken   string
+
+	// Redis integration (optional)
+	RedisEnabled    bool
+	RedisHost       string
+	RedisPort       int
+	RedisPassword   string
+	RedisDB         int
+	RedisTLSEnabled bool
+
+	// Optional node alias configuration for telemetry overlays
+	NodeAliasMap  map[string]string
+	NodeAliasList []string
 }
 
 // DefaultAPIConfig returns secure defaults
@@ -76,6 +96,7 @@ func DefaultAPIConfig() *APIConfig {
 		MaxConcurrentReqs:  100,
 		RequestTimeout:     30 * time.Second,
 		Environment:        "production",
+		AIServiceTimeout:   2 * time.Second,
 		AllowedRoles:       defaultRoleMapping(),
 	}
 }
@@ -164,12 +185,80 @@ func LoadAPIConfig(cm *utils.ConfigManager) (*APIConfig, error) {
 		cfg.Environment = env
 	}
 
+	// AI service integration
+	if base := cm.GetString("AI_SERVICE_API_BASE", ""); base != "" {
+		cfg.AIServiceBaseURL = strings.TrimRight(base, "/")
+	}
+
+	if timeout := cm.GetDuration("AI_SERVICE_API_TIMEOUT", 0); timeout > 0 {
+		cfg.AIServiceTimeout = timeout
+	}
+
+	if token := cm.GetString("AI_SERVICE_API_TOKEN", ""); token != "" {
+		cfg.AIServiceToken = token
+	}
+
+	// Redis configuration (optional)
+	redisHost := cm.GetString("REDIS_HOST", "")
+	redisPort := cm.GetInt("REDIS_PORT", 6379)
+	if redisHost != "" {
+		cfg.RedisEnabled = true
+		cfg.RedisHost = redisHost
+		cfg.RedisPort = redisPort
+		cfg.RedisPassword = cm.GetString("REDIS_PASSWORD", "")
+		cfg.RedisDB = cm.GetInt("REDIS_DB", 0)
+		cfg.RedisTLSEnabled = cm.GetBool("REDIS_TLS_ENABLED", false)
+	}
+
 	// Validate configuration
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("API config validation failed: %w", err)
 	}
 
+	if aliasMapEnv := cm.GetString("NETWORK_NODE_ALIASES", ""); aliasMapEnv != "" {
+		cfg.NodeAliasMap = parseAliasMap(aliasMapEnv)
+	}
+
+	if aliasListEnv := cm.GetString("NETWORK_NODE_ALIAS_LIST", ""); aliasListEnv != "" {
+		cfg.NodeAliasList = parseCommaSeparated(aliasListEnv)
+	}
+
 	return cfg, nil
+}
+
+func parseAliasMap(input string) map[string]string {
+	result := make(map[string]string)
+	if input == "" {
+		return result
+	}
+	trimmed := strings.TrimSpace(input)
+	if strings.HasPrefix(trimmed, "{") {
+		var jsonMap map[string]string
+		if err := json.Unmarshal([]byte(trimmed), &jsonMap); err == nil {
+			for k, v := range jsonMap {
+				if key := strings.TrimSpace(k); key != "" {
+					result[strings.ToLower(key)] = strings.TrimSpace(v)
+				}
+			}
+			return result
+		}
+	}
+	parts := strings.Split(trimmed, ",")
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		kv := strings.SplitN(part, ":", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(kv[0]))
+		value := strings.TrimSpace(kv[1])
+		if key != "" && value != "" {
+			result[key] = value
+		}
+	}
+	return result
 }
 
 // Validate checks configuration for security compliance
@@ -288,6 +377,28 @@ func (c *APIConfig) Validate() error {
 		return &SecurityError{
 			Field:  "EnablePprof",
 			Reason: "Pprof profiling forbidden in production (security risk)",
+		}
+	}
+
+	if c.AIServiceBaseURL != "" {
+		u, err := url.Parse(c.AIServiceBaseURL)
+		if err != nil || !u.IsAbs() {
+			return fmt.Errorf("invalid AI service base URL: %s", c.AIServiceBaseURL)
+		}
+		if c.Environment == "production" && u.Scheme != "https" {
+			return fmt.Errorf("AI service base URL must use https in production")
+		}
+	}
+
+	if c.RedisEnabled {
+		if c.RedisHost == "" {
+			return fmt.Errorf("redis host must be provided when Redis is enabled")
+		}
+		if c.RedisPort <= 0 || c.RedisPort > 65535 {
+			return fmt.Errorf("redis port must be between 1 and 65535")
+		}
+		if c.RedisDB < 0 {
+			return fmt.Errorf("redis db index cannot be negative")
 		}
 	}
 

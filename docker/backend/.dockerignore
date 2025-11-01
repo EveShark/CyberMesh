@@ -1,0 +1,41 @@
+# Backend Docker Ignore
+# Keep the image minimal - only binary and certs needed
+
+# Documentation
+*.md
+README*
+CHANGELOG*
+LICENSE
+docs/
+
+# Development files
+.git/
+.gitignore
+.env*
+.vscode/
+.idea/
+
+# Test and build artifacts
+tests/
+test/
+*.test
+coverage.out
+*.prof
+
+# Temporary files
+*.log
+*.tmp
+tmp/
+temp/
+
+# Go source (we're using pre-built binary)
+*.go
+go.mod
+go.sum
+vendor/
+
+# Other binaries not needed
+*.exe
+*.dll
+*.so
+*.dylib

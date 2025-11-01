@@ -8,17 +8,21 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"backend/pkg/config"
 	consapi "backend/pkg/consensus/api"
+	"backend/pkg/ingest/kafka"
 	"backend/pkg/mempool"
 	"backend/pkg/p2p"
 	"backend/pkg/state"
 	"backend/pkg/storage/cockroach"
 	"backend/pkg/utils"
+
+	redis "github.com/redis/go-redis/v9"
 )
 
 // Server provides read-only API access to backend state
@@ -29,34 +33,60 @@ type Server struct {
 	httpServer *http.Server
 
 	// Backend components
-	storage    cockroach.Adapter
-	stateStore state.StateStore
-	mempool    *mempool.Mempool
-	engine     *consapi.ConsensusEngine
-	p2pRouter  *p2p.Router
+	storage      cockroach.Adapter
+	stateStore   state.StateStore
+	mempool      *mempool.Mempool
+	engine       *consapi.ConsensusEngine
+	p2pRouter    *p2p.Router
+	kafkaProd    *kafka.Producer
+	kafkaCons    *kafka.Consumer
+	redisClient  *redis.Client
+	redisMetrics *redisTelemetry
+
+	nodeAliases   map[string]string
+	nodeAliasList []string
+
+	metricsMu            sync.Mutex
+	storageLatencyMs     float64
+	kafkaReadyLatencyMs  float64
+	p2pThroughputMu      sync.Mutex
+	p2pLastBytesReceived uint64
+	p2pLastBytesSent     uint64
+	p2pLastSample        time.Time
+	apiRequestsTotal     atomic.Uint64
+	apiRequestErrors     atomic.Uint64
 
 	// Middleware components
 	rateLimiter *RateLimiter
 	ipAllowlist *utils.IPAllowlist
 	sem         chan struct{}
 
+	aiClient    *http.Client
+	aiBaseURL   string
+	aiAuthToken string
+
 	// State
-	running   atomic.Bool
-	closeOnce sync.Once
-	stopCh    chan struct{}
-	wg        sync.WaitGroup
+	running          atomic.Bool
+	closeOnce        sync.Once
+	stopCh           chan struct{}
+	wg               sync.WaitGroup
+	processStartTime int64 // Unix timestamp when server started
 }
 
 // Dependencies holds server dependencies
 type Dependencies struct {
-	Config      *config.APIConfig
-	Logger      *utils.Logger
-	AuditLogger *utils.AuditLogger
-	Storage     cockroach.Adapter
-	StateStore  state.StateStore
-	Mempool     *mempool.Mempool
-	Engine      *consapi.ConsensusEngine
-	P2PRouter   *p2p.Router
+	Config        *config.APIConfig
+	Logger        *utils.Logger
+	AuditLogger   *utils.AuditLogger
+	Storage       cockroach.Adapter
+	StateStore    state.StateStore
+	Mempool       *mempool.Mempool
+	Engine        *consapi.ConsensusEngine
+	P2PRouter     *p2p.Router
+	KafkaProd     *kafka.Producer
+	KafkaCons     *kafka.Consumer
+	NodeAliases   map[string]string
+	NodeAliasList []string
 }
 
 // NewServer creates a new API server
@@ -86,15 +116,36 @@ func NewServer(deps Dependencies) (*Server, error) {
 	}
 
 	s := &Server{
-		config:     deps.Config,
-		logger:     deps.Logger,
-		audit:      deps.AuditLogger,
-		storage:    deps.Storage,
-		stateStore: deps.StateStore,
-		mempool:    deps.Mempool,
-		engine:     deps.Engine,
-		p2pRouter:  deps.P2PRouter,
-		stopCh:     make(chan struct{}),
+		config:           deps.Config,
+		logger:           deps.Logger,
+		audit:            deps.AuditLogger,
+		storage:          deps.Storage,
+		stateStore:       deps.StateStore,
+		mempool:          deps.Mempool,
+		engine:           deps.Engine,
+		p2pRouter:        deps.P2PRouter,
+		kafkaProd:        deps.KafkaProd,
+		kafkaCons:        deps.KafkaCons,
+		stopCh:           make(chan struct{}),
+		processStartTime: time.Now().Unix(),
+	}
+
+	if len(deps.NodeAliases) > 0 {
+		s.nodeAliases = make(map[string]string, len(deps.NodeAliases))
+		for key, value := range deps.NodeAliases {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				s.nodeAliases[strings.ToLower(strings.TrimSpace(key))] = trimmed
+			}
+		}
+	}
+
+	if len(deps.NodeAliasList) > 0 {
+		s.nodeAliasList = make([]string, 0, len(deps.NodeAliasList))
+		for _, alias := range deps.NodeAliasList {
+			if trimmed := strings.TrimSpace(alias); trimmed != "" {
+				s.nodeAliasList = append(s.nodeAliasList, trimmed)
+			}
+		}
 	}
 
 	// Initialize rate limiter if enabled
@@ -133,6 +184,38 @@ func NewServer(deps Dependencies) (*Server, error) {
 	// Create HTTP server
 	if err := s.createHTTPServer(); err != nil {
 		return nil, fmt.Errorf("failed to create HTTP server: %w", err)
+	}
+
+	if deps.Config.AIServiceBaseURL != "" {
+		s.aiBaseURL = deps.Config.AIServiceBaseURL
+		timeout := deps.Config.AIServiceTimeout
+		if timeout <= 0 {
+			timeout = 2 * time.Second
+		}
+		s.aiClient = &http.Client{Timeout: timeout}
+		s.aiAuthToken = deps.Config.AIServiceToken
+	}
+
+	if deps.Config.RedisEnabled {
+		opts := &redis.Options{
+			Addr:     fmt.Sprintf("%s:%d", deps.Config.RedisHost, deps.Config.RedisPort),
+			Password: deps.Config.RedisPassword,
+			DB:       deps.Config.RedisDB,
+		}
+		if deps.Config.RedisTLSEnabled {
+			opts.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+		}
+		s.redisClient = redis.NewClient(opts)
+		s.redisMetrics = newRedisTelemetry()
+		s.redisClient.AddHook(&redisTelemetryHook{telemetry: s.redisMetrics})
+		if err := s.redisClient.Ping(context.Background()).Err(); err != nil {
+			deps.Logger.Warn("Redis ping failed", utils.ZapError(err))
+		} else {
+			deps.Logger.Info("Redis client initialized",
+				utils.ZapString("host", deps.Config.RedisHost),
+				utils.ZapInt("port", deps.Config.RedisPort),
+				utils.ZapBool("tls_enabled", deps.Config.RedisTLSEnabled))
+		}
 	}
 
 	return s, nil
@@ -291,6 +374,12 @@ func (s *Server) Stop() error {
 			stopErr = err
 		}
 
+		if s.redisClient != nil {
+			if err := s.redisClient.Close(); err != nil {
+				s.logger.Warn("Redis client close error", utils.ZapError(err))
+			}
+		}
+
 		// Wait for all goroutines
 		s.wg.Wait()
 
@@ -314,6 +403,70 @@ func (s *Server) IsRunning() bool {
 	return s.running.Load()
 }
 
+func (s *Server) recordStorageLatency(latency float64) {
+	s.metricsMu.Lock()
+	s.storageLatencyMs = latency
+	s.metricsMu.Unlock()
+}
+
+func (s *Server) recordKafkaLatency(latency float64) {
+	s.metricsMu.Lock()
+	s.kafkaReadyLatencyMs = latency
+	s.metricsMu.Unlock()
+}
+
+func (s *Server) recordAPIRequest(status int) {
+	s.apiRequestsTotal.Add(1)
+	if status >= 400 {
+		s.apiRequestErrors.Add(1)
+	}
+}
+
+func (s *Server) getStorageLatencyMs() float64 {
+	s.metricsMu.Lock()
+	defer s.metricsMu.Unlock()
+	return s.storageLatencyMs
+}
+
+func (s *Server) getKafkaReadyLatencyMs() float64 {
+	s.metricsMu.Lock()
+	defer s.metricsMu.Unlock()
+	return s.kafkaReadyLatencyMs
+}
+
+func (s *Server) computeP2PThroughput(now time.Time, stats p2p.RouterStats) (float64, float64) {
+	s.p2pThroughputMu.Lock()
+	defer s.p2pThroughputMu.Unlock()
+
+	if s.p2pLastSample.IsZero() {
+		s.p2pLastSample = now
+		s.p2pLastBytesReceived = stats.BytesReceived
+		s.p2pLastBytesSent = stats.BytesSent
+		return 0, 0
+	}
+
+	elapsed := now.Sub(s.p2pLastSample).Seconds()
+	if elapsed <= 0 {
+		return 0, 0
+	}
+
+	var inbound float64
+	if stats.BytesReceived >= s.p2pLastBytesReceived {
+		inbound = float64(stats.BytesReceived-s.p2pLastBytesReceived) / elapsed
+	}
+
+	var outbound float64
+	if stats.BytesSent >= s.p2pLastBytesSent {
+		outbound = float64(stats.BytesSent-s.p2pLastBytesSent) / elapsed
+	}
+
+	s.p2pLastSample = now
+	s.p2pLastBytesReceived = stats.BytesReceived
+	s.p2pLastBytesSent = stats.BytesSent
+
+	return inbound, outbound
+}
+
 // GetMetrics returns server metrics
 func (s *Server) GetMetrics() map[string]interface{} {
 	metrics := make(map[string]interface{})
@@ -330,6 +483,13 @@ func (s *Server) GetMetrics() map[string]interface{} {
 	}
 
 	return metrics
+}
+
+func (s *Server) redisSnapshot() ([]utils.HistogramBucket, uint64, float64, uint64) {
+	if s.redisMetrics == nil {
+		return nil, 0, 0, 0
+	}
+	return s.redisMetrics.snapshot()
 }
 
 // Helper functions

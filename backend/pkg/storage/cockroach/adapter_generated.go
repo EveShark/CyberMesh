@@ -10,6 +10,8 @@ import (
 )
 
 func (a *adapter) SaveProposal(ctx context.Context, hash []byte, height uint64, view uint64, proposer []byte, data []byte) error {
+	stop := a.recordQuery("save_proposal")
+	defer stop()
 	if len(hash) != 32 {
 		return fmt.Errorf("save proposal: invalid hash length %d", len(hash))
 	}
@@ -24,6 +26,8 @@ func (a *adapter) SaveProposal(ctx context.Context, hash []byte, height uint64, 
 }
 
 func (a *adapter) LoadProposal(ctx context.Context, hash []byte) ([]byte, error) {
+	stop := a.recordQuery("load_proposal")
+	defer stop()
 	row := a.stmtGetProposal.QueryRowContext(ctx, hash)
 	var payload []byte
 	if err := row.Scan(&payload); err != nil {
@@ -36,6 +40,8 @@ func (a *adapter) LoadProposal(ctx context.Context, hash []byte) ([]byte, error)
 }
 
 func (a *adapter) SaveQC(ctx context.Context, hash []byte, height uint64, view uint64, data []byte) error {
+	stop := a.recordQuery("save_qc")
+	defer stop()
 	if len(hash) != 32 {
 		return fmt.Errorf("save qc: invalid hash length %d", len(hash))
 	}
@@ -47,6 +53,8 @@ func (a *adapter) SaveQC(ctx context.Context, hash []byte, height uint64, view u
 }
 
 func (a *adapter) LoadQC(ctx context.Context, hash []byte) ([]byte, error) {
+	stop := a.recordQuery("load_qc")
+	defer stop()
 	row := a.stmtGetQC.QueryRowContext(ctx, hash)
 	var payload []byte
 	if err := row.Scan(&payload); err != nil {
@@ -59,6 +67,8 @@ func (a *adapter) LoadQC(ctx context.Context, hash []byte) ([]byte, error) {
 }
 
 func (a *adapter) ListProposals(ctx context.Context, minHeight uint64, limit int) ([]types.ProposalRecord, error) {
+	stop := a.recordQuery("list_proposals")
+	defer stop()
 	rows, err := a.stmtListProposals.QueryContext(ctx, minHeight, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list proposals: %w", err)
@@ -80,6 +90,8 @@ func (a *adapter) ListProposals(ctx context.Context, minHeight uint64, limit int
 }
 
 func (a *adapter) ListQCs(ctx context.Context, minHeight uint64, limit int) ([]types.QCRecord, error) {
+	stop := a.recordQuery("list_qcs")
+	defer stop()
 	rows, err := a.stmtListQCs.QueryContext(ctx, minHeight, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list qcs: %w", err)
@@ -101,6 +113,8 @@ func (a *adapter) ListQCs(ctx context.Context, minHeight uint64, limit int) ([]t
 }
 
 func (a *adapter) SaveVote(ctx context.Context, view uint64, height uint64, voter []byte, blockHash []byte, voteHash []byte, data []byte) error {
+	stop := a.recordQuery("save_vote")
+	defer stop()
 	if len(voteHash) != 32 {
 		return fmt.Errorf("save vote: invalid vote hash length %d", len(voteHash))
 	}
@@ -115,6 +129,8 @@ func (a *adapter) SaveVote(ctx context.Context, view uint64, height uint64, vote
 }
 
 func (a *adapter) ListVotes(ctx context.Context, minHeight uint64, limit int) ([]types.VoteRecord, error) {
+	stop := a.recordQuery("list_votes")
+	defer stop()
 	rows, err := a.stmtListVotes.QueryContext(ctx, minHeight, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list votes: %w", err)
@@ -136,6 +152,8 @@ func (a *adapter) ListVotes(ctx context.Context, minHeight uint64, limit int) ([
 }
 
 func (a *adapter) SaveEvidence(ctx context.Context, hash []byte, height uint64, data []byte) error {
+	stop := a.recordQuery("save_evidence")
+	defer stop()
 	if len(hash) != 32 {
 		return fmt.Errorf("save evidence: invalid hash length %d", len(hash))
 	}
@@ -147,6 +165,8 @@ func (a *adapter) SaveEvidence(ctx context.Context, hash []byte, height uint64, 
 }
 
 func (a *adapter) LoadEvidence(ctx context.Context, hash []byte) ([]byte, error) {
+	stop := a.recordQuery("load_evidence")
+	defer stop()
 	row := a.stmtGetEvidence.QueryRowContext(ctx, hash)
 	var payload []byte
 	if err := row.Scan(&payload); err != nil {
@@ -159,6 +179,8 @@ func (a *adapter) LoadEvidence(ctx context.Context, hash []byte) ([]byte, error)
 }
 
 func (a *adapter) ListEvidence(ctx context.Context, minHeight uint64, limit int) ([]types.EvidenceRecord, error) {
+	stop := a.recordQuery("list_evidence")
+	defer stop()
 	rows, err := a.stmtListEvidence.QueryContext(ctx, minHeight, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list evidence: %w", err)
@@ -180,6 +202,8 @@ func (a *adapter) ListEvidence(ctx context.Context, minHeight uint64, limit int)
 }
 
 func (a *adapter) SaveCommittedBlock(ctx context.Context, height uint64, hash []byte, qc []byte) error {
+	stop := a.recordQuery("save_committed_block")
+	defer stop()
 	if len(hash) != 32 {
 		return fmt.Errorf("save committed block: invalid block hash length %d", len(hash))
 	}
@@ -190,6 +214,8 @@ func (a *adapter) SaveCommittedBlock(ctx context.Context, height uint64, hash []
 }
 
 func (a *adapter) LoadLastCommitted(ctx context.Context) (uint64, []byte, []byte, error) {
+	stop := a.recordQuery("load_last_committed")
+	defer stop()
 	row := a.stmtGetMeta.QueryRowContext(ctx)
 	var height sql.NullInt64
 	var hash []byte
@@ -210,6 +236,8 @@ func (a *adapter) LoadLastCommitted(ctx context.Context) (uint64, []byte, []byte
 }
 
 func (a *adapter) GetCommittedBlockHash(ctx context.Context, height uint64) ([]byte, bool, error) {
+	stop := a.recordQuery("get_committed_block_hash")
+	defer stop()
 	row := a.stmtGetCommitted.QueryRowContext(ctx, height)
 	var hash []byte
 	if err := row.Scan(&hash); err != nil {
@@ -222,6 +250,8 @@ func (a *adapter) GetCommittedBlockHash(ctx context.Context, height uint64) ([]b
 }
 
 func (a *adapter) DeleteBefore(ctx context.Context, height uint64) error {
+	stop := a.recordQuery("delete_before_height")
+	defer stop()
 	if _, err := a.stmtDeleteProposalsBefore.ExecContext(ctx, height); err != nil {
 		return fmt.Errorf("delete proposals before: %w", err)
 	}
@@ -238,6 +268,8 @@ func (a *adapter) DeleteBefore(ctx context.Context, height uint64) error {
 }
 
 func (a *adapter) LoadGenesisCertificate(ctx context.Context) ([]byte, bool, error) {
+	stop := a.recordQuery("load_genesis_certificate")
+	defer stop()
 	row := a.stmtLoadGenesisCert.QueryRowContext(ctx)
 	var cert []byte
 	if err := row.Scan(&cert); err != nil {
@@ -250,6 +282,8 @@ func (a *adapter) LoadGenesisCertificate(ctx context.Context) ([]byte, bool, err
 }
 
 func (a *adapter) SaveGenesisCertificate(ctx context.Context, data []byte) error {
+	stop := a.recordQuery("save_genesis_certificate")
+	defer stop()
 	if len(data) == 0 {
 		return fmt.Errorf("save genesis certificate: data required")
 	}
@@ -260,6 +294,8 @@ func (a *adapter) SaveGenesisCertificate(ctx context.Context, data []byte) error
 }
 
 func (a *adapter) DeleteGenesisCertificate(ctx context.Context) error {
+	stop := a.recordQuery("delete_genesis_certificate")
+	defer stop()
 	if _, err := a.stmtDeleteGenesisCert.ExecContext(ctx); err != nil {
 		return fmt.Errorf("delete genesis certificate: %w", err)
 	}

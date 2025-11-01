@@ -128,13 +128,36 @@ class MessageHandlers:
             )
             
             # Record metrics
-            if self.service_manager.ml_metrics and result.decision:
+            if self.service_manager.ml_metrics:
                 self.service_manager.ml_metrics.record_pipeline_result(
                     decision=result.decision,
                     latencies=result.latency_ms,
                     total_latency=result.total_latency_ms,
                     feature_count=result.feature_count,
                     candidate_count=result.candidate_count
+                )
+
+            # Persist detection history for API consumers
+            if self.service_manager and result.decision:
+                decision = result.decision
+                severity = max(1, min(10, int(decision.final_score * 10)))
+                block_hash_prefix = (
+                    event.block_hash[:8].hex() if getattr(event, "block_hash", None) else None
+                )
+                self.service_manager.record_detection_event(
+                    source="commit",
+                    validator_id=getattr(event, "producer_id", None),
+                    threat_type=decision.threat_type.value if decision.threat_type else "unknown",
+                    severity=severity,
+                    confidence=decision.confidence,
+                    final_score=decision.final_score,
+                    should_publish=decision.should_publish,
+                    metadata={
+                        "block_height": getattr(event, "height", None),
+                        "block_hash": block_hash_prefix,
+                        "transaction_count": getattr(event, "transaction_count", None),
+                        "abstention_reason": decision.abstention_reason,
+                    },
                 )
             
             # Check if we should publish

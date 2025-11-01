@@ -10,6 +10,8 @@ Tracks:
 No secrets in metrics - security-first.
 """
 
+import time
+
 from prometheus_client import Histogram, Counter, Gauge
 from typing import Dict
 from .types import EnsembleDecision
@@ -79,6 +81,63 @@ class PrometheusMetrics:
             'ml_pipeline_runs_total',
             'Total pipeline runs',
             ['status']  # 'success', 'error'
+        )
+
+        # Detection loop metrics
+        self.detection_loop_running = Gauge(
+            'ml_detection_loop_running',
+            'Detection loop running status (1=running, 0=stopped)'
+        )
+
+        self.detection_loop_last_iteration = Gauge(
+            'ml_detection_loop_last_iteration_timestamp',
+            'Unix timestamp of the last detection loop iteration'
+        )
+
+        self.detection_loop_last_detection = Gauge(
+            'ml_detection_loop_last_detection_timestamp',
+            'Unix timestamp of the last published detection'
+        )
+
+        self.detection_iteration_latency = Histogram(
+            'ml_detection_iteration_latency_ms',
+            'Detection loop iteration latency in milliseconds',
+            buckets=[5, 10, 25, 50, 100, 250, 500, 1000]
+        )
+
+        self.detection_decisions = Counter(
+            'ml_detection_decisions_total',
+            'Detection loop decisions by outcome',
+            ['outcome']
+        )
+
+        self.detection_errors = Counter(
+            'ml_detection_errors_total',
+            'Detection loop errors'
+        )
+
+        self.engine_candidates = Counter(
+            'ml_engine_candidates_total',
+            'Detection candidates produced per engine',
+            ['engine_type']
+        )
+
+        self.engine_published = Counter(
+            'ml_engine_published_total',
+            'Published decisions where engine contributed',
+            ['engine_type']
+        )
+
+        self.engine_confidence_sum = Counter(
+            'ml_engine_confidence_sum',
+            'Aggregate confidence sum per engine',
+            ['engine_type']
+        )
+
+        self.engine_confidence_count = Counter(
+            'ml_engine_confidence_count',
+            'Number of confidence samples per engine',
+            ['engine_type']
         )
         
         # Quality metrics
@@ -237,5 +296,46 @@ class PrometheusMetrics:
     def inc_variant_dlq(self, variant: str, reason: str):
         try:
             self.variant_dlq.labels(variant=variant, reason=reason).inc()
+        except Exception:
+            pass
+
+    # Detection loop helpers
+    def set_detection_loop_running(self, running: bool):
+        try:
+            self.detection_loop_running.set(1 if running else 0)
+        except Exception:
+            pass
+
+    def record_detection_iteration(self, *, latency_ms: float, published: bool, rate_limited: bool):
+        try:
+            self.detection_iteration_latency.observe(latency_ms)
+            self.detection_loop_last_iteration.set(time.time())
+
+            if published:
+                outcome = 'published'
+                self.detection_loop_last_detection.set(time.time())
+            elif rate_limited:
+                outcome = 'rate_limited'
+            else:
+                outcome = 'no_publish'
+
+            self.detection_decisions.labels(outcome=outcome).inc()
+        except Exception:
+            pass
+
+    def record_detection_error(self):
+        try:
+            self.detection_errors.inc()
+        except Exception:
+            pass
+
+    def record_engine_iteration(self, *, engine_type: str, candidates: int, published: int, confidence_sum: float):
+        try:
+            if candidates > 0:
+                self.engine_candidates.labels(engine_type=engine_type).inc(candidates)
+                self.engine_confidence_sum.labels(engine_type=engine_type).inc(confidence_sum)
+                self.engine_confidence_count.labels(engine_type=engine_type).inc(candidates)
+            if published > 0:
+                self.engine_published.labels(engine_type=engine_type).inc(published)
         except Exception:
             pass

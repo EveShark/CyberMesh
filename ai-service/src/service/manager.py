@@ -13,11 +13,13 @@ Security:
     - Saves crypto state on shutdown
     - Thread-safe operations
 """
+import math
 import threading
 import time
-from enum import Enum
-from typing import Optional, Dict, Any, Callable
+from collections import deque
 from datetime import datetime
+from enum import Enum
+from typing import Optional, Dict, Any, Callable, List
 
 from ..config import Settings
 from ..logging import get_logger
@@ -121,6 +123,33 @@ class ServiceManager:
             "errors": 0,
         }
         self._metrics_lock = threading.Lock()
+
+        # Cached detection metrics for API exposure
+        self._cached_detection_metrics = {
+            "running": False,
+            "metrics": {
+                "detections_total": 0,
+                "detections_published": 0,
+                "detections_rate_limited": 0,
+                "errors": 0,
+                "last_detection_time": None,
+                "last_iteration_time": None,
+                "loop_iterations": 0,
+                "avg_latency_ms": 0.0,
+                "last_latency_ms": 0.0,
+            },
+            "last_updated": None,
+        }
+
+        # Detection history (for API exposure)
+        self._history_lock = threading.Lock()
+        self._detection_history = deque(maxlen=500)
+
+        # Aggregated engine analytics
+        self._engine_metrics_lock = threading.RLock()
+        self._engine_metrics = {}
+        self._variant_metrics_lock = threading.RLock()
+        self._variant_metrics = {}
     
     @property
     def state(self) -> ServiceState:
@@ -665,17 +694,48 @@ class ServiceManager:
             
             # Detection loop metrics (Phase 8)
             if self.detection_loop:
-                health["detection_loop"] = {
+                loop_metrics = self.detection_loop.get_metrics()
+                snapshot = {
                     "running": self.detection_loop.is_healthy(),
-                    "metrics": self.detection_loop.get_metrics()
+                    "metrics": loop_metrics,
+                    "last_updated": time.time(),
                 }
+                self._cached_detection_metrics = {
+                    "running": snapshot["running"],
+                    "metrics": dict(loop_metrics),
+                    "last_updated": snapshot["last_updated"],
+                }
+                health["detection_loop"] = snapshot
+            else:
+                # Serve cached metrics when loop not initialized or stopped
+                cached = {
+                    "running": self._cached_detection_metrics.get("running", False),
+                    "metrics": dict(self._cached_detection_metrics.get("metrics", {})),
+                    "last_updated": self._cached_detection_metrics.get("last_updated"),
+                }
+                health["detection_loop"] = cached
             
             # Rate limiter stats (Phase 8)
             if self.rate_limiter:
                 health["rate_limiter"] = self.rate_limiter.get_stats()
+
+            if self.producer:
+                health["kafka_producer"] = self.producer.get_metrics()
+
+            if self.consumer:
+                health["kafka_consumer"] = self.consumer.get_metrics()
             
             return health
     
+    def get_detection_metrics(self) -> Dict[str, Any]:
+        """Return latest detection loop metrics snapshot."""
+        with self._state_lock:
+            return {
+                "running": self._cached_detection_metrics.get("running", False),
+                "metrics": dict(self._cached_detection_metrics.get("metrics", {})),
+                "last_updated": self._cached_detection_metrics.get("last_updated"),
+            }
+
     def get_handler_metrics(self) -> Dict[str, Any]:
         """
         Get message handler metrics.
@@ -772,7 +832,14 @@ class ServiceManager:
                 'user': get_config('DB_USER', 'postgres'),
                 'password': get_config('DB_PASSWORD', 'postgres'),
             }
-            telemetry_source = PostgresTelemetrySource(db_config=db_config, sample_size=100)
+            table_name = get_config('DB_TABLE', 'test_ddos_binary')
+            schema = 'curated' if 'test' in table_name else 'public'
+            telemetry_source = PostgresTelemetrySource(
+                db_config=db_config, 
+                sample_size=100,
+                table_name=table_name,
+                schema=schema
+            )
             self.logger.info('Using PostgreSQL telemetry source')
         else:
             telemetry_source = FileTelemetrySource(
@@ -924,11 +991,359 @@ class ServiceManager:
             publisher=self.publisher,
             rate_limiter=self.rate_limiter,
             config=detection_config,
-            logger=self.logger
+            logger=self.logger,
+            metrics=self.ml_metrics,
+            event_recorder=self.record_detection_event,
+            engine_metrics_callback=self.record_engine_metrics,
         )
         
         self.logger.info(
             f"Detection loop initialized: interval={detection_config['DETECTION_INTERVAL']}s, "
             f"rate_limit={max_detections_per_second}/s"
         )
+
+    def record_engine_metrics(self, engines: List[Dict[str, Any]], variants: List[Dict[str, Any]]) -> None:
+        """Record per-iteration engine and variant analytics."""
+
+        now = time.time()
+
+        if engines:
+            with self._engine_metrics_lock:
+                for snapshot in engines:
+                    engine = snapshot.get("engine")
+                    if not engine:
+                        continue
+
+                    entry = self._engine_metrics.setdefault(
+                        engine,
+                        {
+                            "engine": engine,
+                            "candidates": 0,
+                            "published": 0,
+                            "confidence_sum": 0.0,
+                            "confidence_samples": 0,
+                            "first_seen": now,
+                            "last_updated": now,
+                            "last_latency_ms": None,
+                            "threat_types": set(),
+                        },
+                    )
+
+                    candidates = int(snapshot.get("candidates", 0))
+                    published = int(snapshot.get("published", 0))
+                    confidence_sum = float(snapshot.get("confidence_sum", 0.0))
+                    threat_types = snapshot.get("threat_types", [])
+
+                    entry["candidates"] += candidates
+                    entry["published"] += published
+                    entry["confidence_sum"] += confidence_sum
+                    entry["confidence_samples"] += max(0, candidates)
+                    entry["last_updated"] = snapshot.get("timestamp", now)
+                    entry["last_latency_ms"] = snapshot.get("iteration_latency_ms")
+                    entry["threat_types"].update(threat_types)
+
+        if variants:
+            with self._variant_metrics_lock:
+                for snapshot in variants:
+                    variant = snapshot.get("variant")
+                    if not variant:
+                        continue
+
+                    entry = self._variant_metrics.setdefault(
+                        variant,
+                        {
+                            "variant": variant,
+                            "total": 0,
+                            "published": 0,
+                            "confidence_sum": 0.0,
+                            "confidence_samples": 0,
+                            "engines": set(),
+                            "threat_types": set(),
+                            "first_seen": now,
+                            "last_updated": now,
+                        },
+                    )
+
+                    total = int(snapshot.get("total", 0))
+                    published = int(snapshot.get("published", 0))
+                    confidence_sum = float(snapshot.get("confidence_sum", 0.0))
+
+                    entry["total"] += total
+                    entry["published"] += published
+                    entry["confidence_sum"] += confidence_sum
+                    entry["confidence_samples"] += max(0, total)
+                    entry["last_updated"] = snapshot.get("timestamp", now)
+                    if snapshot.get("engine"):
+                        entry["engines"].add(snapshot["engine"])
+                    entry["threat_types"].update(snapshot.get("threat_types", []))
+
+    def get_engine_metrics_summary(self) -> List[Dict[str, Any]]:
+        """Return aggregated per-engine metrics for API payloads."""
+
+        now = time.time()
+        summary: List[Dict[str, Any]] = []
+        with self._engine_metrics_lock:
+            for engine, data in self._engine_metrics.items():
+                candidates = max(0, int(data.get("candidates", 0)))
+                published = max(0, int(data.get("published", 0)))
+                confidence_samples = max(0, int(data.get("confidence_samples", 0)))
+                confidence_sum = float(data.get("confidence_sum", 0.0))
+                first_seen = float(data.get("first_seen", now))
+                elapsed_minutes = max((now - first_seen) / 60.0, 0.0001)
+
+                avg_confidence = None
+                if confidence_samples > 0:
+                    avg_confidence = confidence_sum / confidence_samples
+
+                throughput = candidates / elapsed_minutes if candidates > 0 else 0.0
+                publish_ratio = float(published) / candidates if candidates > 0 else 0.0
+
+                summary.append(
+                    {
+                        "engine": engine,
+                        "ready": self._is_engine_ready(engine),
+                        "candidates": candidates,
+                        "published": published,
+                        "publish_ratio": publish_ratio,
+                        "throughput_per_minute": throughput,
+                        "avg_confidence": avg_confidence,
+                        "threat_types": sorted(data.get("threat_types", set())),
+                        "last_latency_ms": data.get("last_latency_ms"),
+                        "last_updated": data.get("last_updated"),
+                    }
+                )
+
+        summary.sort(key=lambda item: item.get("throughput_per_minute", 0.0), reverse=True)
+        return summary
+
+    def get_variant_metrics_summary(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """Return aggregated variant metrics sorted by total activity."""
+
+        now = time.time()
+        limit = max(1, min(limit, 100))
+        items: List[Dict[str, Any]] = []
+        with self._variant_metrics_lock:
+            for variant, data in self._variant_metrics.items():
+                total = max(0, int(data.get("total", 0)))
+                published = max(0, int(data.get("published", 0)))
+                confidence_samples = max(0, int(data.get("confidence_samples", 0)))
+                confidence_sum = float(data.get("confidence_sum", 0.0))
+                first_seen = float(data.get("first_seen", now))
+                elapsed_minutes = max((now - first_seen) / 60.0, 0.0001)
+
+                avg_confidence = None
+                if confidence_samples > 0:
+                    avg_confidence = confidence_sum / confidence_samples
+
+                publish_ratio = float(published) / total if total > 0 else 0.0
+                throughput = total / elapsed_minutes if total > 0 else 0.0
+
+                items.append(
+                    {
+                        "variant": variant,
+                        "engines": sorted(data.get("engines", set())),
+                        "total": total,
+                        "published": published,
+                        "publish_ratio": publish_ratio,
+                        "throughput_per_minute": throughput,
+                        "avg_confidence": avg_confidence,
+                        "threat_types": sorted(data.get("threat_types", set())),
+                        "last_updated": data.get("last_updated"),
+                    }
+                )
+
+        items.sort(key=lambda item: item.get("total", 0), reverse=True)
+        return items[:limit]
+
+    def _is_engine_ready(self, engine: str) -> bool:
+        if not self.detection_pipeline:
+            return False
+        try:
+            engines = getattr(self.detection_pipeline, "engines", [])
+        except Exception:
+            return False
+
+        for detector in engines:
+            try:
+                engine_type = getattr(detector, "engine_type")
+                if engine_type and engine_type.value == engine:
+                    return bool(getattr(detector, "is_ready", False))
+            except Exception:
+                continue
+        return False
+
+    # ------------------------------------------------------------------
+    # Detection history helpers (AI API exposure)
+    # ------------------------------------------------------------------
+
+    def record_detection_event(
+        self,
+        *,
+        source: str,
+        validator_id: Optional[str],
+        threat_type: str,
+        severity: int,
+        confidence: float,
+        final_score: float,
+        should_publish: bool,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Persist sanitized detection event for API queries."""
+
+        if validator_id is not None and isinstance(validator_id, bytes):
+            validator_id = validator_id.hex()
+
+        event = {
+            "timestamp": time.time(),
+            "source": source,
+            "validator_id": validator_id,
+            "threat_type": threat_type,
+            "severity": int(max(0, severity)),
+            "confidence": float(max(0.0, min(confidence, 1.0))),
+            "final_score": float(max(0.0, min(final_score, 1.0))),
+            "should_publish": bool(should_publish),
+            "metadata": self._sanitize_event_metadata(metadata or {}),
+        }
+
+        with self._history_lock:
+            self._detection_history.append(event)
+
+    def get_detection_history(
+        self,
+        limit: int = 50,
+        since: Optional[float] = None,
+        validator_id: Optional[str] = None,
+    ) -> list:
+        """Return recent detection events (newest first)."""
+
+        limit = max(1, min(limit, 200))
+        with self._history_lock:
+            events = list(self._detection_history)
+
+        if since is not None:
+            events = [evt for evt in events if evt["timestamp"] >= since]
+
+        if validator_id:
+            validator_id = validator_id.lower()
+            events = [evt for evt in events if (evt.get("validator_id") or "").lower() == validator_id]
+
+        events.sort(key=lambda evt: evt["timestamp"], reverse=True)
+
+        return [self._format_detection_entry(evt) for evt in events[:limit]]
+
+    def get_ai_suspicious_nodes(self, limit: int = 10) -> list:
+        """Compute AI-driven suspicious validator scores."""
+
+        limit = max(1, min(limit, 50))
+        now = time.time()
+
+        with self._history_lock:
+            events = list(self._detection_history)
+
+        aggregates: Dict[str, Dict[str, Any]] = {}
+        for event in events:
+            if not event.get("should_publish"):
+                continue
+
+            validator_id = event.get("validator_id")
+            if not validator_id:
+                continue
+
+            age_seconds = now - event["timestamp"]
+            decay = math.exp(-age_seconds / 900.0) if age_seconds > 0 else 1.0
+            decay = max(decay, 0.05)
+
+            severity_component = float(event["severity"]) * 8.0
+            confidence_component = float(event["confidence"]) * 20.0
+            score = (severity_component + confidence_component) * decay
+
+            entry = aggregates.setdefault(
+                validator_id,
+                {
+                    "score": 0.0,
+                    "event_count": 0,
+                    "last_seen": event["timestamp"],
+                    "max_severity": 0,
+                    "max_confidence": 0.0,
+                    "threat_types": set(),
+                },
+            )
+
+            entry["score"] += score
+            entry["event_count"] += 1
+            entry["last_seen"] = max(entry["last_seen"], event["timestamp"])
+            entry["max_severity"] = max(entry["max_severity"], event["severity"])
+            entry["max_confidence"] = max(entry["max_confidence"], event["confidence"])
+            entry["threat_types"].add(event.get("threat_type", "unknown"))
+
+        results = []
+        for validator_id, data in aggregates.items():
+            suspicion = min(100.0, round(data["score"], 2))
+
+            if suspicion < 20.0:
+                # Ignore noise-level scores
+                continue
+
+            if suspicion >= 75.0:
+                status = "critical"
+            elif suspicion >= 40.0:
+                status = "warning"
+            else:
+                status = "healthy"
+
+            last_seen_iso = datetime.utcfromtimestamp(data["last_seen"]).isoformat() + "Z"
+            reason = (
+                f"events={data['event_count']};"
+                f"max_severity={data['max_severity']};"
+                f"last_seen={last_seen_iso}"
+            )
+
+            results.append(
+                {
+                    "id": validator_id,
+                    "status": status,
+                    "uptime": max(0.0, 100.0 - suspicion),
+                    "suspicion_score": suspicion,
+                    "reason": reason,
+                    "event_count": data["event_count"],
+                    "last_seen": last_seen_iso,
+                    "threat_types": sorted(data["threat_types"]),
+                }
+            )
+
+        results.sort(key=lambda item: item["suspicion_score"], reverse=True)
+        return results[:limit]
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _sanitize_event_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """Keep only primitive metadata fields (no PII, no nested objects)."""
+
+        sanitized = {}
+        for key, value in metadata.items():
+            if len(sanitized) >= 8:
+                break
+            if isinstance(value, (str, int, float, bool)) and len(str(value)) <= 256:
+                sanitized[str(key)[:64]] = value
+        return sanitized
+
+    def _format_detection_entry(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        formatted = {
+            "timestamp": datetime.utcfromtimestamp(event["timestamp"]).isoformat() + "Z",
+            "source": event["source"],
+            "validator_id": event.get("validator_id"),
+            "threat_type": event.get("threat_type"),
+            "severity": event.get("severity"),
+            "confidence": round(float(event.get("confidence", 0.0)), 4),
+            "final_score": round(float(event.get("final_score", 0.0)), 4),
+            "should_publish": event.get("should_publish", False),
+        }
+
+        metadata = event.get("metadata")
+        if metadata:
+            formatted["metadata"] = metadata
+
+        return formatted
 

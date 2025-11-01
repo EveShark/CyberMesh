@@ -14,7 +14,7 @@ kubectl config current-context
 # Switch to GKE cluster
 gcloud container clusters get-credentials cybermesh-cluster \
   --region=asia-southeast1 \
-  --project=cybermesh-474414
+  --project=cybermesh-476310
 
 # List all contexts
 kubectl config get-contexts
@@ -76,7 +76,7 @@ kubectl logs -n cybermesh validator-0 --previous
 kubectl logs -n cybermesh -l component=validator --tail=50
 
 # All pods with app label
-kubectl logs -n cybermesh -l app=consensus-backend --tail=100
+kubectl logs -n cybermesh -l app=cybermesh-backend --tail=100
 
 # Stream all validator logs
 kubectl logs -n cybermesh -l component=validator -f
@@ -431,7 +431,7 @@ kubectl scale statefulset validator -n cybermesh --replicas=5
 ```bash
 # Update image
 kubectl set image statefulset/validator \
-  validator=us-central1-docker.pkg.dev/cybermesh-474414/cybermesh-repo/consensus-backend:v1.1.0 \
+  validator=asia-southeast1-docker.pkg.dev/cybermesh-476310/cybermesh-repo/cybermesh-backend:v1.1.0 \
   -n cybermesh
 
 # Check rollout history
@@ -665,6 +665,6 @@ kubectl get all -n cybermesh                            # All resources
 ---
 
 **Namespace:** `cybermesh`
-**App Label:** `app=consensus-backend`
+**App Label:** `app=cybermesh-backend`
 **Component Label:** `component=validator`
 **LoadBalancer IP:** `34.143.137.254`

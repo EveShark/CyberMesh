@@ -1,0 +1,165 @@
+# CyberMesh Unified Docker Ignore
+# Used for all service builds from project root with -f docker/*/Dockerfile
+
+# ============================================================
+# Version Control
+# ============================================================
+.git
+.gitignore
+.gitattributes
+
+# ============================================================
+# Documentation
+# ============================================================
+*.md
+docs/
+AGENTS.md
+README*
+CHANGELOG*
+LICENSE
+
+# ============================================================
+# CI/CD
+# ============================================================
+.github/
+.gitlab-ci.yml
+cloudbuild.yaml
+
+# ============================================================
+# IDE & Editors
+# ============================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ============================================================
+# Environment Files (Use ConfigMaps/Secrets instead)
+# ============================================================
+.env*
+!.env.example
+
+# ============================================================
+# Logs & Runtime Files
+# ============================================================
+logs/
+*.log
+ai_*.log
+*.pid
+nonce_state.json
+
+# ============================================================
+# Test Files
+# ============================================================
+test/
+tests/
+*_test.go
+**/*_test.go
+*.test.js
+*.spec.js
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ============================================================
+# Build Artifacts (Exclude built binaries except what's needed)
+# ============================================================
+dist/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Backend: Allow bin/cybermesh (needed for Docker COPY)
+bin/*
+!bin/cybermesh
+
+# ============================================================
+# Frontend Node Modules (npm ci runs inside Docker)
+# ============================================================
+frontend/node_modules
+frontend/.next
+frontend/.env*
+frontend/*.log
+
+# ============================================================
+# AI Service Python
+# ============================================================
+ai-service/__pycache__/
+ai-service/**/__pycache__/
+ai-service/*.pyc
+ai-service/*.pyo
+ai-service/*.pyd
+ai-service/.pytest_cache/
+ai-service/venv/
+ai-service/.venv/
+ai-service/*.log
+
+# Exclude large model files (mounted at runtime from OCI Object Storage)
+ai-service/data/models/*.pkl
+ai-service/data/models/**/*.pkl
+ai-service/data/models/**/*.sig
+ai-service/data/datasets/**/*
+
+# ============================================================
+# Keys & Certificates (Mounted as Secrets)
+# ============================================================
+keys/
+*.pem
+*.key
+*.crt
+!certs/root.crt
+
+# ============================================================
+# Database Files
+# ============================================================
+*.sql
+*.db
+*.sqlite
+
+# ============================================================
+# Temporary Files
+# ============================================================
+tmp/
+temp/
+*.tmp
+*.bak
+
+# ============================================================
+# Archive & Unused Code
+# ============================================================
+Archive/
+**/Archive/
+backup/
+Old*/
+old*/
+
+# Frontend unused directories
+frontend/p2p/
+frontend/consensus/
+frontend/src/Archive/
+frontend/src/p2p/
+frontend/src/consensus/
+
+# ============================================================
+# Kubernetes Manifests (Not needed in Docker images)
+# ============================================================
+k8s/
+k8s_gke/
+k8s_oke/
+*.yaml
+*.yml
+!backend/**/*.yaml
+!backend/**/*.yml
+
+# ============================================================
+# Tools & Scripts (Not needed in production images)
+# ============================================================
+tools/
+scripts/
+*.ps1
+*.sh
+!docker/**/entrypoint.sh

@@ -1,0 +1,102 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: verify-cockroachdb
+  namespace: cybermesh
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      
+      # Prefer stateless node (soft requirement)
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: workload-type
+                operator: In
+                values:
+                - stateless
+      
+      volumes:
+      - name: db-cert
+        secret:
+          secretName: db-root-cert
+          optional: true
+      containers:
+      - name: verify-db
+        image: postgres:15-alpine
+        volumeMounts:
+        - name: db-cert
+          mountPath: /certs
+          readOnly: true
+        command:
+        - sh
+        - -c
+        - |
+          set -e
+          echo "=== Querying CockroachDB to verify data ==="
+          
+          PGPASSWORD="${DB_PASSWORD}" psql \
+            "host=${DB_HOST} port=${DB_PORT} dbname=${DB_NAME} user=${DB_USER} sslmode=require sslrootcert=/certs/root.crt" \
+            << 'EOF'
+          
+          -- Check blocks table
+          SELECT 'Total blocks:' as info, COUNT(*) as count FROM blocks;
+          
+          -- Show recent blocks
+          SELECT height, 
+                 LEFT(ENCODE(block_hash, 'hex'), 16) as hash,
+                 tx_count,
+                 timestamp
+          FROM blocks 
+          ORDER BY height DESC 
+          LIMIT 10;
+          
+          -- Check transactions table  
+          SELECT 'Total transactions:' as info, COUNT(*) as count FROM transactions;
+          
+          -- Show recent transactions
+          SELECT block_height,
+                 tx_index,
+                 tx_type,
+                 LEFT(ENCODE(content_hash, 'hex'), 16) as content_hash,
+                 status
+          FROM transactions
+          ORDER BY block_height DESC, tx_index
+          LIMIT 10;
+          
+          -- Show all distinct transaction types
+          SELECT 'All transaction types:' as info;
+          SELECT DISTINCT tx_type, COUNT(*) as count
+          FROM transactions
+          GROUP BY tx_type
+          ORDER BY count DESC;
+          
+          -- Show most recent transactions with details
+          SELECT 'Recent transactions:' as info;
+          SELECT block_height, tx_index, tx_type, 
+                 LEFT(producer_id, 20) as producer,
+                 status, executed_at
+          FROM transactions
+          ORDER BY block_height DESC, tx_index
+          LIMIT 20;
+          
+          EOF
+          
+          echo ""
+          echo "=== Verification complete! ==="
+        env:
+        - name: DB_HOST
+          value: "cybermesh-threats-9633.jxf.gcp-asia-southeast1.cockroachlabs.cloud"
+        - name: DB_PORT
+          value: "26257"
+        - name: DB_NAME
+          value: "defaultdb"
+        - name: DB_USER
+          value: "lenny"
+        - name: DB_PASSWORD
+          value: "VnF_SqShUO-rcYx0VmnJ9w"

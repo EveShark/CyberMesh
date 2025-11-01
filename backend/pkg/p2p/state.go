@@ -62,6 +62,7 @@ type PeerState struct {
 	Quarantined  bool
 	QuarantineAt time.Time
 	Labels       map[string]string
+	LatencyEMA   float64
 }
 
 // NewState constructs a State with parameters from configuration (no hardcoding).
@@ -168,7 +169,18 @@ func (s *State) OnMessage(topic string, from peer.ID, n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ps := s.ensure(from)
-	ps.LastSeen = time.Now()
+	now := time.Now()
+	if !ps.LastSeen.IsZero() {
+		interval := now.Sub(ps.LastSeen).Seconds()
+		if interval >= 0 {
+			if ps.LatencyEMA == 0 {
+				ps.LatencyEMA = interval
+			} else {
+				ps.LatencyEMA = ps.LatencyEMA*0.9 + interval*0.1
+			}
+		}
+	}
+	ps.LastSeen = now
 	ps.MsgIn++
 	ps.BytesIn += uint64(n)
 	s.seen[from] = ps.LastSeen
@@ -270,6 +282,39 @@ func (s *State) GetConnectedPeerCount() int {
 		}
 	}
 	return count
+}
+
+// TouchPeer updates the last-seen timestamp for a connected peer without mutating scores.
+// It is used to keep transport-level connections from being misclassified as inactive when
+// higher-level protocols have not yet exchanged messages (e.g., during startup grace periods).
+func (s *State) TouchPeer(pid peer.ID, ts time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ps, ok := s.peers[pid]
+	if !ok || ps.Quarantined {
+		return
+	}
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	ps.LastSeen = ts
+	s.seen[pid] = ts
+}
+
+// RecordLatencySample incorporates an external latency measurement into the peer's EMA.
+func (s *State) RecordLatencySample(pid peer.ID, latency time.Duration) {
+	if latency <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ps := s.ensure(pid)
+	seconds := latency.Seconds()
+	if ps.LatencyEMA == 0 {
+		ps.LatencyEMA = seconds
+	} else {
+		ps.LatencyEMA = ps.LatencyEMA*0.8 + seconds*0.2
+	}
 }
 
 // GetActivePeerCount returns the number of recently active peers.

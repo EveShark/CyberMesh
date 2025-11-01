@@ -132,6 +132,15 @@ func NewStorage(
 	}
 }
 
+// SetBackend attaches or replaces the persistent storage backend.
+// Safe to call before Start(); after Start(), it will take effect for subsequent
+// persistence operations. Restoration occurs in Start() when backend is present.
+func (s *Storage) SetBackend(backend StorageBackend) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    s.backend = backend
+}
+
 // Start initializes storage and loads persisted state
 func (s *Storage) Start(ctx context.Context) error {
 	s.mu.Lock()

@@ -1,0 +1,107 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cleanup-telemetry
+  namespace: cybermesh
+spec:
+  # Run daily at 2 AM UTC
+  schedule: "0 2 * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 3600  # Clean up job pods after 1 hour
+      template:
+        spec:
+          restartPolicy: OnFailure
+          
+          # Prefer stateless node where postgres runs
+          affinity:
+            nodeAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                preference:
+                  matchExpressions:
+                  - key: workload-type
+                    operator: In
+                    values:
+                    - stateless
+          
+          containers:
+          - name: cleanup-telemetry
+            image: postgres:15-alpine
+            env:
+            - name: PGHOST
+              value: "postgres.cybermesh.svc.cluster.local"
+            - name: PGPORT
+              value: "5432"
+            - name: PGDATABASE
+              value: "telemetry"
+            - name: PGUSER
+              value: "aiservice"
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ai-service-postgres
+                  key: password
+            - name: RETENTION_DAYS
+              value: "7"  # Keep last 7 days of data
+            command:
+            - sh
+            - -c
+            - |
+              set -e
+              echo "=== PostgreSQL Telemetry Cleanup Started ==="
+              echo "Retention policy: ${RETENTION_DAYS} days"
+              
+              # Count records before cleanup
+              BEFORE=$(psql -t -c "SELECT COUNT(*) FROM flows;")
+              echo "Records before cleanup: ${BEFORE}"
+              
+              # Get oldest and newest timestamps
+              psql -c "SELECT 
+                'Oldest record:' as info, MIN(timestamp) as timestamp 
+                FROM flows
+                UNION ALL
+                SELECT 'Newest record:', MAX(timestamp)
+                FROM flows;"
+              
+              # Delete old records
+              echo ""
+              echo "Deleting records older than ${RETENTION_DAYS} days..."
+              DELETED=$(psql -t -c "
+                WITH deleted AS (
+                  DELETE FROM flows 
+                  WHERE timestamp < NOW() - INTERVAL '${RETENTION_DAYS} days'
+                  RETURNING *
+                )
+                SELECT COUNT(*) FROM deleted;
+              ")
+              
+              echo "Records deleted: ${DELETED}"
+              
+              # Count records after cleanup
+              AFTER=$(psql -t -c "SELECT COUNT(*) FROM flows;")
+              echo "Records after cleanup: ${AFTER}"
+              
+              # Show table size
+              psql -c "SELECT 
+                pg_size_pretty(pg_total_relation_size('flows')) as table_size,
+                pg_size_pretty(pg_table_size('flows')) as data_size,
+                pg_size_pretty(pg_indexes_size('flows')) as index_size;"
+              
+              # Vacuum to reclaim space
+              echo ""
+              echo "Running VACUUM ANALYZE to reclaim disk space..."
+              psql -c "VACUUM ANALYZE flows;"
+              
+              # Show final stats
+              psql -c "SELECT 
+                COUNT(*) as total_records,
+                MIN(timestamp) as oldest_record,
+                MAX(timestamp) as newest_record,
+                EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp)))/86400 as days_covered
+                FROM flows;"
+              
+              echo ""
+              echo "=== Cleanup Complete ==="
