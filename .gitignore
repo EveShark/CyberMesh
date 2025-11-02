@@ -283,10 +283,6 @@ frontend/docs/
 # Root data directory (runtime state)
 /data/
 
-# Node.js artifacts for archived Excel scripts
-package.json
-package-lock.json
-
 # Temporary gitignore files
 .gitignore.old
 .gitignore.proposed
