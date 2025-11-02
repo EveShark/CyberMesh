@@ -274,8 +274,10 @@ ai-service/tests/
 backend/tests/
 frontend/tests/
 
-# Documentation directories (contain old/archived docs)
+# Documentation directories (keep locally, not in git)
 backend/docs/
+ai-service/docs/
+frontend/docs/
 /docs/
 
 # Root data directory (runtime state)
