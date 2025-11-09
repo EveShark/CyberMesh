@@ -137,8 +137,13 @@ class APIHandler(BaseHTTPRequestHandler):
             if circuit_breaker_state == 'open':
                 ready = False
             
-            status_code = 200 if ready else 503
             detection_snapshot = health.get('detection_loop') or self.service_manager.get_detection_metrics()
+            if detection_snapshot:
+                loop_status = detection_snapshot.get('status')
+                if detection_snapshot.get('blocking') or loop_status in ('critical', 'stopped'):
+                    ready = False
+
+            status_code = 200 if ready else 503
             self._send_json(status_code, {
                 "ready": ready,
                 "state": health.get('state', 'unknown'),
@@ -238,6 +243,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 "uptime_seconds": uptime,
                 "detection_loop": {
                     "running": detection_snapshot.get('running', False),
+                    "status": detection_snapshot.get('status', 'unknown'),
+                    "message": detection_snapshot.get('message'),
+                    "issues": detection_snapshot.get('issues', []),
+                    "blocking": detection_snapshot.get('blocking', False),
+                    "healthy": detection_snapshot.get('healthy', False),
                     "last_updated": detection_snapshot.get('last_updated'),
                     "cache_age_seconds": cache_age,
                     "metrics": metrics,

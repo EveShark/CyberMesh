@@ -79,6 +79,7 @@ type IPAllowlist interface {
 type ValidatorInfo struct {
 	ID         ValidatorID
 	PublicKey  []byte
+	PeerID     string
 	Reputation float64
 	IsActive   bool
 	JoinedView uint64
@@ -227,6 +228,7 @@ type Pacemaker interface {
 	// View management
 	GetCurrentView() uint64
 	GetCurrentHeight() uint64
+	SetCurrentView(view uint64)
 	SetCurrentHeight(height uint64)
 	GetHighestQC() QC
 	GetCurrentTimeout() time.Duration

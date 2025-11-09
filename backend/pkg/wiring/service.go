@@ -22,11 +22,12 @@ import (
 )
 
 type Config struct {
-	BuildInterval time.Duration
-	MinMempoolTxs int
-	TimestampSkew time.Duration // For state.ApplyBlock validation
-	GenesisHash   [32]byte      // Initial parent hash for first block
-	BlockTimeout  time.Duration // Consensus block timeout (controls leader retry cadence)
+	BuildInterval     time.Duration
+	MinMempoolTxs     int
+	TimestampSkew     time.Duration // For state.ApplyBlock validation
+	GenesisHash       [32]byte      // Initial parent hash for first block
+	BlockTimeout      time.Duration // Consensus block timeout (controls leader retry cadence)
+	AllowSoloProposal bool          // Allow proposals even if peer quorum not met (dev/single-node)
 
 	// Persistence configuration
 	EnablePersistence bool                    // Enable async persistence (default: true)
@@ -169,14 +170,14 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 		}
 	}
 
-    // Initialize persistence worker if enabled
+	// Initialize persistence worker if enabled
 	if cfg.EnablePersistence && cfg.DBAdapter != nil {
 		// Wire Kafka producer as onSuccess callback
 		// Fix: Gap 2 - Updated to pass anomaly IDs for COMMITTED state tracking
 		if kafkaProducer != nil {
-			cfg.PersistenceWorker.OnSuccess = func(ctx context.Context, height uint64, hash [32]byte, stateRoot [32]byte, txCount int, ts int64, anomalyIDs []string) {
+			cfg.PersistenceWorker.OnSuccess = func(ctx context.Context, height uint64, hash [32]byte, stateRoot [32]byte, txCount int, ts int64, anomalyCount int, evidenceCount int, policyCount int, anomalyIDs []string) {
 				// Publish commit event to Kafka after successful persistence
-				if err := kafkaProducer.PublishCommit(ctx, height, hash, stateRoot, txCount, ts, anomalyIDs); err != nil {
+				if err := kafkaProducer.PublishCommit(ctx, height, hash, stateRoot, txCount, ts, anomalyCount, evidenceCount, policyCount, anomalyIDs); err != nil {
 					if log != nil {
 						log.ErrorContext(ctx, "Failed to publish commit to Kafka",
 							utils.ZapError(err),
@@ -199,11 +200,11 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 			}
 			return nil, fmt.Errorf("failed to create persistence worker: %w", err)
 		}
-        s.persistWorker = worker
-        // Wire persistence into consensus engine now that worker exists
-        if eng != nil {
-            eng.AttachPersistence(worker)
-        }
+		s.persistWorker = worker
+		// Wire persistence into consensus engine now that worker exists
+		if eng != nil {
+			eng.AttachPersistence(worker)
+		}
 	}
 
 	// Initialize Kafka consumer if enabled (after mempool is set)

@@ -1,9 +1,8 @@
 "use client"
-
-import { useMemo } from "react"
 import {
   Activity,
   AlertCircle,
+  AlertTriangle,
   BrainCircuit,
   Cpu,
   Database,
@@ -42,9 +41,11 @@ function humanizeStatus(value: ReadinessValue): string {
   if (!status) return "Unknown"
   switch (status) {
     case "ok":
-    case "single_node":
-    case "genesis":
       return "Healthy"
+    case "single_node":
+      return "Single node"
+    case "genesis":
+      return "Genesis"
     case "not configured":
       return "Maintenance"
     case "not ready":
@@ -101,11 +102,23 @@ function formatThroughputBytesPerSec(value?: number): string {
   return `${(value / 1024).toFixed(1)} KB/s`
 }
 
-function sumRecord(record?: Record<string, number>): number | undefined {
-  if (!record) return undefined
-  const values = Object.values(record)
-  if (values.length === 0) return undefined
-  return values.reduce((acc, curr) => acc + curr, 0)
+function humanizeLabel(value?: string): string {
+  if (!value) return "Unknown"
+  return value
+    .split(/[\s,_-]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ")
+}
+
+function formatRelativeTime(unixSeconds?: number): string {
+  if (!unixSeconds || !Number.isFinite(unixSeconds)) return "--"
+  const nowSeconds = Math.floor(Date.now() / 1000)
+  const delta = Math.max(0, nowSeconds - Math.floor(unixSeconds))
+  if (delta < 60) return `${delta}s ago`
+  if (delta < 3600) return `${Math.floor(delta / 60)}m ago`
+  if (delta < 86400) return `${Math.floor(delta / 3600)}h ago`
+  return `${Math.floor(delta / 86400)}d ago`
 }
 
 function computeCpuPercent(cpuSeconds?: number, uptimeSeconds?: number): number | undefined {
@@ -117,12 +130,12 @@ function resolveStatusVariant(status: ReadinessValue) {
   const value = extractStatus(status)
   switch (value) {
     case "ok":
-    case "single_node":
-    case "genesis":
       return { variant: "outline" as const, className: "border-emerald-500 text-emerald-500" }
     case "not ready":
     case "insufficient":
     case "no_peers":
+    case "single_node":
+    case "genesis":
       return { variant: "outline" as const, className: "border-yellow-500 text-yellow-500" }
     case "not configured":
       return { variant: "outline" as const, className: "border-blue-500 text-blue-500" }
@@ -135,6 +148,11 @@ export default function SystemHealthPageClient() {
   const { data, error, isLoading, mutate, keyMetrics, aiLatencyMs } = useSystemHealthData(5000)
 
   const readiness = data?.backend.readiness
+  const readinessWarningsRaw = Array.isArray(readiness?.warnings)
+    ? (readiness?.warnings ?? []).filter(
+        (warning): warning is string => typeof warning === "string" && warning.trim().length > 0,
+      )
+    : []
   const checks = readiness?.checks ?? {}
   const storageStats = data?.backend.stats.storage as StorageStatsSummary | undefined
   const redisStats = data?.backend.stats.redis as RedisStatsSummary | undefined
@@ -148,23 +166,59 @@ export default function SystemHealthPageClient() {
   const aiUptimeSeconds = keyMetrics.aiUptimeSeconds
   const mempoolBytes = keyMetrics.mempoolBytes ?? data?.backend.stats.mempool?.size_bytes
 
+  const derived = data?.backend.derived
   const kafkaPublishP95 = kafkaStats?.publish_latency_p95_ms ?? kafkaStats?.publish_latency_ms
   const kafkaPublishP50 = kafkaStats?.publish_latency_p50_ms
 
   const networkInbound = networkStats?.inbound_throughput_bytes_per_second
-  const networkOutbound = networkStats?.outbound_throughput_bytes_per_second
 
   const latestUpdatedAt = data ? new Date(data.timestamp).toLocaleTimeString() : null
 
-  const statusBadge = readiness?.ready
-    ? { label: "Operational", className: "bg-emerald-500/10 text-emerald-400" }
-    : { label: "Degraded", className: "bg-yellow-500/10 text-yellow-400" }
+  const aiLoopStatus = derived?.aiLoopStatus ?? aiStats?.detection_loop_status ?? (aiStats?.detection_loop_running ? "ok" : "stopped")
+  const aiLoopBlocking = derived?.aiLoopBlocking ?? aiStats?.detection_loop_blocking ?? false
+  const aiLoopStatusUpdatedAt = derived?.aiLoopStatusUpdatedAt
+  const aiLoopIssues = derived?.aiLoopIssues
+  const aiLoopIssuesList = Array.isArray(aiLoopIssues) ? aiLoopIssues : []
+  const aiLoopLatencyOnly =
+    aiLoopStatus === "degraded" &&
+    !aiLoopBlocking &&
+    aiLoopIssuesList.length > 0 &&
+    aiLoopIssuesList.every((issue) => issue.toLowerCase().includes("latency"))
+  const aiDisplayStatus = aiLoopLatencyOnly ? "ok" : aiLoopStatus
+  const readinessWarnings = aiLoopLatencyOnly
+    ? readinessWarningsRaw.filter((warning) => !/iteration latency/i.test(warning))
+    : readinessWarningsRaw
+  const aiLoopBadgeVariant = (() => {
+    if (aiDisplayStatus === "critical" || aiDisplayStatus === "stopped" || aiLoopBlocking) return "destructive" as const
+    if (aiDisplayStatus === "degraded") return "outline" as const
+    return aiStats?.detection_loop_running ? ("outline" as const) : ("secondary" as const)
+  })()
+  const aiLoopBadgeClass = cn(
+    "flex items-center gap-1.5 text-xs",
+    aiDisplayStatus === "ok" && aiStats?.detection_loop_running ? "border-emerald-500 text-emerald-500" : undefined,
+    aiDisplayStatus === "degraded" ? "border-yellow-500 text-yellow-500" : undefined,
+  )
+  const aiLoopLabel = (() => {
+    if (aiDisplayStatus === "critical" || aiDisplayStatus === "stopped" || aiLoopBlocking) return "AI Halted"
+    if (aiDisplayStatus === "degraded") return "AI Degraded"
+    return aiStats?.detection_loop_running ? "AI Running" : "AI Paused"
+  })()
 
-  const aiStatus = aiStats?.detection_loop_running
-    ? { label: "AI Loop Running", className: "bg-emerald-500/10 text-emerald-400" }
-    : { label: "AI Loop Paused", className: "bg-yellow-500/10 text-yellow-400" }
-
-  const hasError = Boolean(error)
+  const threatDataSource = derived?.threatDataSource ?? "history"
+  const threatSourceUpdatedAt = derived?.threatSourceUpdatedAt
+  const threatFallbackCount = derived?.threatFallbackCount
+  const threatFallbackReason = derived?.threatFallbackReason
+  const threatFallbackAt = derived?.threatFallbackAt
+  const threatSourceLabel = humanizeLabel(threatDataSource)
+  const threatFallbackCountDisplay = typeof threatFallbackCount === "number" ? threatFallbackCount : undefined
+  const threatFallbackReasonLabel = threatFallbackReason
+    ? threatFallbackReason
+        .split(",")
+        .map((reason) => humanizeLabel(reason.trim()))
+        .join(", ")
+    : undefined
+  const threatFallbackTime = typeof threatFallbackAt === "number" ? formatRelativeTime(threatFallbackAt) : "--"
+  const threatSourceUpdatedLabel = typeof threatSourceUpdatedAt === "number" ? formatRelativeTime(threatSourceUpdatedAt) : "--"
 
   return (
     <div className="min-h-screen">
@@ -184,8 +238,8 @@ export default function SystemHealthPageClient() {
             <Badge variant={readiness?.ready ? "outline" : "destructive"} className={cn("flex items-center gap-1.5 text-xs", readiness?.ready ? "border-emerald-500 text-emerald-500" : "")}>
               <PackageCheck className="h-3 w-3" /> {readiness?.ready ? "Operational" : "Degraded"}
             </Badge>
-            <Badge variant={aiStats?.detection_loop_running ? "outline" : "secondary"} className={cn("flex items-center gap-1.5 text-xs", aiStats?.detection_loop_running ? "border-emerald-500 text-emerald-500" : "")}>
-              <BrainCircuit className="h-3 w-3" /> {aiStats?.detection_loop_running ? "AI Running" : "AI Paused"}
+            <Badge variant={aiLoopBadgeVariant} className={aiLoopBadgeClass}>
+              <BrainCircuit className="h-3 w-3" /> {aiLoopLabel}
             </Badge>
             <Button variant="outline" size="sm" onClick={() => mutate()} disabled={isLoading}>
               <RefreshCw className={cn("mr-2 h-4 w-4", isLoading ? "animate-spin" : undefined)} /> Refresh
@@ -200,6 +254,20 @@ export default function SystemHealthPageClient() {
               <p className="font-medium">Unable to fetch system health</p>
               <p className="text-destructive/80">{error instanceof Error ? error.message : "Unknown error"}</p>
             </div>
+          </div>
+        ) : null}
+
+        {!error && readinessWarnings.length > 0 ? (
+          <div className="flex flex-col gap-2 rounded-lg border border-yellow-500/30 bg-yellow-500/10 p-4 text-sm text-yellow-700 dark:text-yellow-300">
+            <div className="flex items-center gap-2 font-semibold">
+              <AlertTriangle className="h-4 w-4" />
+              {readinessWarnings.length === 1 ? "Readiness warning" : `${readinessWarnings.length} readiness warnings`}
+            </div>
+            <ul className="list-disc space-y-1 pl-5 text-xs text-yellow-700/90 dark:text-yellow-200/80">
+              {readinessWarnings.map((warning, idx) => (
+                <li key={`${warning}-${idx}`}>{warning}</li>
+              ))}
+            </ul>
           </div>
         ) : null}
 
@@ -223,12 +291,23 @@ export default function SystemHealthPageClient() {
               <div className="flex items-center justify-between">
                 <div>
                   <p className="text-sm font-medium text-muted-foreground">AI Uptime</p>
-                  <p className="text-xs text-muted-foreground/80">{aiStats?.state ? `State: ${aiStats.state}` : "Detection loop"}</p>
+                  <p className="text-xs text-muted-foreground/80">
+                    {aiStats?.state ? `State: ${aiStats.state}` : "Detection loop"}
+                  </p>
+                  <p className="text-xs text-muted-foreground/70">
+                    Loop: {humanizeLabel(aiLoopStatus)}
+                    {aiLoopStatusUpdatedAt ? ` • ${formatRelativeTime(aiLoopStatusUpdatedAt)}` : ""}
+                  </p>
                 </div>
                 <BrainCircuit className="h-5 w-5 text-primary" />
               </div>
               <p className="text-3xl font-bold text-foreground font-mono tracking-tight">{formatDuration(aiUptimeSeconds)}</p>
-              <p className="text-xs text-muted-foreground">Detection loop uptime</p>
+              <div className="space-y-1">
+                <p className="text-xs text-muted-foreground">Detection loop uptime</p>
+                {aiLoopIssues ? (
+                  <p className="text-xs text-yellow-600 dark:text-yellow-400">Issues: {aiLoopIssues}</p>
+                ) : null}
+              </div>
             </CardContent>
           </Card>
 
@@ -336,6 +415,37 @@ export default function SystemHealthPageClient() {
                   <div className="rounded-lg border border-border/30 bg-background/60 p-3">
                     <p className="text-xs text-muted-foreground">Mempool Size</p>
                     <p className="text-lg font-semibold text-foreground">{formatBytes(mempoolBytes)}</p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-3">
+                <div className="flex items-center gap-2 mb-2">
+                  <AlertCircle className="h-4 w-4 text-primary" />
+                  <span className="text-sm font-semibold text-foreground">Threat Feed</span>
+                </div>
+                <div className="grid grid-cols-2 gap-3 text-sm">
+                  <div className="rounded-lg border border-border/30 bg-background/60 p-3">
+                    <p className="text-xs text-muted-foreground">Data Source</p>
+                    <p className="text-lg font-semibold text-foreground">{threatSourceLabel}</p>
+                    {threatSourceUpdatedLabel !== "--" ? (
+                      <p className="text-[11px] text-muted-foreground/70">Updated {threatSourceUpdatedLabel}</p>
+                    ) : null}
+                  </div>
+                  <div className="rounded-lg border border-border/30 bg-background/60 p-3">
+                    <p className="text-xs text-muted-foreground">Fallback Count</p>
+                    <p className="text-lg font-semibold text-foreground">
+                      {threatFallbackCountDisplay !== undefined ? threatFallbackCountDisplay : "--"}
+                    </p>
+                  </div>
+                  <div className="col-span-2 rounded-lg border border-border/30 bg-background/60 p-3">
+                    <p className="text-xs text-muted-foreground">Last Fallback</p>
+                    <p className="text-sm font-semibold text-foreground">
+                      {threatFallbackTime}
+                    </p>
+                    {threatFallbackReasonLabel ? (
+                      <p className="text-xs text-muted-foreground/80">Reason: {threatFallbackReasonLabel}</p>
+                    ) : null}
                   </div>
                 </div>
               </div>

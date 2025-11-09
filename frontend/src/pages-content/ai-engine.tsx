@@ -22,6 +22,12 @@ import { PageContainer } from "@/components/page-container"
 import { AiEngineStats } from "@/components/ai-engine-stats"
 import { useAiEngineData } from "@/hooks/use-ai-engine-data"
 
+function extractUptimeSeconds(record?: Record<string, unknown> | null): number | undefined {
+  if (!record || typeof record !== "object") return undefined
+  const value = (record as { uptime_seconds?: unknown }).uptime_seconds
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
 function formatNumber(value?: number, digits = 1) {
   if (typeof value !== "number" || Number.isNaN(value)) return "--"
   return value.toFixed(digits)
@@ -58,20 +64,20 @@ export default function AiEnginePageContent() {
   const loop = metrics?.loop
   const derived = metrics?.derived
 
-  const recentDetections = useMemo(() => history?.detections ?? [], [history?.detections])
-  const trackedVariants = metrics?.variants ?? []
-  const trackedEngines = metrics?.engines ?? []
-  const suspiciousNodes = suspicious?.nodes ?? []
+  const recentDetections = useMemo(() => history?.detections ?? [], [history])
+  const trackedVariants = useMemo(() => metrics?.variants ?? [], [metrics])
+  const trackedEngines = useMemo(() => metrics?.engines ?? [], [metrics])
+  const suspiciousNodes = useMemo(() => suspicious?.nodes ?? [], [suspicious])
 
   // Track latency trend (last 20 data points = 100s history at 5s interval)
   useEffect(() => {
-    if (metrics?.loop?.last_latency_ms !== undefined && metrics.loop) {
+    if (loop?.last_latency_ms !== undefined) {
       setLatencyHistory((prev) => {
-        const updated = [...prev, { time: Date.now(), latency: metrics.loop!.last_latency_ms }]
+        const updated = [...prev, { time: Date.now(), latency: loop.last_latency_ms }]
         return updated.slice(-20) // Keep last 20 points
       })
     }
-  }, [metrics?.loop?.last_latency_ms])
+  }, [loop])
 
   // Calculated insights
   const displayedDetections = showAllDetections ? recentDetections : recentDetections.slice(0, 5)
@@ -99,15 +105,15 @@ export default function AiEnginePageContent() {
   }, [suspiciousNodes])
 
   const totalIterations = useMemo(() => {
-    if (!derived?.iterations_per_minute || !health) return null
-    const uptime = (health as any)?.uptime_seconds
-    if (!uptime) return null
+    if (!derived?.iterations_per_minute) return null
+    const uptime = extractUptimeSeconds(health?.health)
+    if (uptime === undefined) return null
     return Math.floor(derived.iterations_per_minute * (uptime / 60))
-  }, [derived?.iterations_per_minute, health])
+  }, [derived?.iterations_per_minute, health?.health])
 
   const loopHealth = useMemo(() => {
     if (!loop?.avg_latency_ms) return { status: "unknown", color: "text-muted-foreground" }
-    if (loop.avg_latency_ms < 10) return { status: "Stable", color: "text-green-500" }
+    if (loop.avg_latency_ms < 100) return { status: "Stable", color: "text-green-500" }
     return { status: "Degraded", color: "text-yellow-500" }
   }, [loop?.avg_latency_ms])
 
@@ -279,7 +285,7 @@ export default function AiEnginePageContent() {
                 {loopHealth.status}
               </span>
               <span className="text-muted-foreground">
-                (avg {formatNumber(loop?.avg_latency_ms, 2)}ms, target &lt;10ms)
+                (avg {formatNumber(loop?.avg_latency_ms, 2)}ms, target &lt;100ms)
               </span>
             </div>
             {totalIterations !== null && (
@@ -403,8 +409,11 @@ export default function AiEnginePageContent() {
                     <div key={node.id} className="rounded-lg border border-red-500/30 bg-red-500/5 p-4">
                       <div className="flex items-center justify-between mb-3">
                         <div className="space-y-1">
-                          <p className="font-semibold text-foreground">{node.id}</p>
-                          <p className="text-xs text-muted-foreground">{node.reason ?? "No reason provided"}</p>
+                          <p className="font-semibold text-foreground">{node.alias ?? node.id}</p>
+                          <p className="text-xs text-muted-foreground">
+                            {node.reason ?? "No reason provided"}
+                            {node.alias ? ` • ${node.id}` : ""}
+                          </p>
                         </div>
                         <Badge variant="outline" className="uppercase border-red-500 text-red-500">
                           {node.status || "CRITICAL"}
@@ -441,8 +450,11 @@ export default function AiEnginePageContent() {
                     <div key={node.id} className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-4">
                       <div className="flex items-center justify-between mb-3">
                         <div className="space-y-1">
-                          <p className="font-semibold text-foreground">{node.id}</p>
-                          <p className="text-xs text-muted-foreground">{node.reason ?? "No reason provided"}</p>
+                          <p className="font-semibold text-foreground">{node.alias ?? node.id}</p>
+                          <p className="text-xs text-muted-foreground">
+                            {node.reason ?? "No reason provided"}
+                            {node.alias ? ` • ${node.id}` : ""}
+                          </p>
                         </div>
                         <Badge variant="outline" className="uppercase border-amber-500 text-amber-500">
                           {node.status || "WARNING"}
@@ -518,7 +530,10 @@ export default function AiEnginePageContent() {
                     </div>
                     {detection.validator_id ? (
                       <div>
-                        <span className="text-foreground">Validator:</span> {detection.validator_id}
+                        <span className="text-foreground">Validator:</span> {detection.validator_alias ?? detection.validator_id}
+                        {detection.validator_alias && (
+                          <span className="text-muted-foreground"> ({detection.validator_id})</span>
+                        )}
                       </div>
                     ) : null}
                     {detection.metadata ? (

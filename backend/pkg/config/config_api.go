@@ -35,22 +35,30 @@ type APIConfig struct {
 	RBACEnabled  bool                // Role-based access control
 	IPAllowlist  []string            // Allowed client IPs/CIDRs
 	AllowedRoles map[string][]string // Role -> allowed endpoints mapping
+	// Auth gating (feature-flagged)
+	RequireAuth  bool     // If true, require auth even outside production (e.g., staging)
+	BearerTokens []string // Optional static bearer tokens accepted for auth
 
 	// Rate limiting
 	RateLimitEnabled   bool
 	RateLimitPerMinute int
 	RateLimitBurst     int
+	RouteRateLimits    map[string]RateLimitOverride
 
 	// Observability
-	EnableMetrics bool
-	EnableAudit   bool
-	EnablePprof   bool // Debug only, never in production
+	EnableMetrics          bool
+	EnableAudit            bool
+	EnablePprof            bool // Debug only, never in production
+	MetricsAllowedPrefixes []string
+	MetricsCompress        bool
 
 	// Request limits
-	MaxRequestSize    int64 // bytes
-	MaxHeaderSize     int   // bytes
-	MaxConcurrentReqs int
-	RequestTimeout    time.Duration
+	MaxRequestSize      int64 // bytes
+	MaxHeaderSize       int   // bytes
+	MaxConcurrentReqs   int
+	RequestTimeout      time.Duration
+	DashboardBlockLimit int
+	DashboardCacheTTL   time.Duration
 
 	// Environment
 	Environment string // "development", "staging", "production"
@@ -73,6 +81,12 @@ type APIConfig struct {
 	NodeAliasList []string
 }
 
+// RateLimitOverride configures per-route rate limiting policies.
+type RateLimitOverride struct {
+	RequestsPerMinute int `json:"rpm"`
+	Burst             int `json:"burst"`
+}
+
 // DefaultAPIConfig returns secure defaults
 func DefaultAPIConfig() *APIConfig {
 	return &APIConfig{
@@ -88,16 +102,34 @@ func DefaultAPIConfig() *APIConfig {
 		RateLimitEnabled:   true,
 		RateLimitPerMinute: 100,
 		RateLimitBurst:     10,
+		RouteRateLimits:    make(map[string]RateLimitOverride),
 		EnableMetrics:      true,
 		EnableAudit:        true,
 		EnablePprof:        false,
-		MaxRequestSize:     1024 * 1024, // 1MB
-		MaxHeaderSize:      1024 * 1024, // 1MB
-		MaxConcurrentReqs:  100,
-		RequestTimeout:     30 * time.Second,
-		Environment:        "production",
-		AIServiceTimeout:   2 * time.Second,
-		AllowedRoles:       defaultRoleMapping(),
+		MetricsAllowedPrefixes: []string{
+			"process_",
+			"go_",
+			"cybermesh_",
+			"consensus_",
+			"kafka_",
+			"redis_",
+			"cockroach_",
+			"p2p_",
+			"api_",
+			"storage_",
+			"state_",
+			"mempool_",
+		},
+		MetricsCompress:     true,
+		MaxRequestSize:      1024 * 1024, // 1MB
+		MaxHeaderSize:       1024 * 1024, // 1MB
+		MaxConcurrentReqs:   100,
+		RequestTimeout:      30 * time.Second,
+		DashboardBlockLimit: 50,
+		DashboardCacheTTL:   3 * time.Second,
+		Environment:         "production",
+		AIServiceTimeout:    2 * time.Second,
+		AllowedRoles:        defaultRoleMapping(),
 	}
 }
 
@@ -147,12 +179,21 @@ func LoadAPIConfig(cm *utils.ConfigManager) (*APIConfig, error) {
 	if timeout := cm.GetDuration("API_REQUEST_TIMEOUT", 0); timeout > 0 {
 		cfg.RequestTimeout = timeout
 	}
+	if ttl := cm.GetDuration("DASHBOARD_CACHE_TTL", 0); ttl > 0 {
+		cfg.DashboardCacheTTL = ttl
+	}
 
 	// Security
 	cfg.RBACEnabled = cm.GetBool("API_RBAC_ENABLED", true)
 
 	if allowlist := cm.GetString("API_IP_ALLOWLIST", ""); allowlist != "" {
 		cfg.IPAllowlist = parseCommaSeparated(allowlist)
+	}
+
+	// Feature-flagged auth gating
+	cfg.RequireAuth = cm.GetBool("API_REQUIRE_AUTH", false)
+	if tokens := cm.GetString("API_BEARER_TOKENS", ""); tokens != "" {
+		cfg.BearerTokens = parseCommaSeparated(tokens)
 	}
 
 	// Rate limiting
@@ -163,11 +204,22 @@ func LoadAPIConfig(cm *utils.ConfigManager) (*APIConfig, error) {
 	if burst := cm.GetInt("API_RATE_LIMIT_BURST", 0); burst > 0 {
 		cfg.RateLimitBurst = burst
 	}
+	if overrides := cm.GetString("API_RATE_LIMIT_OVERRIDES", ""); overrides != "" {
+		parsed := make(map[string]RateLimitOverride)
+		if err := json.Unmarshal([]byte(overrides), &parsed); err != nil {
+			return nil, fmt.Errorf("invalid API_RATE_LIMIT_OVERRIDES: %w", err)
+		}
+		cfg.RouteRateLimits = parsed
+	}
 
 	// Observability
 	cfg.EnableMetrics = cm.GetBool("API_ENABLE_METRICS", true)
 	cfg.EnableAudit = cm.GetBool("API_ENABLE_AUDIT", true)
 	cfg.EnablePprof = cm.GetBool("API_ENABLE_PPROF", false)
+	if prefixes := cm.GetString("API_METRICS_ALLOWED_PREFIXES", ""); prefixes != "" {
+		cfg.MetricsAllowedPrefixes = parseCommaSeparated(prefixes)
+	}
+	cfg.MetricsCompress = cm.GetBool("API_METRICS_COMPRESS", true)
 
 	// Request limits
 	if maxSize := cm.GetInt("API_MAX_REQUEST_SIZE", 0); maxSize > 0 {
@@ -178,6 +230,9 @@ func LoadAPIConfig(cm *utils.ConfigManager) (*APIConfig, error) {
 	}
 	if maxReqs := cm.GetInt("API_MAX_CONCURRENT_REQUESTS", 0); maxReqs > 0 {
 		cfg.MaxConcurrentReqs = maxReqs
+	}
+	if blockLimit := cm.GetInt("API_DASHBOARD_BLOCK_LIMIT", 0); blockLimit > 0 {
+		cfg.DashboardBlockLimit = blockLimit
 	}
 
 	// Environment
@@ -362,6 +417,23 @@ func (c *APIConfig) Validate() error {
 	}
 	if c.MaxConcurrentReqs <= 0 {
 		return fmt.Errorf("max concurrent requests must be positive")
+	}
+	if c.DashboardBlockLimit <= 0 || c.DashboardBlockLimit > 50 {
+		return fmt.Errorf("dashboard block limit must be between 1 and 50")
+	}
+	if c.DashboardCacheTTL < 0 {
+		return fmt.Errorf("dashboard cache TTL cannot be negative")
+	}
+	for key, override := range c.RouteRateLimits {
+		if strings.TrimSpace(key) == "" {
+			return fmt.Errorf("route rate limit key cannot be empty")
+		}
+		if override.RequestsPerMinute <= 0 {
+			return fmt.Errorf("route rate limit rpm must be positive for key %s", key)
+		}
+		if override.Burst < 0 {
+			return fmt.Errorf("route rate limit burst cannot be negative for key %s", key)
+		}
 	}
 
 	// Security validation (audit required in production)

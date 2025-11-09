@@ -1,32 +1,43 @@
 {
-  "description": "Backend validator public keys for signature verification",
-  "generated_at": "2025-10-20T16:45:00Z",
+  "description": "Backend public keys for signature verification: 5 validators + 1 control signing key",
+  "generated_at": "2025-11-04T08:30:00.000000Z",
   "key_algorithm": "Ed25519",
   "bft_config": {
-    "total_validators": 4,
+    "total_validators": 5,
     "fault_tolerance": 1,
     "quorum_size": 3
   },
   "validators": [
     {
-      "node_id": 1,
-      "public_key_path": "validator_1_public.pem",
+      "node_id": 0,
+      "public_key_path": "validator-0_public.pem",
       "public_key_hex": "8bf26c134a9660e6387ab4b436f0c65325ab91d7d0643124b6748e9f69d6cb7b"
     },
     {
+      "node_id": 1,
+      "public_key_path": "validator-1_public.pem",
+      "public_key_hex": "25a3b9156c2c77a382782fdad554d444e43e8963ed7d6d7b20bf095432fd3cca"
+    },
+    {
       "node_id": 2,
-      "public_key_path": "validator_2_public.pem",
-      "public_key_hex": "b2ee493b0c10b3bc4b69575607b5e7cd3964c0e0a4063596d2fe9ca9abd3366d"
+      "public_key_path": "validator-2_public.pem",
+      "public_key_hex": "6265114ddaa3c48d1170584c48f165405ca4bf49a06bb130b8020db64db82ebd"
     },
     {
       "node_id": 3,
-      "public_key_path": "validator_3_public.pem",
-      "public_key_hex": "ba5054d8786332dd13356401a4647b933931e29c5da8a0f9bbbb187d17261b67"
+      "public_key_path": "validator-3_public.pem",
+      "public_key_hex": "ebe9e939094bca897283a8f587a91048dc59e1d92247583e93d46fbfdc46f5e9"
     },
     {
       "node_id": 4,
-      "public_key_path": "validator_4_public.pem",
-      "public_key_hex": "d1d7a29f0afe601e3f47eb07cd71e4187821cfd269df4205ba7087372d1f6966"
+      "public_key_path": "validator-4_public.pem",
+      "public_key_hex": "2fce8f4b8585c6de9a20ae355575927809a4a5018311fb15944a0372979bd90e"
+    },
+    {
+      "node_id": 5,
+      "public_key_path": "control_signing_public.pem",
+      "public_key_hex": "d9661d47a57d43d9cb292f6818a0d871e55e5868a2d32d1b5df7d2f78dd466c0",
+      "note": "Backend control plane signing key (signs control.commits.v1 messages)"
     }
   ]
 }

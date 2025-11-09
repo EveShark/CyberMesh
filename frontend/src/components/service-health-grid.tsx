@@ -50,19 +50,26 @@ function extractStatus(value: ReadinessValue): string | undefined {
 }
 
 function mapStatus(value: ReadinessValue): ServiceStatus {
-  const status = extractStatus(value)
+  const status = extractStatus(value)?.toLowerCase()
   if (!status) return "warning"
+
   switch (status) {
     case "ok":
-    case "single_node":
-    case "genesis":
       return "healthy"
-    case "insufficient":
-    case "not ready":
-    case "no_peers":
-      return "warning"
     case "not configured":
       return "maintenance"
+    case "critical":
+    case "error":
+    case "failed":
+    case "not ready":
+      return "critical"
+    case "warning":
+    case "degraded":
+    case "single_node":
+    case "genesis":
+    case "insufficient":
+    case "no_peers":
+      return "warning"
     default:
       return status === "ok" ? "healthy" : "warning"
   }
@@ -257,12 +264,36 @@ export function ServiceHealthGrid({ readiness, aiHealth, stats, aiStats, aiLaten
 
   if (aiHealth?.ready) {
     const aiReady = aiHealth.ready as { ready?: boolean; state?: string }
+    const aiServiceStatus: ServiceStatus = (() => {
+      if (aiStats?.detection_loop_status === "critical" || aiStats?.detection_loop_status === "stopped" || aiStats?.detection_loop_blocking) {
+        return "critical"
+      }
+      if (aiStats?.detection_loop_status === "degraded") {
+        return "warning"
+      }
+      return aiReady?.ready ? "healthy" : "warning"
+    })()
+
+    const detailParts: string[] = []
+    if (aiReady?.state) {
+      detailParts.push(`State: ${aiReady.state}`)
+    }
+    if (aiStats?.detection_loop_status && aiStats.detection_loop_status !== "ok") {
+      detailParts.push(`Loop: ${aiStats.detection_loop_status}`)
+    }
+    if (aiStats?.message) {
+      detailParts.push(aiStats.message)
+    } else if (aiStats?.detection_loop_issues && aiStats.detection_loop_issues.length > 0) {
+      detailParts.push(aiStats.detection_loop_issues.slice(0, 2).join("; "))
+    }
+
     services.push({
       name: "AI Service",
-      status: aiReady?.ready ? "healthy" : "warning",
-      details: aiReady?.state ? `State: ${aiReady.state}` : undefined,
+      status: aiServiceStatus,
+      details: detailParts.length > 0 ? detailParts.join(" • ") : undefined,
       icon: <BrainCircuit className="h-5 w-5 text-primary" />,
       metrics: [
+        { label: "Loop", value: aiStats?.detection_loop_status ?? (aiStats?.detection_loop_running ? "ok" : "stopped") },
         { label: "Publish/min", value: formatNumber(aiStats?.publish_rate_per_minute, 1) },
         { label: "Detections/min", value: formatNumber(aiStats?.detections_per_minute, 1) },
         { label: "Latency", value: formatMilliseconds(aiLatencyMs ?? aiStats?.detection_loop_avg_latency_ms) },

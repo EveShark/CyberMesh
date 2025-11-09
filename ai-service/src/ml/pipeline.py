@@ -6,7 +6,7 @@ Instrumented: Per-stage latency tracking, error handling, metrics
 """
 
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, TYPE_CHECKING
 
 import numpy as np
 
@@ -18,6 +18,9 @@ from .evidence import EvidenceGenerator
 from .types import InstrumentedResult, EnsembleDecision
 from ..utils.circuit_breaker import CircuitBreaker
 from ..logging import get_logger
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .metrics import PrometheusMetrics
 
 
 class DetectionPipeline:
@@ -46,7 +49,8 @@ class DetectionPipeline:
         ensemble: EnsembleVoter,
         evidence_generator: EvidenceGenerator,
         circuit_breaker: CircuitBreaker,
-        config: Dict
+        config: Dict,
+        metrics: Optional["PrometheusMetrics"] = None,
     ):
         """
         Initialize detection pipeline.
@@ -68,7 +72,10 @@ class DetectionPipeline:
         self.circuit_breaker = circuit_breaker
         self.config = config
         self.logger = get_logger(__name__)
+        self.metrics = metrics
         self._feature_adapter = FeatureAdapter()
+        self._max_flows_per_iteration = int(config.get('MAX_FLOWS_PER_ITERATION', 100))
+        self._stage_warn_threshold_ms = float(config.get('STAGE_WARN_THRESHOLD_MS', 2000))
         
         # Pipeline statistics
         self.stats = {
@@ -108,8 +115,28 @@ class DetectionPipeline:
         try:
             # Stage 1: Load telemetry
             stage_start = time.perf_counter()
-            flows = self.telemetry.get_network_flows(limit=100)
+            telemetry_limit = int(self.config.get('TELEMETRY_BATCH_SIZE', 1000))
+            limit = max(1, min(self._max_flows_per_iteration, telemetry_limit))
+            flows = self.telemetry.get_network_flows(limit=limit)
             latencies['telemetry_load'] = (time.perf_counter() - stage_start) * 1000
+            self._warn_if_slow('telemetry_load', latencies['telemetry_load'], limit=limit)
+
+            db_timings = {}
+            get_timings = getattr(self.telemetry, "get_last_timings", None)
+            if callable(get_timings):
+                try:
+                    db_timings = get_timings() or {}
+                except Exception:
+                    db_timings = {}
+
+            if db_timings:
+                for key, value in db_timings.items():
+                    latencies[f"telemetry_{key}"] = value
+                if self.metrics:
+                    try:
+                        self.metrics.record_db_timings(**db_timings)
+                    except Exception:
+                        self.logger.debug("Failed to record DB timing metrics", exc_info=True)
             
             if not flows:
                 return InstrumentedResult(
@@ -132,6 +159,7 @@ class DetectionPipeline:
                 raise
             
             latencies['feature_extraction'] = (time.perf_counter() - stage_start) * 1000
+            self._warn_if_slow('feature_extraction', latencies['feature_extraction'], feature_count=feature_count)
             
             # Stage 3: Run all engines
             stage_start = time.perf_counter()
@@ -163,6 +191,7 @@ class DetectionPipeline:
                     # Continue with other engines (graceful degradation)
             
             latencies['engine_inference'] = (time.perf_counter() - stage_start) * 1000
+            self._warn_if_slow('engine_inference', latencies['engine_inference'], engines=len(self.engines))
             
             # Stage 4: Ensemble voting
             stage_start = time.perf_counter()
@@ -189,6 +218,7 @@ class DetectionPipeline:
                 # Best-effort only; do not fail pipeline on context extraction
                 pass
             latencies['ensemble_vote'] = (time.perf_counter() - stage_start) * 1000
+            self._warn_if_slow('ensemble_vote', latencies['ensemble_vote'], candidates=len(all_candidates))
             
             # Stage 5: Evidence generation (if publishing)
             if decision.should_publish:
@@ -199,6 +229,7 @@ class DetectionPipeline:
                 )
                 decision.metadata['evidence'] = evidence_bytes
                 latencies['evidence_generation'] = (time.perf_counter() - stage_start) * 1000
+                self._warn_if_slow('evidence_generation', latencies['evidence_generation'])
             
             # Update statistics
             self.stats['total_processed'] += 1
@@ -242,6 +273,19 @@ class DetectionPipeline:
                 error=error_msg
             )
     
+    def _warn_if_slow(self, stage: str, duration_ms: float, **kwargs) -> None:
+        if duration_ms <= self._stage_warn_threshold_ms:
+            return
+        context = {
+            "stage": stage,
+            "duration_ms": round(duration_ms, 2),
+        }
+        for key, value in kwargs.items():
+            if value is None:
+                continue
+            context[key] = value
+        self.logger.warning("Detection pipeline stage latency warning", extra=context)
+
     def get_statistics(self) -> Dict:
         """
         Get pipeline statistics.

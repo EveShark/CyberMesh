@@ -9,7 +9,7 @@ import time
 import uuid
 import math
 from enum import Enum
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any, Tuple, Iterable
 from dataclasses import dataclass
 
 from ..utils.errors import ValidationError, StorageError
@@ -36,7 +36,8 @@ VALID_TRANSITIONS = {
         AnomalyState.ADMITTED,
         AnomalyState.REJECTED,
         AnomalyState.TIMEOUT,
-        AnomalyState.EXPIRED
+        AnomalyState.EXPIRED,
+        AnomalyState.COMMITTED,
     ],
     AnomalyState.ADMITTED: [
         AnomalyState.COMMITTED,
@@ -273,6 +274,118 @@ class AnomalyLifecycleTracker:
             timestamp,
             {"published_at": str(timestamp)}
         )
+
+    def record_batch(self, events: Iterable[Dict[str, Any]]) -> int:
+        """Persist a batch of detection events using a single Redis pipeline."""
+
+        events_list = list(events)
+        if not events_list:
+            return 0
+
+        pipeline = self.storage._client.pipeline(transaction=False)
+        processed = 0
+        now = time.time()
+
+        for event in events_list:
+            anomaly_id = event.get("anomaly_id")
+            anomaly_type = event.get("anomaly_type") or "unknown"
+            confidence = event.get("confidence")
+            severity = event.get("severity")
+            timestamp = float(event.get("timestamp") or now)
+            raw_score = event.get("raw_score")
+
+            try:
+                if anomaly_id is None or confidence is None or severity is None:
+                    raise ValidationError("Missing required anomaly fields")
+
+                confidence_val = float(confidence)
+                severity_val = int(severity)
+                raw_score_val = None
+                if raw_score is not None:
+                    raw_score_val = float(raw_score)
+
+                anomaly_id_str = str(anomaly_id)
+                self._validate_uuid(anomaly_id_str)
+                self._validate_timestamp(timestamp)
+                self._validate_confidence(confidence_val)
+                self._validate_severity(severity_val)
+                if raw_score_val is not None:
+                    self._validate_confidence(raw_score_val)
+                self._check_rate_limit(anomaly_id_str)
+
+                if self._anomaly_exists(anomaly_id_str):
+                    self.logger.warning(
+                        "Duplicate anomaly in tracker batch",
+                        extra={"anomaly_id": anomaly_id}
+                    )
+                    continue
+
+                key = self._lifecycle_key(anomaly_id_str)
+                mapping = {
+                    "state": AnomalyState.PUBLISHED.value,
+                    "detected_at": str(timestamp),
+                    "published_at": str(timestamp),
+                    "anomaly_type": anomaly_type,
+                    "confidence": str(confidence_val),
+                    "severity": str(severity_val),
+                }
+                if raw_score_val is not None:
+                    mapping["raw_score"] = str(raw_score_val)
+
+                pipeline.hset(key, mapping=mapping)
+                pipeline.expire(key, self.config.lifecycle_ttl_seconds)
+
+                pipeline.zadd("anomaly:timeline:all", {anomaly_id_str: timestamp})
+                pipeline.zadd(
+                    f"anomaly:timeline:{AnomalyState.DETECTED.value}",
+                    {anomaly_id_str: timestamp}
+                )
+                pipeline.zadd(
+                    f"anomaly:timeline:{AnomalyState.PUBLISHED.value}",
+                    {anomaly_id_str: timestamp}
+                )
+
+                hour_key = self._hour_key(timestamp)
+                metrics_key = f"metrics:state_counts:hourly:{hour_key}"
+                pipeline.hincrby(
+                    metrics_key,
+                    AnomalyState.DETECTED.value,
+                    1
+                )
+                pipeline.hincrby(
+                    metrics_key,
+                    AnomalyState.PUBLISHED.value,
+                    1
+                )
+                pipeline.expire(metrics_key, 8 * 24 * 3600)
+
+                processed += 1
+
+            except ValidationError as err:
+                self.logger.warning(
+                    "Skipping invalid anomaly in tracker batch",
+                    extra={
+                        "anomaly_id": anomaly_id,
+                        "error": str(err),
+                    },
+                )
+                continue
+
+        if processed == 0:
+            return 0
+
+        try:
+            pipeline.execute()
+        except Exception as exc:
+            raise StorageError(f"Failed to execute tracker batch: {exc}") from exc
+
+        if self.config.audit_all_state_changes and processed:
+            self.logger.info(
+                "Anomaly tracker batch persisted",
+                extra={"count": processed}
+            )
+
+        return processed
     
     def record_admitted(
         self,

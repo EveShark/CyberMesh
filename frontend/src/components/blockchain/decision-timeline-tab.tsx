@@ -1,126 +1,110 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useMemo } from "react"
 import { Card } from "@/components/ui/card"
 import { ChartContainer, ChartTooltip, ChartTooltipContent } from "@/components/ui/chart"
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, ResponsiveContainer } from "recharts"
-import { TrendingUp, TrendingDown, Minus, Loader2 } from "lucide-react"
-import type { BlockSummary } from "@/lib/api"
+import { TrendingUp, TrendingDown, Minus } from "lucide-react"
 
-interface DecisionTimelineTabProps {
-  data?: Array<{
-    time: string
-    normal_txs?: number
-    anomaly_txs?: number
-    total?: number
-    // Legacy fields (kept for backwards compatibility)
-    approved?: number
-    rejected?: number
-    timeout?: number
-  }>
-}
+import type { DashboardOverviewResponse } from "@/lib/api"
+import { useDashboardData } from "@/hooks/use-dashboard-data"
 
 const chartConfig = {
   normal_txs: {
-    label: "Normal Transactions",
-    color: "hsl(var(--status-healthy))",
+    label: "Approved",
+    color: "var(--status-healthy)",
   },
   anomaly_txs: {
-    label: "Anomaly Transactions",
-    color: "hsl(var(--status-warning))",
+    label: "Rejected",
+    color: "var(--status-warning)",
   },
 }
 
-export function DecisionTimelineTab({ data }: DecisionTimelineTabProps) {
-  const [blocks, setBlocks] = useState<BlockSummary[]>([])
-  const [isLoading, setIsLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+const NORMAL_COLOR = "var(--status-healthy)"
+const ANOMALY_COLOR = "var(--status-warning)"
 
-  // Fetch real block data
-  useEffect(() => {
-    const fetchBlocks = async () => {
-      try {
-        setIsLoading(true)
-        const res = await fetch(`/api/blocks?start=0&limit=50`, { cache: "no-store" })
-        if (!res.ok) {
-          const message = await res.text().catch(() => res.statusText)
-          throw new Error(message || `Request failed (${res.status})`)
-        }
-        const data = (await res.json()) as { blocks?: BlockSummary[] }
-        setBlocks(data.blocks ?? [])
-        setError(null)
-      } catch (err) {
-        console.error("Failed to fetch blocks:", err)
-        setError(err instanceof Error ? err.message : "Failed to load timeline data")
-      } finally {
-        setIsLoading(false)
-      }
-    }
+const DEFAULT_REFRESH_MS = 15000
 
-    fetchBlocks()
-  }, [])
+type DecisionTimelineEntry = DashboardOverviewResponse["blocks"]["decision_timeline"][number]
 
-  // Convert real blocks to chart data
-  // Show normal vs anomaly transactions in each block
-  const chartData = blocks.map(block => ({
-    time: `Block ${block.height}`,
-    normal_txs: (block.transaction_count || 0) - (block.anomaly_count || 0),
-    anomaly_txs: block.anomaly_count || 0,
-    total: block.transaction_count || 0,
-  }))
+const toChartPoint = (entry: DecisionTimelineEntry) => {
+  const approved = entry.approved ?? 0
+  const rejected = entry.rejected ?? 0
+  const timeout = entry.timeout ?? 0
+  const total = approved + rejected + timeout
+  return {
+    time: entry.time,
+    height: entry.height,
+    hash: entry.hash,
+    proposer: entry.proposer,
+    normal_txs: approved,
+    anomaly_txs: rejected,
+    timeout,
+    total,
+  }
+}
 
-  // Debug logging to see actual data values
-  console.log("Timeline Debug - Raw blocks:", blocks.length)
-  console.log("Timeline Debug - Chart data sample:", chartData.slice(0, 3))
-  console.log("Timeline Debug - Normal txs values:", chartData.map(d => d.normal_txs))
+export function DecisionTimelineTab() {
+  const { data: dashboard, isLoading } = useDashboardData(DEFAULT_REFRESH_MS)
 
-  const sampleData = data || chartData
+  const chartData = useMemo(() => {
+    if (!dashboard?.blocks.decision_timeline?.length) return []
+    return dashboard.blocks.decision_timeline.map(toChartPoint)
+  }, [dashboard?.blocks.decision_timeline])
 
-  // Calculate stats
-  const totalNormal = sampleData.reduce((sum, item) => sum + ("normal_txs" in item ? (item.normal_txs || 0) : 0), 0)
-  const totalAnomalies = sampleData.reduce((sum, item) => sum + ("anomaly_txs" in item ? (item.anomaly_txs || 0) : 0), 0)
-  const totalTransactions = totalNormal + totalAnomalies
+  const totals = useMemo(() => {
+    return chartData.reduce(
+      (acc, point) => {
+        acc.approved += point.normal_txs ?? 0
+        acc.rejected += point.anomaly_txs ?? 0
+        acc.timeout += point.timeout ?? 0
+        acc.total += point.total ?? 0
+        return acc
+      },
+      { approved: 0, rejected: 0, timeout: 0, total: 0 },
+    )
+  }, [chartData])
 
-  const normalRate = totalTransactions > 0 ? (totalNormal / totalTransactions) * 100 : 0
-  const health = normalRate >= 98 ? "Excellent" : normalRate >= 95 ? "Good" : "Needs Attention"
-  const healthColor = normalRate >= 98 ? "text-status-healthy" : normalRate >= 95 ? "text-status-warning" : "text-status-critical"
+  const totalNormal = totals.approved
+  const totalRejected = totals.rejected
+  const totalTimeout = totals.timeout
+  const totalVotes = totals.total
 
-  if (isLoading) {
+  const normalRate = totalVotes > 0 ? (totalNormal / totalVotes) * 100 : 0
+
+  if (isLoading && chartData.length === 0) {
     return (
-      <div className="flex items-center justify-center py-12">
-        <Loader2 className="h-8 w-8 animate-spin text-primary" />
-        <span className="ml-3 text-muted-foreground">Loading timeline data...</span>
+      <div className="flex items-center justify-center py-12 text-muted-foreground">
+        Loading timeline data...
       </div>
     )
   }
 
-  if (error) {
+  if (chartData.length === 0) {
     return (
-      <Card className="bg-status-critical/10 border-status-critical/40 p-6">
-        <p className="text-status-critical">{error}</p>
+      <Card className="bg-card/40 border border-border/40 p-6 text-center text-muted-foreground">
+        No recent decision timeline data available.
       </Card>
     )
   }
 
   return (
     <div className="space-y-6">
-      {/* Chart */}
       <div className="space-y-3">
-        {/* Legend */}
         <div className="flex items-center justify-center gap-6 text-sm">
           <div className="flex items-center gap-2">
-            <div className="h-3 w-3 rounded-full bg-[#10b981]"></div>
-            <span className="text-muted-foreground">Normal Transactions</span>
+            <div className="h-3 w-3 rounded-full" style={{ backgroundColor: NORMAL_COLOR }} />
+            <span className="text-muted-foreground">Approved</span>
           </div>
           <div className="flex items-center gap-2">
-            <div className="h-3 w-3 rounded-full bg-[#f59e0b]"></div>
-            <span className="text-muted-foreground">Anomalies</span>
+            <div className="h-3 w-3 rounded-full" style={{ backgroundColor: ANOMALY_COLOR }} />
+            <span className="text-muted-foreground">Rejected</span>
           </div>
         </div>
-        
+
         <ChartContainer config={chartConfig} className="h-64 w-full">
           <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={sampleData} margin={{ top: 5, right: 5, left: 5, bottom: 5 }}>
+            <LineChart data={chartData} margin={{ top: 5, right: 5, left: 5, bottom: 5 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--muted-foreground) / 0.2)" vertical={false} />
               <XAxis
                 dataKey="time"
@@ -137,41 +121,73 @@ export function DecisionTimelineTab({ data }: DecisionTimelineTabProps) {
                 axisLine={false}
                 tick={{ fill: "hsl(var(--muted-foreground))" }}
               />
-              <ChartTooltip content={<ChartTooltipContent />} />
+            <ChartTooltip
+              content={
+                <ChartTooltipContent
+                  formatter={(value, name) => {
+                    const label = name === "normal_txs" ? "Approved" : name === "anomaly_txs" ? "Rejected" : name === "timeout" ? "Timeout" : name
+                    return (
+                      <div className="flex w-full items-center justify-between gap-4">
+                        <span className="text-muted-foreground">{label}</span>
+                        <span className="font-semibold text-foreground">{value as number}</span>
+                      </div>
+                    )
+                  }}
+                  labelFormatter={(_, payload) => {
+                    const [item] = payload ?? []
+                    if (!item) return null
+                    const point = item.payload as ReturnType<typeof toChartPoint>
+                    const height = point.height ? `#${point.height.toLocaleString()}` : "—"
+                    const proposer = point.proposer
+                      ? point.proposer.length > 16
+                        ? `${point.proposer.slice(0, 10)}…${point.proposer.slice(-6)}`
+                        : point.proposer
+                      : "unknown"
+                    return (
+                      <div className="flex flex-col gap-1">
+                        <span className="text-xs uppercase tracking-wide text-muted-foreground">{point.time}</span>
+                        <span className="text-sm font-semibold text-foreground">Block {height}</span>
+                        <span className="text-xs text-muted-foreground">Proposer {proposer}</span>
+                      </div>
+                    )
+                  }}
+                />
+              }
+            />
               <Line
                 type="monotone"
                 dataKey="normal_txs"
-                stroke="#10b981"
+                stroke={NORMAL_COLOR}
                 strokeWidth={2}
-                dot={{ fill: "#10b981", strokeWidth: 2, r: 3 }}
+                dot={{ fill: NORMAL_COLOR, strokeWidth: 2, r: 3 }}
                 activeDot={{ r: 5 }}
-                name="Normal Transactions"
+                name="Approved"
               />
               <Line
                 type="monotone"
                 dataKey="anomaly_txs"
-                stroke="#f59e0b"
+                stroke={ANOMALY_COLOR}
                 strokeWidth={2}
-                dot={{ fill: "#f59e0b", strokeWidth: 2, r: 3 }}
+                dot={{ fill: ANOMALY_COLOR, strokeWidth: 2, r: 3 }}
                 activeDot={{ r: 5 }}
-                name="Anomaly Transactions"
+                name="Rejected"
               />
             </LineChart>
           </ResponsiveContainer>
         </ChartContainer>
       </div>
 
-      {/* Key Insights */}
       <div>
         <h4 className="text-sm font-semibold text-foreground mb-3">Key Insights</h4>
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-          {/* Normal Transaction Rate */}
           <Card className="bg-card/40 border border-border/40 p-4">
             <div className="flex items-start justify-between">
               <div className="space-y-1">
-                <p className="text-xs text-muted-foreground">Normal Tx Rate</p>
+                <p className="text-xs text-muted-foreground">Approval Rate</p>
                 <p className="text-2xl font-bold text-status-healthy">{normalRate.toFixed(1)}%</p>
-                <p className="text-xs text-muted-foreground">{totalNormal} of {totalTransactions}</p>
+                <p className="text-xs text-muted-foreground">
+                  {totalNormal} approvals of {totalVotes} total votes
+                </p>
               </div>
               <div className="p-2 rounded-lg bg-status-healthy/10">
                 <TrendingUp className="h-4 w-4 text-status-healthy" />
@@ -179,40 +195,32 @@ export function DecisionTimelineTab({ data }: DecisionTimelineTabProps) {
             </div>
           </Card>
 
-          {/* Anomalies */}
           <Card className="bg-card/40 border border-border/40 p-4">
             <div className="flex items-start justify-between">
               <div className="space-y-1">
-                <p className="text-xs text-muted-foreground">Anomalies</p>
-                <p className={`text-2xl font-bold ${totalAnomalies > 10 ? "text-status-critical" : totalAnomalies > 5 ? "text-status-warning" : "text-muted-foreground"}`}>
-                  {totalAnomalies}
+                <p className="text-xs text-muted-foreground">Rejections</p>
+                <p className={`text-2xl font-bold ${totalRejected > 5 ? "text-status-warning" : "text-muted-foreground"}`}>
+                  {totalRejected}
                 </p>
-                <p className="text-xs text-muted-foreground">in last {sampleData.length} blocks</p>
+                <p className="text-xs text-muted-foreground">over last {chartData.length} blocks</p>
               </div>
-              <div className={`p-2 rounded-lg ${totalAnomalies > 5 ? "bg-status-warning/10" : "bg-muted/10"}`}>
-                {totalAnomalies > 5 ? (
-                  <TrendingDown className="h-4 w-4 text-status-warning" />
-                ) : (
-                  <Minus className="h-4 w-4 text-muted-foreground" />
-                )}
+              <div className="p-2 rounded-lg bg-status-warning/10">
+                {totalRejected > 5 ? <TrendingDown className="h-4 w-4 text-status-warning" /> : <Minus className="h-4 w-4 text-muted-foreground" />}
               </div>
             </div>
           </Card>
 
-          {/* Chain Health */}
           <Card className="bg-card/40 border border-border/40 p-4">
             <div className="flex items-start justify-between">
               <div className="space-y-1">
-                <p className="text-xs text-muted-foreground">Chain Health</p>
-                <p className={`text-2xl font-bold ${healthColor}`}>{health}</p>
-                <p className="text-xs text-muted-foreground">Overall status</p>
+                <p className="text-xs text-muted-foreground">Timeouts</p>
+                <p className={`text-2xl font-bold ${totalTimeout > 0 ? "text-status-warning" : "text-muted-foreground"}`}>
+                  {totalTimeout}
+                </p>
+                <p className="text-xs text-muted-foreground">Unmet quorum votes</p>
               </div>
-              <div className={`p-2 rounded-lg ${normalRate >= 98 ? "bg-status-healthy/10" : "bg-status-warning/10"}`}>
-                {normalRate >= 98 ? (
-                  <TrendingUp className="h-4 w-4 text-status-healthy" />
-                ) : (
-                  <Minus className="h-4 w-4 text-status-warning" />
-                )}
+              <div className="p-2 rounded-lg bg-muted/10">
+                {totalTimeout > 0 ? <TrendingDown className="h-4 w-4 text-status-warning" /> : <Minus className="h-4 w-4 text-muted-foreground" />}
               </div>
             </div>
           </Card>

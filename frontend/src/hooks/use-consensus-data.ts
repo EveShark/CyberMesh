@@ -1,6 +1,6 @@
 "use client"
 
-import useSWR from "swr"
+import { useMemo } from "react"
 
 import type { BackendConsensusOverview } from "@/lib/api"
 import { resolveDisplayName } from "@/lib/node-alias"
@@ -10,6 +10,8 @@ import type {
   ConsensusVote,
   SuspiciousNode,
 } from "@/p2p-consensus/lib/types"
+
+import { useDashboardData } from "./use-dashboard-data"
 
 const mapProposals = (proposals: BackendConsensusOverview["proposals"]): ConsensusProposal[] =>
   proposals.map((proposal) => ({
@@ -51,27 +53,20 @@ const toConsensusOverview = (source: BackendConsensusOverview): ConsensusOvervie
   }
 }
 
-const fetchConsensusOverview = async (): Promise<ConsensusOverview> => {
-  const response = await fetch("/api/consensus/overview", { cache: "no-store" })
-  if (!response.ok) {
-    const text = await response.text().catch(() => "")
-    throw new Error(`Consensus overview request failed: ${response.status} ${response.statusText}${text ? ` - ${text}` : ""}`)
-  }
-  const backendOverview = (await response.json()) as BackendConsensusOverview
-  return toConsensusOverview(backendOverview)
-}
+const DEFAULT_CONSENSUS_REFRESH_MS = 15000
 
-export function useConsensusData(refreshInterval = 5000) {
-  const { data, error, isLoading, mutate } = useSWR<ConsensusOverview>(
-    "consensus-overview",
-    fetchConsensusOverview,
-    { refreshInterval }
-  )
+export function useConsensusData(refreshInterval = DEFAULT_CONSENSUS_REFRESH_MS) {
+  const { data: dashboard, error, isLoading, mutate } = useDashboardData(refreshInterval)
+
+  const overview = useMemo(() => {
+    if (!dashboard?.consensus) return undefined
+    return toConsensusOverview(dashboard.consensus)
+  }, [dashboard?.consensus])
 
   return {
-    data,
+    data: overview,
     error,
-    isLoading,
+    isLoading: !overview && isLoading,
     refresh: mutate,
   }
 }

@@ -18,7 +18,8 @@ type Metrics struct {
 	CommitErrors          uint64
 
 	// Validation metrics
-	ValidationFailures uint64
+	ValidationFailures   uint64
+	ParentHashMismatches uint64
 
 	// Timing metrics (in nanoseconds)
 	LastCommitDuration   int64
@@ -69,6 +70,11 @@ func (m *Metrics) IncrementValidationFailures() {
 	atomic.AddUint64(&m.ValidationFailures, 1)
 }
 
+// IncrementParentHashMismatches atomically increments the counter
+func (m *Metrics) IncrementParentHashMismatches() {
+	atomic.AddUint64(&m.ParentHashMismatches, 1)
+}
+
 // RecordCommitDuration records the duration of a commit operation
 func (m *Metrics) RecordCommitDuration(d time.Duration) {
 	nanos := d.Nanoseconds()
@@ -107,6 +113,7 @@ func (m *Metrics) GetSnapshot() Metrics {
 		TransactionsCommitted: atomic.LoadUint64(&m.TransactionsCommitted),
 		CommitErrors:          atomic.LoadUint64(&m.CommitErrors),
 		ValidationFailures:    atomic.LoadUint64(&m.ValidationFailures),
+		ParentHashMismatches:  atomic.LoadUint64(&m.ParentHashMismatches),
 		LastCommitDuration:    atomic.LoadInt64(&m.LastCommitDuration),
 		TotalCommitDuration:   atomic.LoadInt64(&m.TotalCommitDuration),
 		LastProposalDuration:  atomic.LoadInt64(&m.LastProposalDuration),

@@ -2,7 +2,7 @@
 
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
-import { EnvelopeClosedIcon, CalendarIcon } from "@radix-ui/react-icons"
+import { Calendar, Mail } from "lucide-react"
 
 interface CTASectionProps {
   detectionTotal?: number
@@ -27,7 +27,7 @@ export function CTASection({ detectionTotal }: CTASectionProps) {
 
               <div className="flex flex-col sm:flex-row gap-4 justify-center">
                 <Button size="lg" className="gap-2 bg-primary hover:bg-primary/90">
-                  <CalendarIcon className="h-4 w-4" />
+                  <Calendar className="h-4 w-4" />
                   Schedule Meeting
                 </Button>
                 <Button
@@ -35,7 +35,7 @@ export function CTASection({ detectionTotal }: CTASectionProps) {
                   variant="outline"
                   className="gap-2 border-border/30 hover:bg-accent/10 bg-transparent"
                 >
-                  <EnvelopeClosedIcon className="h-4 w-4" />
+                  <Mail className="h-4 w-4" />
                   Request Deck
                 </Button>
               </div>

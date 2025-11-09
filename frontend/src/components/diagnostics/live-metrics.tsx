@@ -1,122 +1,96 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useMemo } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Activity, Database, FileText, AlertTriangle, TrendingUp, Loader2 } from "lucide-react"
 
-interface BlockchainMetrics {
+import { useDashboardData } from "@/hooks/use-dashboard-data"
+
+interface LiveMetricsSnapshot {
   height: number
   totalTransactions: number
   evidenceCount: number
   successRate: number
-  lastBlockTime?: string
-  avgBlockTime?: number
+  lastBlockLabel?: string
+  avgBlockTimeSeconds?: number
+  avgTxPerBlock?: number
+}
+
+const REFRESH_INTERVAL_MS = 15000
+
+const formatRelative = (timestampSeconds?: number) => {
+  if (!timestampSeconds) return undefined
+  const blockTime = new Date(timestampSeconds * 1000)
+  const diffSeconds = Math.max(0, Math.floor((Date.now() - blockTime.getTime()) / 1000))
+  if (diffSeconds < 60) return `${diffSeconds}s ago`
+  if (diffSeconds < 3600) return `${Math.floor(diffSeconds / 60)}m ago`
+  return `${Math.floor(diffSeconds / 3600)}h ago`
 }
 
 export function LiveMetrics() {
-  const [metrics, setMetrics] = useState<BlockchainMetrics | null>(null)
-  const [isLoading, setIsLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const { data: dashboard, isLoading, error } = useDashboardData(REFRESH_INTERVAL_MS)
 
-  useEffect(() => {
-    fetchMetrics()
-  }, [])
+  const metrics = useMemo<LiveMetricsSnapshot | null>(() => {
+    if (!dashboard) return null
 
-  async function fetchMetrics() {
-    setIsLoading(true)
-    setError(null)
+    const chain = dashboard.backend.stats.chain
+    const blockMetrics = dashboard.blocks.metrics
+    const threatsStats = dashboard.threats.stats
+    const recentBlocks = dashboard.blocks.recent
 
-    try {
-      // Fetch stats using Next.js API proxy
-      const statsResponse = await fetch(`/api/backend/stats`, {
-        headers: { "X-API-Key": "test" }
-      })
+    const latestHeight = blockMetrics.latest_height ?? chain?.height ?? 0
+    const totalTransactions = blockMetrics.total_transactions ?? chain?.total_transactions ?? 0
+    const successRaw = blockMetrics.success_rate ?? chain?.success_rate ?? 0
+    const successRate = successRaw <= 1 ? successRaw * 100 : successRaw
+    const evidenceCount = threatsStats?.total_count ?? dashboard.threats.breakdown?.totals?.published ?? 0
 
-      if (!statsResponse.ok) {
-        throw new Error(`Stats API returned ${statsResponse.status}`)
-      }
+    const lastBlockLabel = formatRelative(recentBlocks?.[0]?.timestamp)
+    const avgBlockTimeSeconds = blockMetrics.avg_block_time_seconds ?? chain?.avg_block_time_seconds
+    const avgTxPerBlock = latestHeight > 0 ? totalTransactions / latestHeight : undefined
 
-      const statsData = await statsResponse.json()
-
-      // Fetch anomaly stats
-      const anomalyResponse = await fetch(`/api/backend/anomalies/stats`, {
-        headers: { "X-API-Key": "test" }
-      })
-
-      let evidenceCount = 0
-      if (anomalyResponse.ok) {
-        const anomalyData = await anomalyResponse.json()
-        evidenceCount = anomalyData.data?.total_count || 0
-      }
-
-      // Fetch latest blocks to calculate last block time
-      const blocksResponse = await fetch(`/api/blocks?start=0&limit=2`, {
-        headers: { "X-API-Key": "test" }
-      })
-
-      let lastBlockTime = undefined
-      let avgBlockTime = undefined
-
-      if (blocksResponse.ok) {
-        const blocksData = await blocksResponse.json()
-        if (blocksData.data?.blocks?.length > 0) {
-          const latestBlock = blocksData.data.blocks[0]
-          const now = new Date()
-          const blockTime = new Date(latestBlock.timestamp)
-          const diffSeconds = Math.floor((now.getTime() - blockTime.getTime()) / 1000)
-          lastBlockTime = diffSeconds < 60 ? `${diffSeconds}s ago` : `${Math.floor(diffSeconds / 60)}m ago`
-
-          // Calculate average block time if we have 2 blocks
-          if (blocksData.data.blocks.length === 2) {
-            const block1Time = new Date(blocksData.data.blocks[0].timestamp).getTime()
-            const block2Time = new Date(blocksData.data.blocks[1].timestamp).getTime()
-            avgBlockTime = Math.abs(block1Time - block2Time) / 1000
-          }
-        }
-      }
-
-      setMetrics({
-        height: statsData.data?.chain?.height || 0,
-        totalTransactions: statsData.data?.chain?.total_transactions || 0,
-        evidenceCount,
-        successRate: (statsData.data?.chain?.success_rate || 0) * 100,
-        lastBlockTime,
-        avgBlockTime
-      })
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to fetch metrics")
-    } finally {
-      setIsLoading(false)
+    return {
+      height: latestHeight,
+      totalTransactions,
+      evidenceCount,
+      successRate,
+      lastBlockLabel,
+      avgBlockTimeSeconds,
+      avgTxPerBlock,
     }
-  }
+  }, [dashboard])
 
-  if (isLoading) {
+  const errorMessage = useMemo(() => {
+    if (!error) return undefined
+    return error instanceof Error ? error.message : String(error)
+  }, [error])
+
+  if (isLoading && !metrics) {
     return (
       <Card>
         <CardHeader>
           <CardTitle>Live Blockchain Metrics</CardTitle>
-          <CardDescription>Real-time data from the blockchain</CardDescription>
+          <CardDescription>Real-time data sourced from the consolidated dashboard snapshot</CardDescription>
         </CardHeader>
         <CardContent>
-          <div className="flex items-center justify-center py-8">
-            <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+          <div className="flex items-center justify-center py-8 text-muted-foreground">
+            <Loader2 className="mr-2 h-5 w-5 animate-spin" /> Syncing latest metrics…
           </div>
         </CardContent>
       </Card>
     )
   }
 
-  if (error) {
+  if (!metrics) {
     return (
       <Card>
         <CardHeader>
           <CardTitle>Live Blockchain Metrics</CardTitle>
-          <CardDescription>Real-time data from the blockchain</CardDescription>
+          <CardDescription>Real-time data sourced from the consolidated dashboard snapshot</CardDescription>
         </CardHeader>
         <CardContent>
           <div className="p-4 rounded-lg bg-red-500/10 border border-red-500/20 text-red-600 dark:text-red-400">
-            Error: {error}
+            {errorMessage ?? "Metrics are unavailable in the current snapshot."}
           </div>
         </CardContent>
       </Card>
@@ -129,99 +103,86 @@ export function LiveMetrics() {
         <div className="flex items-center justify-between">
           <div>
             <CardTitle>Live Blockchain Metrics</CardTitle>
-            <CardDescription>Real-time data from CockroachDB</CardDescription>
+            <CardDescription>Powered by `/api/dashboard/overview`</CardDescription>
           </div>
           <Badge variant="default" className="bg-green-500">
-            <Activity className="h-3 w-3 mr-1" />
-            Live
+            <Activity className="mr-1 h-3 w-3" /> Live
           </Badge>
         </div>
       </CardHeader>
       <CardContent>
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-          {/* Blockchain Height */}
-          <div className="p-4 rounded-lg border bg-card">
-            <div className="flex items-center gap-2 mb-2">
+          <div className="rounded-lg border bg-card p-4">
+            <div className="mb-2 flex items-center gap-2">
               <Database className="h-4 w-4 text-blue-500" />
               <div className="text-sm font-medium text-muted-foreground">Blockchain Height</div>
             </div>
-            <div className="text-3xl font-bold">{metrics?.height.toLocaleString()}</div>
-            {metrics?.lastBlockTime && (
-              <div className="text-xs text-muted-foreground mt-1">
-                Last block: {metrics.lastBlockTime}
-              </div>
-            )}
+            <div className="text-3xl font-bold">{metrics.height.toLocaleString()}</div>
+            {metrics.lastBlockLabel ? (
+              <div className="mt-1 text-xs text-muted-foreground">Last block {metrics.lastBlockLabel}</div>
+            ) : null}
           </div>
 
-          {/* Total Transactions */}
-          <div className="p-4 rounded-lg border bg-card">
-            <div className="flex items-center gap-2 mb-2">
+          <div className="rounded-lg border bg-card p-4">
+            <div className="mb-2 flex items-center gap-2">
               <FileText className="h-4 w-4 text-purple-500" />
               <div className="text-sm font-medium text-muted-foreground">Total Transactions</div>
             </div>
-            <div className="text-3xl font-bold">{metrics?.totalTransactions.toLocaleString()}</div>
-            {metrics?.avgBlockTime && (
-              <div className="text-xs text-muted-foreground mt-1">
-                Avg block time: {metrics.avgBlockTime.toFixed(0)}s
+            <div className="text-3xl font-bold">{metrics.totalTransactions.toLocaleString()}</div>
+            {metrics.avgBlockTimeSeconds ? (
+              <div className="mt-1 text-xs text-muted-foreground">
+                Avg block time {metrics.avgBlockTimeSeconds.toFixed(1)}s
               </div>
-            )}
+            ) : null}
           </div>
 
-          {/* Evidence Count */}
-          <div className="p-4 rounded-lg border bg-card">
-            <div className="flex items-center gap-2 mb-2">
+          <div className="rounded-lg border bg-card p-4">
+            <div className="mb-2 flex items-center gap-2">
               <AlertTriangle className="h-4 w-4 text-orange-500" />
-              <div className="text-sm font-medium text-muted-foreground">Evidence Transactions</div>
+              <div className="text-sm font-medium text-muted-foreground">Evidence Events</div>
             </div>
-            <div className="text-3xl font-bold">{metrics?.evidenceCount.toLocaleString()}</div>
-            <div className="text-xs text-muted-foreground mt-1">
-              {((metrics?.evidenceCount || 0) / (metrics?.totalTransactions || 1) * 100).toFixed(1)}% of total
+            <div className="text-3xl font-bold">{metrics.evidenceCount.toLocaleString()}</div>
+            <div className="mt-1 text-xs text-muted-foreground">
+              {(metrics.totalTransactions > 0
+                ? ((metrics.evidenceCount / metrics.totalTransactions) * 100).toFixed(1)
+                : "0.0")}% of tx volume
             </div>
           </div>
 
-          {/* Success Rate */}
-          <div className="p-4 rounded-lg border bg-card">
-            <div className="flex items-center gap-2 mb-2">
+          <div className="rounded-lg border bg-card p-4">
+            <div className="mb-2 flex items-center gap-2">
               <TrendingUp className="h-4 w-4 text-green-500" />
               <div className="text-sm font-medium text-muted-foreground">Success Rate</div>
             </div>
-            <div className="text-3xl font-bold">{metrics?.successRate.toFixed(2)}%</div>
-            <div className="text-xs text-green-600 dark:text-green-400 mt-1">
-              ✓ Calculated from DB
-            </div>
+            <div className="text-3xl font-bold">{metrics.successRate.toFixed(2)}%</div>
+            <div className="mt-1 text-xs text-green-600 dark:text-green-400">Consensus confirmations</div>
           </div>
 
-          {/* Transactions per Block */}
-          <div className="p-4 rounded-lg border bg-card">
-            <div className="flex items-center gap-2 mb-2">
+          <div className="rounded-lg border bg-card p-4">
+            <div className="mb-2 flex items-center gap-2">
               <Activity className="h-4 w-4 text-cyan-500" />
               <div className="text-sm font-medium text-muted-foreground">Avg Txs per Block</div>
             </div>
             <div className="text-3xl font-bold">
-              {((metrics?.totalTransactions || 0) / (metrics?.height || 1)).toFixed(1)}
+              {metrics.avgTxPerBlock ? metrics.avgTxPerBlock.toFixed(1) : "--"}
             </div>
-            <div className="text-xs text-muted-foreground mt-1">
-              Real-time average
-            </div>
+            <div className="mt-1 text-xs text-muted-foreground">Rolling snapshot window</div>
           </div>
 
-          {/* Data Source */}
-          <div className="p-4 rounded-lg border bg-card">
-            <div className="flex items-center gap-2 mb-2">
+          <div className="rounded-lg border bg-card p-4">
+            <div className="mb-2 flex items-center gap-2">
               <Database className="h-4 w-4 text-indigo-500" />
               <div className="text-sm font-medium text-muted-foreground">Data Source</div>
             </div>
-            <div className="text-lg font-bold">CockroachDB</div>
-            <div className="text-xs text-green-600 dark:text-green-400 mt-1">
-              ✓ Production database
-            </div>
+            <div className="text-lg font-bold">Dashboard Snapshot</div>
+            <div className="mt-1 text-xs text-green-600 dark:text-green-400">✓ `/dashboard/overview`</div>
           </div>
         </div>
 
-        <div className="mt-4 p-3 rounded-lg bg-green-500/10 border border-green-500/20">
+        <div className="mt-4 rounded-lg border border-green-500/20 bg-green-500/10 p-3">
           <div className="flex items-center gap-2 text-green-600 dark:text-green-400">
             <Activity className="h-4 w-4" />
-            <span className="font-medium">Blockchain is live and producing blocks</span>
+            <span className="font-medium">Live blockchain telemetry with zero legacy polling.</span>
           </div>
         </div>
       </CardContent>

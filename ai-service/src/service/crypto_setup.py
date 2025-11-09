@@ -191,9 +191,9 @@ def initialize_nonce_manager(settings: Settings, logger) -> NonceManager:
     state_path.parent.mkdir(parents=True, exist_ok=True)
     
     # Try to load existing state
-    last_counter = None
+    saved_state = None
     if state_path.exists():
-        last_counter = _load_nonce_state(
+        saved_state = _load_nonce_state(
             state_path, 
             instance_id, 
             is_production, 
@@ -201,16 +201,22 @@ def initialize_nonce_manager(settings: Settings, logger) -> NonceManager:
         )
     
     # Create nonce manager
-    # Note: NonceManager uses timestamp+random, not a counter
-    # Persistence tracks last timestamp to detect clock skew
-    nonce_mgr = NonceManager(instance_id=instance_id)
-    
-    # last_counter from state file is actually last_timestamp
-    if last_counter is not None:
+    initial_timestamp = None
+    initial_counter = 0
+    if saved_state is not None:
+        initial_timestamp, initial_counter = saved_state
+    nonce_mgr = NonceManager(
+        instance_id=instance_id,
+        initial_timestamp_ms=initial_timestamp,
+        initial_counter=initial_counter,
+    )
+
+    if saved_state is not None:
         logger.info(
             "Nonce manager resumed (timestamp-based, no replay risk)",
             extra={
-                "last_saved_timestamp": last_counter,
+                "last_saved_timestamp": initial_timestamp,
+                "last_saved_counter": initial_counter,
                 "instance_id": instance_id,
             }
         )
@@ -222,8 +228,8 @@ def initialize_nonce_manager(settings: Settings, logger) -> NonceManager:
     
     # Save initial state (use current timestamp as marker)
     from ..utils.time import now_ms
-    current_ts = now_ms()
-    _save_nonce_state(state_path, instance_id, current_ts, logger)
+    current_ts, current_counter = nonce_mgr.state_snapshot()
+    _save_nonce_state(state_path, instance_id, current_ts, current_counter, logger)
     
     # Set up periodic state saving (every 100 nonces)
     # Track nonce count in wrapper
@@ -235,8 +241,8 @@ def initialize_nonce_manager(settings: Settings, logger) -> NonceManager:
         nonce = original_generate()
         nonce_count[0] += 1
         if nonce_count[0] % save_interval == 0:
-            ts = now_ms()
-            _save_nonce_state(state_path, instance_id, ts, logger)
+            ts, counter = nonce_mgr.state_snapshot()
+            _save_nonce_state(state_path, instance_id, ts, counter, logger)
         return nonce
     
     nonce_mgr.generate = generate_with_save
@@ -257,7 +263,7 @@ def _load_nonce_state(
     instance_id: int,
     is_production: bool,
     logger
-) -> Optional[int]:
+) -> Optional[tuple[int, int]]:
     """
     Load nonce state from disk.
     
@@ -292,9 +298,8 @@ def _load_nonce_state(
         if not isinstance(state, dict):
             raise ValueError("State file is not a JSON object")
         
-        if state.get("version") != 1:
-            raise ValueError(f"Unsupported state version: {state.get('version')}")
-        
+        version = state.get("version", 1)
+
         if state.get("instance_id") != instance_id:
             logger.warning(
                 "Nonce state instance_id mismatch - ignoring saved state",
@@ -304,20 +309,31 @@ def _load_nonce_state(
                 }
             )
             return None
-        
-        last_counter = state.get("last_nonce_counter")
-        if not isinstance(last_counter, int) or last_counter < 0:
-            raise ValueError(f"Invalid last_nonce_counter: {last_counter}")
-        
+
+        if version == 1:
+            last_counter = state.get("last_nonce_counter")
+            if not isinstance(last_counter, int) or last_counter < 0:
+                raise ValueError(f"Invalid last_nonce_counter: {last_counter}")
+            last_ts_ms = last_counter
+            counter = 0
+        else:
+            last_ts_ms = state.get("last_timestamp_ms")
+            counter = state.get("last_counter", 0)
+            if not isinstance(last_ts_ms, int) or last_ts_ms < 0:
+                raise ValueError(f"Invalid last_timestamp_ms: {last_ts_ms}")
+            if not isinstance(counter, int) or counter < 0:
+                raise ValueError(f"Invalid last_counter: {counter}")
+
         logger.info(
             "Nonce state loaded",
             extra={
-                "last_counter": last_counter,
+                "last_timestamp_ms": last_ts_ms,
+                "last_counter": counter,
                 "last_updated": state.get("last_updated"),
             }
         )
         
-        return last_counter
+        return last_ts_ms, counter
         
     except json.JSONDecodeError as e:
         if is_production:
@@ -360,6 +376,7 @@ def _load_nonce_state(
 def _save_nonce_state(
     state_path: Path,
     instance_id: int,
+    timestamp_ms: int,
     counter: int,
     logger
 ) -> None:
@@ -371,9 +388,10 @@ def _save_nonce_state(
     from datetime import datetime
     
     state = {
-        "version": 1,
+        "version": 2,
         "instance_id": instance_id,
-        "last_nonce_counter": counter,
+        "last_timestamp_ms": timestamp_ms,
+        "last_counter": counter,
         "last_updated": datetime.utcnow().isoformat() + "Z",
     }
     
@@ -428,14 +446,15 @@ def shutdown_nonce_manager(nonce_mgr: NonceManager, state_path: Path, instance_i
     Call this during service shutdown to ensure state is persisted.
     """
     try:
-        # Get current timestamp for timestamp-based nonces
-        from ..utils.time import now_ms
-        current_timestamp = now_ms()
-        
-        _save_nonce_state(state_path, instance_id, current_timestamp, logger)
+        current_timestamp, current_counter = nonce_mgr.state_snapshot()
+
+        _save_nonce_state(state_path, instance_id, current_timestamp, current_counter, logger)
         logger.info(
             "Nonce manager shutdown complete",
-            extra={"final_timestamp": current_timestamp}
+            extra={
+                "final_timestamp": current_timestamp,
+                "final_counter": current_counter,
+            }
         )
     except Exception as e:
         logger.error(

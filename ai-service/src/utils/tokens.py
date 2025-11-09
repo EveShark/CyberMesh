@@ -17,7 +17,7 @@ to a constant key which is NOT allowed for production (guarded).
 import hmac
 import hashlib
 import os
-from typing import Optional
+from typing import Optional, Any
 
 
 _FALLBACK_DEV_KEY = b"cybermesh-dev-token-key"
@@ -67,22 +67,34 @@ def token_ip(ip: Optional[str]) -> str:
     return hmac_token(ip or "")
 
 
+def _normalize_component(value: Optional[Any]) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8", errors="ignore").lower()
+        except Exception:
+            return value.hex()
+    text = str(value)
+    return text.lower()
+
+
 def token_flow_key(
-    src_ip: Optional[str],
-    dst_ip: Optional[str],
+    src_ip: Optional[Any],
+    dst_ip: Optional[Any],
     src_port: Optional[int],
     dst_port: Optional[int],
-    proto: Optional[str],
+    proto: Optional[Any],
 ) -> str:
     """
     Tokenize a 5-tuple flow identifier. Ports and proto normalized to strings.
     Layout: src|dst|sport|dport|proto (all lowercased)
     """
     parts = [
-        (src_ip or "").lower(),
-        (dst_ip or "").lower(),
+        _normalize_component(src_ip),
+        _normalize_component(dst_ip),
         str(src_port or 0),
         str(dst_port or 0),
-        (proto or "").lower(),
+        _normalize_component(proto),
     ]
     return hmac_token("|".join(parts))

@@ -47,6 +47,13 @@ func (s *Service) validateBlock(b api.Block) error {
 				utils.ZapString("expected_parent", fmt.Sprintf("%x", expectedParent[:8])),
 				utils.ZapString("incoming_parent", fmt.Sprintf("%x", actualParent[:8])))
 		} else {
+			// Record specific parent-hash mismatch metric for alerting
+			if s.metrics != nil {
+				s.metrics.IncrementParentHashMismatches()
+			}
+			if s.eng != nil {
+				s.eng.RecordParentHashMismatch()
+			}
 			return fmt.Errorf("invalid parent hash: got %x, expected %x",
 				actualParent[:8], expectedParent[:8])
 		}

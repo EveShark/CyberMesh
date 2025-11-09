@@ -5,9 +5,35 @@ Runs in background thread, publishes detections to Kafka.
 """
 
 import logging
+import random
 import threading
 import time
-from typing import Optional, Dict, Any, Callable, List
+from typing import Optional, Dict, Any, Callable, List, TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover - avoid runtime dependency cycle
+    from ..feedback.tracker import AnomalyLifecycleTracker
+
+
+def _extract_raw_score(decision) -> Optional[float]:
+    """Best-effort extraction of the ensemble's underlying raw score."""
+
+    if not decision or not getattr(decision, "candidates", None):
+        return None
+
+    try:
+        from ..ml.types import DetectionCandidate  # local import to prevent cycle
+
+        typed_candidates = [
+            c for c in decision.candidates
+            if isinstance(c, DetectionCandidate) and c.threat_type == decision.threat_type
+        ]
+        target = typed_candidates[0] if typed_candidates else decision.candidates[0]
+        raw = getattr(target, "raw_score", None)
+        if raw is None:
+            return None
+        return float(raw)
+    except Exception:
+        return None
 
 
 class DetectionLoop:
@@ -57,6 +83,7 @@ class DetectionLoop:
         self._metrics_collector = metrics
         self._event_recorder = event_recorder
         self._engine_metrics_callback = engine_metrics_callback
+        self._tracker: Optional["AnomalyLifecycleTracker"] = None
         
         # Thread control
         self._running = False
@@ -80,12 +107,152 @@ class DetectionLoop:
             "last_latency_ms": 0.0,
         }
         self._metrics_lock = threading.Lock()
+        self._summary_interval = max(1, int(config.get('DETECTION_SUMMARY_INTERVAL', 10)))
+        self._max_flows_per_iteration = int(config.get('MAX_FLOWS_PER_ITERATION', 100))
+        self._max_iteration_lag = max(0, float(config.get('MAX_ITERATION_LAG_SECONDS', 20)))
+        self._max_detection_gap = max(0, float(config.get('MAX_DETECTION_GAP_SECONDS', 600)))
+        self._max_loop_latency_ms = max(0, float(config.get('MAX_LOOP_LATENCY_WARNING_MS', 3000)))
+        self._publish_flush = bool(config.get('DETECTION_PUBLISH_FLUSH', False))
+        self._summary_state = {
+            "count": 0,
+            "latency_total": 0.0,
+            "total_latency_total": 0.0,
+            "published": 0,
+            "rate_limited": 0,
+            "errors": 0,
+        }
+        self._tracker_sample_window_size = max(1, int(config.get('TRACKER_SAMPLE_WINDOW_SIZE', 500)))
+        self._tracker_sample_cap = max(0, min(self._tracker_sample_window_size, int(config.get('TRACKER_SAMPLE_CAP', 100))))
+        self._tracker_batch_size = max(1, int(config.get('TRACKER_BATCH_SIZE', 50)))
+        self._tracker_flush_interval = max(1.0, float(config.get('TRACKER_FLUSH_INTERVAL_SECONDS', 5)))
+        self._tracker_buffer: List[Dict[str, Any]] = []
+        self._last_tracker_flush = time.time()
+        self._sample_window_total = 0
+        self._sample_window_taken = 0
+        self._rng = random.Random()
         
         self.logger.info(
             f"DetectionLoop initialized: interval={self._interval}s, "
             f"timeout={self._timeout}s"
         )
     
+    def set_tracker(self, tracker: Optional["AnomalyLifecycleTracker"]) -> None:
+        """Attach lifecycle tracker for anomaly persistence."""
+
+        if tracker is self._tracker:
+            return
+
+        if tracker is None:
+            self._maybe_flush_tracker_buffer(force=True)
+            self._tracker = None
+            self.logger.info("Detection loop tracker detached")
+            return
+
+        self._tracker = tracker
+        self.logger.info("Detection loop tracker attached")
+        self._maybe_flush_tracker_buffer(force=True)
+
+    def _record_tracker_events(
+        self,
+        *,
+        anomaly_id: str,
+        anomaly_type: str,
+        severity: int,
+        confidence: float,
+        raw_score: Optional[float],
+        timestamp: float,
+    ) -> None:
+        if not self._should_sample_tracker_event():
+            return
+
+        self._tracker_buffer.append(
+            {
+                "anomaly_id": anomaly_id,
+                "anomaly_type": anomaly_type,
+                "severity": severity,
+                "confidence": float(confidence),
+                "raw_score": None if raw_score is None else float(raw_score),
+                "timestamp": float(timestamp),
+            }
+        )
+
+        if len(self._tracker_buffer) >= self._tracker_batch_size:
+            self._maybe_flush_tracker_buffer()
+
+    def _should_sample_tracker_event(self) -> bool:
+        if self._tracker_sample_cap <= 0:
+            self._sample_window_total += 1
+            if self._sample_window_total >= self._tracker_sample_window_size:
+                self._sample_window_total = 0
+                self._sample_window_taken = 0
+            return False
+
+        if self._sample_window_total >= self._tracker_sample_window_size:
+            self._sample_window_total = 0
+            self._sample_window_taken = 0
+
+        remaining_events = self._tracker_sample_window_size - self._sample_window_total
+        remaining_slots = self._tracker_sample_cap - self._sample_window_taken
+
+        if remaining_slots <= 0:
+            self._sample_window_total += 1
+            if self._sample_window_total >= self._tracker_sample_window_size:
+                self._sample_window_total = 0
+                self._sample_window_taken = 0
+            return False
+
+        probability = min(1.0, max(0.0, remaining_slots / float(max(1, remaining_events))))
+        keep = self._rng.random() < probability
+
+        self._sample_window_total += 1
+        if keep:
+            self._sample_window_taken += 1
+
+        if self._sample_window_total >= self._tracker_sample_window_size:
+            self._sample_window_total = 0
+            self._sample_window_taken = 0
+
+        return keep
+
+    def _maybe_flush_tracker_buffer(self, force: bool = False) -> None:
+        if not self._tracker_buffer:
+            if force:
+                self._last_tracker_flush = time.time()
+            return
+
+        now = time.time()
+        if not force:
+            if len(self._tracker_buffer) < self._tracker_batch_size and (now - self._last_tracker_flush) < self._tracker_flush_interval:
+                return
+
+        tracker = self._tracker
+        if tracker is None:
+            if force and self._tracker_buffer:
+                self.logger.warning(
+                    "Dropping tracker batch because tracker unavailable",
+                    extra={"count": len(self._tracker_buffer)}
+                )
+                self._tracker_buffer.clear()
+            self._last_tracker_flush = now
+            return
+
+        try:
+            tracker.record_batch(list(self._tracker_buffer))
+        except Exception as err:
+            self.logger.error(
+                "Failed to flush tracker batch",
+                extra={
+                    "count": len(self._tracker_buffer),
+                    "error": str(err),
+                },
+                exc_info=True,
+            )
+            self._last_tracker_flush = now
+            return
+
+        self._tracker_buffer.clear()
+        self._last_tracker_flush = now
+
     def start(self) -> None:
         """
         Start detection loop in background thread.
@@ -147,6 +314,8 @@ class DetectionLoop:
                     )
                 else:
                     self.logger.info("Detection loop stopped")
+
+            self._maybe_flush_tracker_buffer(force=True)
 
             if self._metrics_collector is not None:
                 try:
@@ -239,6 +408,8 @@ class DetectionLoop:
                         anomaly_type = decision.threat_type.value
                         severity = max(1, min(10, int(decision.final_score * 10)))
                         confidence = decision.confidence
+                        detection_ts = time.time()
+                        raw_score = _extract_raw_score(decision)
                         
                         # Build JSON payload with FULL security context
                         
@@ -261,7 +432,7 @@ class DetectionLoop:
                         
                         payload_obj = {
                             # Detection metadata
-                            'detection_timestamp': time.time(),
+                            'detection_timestamp': detection_ts,
                             'anomaly_id': anomaly_id,
                             'severity': severity,
                             'confidence': float(confidence),
@@ -276,49 +447,65 @@ class DetectionLoop:
                         }
                         payload_bytes = json.dumps(payload_obj, separators=(",", ":")).encode('utf-8')
                         
-                        self.publisher.publish_anomaly(
-                            anomaly_id=anomaly_id,
-                            anomaly_type=anomaly_type,
-                            source='detection_loop',
-                            severity=severity,
-                            confidence=confidence,
-                            payload=payload_bytes,
-                            model_version='v1.0.0'
-                        )
-                        
-                        self._increment_metric("detections_published")
-                        
-                        self.logger.info(
-                            f"Published anomaly: {anomaly_type} "
-                            f"(confidence={confidence:.2f}, severity={severity})"
-                        )
-                        
-                        # Publish supporting evidence (Fix: Gap 1)
-                        self.logger.info(f"[EVIDENCE_DEBUG] Starting evidence publishing attempt for anomaly {anomaly_id}")
+                        published = False
                         try:
-                            ev_bytes = decision.metadata.get('evidence')
-                            self.logger.info(f"[EVIDENCE_DEBUG] ev_bytes={'PRESENT' if ev_bytes else 'MISSING'}, metadata_keys={list(decision.metadata.keys())}")
-                            if ev_bytes:
-                                # Evidence is already a signed, serialized protobuf EvidenceMessage
-                                # Send it directly to Kafka
-                                topic = self.publisher.producer.topics.ai_evidence
-                                self.publisher.producer.producer.produce(
-                                    topic,
-                                    value=ev_bytes,
-                                    callback=self.publisher.producer._delivery_callback
-                                )
-                                self.publisher.producer.producer.poll(0)
-                                self.publisher.producer.producer.flush(timeout=10)
-                                
-                                self.logger.info(
-                                    f"Published evidence for anomaly {anomaly_id}"
-                                )
-                        except Exception as e:
-                            # Don't fail detection on evidence publication errors
-                            self.logger.error(
-                                f"Failed to publish evidence: {e}",
-                                exc_info=True
+                            self.publisher.publish_anomaly(
+                                anomaly_id=anomaly_id,
+                                anomaly_type=anomaly_type,
+                                source='detection_loop',
+                                severity=severity,
+                                confidence=confidence,
+                                payload=payload_bytes,
+                                model_version='v1.0.0'
                             )
+                            published = True
+                        finally:
+                            if published:
+                                self._increment_metric("detections_published")
+
+                        if published:
+                            self.logger.info(
+                                f"Published anomaly: {anomaly_type} "
+                                f"(confidence={confidence:.2f}, severity={severity})"
+                            )
+
+                            self._record_tracker_events(
+                                anomaly_id=anomaly_id,
+                                anomaly_type=anomaly_type,
+                                severity=severity,
+                                confidence=float(confidence),
+                                raw_score=raw_score,
+                                timestamp=detection_ts,
+                            )
+                        
+                        if published:
+                            # Publish supporting evidence (Fix: Gap 1)
+                            self.logger.info(f"[EVIDENCE_DEBUG] Starting evidence publishing attempt for anomaly {anomaly_id}")
+                            try:
+                                ev_bytes = decision.metadata.get('evidence')
+                                self.logger.info(f"[EVIDENCE_DEBUG] ev_bytes={'PRESENT' if ev_bytes else 'MISSING'}, metadata_keys={list(decision.metadata.keys())}")
+                                if ev_bytes:
+                                    # Evidence is already a signed, serialized protobuf EvidenceMessage
+                                    # Send it directly to Kafka
+                                    topic = self.publisher.producer.topics.ai_evidence
+                                    self.publisher.producer.producer.produce(
+                                        topic,
+                                        value=ev_bytes,
+                                        callback=self.publisher.producer._delivery_callback
+                                    )
+                                    self.publisher.producer.producer.poll(0)
+                                    if self._publish_flush:
+                                        self.publisher.producer.producer.flush(timeout=5)
+
+                                    self.logger.info(
+                                        f"Published evidence for anomaly {anomaly_id}"
+                                    )
+                            except Exception as e:
+                                # Don't fail detection on evidence publication errors
+                                self.logger.error(
+                                    f"Failed to publish evidence: {e}",
+                                    exc_info=True
+                                )
                     else:
                         self._increment_metric("detections_rate_limited")
                         rate_limited = True
@@ -341,6 +528,14 @@ class DetectionLoop:
                     self._metrics["last_iteration_time"] = time.time()
                     self._metrics["last_latency_ms"] = detection_latency
                 
+                self._update_summary(
+                    iteration_latency=detection_latency,
+                    total_latency=result.total_latency_ms,
+                    published=bool(result.decision and result.decision.should_publish),
+                    rate_limited=rate_limited,
+                    errored=False,
+                )
+
                 # INFO-level iteration summary to make pipeline activity visible without DEBUG
                 self.logger.info(
                     "Detection iteration",
@@ -472,15 +667,36 @@ class DetectionLoop:
                         self._metrics_collector.record_detection_error()
                     except Exception:
                         self.logger.debug("Failed to record detection error metric", exc_info=True)
+
+                self._update_summary(
+                    iteration_latency=0.0,
+                    total_latency=0.0,
+                    published=False,
+                    rate_limited=False,
+                    errored=True,
+                )
             
+            # Flush tracker buffer if interval elapsed
+            self._maybe_flush_tracker_buffer()
+
             # 5. Sleep until next interval
             iteration_time = time.time() - iteration_start
             sleep_time = max(0, self._interval - iteration_time)
             
+            if iteration_time > self._interval + self._max_iteration_lag:
+                self.logger.warning(
+                    "Detection loop lagging",
+                    extra={
+                        "iteration_time_s": round(iteration_time, 2),
+                        "interval_s": self._interval,
+                    },
+                )
+
             if sleep_time > 0:
                 time.sleep(sleep_time)
         
         self.logger.info("Detection loop exited")
+        self._maybe_flush_tracker_buffer(force=True)
         if self._metrics_collector is not None:
             try:
                 self._metrics_collector.set_detection_loop_running(False)
@@ -519,6 +735,100 @@ class DetectionLoop:
         with self._metrics_lock:
             return self._metrics.copy()
     
+    def is_running(self) -> bool:
+        """Return True when the background loop thread is active."""
+        with self._lock:
+            return self._running
+
+    def get_health_snapshot(self) -> Dict[str, Any]:
+        """Evaluate current loop health using configured thresholds."""
+
+        now = time.time()
+        with self._metrics_lock:
+            metrics = self._metrics.copy()
+
+        running = self.is_running()
+        issues: List[str] = []
+        blocking = False
+
+        last_iteration_raw = metrics.get("last_iteration_time")
+        last_detection_raw = metrics.get("last_detection_time")
+        last_latency = metrics.get("last_latency_ms")
+        iterations = metrics.get("loop_iterations", 0) or 0
+        errors = metrics.get("errors", 0) or 0
+
+        iteration_gap: Optional[float] = None
+        detection_gap: Optional[float] = None
+
+        if isinstance(last_iteration_raw, (int, float)):
+            iteration_gap = max(0.0, now - float(last_iteration_raw))
+
+        if isinstance(last_detection_raw, (int, float)):
+            detection_gap = max(0.0, now - float(last_detection_raw))
+
+        if not running:
+            blocking = True
+            issues.append("detection loop not running")
+        else:
+            # Evaluate iteration cadence
+            iteration_threshold = max(self._interval * 3, self._max_iteration_lag + self._interval)
+            if iteration_gap is None:
+                # After a few iterations we expect cadence timestamps
+                if iterations >= max(6, int(self._summary_interval)):
+                    issues.append("no iteration cadence recorded")
+            elif self._max_iteration_lag > 0 and iteration_gap > iteration_threshold:
+                issues.append(f"{iteration_gap:.1f}s since last iteration")
+                if iteration_gap > iteration_threshold*2:
+                    blocking = True
+
+            # Evaluate detection freshness
+            if self._max_detection_gap > 0:
+                if detection_gap is None:
+                    if iterations >= max(12, int(self._summary_interval)*2):
+                        issues.append("no detections recorded yet")
+                elif detection_gap > self._max_detection_gap:
+                    issues.append(f"{detection_gap:.1f}s since last detection")
+                    if detection_gap > self._max_detection_gap*2:
+                        blocking = True
+
+            # Evaluate latency spikes
+            if isinstance(last_latency, (int, float)) and self._max_loop_latency_ms > 0:
+                if last_latency > self._max_loop_latency_ms:
+                    issues.append(f"iteration latency {last_latency:.0f}ms")
+
+            # Evaluate error rate
+            if iterations > 0 and errors > 0:
+                error_rate = errors / max(1, iterations)
+                if error_rate > 0.25:
+                    issues.append(f"error rate {error_rate*100:.1f}%")
+                    if error_rate > 0.5:
+                        blocking = True
+
+        status = "ok"
+        if not running:
+            status = "stopped"
+        elif blocking:
+            status = "critical"
+        elif issues:
+            status = "degraded"
+
+        message = "; ".join(issues)
+
+        snapshot = {
+            "running": running,
+            "status": status,
+            "healthy": status == "ok",
+            "blocking": blocking,
+            "issues": issues,
+            "message": message,
+            "metrics": metrics,
+            "last_updated": now,
+            "seconds_since_last_iteration": iteration_gap,
+            "seconds_since_last_detection": detection_gap,
+        }
+
+        return snapshot
+
     def is_healthy(self) -> bool:
         """
         Check if detection loop is healthy.
@@ -552,3 +862,64 @@ class DetectionLoop:
                     return False
         
         return True
+
+    def _update_summary(self, *, iteration_latency: float, total_latency: float, published: bool, rate_limited: bool, errored: bool) -> None:
+        if self._summary_interval <= 0:
+            return
+
+        self._summary_state["count"] += 1
+        self._summary_state["latency_total"] += iteration_latency
+        self._summary_state["total_latency_total"] += total_latency
+        if published:
+            self._summary_state["published"] += 1
+        if rate_limited:
+            self._summary_state["rate_limited"] += 1
+        if errored:
+            self._summary_state["errors"] += 1
+
+        if iteration_latency > self._max_loop_latency_ms > 0:
+            self.logger.warning(
+                "Detection iteration latency exceeded threshold",
+                extra={
+                    "latency_ms": round(iteration_latency, 2),
+                    "threshold_ms": self._max_loop_latency_ms,
+                },
+            )
+
+        if self._summary_state["count"] >= self._summary_interval:
+            count = self._summary_state["count"]
+            avg_iteration = self._summary_state["latency_total"] / max(1, count)
+            avg_pipeline = self._summary_state["total_latency_total"] / max(1, count)
+            self.logger.info(
+                "Detection loop summary",
+                extra={
+                    "iterations": count,
+                    "avg_iteration_ms": round(avg_iteration, 2),
+                    "avg_pipeline_ms": round(avg_pipeline, 2),
+                    "published": self._summary_state["published"],
+                    "rate_limited": self._summary_state["rate_limited"],
+                    "errors": self._summary_state["errors"],
+                },
+            )
+            if self._max_detection_gap > 0:
+                with self._metrics_lock:
+                    last_detection = self._metrics.get("last_detection_time")
+                if isinstance(last_detection, (int, float)) and last_detection > 0:
+                    gap = time.time() - last_detection
+                    if gap > self._max_detection_gap:
+                        self.logger.warning(
+                            "Detection gap exceeds threshold",
+                            extra={
+                                "gap_seconds": round(gap, 2),
+                                "threshold_seconds": self._max_detection_gap,
+                            },
+                        )
+
+            self._summary_state = {
+                "count": 0,
+                "latency_total": 0.0,
+                "total_latency_total": 0.0,
+                "published": 0,
+                "rate_limited": 0,
+                "errors": 0,
+            }

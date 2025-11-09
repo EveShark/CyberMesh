@@ -56,6 +56,7 @@ from .tracker import (
 from .calibrator import ConfidenceCalibrator
 from .policy_manager import PolicyManager, PolicyRecord
 from .threshold_manager import ThresholdManager, ThresholdAdjustment
+from .service import FeedbackService
 
 __all__ = [
     "RedisStorage",
@@ -70,4 +71,5 @@ __all__ = [
     "PolicyRecord",
     "ThresholdManager",
     "ThresholdAdjustment",
+    "FeedbackService",
 ]

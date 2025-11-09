@@ -99,7 +99,7 @@ data:
   # ============================================================
   # REDIS CONNECTION (Upstash Cloud)
   # ============================================================
-  REDIS_HOST: "merry-satyr-14777.upstash.io"
+  REDIS_HOST: "exotic-mastiff-28332.upstash.io"
   REDIS_PORT: "6379"
   REDIS_DB: "0"
   REDIS_TLS_ENABLED: "true"
@@ -143,6 +143,14 @@ data:
   DETECTION_TIMEOUT: "30"
   TELEMETRY_BATCH_SIZE: "1000"
   MAX_DETECTIONS_PER_SECOND: "100"
+  MAX_LOOP_LATENCY_WARNING_MS: "3000"
+  TRACKER_SAMPLE_WINDOW_SIZE: "500"
+  TRACKER_SAMPLE_CAP: "100"
+  TRACKER_BATCH_SIZE: "50"
+  TRACKER_FLUSH_INTERVAL_SECONDS: "5"
+  # Disable Redis persistence so lifecycle data stays in-memory during load tests.
+  # Set to "false" (or remove) when you want Redis-backed history again.
+  FEEDBACK_DISABLE_PERSISTENCE: "true"
   
   # Detection Thresholds
   DDOS_THRESHOLD: "1000"
@@ -239,11 +247,14 @@ data:
   
   # Feedback Calibration
   FEEDBACK_CALIBRATION_METHOD: "isotonic"
-  FEEDBACK_CALIBRATION_MIN_SAMPLES: "1000"
+  FEEDBACK_CALIBRATION_MIN_SAMPLES: "100"
   FEEDBACK_CALIBRATION_ACCEPTANCE_THRESHOLD: "0.60"
   FEEDBACK_CALIBRATION_RETRAIN_INTERVAL: "3600"
   FEEDBACK_CALIBRATION_MODEL_PATH: "data/models/calibration"
   FEEDBACK_CALIBRATION_SAVE_TO_REDIS: "true"
+  # Disable Redis persistence so lifecycle data stays in-memory during load tests.
+  # Set to "false" (or remove) when you want Redis-backed history again.
+  FEEDBACK_DISABLE_PERSISTENCE: "true"
   
   # Feedback Security
   FEEDBACK_REQUIRE_SIGNATURE_FOR_BACKEND: "true"

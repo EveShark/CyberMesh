@@ -1,7 +1,7 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useState } from "react"
-import { Activity, AlertCircle, Loader2, RefreshCw, Search } from "lucide-react"
+import { useEffect, useMemo, useState } from "react"
+import { Activity, AlertCircle, RefreshCw, Search } from "lucide-react"
 import Link from "next/link"
 
 import { Badge } from "@/components/ui/badge"
@@ -11,92 +11,46 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { PageContainer } from "@/components/page-container"
-import type { BlockSummary } from "@/lib/api"
 
-interface ApiResponse {
-  blocks: BlockSummary[]
-  pagination: {
-    start: number
-    limit: number
-    total: number
-    next?: string
-  }
-}
+import type { BlockSummary } from "@/lib/api"
+import { useDashboardData } from "@/hooks/use-dashboard-data"
 
 const PAGE_SIZE_OPTIONS = [10, 25, 50, 100]
 
 export function BlocksExplorerContent() {
-  const [rows, setRows] = useState<BlockSummary[]>([])
-  const [pagination, setPagination] = useState<ApiResponse["pagination"] | null>(null)
-  const [isLoading, setIsLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [start, setStart] = useState(0)
   const [limit, setLimit] = useState(25)
   const [searchQuery, setSearchQuery] = useState("")
 
-  const fetchPage = useCallback(
-    async (startValue: number, limitValue: number) => {
-      setIsLoading(true)
-      setError(null)
-      try {
-        const params = new URLSearchParams({ start: String(startValue), limit: String(limitValue) })
-        const res = await fetch(`/api/blocks?${params.toString()}`, { cache: "no-store" })
-        if (!res.ok) {
-          const message = await res.text().catch(() => res.statusText)
-          throw new Error(message || `Failed to load blocks (${res.status})`)
-        }
-        const data = (await res.json()) as ApiResponse
-        setRows(data.blocks)
-        setPagination(data.pagination)
-        setStart(startValue)
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to load blocks")
-        setRows([])
-        setPagination(null)
-      } finally {
-        setIsLoading(false)
-      }
-    },
-    [],
-  )
+  const { data: dashboard, error, isLoading, mutate } = useDashboardData(15000)
+
+  const blocks = useMemo<BlockSummary[]>(() => {
+    const recent = dashboard?.blocks.recent ?? []
+    return [...recent].sort((a, b) => b.height - a.height)
+  }, [dashboard?.blocks.recent])
 
   useEffect(() => {
-    void fetchPage(0, limit)
-  }, [fetchPage, limit])
+    if (blocks.length === 0) return
+    setLimit((prev) => {
+      if (prev > 0 && prev <= blocks.length) return prev
+      const fallback = PAGE_SIZE_OPTIONS.find((size) => size <= blocks.length) ?? blocks.length
+      return fallback
+    })
+  }, [blocks.length])
 
   const filteredRows = useMemo(() => {
-    if (!searchQuery.trim()) {
-      return rows
-    }
+    if (!searchQuery.trim()) return blocks
     const query = searchQuery.trim().toLowerCase()
-    return rows.filter((block) => {
+    return blocks.filter((block) => {
       const matchesHeight = block.height.toString().includes(query)
       const matchesHash = block.hash.toLowerCase().includes(query)
       const matchesProposer = block.proposer.toLowerCase().includes(query)
       return matchesHeight || matchesHash || matchesProposer
     })
-  }, [rows, searchQuery])
+  }, [blocks, searchQuery])
 
-  const handleNext = () => {
-    if (pagination?.next) {
-      const nextUrl = new URL(pagination.next, "https://placeholder.local")
-      const nextStart = Number.parseInt(nextUrl.searchParams.get("start") ?? `${start + limit}`, 10)
-      void fetchPage(Number.isNaN(nextStart) ? start + limit : nextStart, limit)
-    } else if (pagination) {
-      const candidate = pagination.start + pagination.limit
-      if (candidate <= pagination.total) {
-        void fetchPage(candidate, limit)
-      }
-    }
-  }
+  const limitedRows = useMemo(() => filteredRows.slice(0, limit), [filteredRows, limit])
 
-  const handlePrev = () => {
-    if (!pagination) return
-    const previousStart = Math.max(0, pagination.start - limit)
-    if (previousStart !== pagination.start) {
-      void fetchPage(previousStart, limit)
-    }
-  }
+  const pagination = dashboard?.blocks.pagination
 
   return (
     <PageContainer align="left" className="flex flex-col gap-8 py-6 lg:py-8">
@@ -114,7 +68,7 @@ export function BlocksExplorerContent() {
           <Button variant="outline" size="sm" asChild>
             <Link href="/blockchain">Back to dashboard</Link>
           </Button>
-          <Button variant="outline" size="sm" onClick={() => void fetchPage(start, limit)}>
+          <Button variant="outline" size="sm" onClick={() => void mutate()} disabled={isLoading}>
             <RefreshCw className="mr-2 h-4 w-4" /> Refresh
           </Button>
         </div>
@@ -153,16 +107,18 @@ export function BlocksExplorerContent() {
             </Select>
           </div>
           <div>
-            <Label className="text-xs uppercase tracking-wide text-muted-foreground">Current window</Label>
+            <Label className="text-xs uppercase tracking-wide text-muted-foreground">Snapshot window</Label>
             <div className="mt-1.5 text-sm text-muted-foreground">
-              {pagination ? `Heights ${pagination.start} – ${pagination.start + rows.length - 1}` : "--"}
+              {pagination && typeof pagination.start === "number" && typeof pagination.end === "number"
+                ? `Blocks ${pagination.start.toLocaleString()} – ${pagination.end.toLocaleString()} (max ${pagination.limit})`
+                : "--"}
             </div>
           </div>
         </div>
         {error ? (
           <div className="flex items-center gap-2 rounded-lg border border-status-critical/40 bg-status-critical/10 px-3 py-2 text-sm text-status-critical">
             <AlertCircle className="h-4 w-4" />
-            {error}
+            {error instanceof Error ? error.message : String(error)}
           </div>
         ) : null}
       </Card>
@@ -172,12 +128,13 @@ export function BlocksExplorerContent() {
           <div>
             <CardTitle className="text-lg text-foreground">Blocks</CardTitle>
             <p className="text-sm text-muted-foreground">
-              Showing {filteredRows.length.toLocaleString()} of {rows.length.toLocaleString()} loaded rows. Total chain height: {pagination?.total.toLocaleString() ?? "--"}
+              Showing {limitedRows.length.toLocaleString()} of {filteredRows.length.toLocaleString()} filtered rows.
+              Snapshot provides up to {blocks.length.toLocaleString()} most recent blocks.
             </p>
           </div>
           {isLoading ? (
             <Badge variant="outline" className="flex items-center gap-1 text-xs">
-              <Loader2 className="h-3 w-3 animate-spin" /> Loading…
+              syncing…
             </Badge>
           ) : null}
         </CardHeader>
@@ -194,14 +151,14 @@ export function BlocksExplorerContent() {
               </tr>
             </thead>
             <tbody>
-              {filteredRows.length === 0 ? (
+              {limitedRows.length === 0 ? (
                 <tr>
                   <td colSpan={6} className="px-3 py-8 text-center text-muted-foreground">
                     {isLoading ? "Loading blocks…" : "No blocks match your filters."}
                   </td>
                 </tr>
               ) : (
-                filteredRows.map((block) => (
+                limitedRows.map((block) => (
                   <tr key={block.hash} className="border-b border-border/20">
                     <td className="px-3 py-2 font-mono text-xs">{block.height.toLocaleString()}</td>
                     <td className="px-3 py-2 font-mono text-xs break-all">{block.hash}</td>
@@ -219,21 +176,8 @@ export function BlocksExplorerContent() {
         </CardContent>
       </Card>
 
-      <div className="flex items-center justify-between">
-        <Button variant="outline" size="sm" onClick={handlePrev} disabled={isLoading || start === 0}>
-          Previous
-        </Button>
-        <div className="text-xs text-muted-foreground">
-          Window starting at {start.toLocaleString()} of approximately {pagination?.total.toLocaleString() ?? "--"} blocks
-        </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={handleNext}
-          disabled={isLoading || (pagination ? pagination.start + pagination.limit > pagination.total : true)}
-        >
-          Next
-        </Button>
+      <div className="text-xs text-muted-foreground text-center">
+        Historical pagination beyond the latest snapshot will return once the backend exposes archived ranges through the dashboard API.
       </div>
     </PageContainer>
   )

@@ -17,7 +17,10 @@ interface ClusterStatusTilesProps {
       round: number
       validator_count: number
       quorum_size: number
+      leader?: string
+      leader_id?: string
       current_leader?: string
+      current_leader_alias?: string
     }
     network?: {
       peer_count: number
@@ -38,9 +41,35 @@ interface ClusterStatusTilesProps {
   error?: Error | null
 }
 
-function formatLeaderId(id?: string) {
+function formatIdentifier(id?: string) {
   if (!id) return "Unknown"
-  return `${id.slice(0, 12)}…${id.slice(-6)}`
+  if (id.length <= 12) return id
+  return `${id.slice(0, 8)}…${id.slice(-6)}`
+}
+
+function getLeaderDisplay(consensus?: {
+  leader?: string
+  leader_id?: string
+  current_leader?: string
+  current_leader_alias?: string
+}) {
+  if (!consensus) {
+    return { primary: "Unknown" }
+  }
+
+  const alias = consensus.leader ?? consensus.current_leader_alias
+  const leaderId = consensus.leader_id ?? consensus.current_leader
+
+  if (alias) {
+    return {
+      primary: alias,
+      secondary: leaderId ? formatIdentifier(leaderId) : undefined,
+    }
+  }
+
+  return {
+    primary: formatIdentifier(leaderId),
+  }
 }
 
 function extractNumber(details: Record<string, unknown> | undefined, key: string): number | undefined {
@@ -66,12 +95,13 @@ export function ClusterStatusTiles({ stats, readiness, isLoading, error }: Clust
   const consensus = stats?.consensus
   const network = stats?.network
 
-  const leaderId = formatLeaderId(consensus?.current_leader)
+  const leaderDisplay = getLeaderDisplay(consensus)
   const phase = readiness?.phase ?? (readiness?.ready ? "active" : "initializing")
 
   const connectedPeers = extractNumber(readiness?.details, "p2p_connected_peers") ?? network?.peer_count ?? 0
   const requiredPeers = extractNumber(readiness?.details, "p2p_required_peers") ?? consensus?.quorum_size ?? 0
   const peerHealthPercentage = requiredPeers > 0 ? Math.round((connectedPeers / requiredPeers) * 100) : 0
+  const clampedPeerHealthPercentage = Math.min(100, Math.max(peerHealthPercentage, 0))
 
   const readyChecks = readiness?.checks ?? {}
 
@@ -100,8 +130,10 @@ export function ClusterStatusTiles({ stats, readiness, isLoading, error }: Clust
           </CardHeader>
           <CardContent className="space-y-3">
             <div>
-              <p className="font-semibold text-lg">{leaderId}</p>
-              <p className="text-xs text-muted-foreground">Quorum size {consensus?.quorum_size ?? "--"}</p>
+              <p className="font-semibold text-lg">{leaderDisplay.primary}</p>
+              <p className="text-xs text-muted-foreground">
+                {leaderDisplay.secondary ? `${leaderDisplay.secondary} • ` : ""}Quorum size {consensus?.quorum_size ?? "--"}
+              </p>
             </div>
             <div className="flex justify-between text-xs">
               <span className="text-muted-foreground">Validators</span>
@@ -181,27 +213,27 @@ export function ClusterStatusTiles({ stats, readiness, isLoading, error }: Clust
                 <span
                   className={cn(
                     "font-medium",
-                    peerHealthPercentage >= 90
+                    clampedPeerHealthPercentage >= 90
                       ? "status-healthy"
-                      : peerHealthPercentage >= 70
+                      : clampedPeerHealthPercentage >= 70
                         ? "status-warning"
                         : "status-critical",
                   )}
                 >
-                  {peerHealthPercentage}%
+                  {clampedPeerHealthPercentage}%
                 </span>
               </div>
               <div className="w-full bg-muted rounded-full h-1.5">
                 <div
                   className={cn(
                     "h-1.5 rounded-full transition-all",
-                    peerHealthPercentage >= 90
+                    clampedPeerHealthPercentage >= 90
                       ? "bg-status-healthy"
-                      : peerHealthPercentage >= 70
+                      : clampedPeerHealthPercentage >= 70
                         ? "bg-status-warning"
                         : "bg-status-critical",
                   )}
-                  style={{ width: `${Math.min(100, Math.max(peerHealthPercentage, 0))}%` }}
+                  style={{ width: `${clampedPeerHealthPercentage}%` }}
                 />
               </div>
             </div>

@@ -2,6 +2,7 @@ package wiring
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -12,7 +13,10 @@ import (
 	"backend/pkg/state"
 	"backend/pkg/storage/cockroach"
 	"backend/pkg/utils"
+	"github.com/google/uuid"
 )
+
+const maxCommitAnomalyIDs = 10000
 
 // PersistenceTask represents a block persistence task
 type PersistenceTask struct {
@@ -24,8 +28,7 @@ type PersistenceTask struct {
 
 // PersistenceSuccessCallback is called after successful block persistence
 // Used to trigger downstream actions like Kafka publishing
-// Fix: Gap 2 - Added anomalyIDs parameter to enable COMMITTED state tracking
-type PersistenceSuccessCallback func(ctx context.Context, height uint64, hash [32]byte, stateRoot [32]byte, txCount int, ts int64, anomalyIDs []string)
+type PersistenceSuccessCallback func(ctx context.Context, height uint64, hash [32]byte, stateRoot [32]byte, txCount int, ts int64, anomalyCount int, evidenceCount int, policyCount int, anomalyIDs []string)
 
 // PersistenceWorkerConfig holds configuration for the persistence worker
 type PersistenceWorkerConfig struct {
@@ -254,17 +257,7 @@ func (pw *PersistenceWorker) processTask(ctx context.Context, task *PersistenceT
 		if err == nil {
 			// Success - persistence completed
 			bh := task.Block.GetHash()
-			if pw.auditLogger != nil {
-				_ = pw.auditLogger.Info("block_persisted_async", map[string]interface{}{
-					"height":     task.Block.GetHeight(),
-					"hash":       fmt.Sprintf("%x", bh[:8]),
-					"attempts":   attempt + 1,
-					"state_root": fmt.Sprintf("%x", task.StateRoot[:8]),
-				})
-			}
-
-			// Invoke onSuccess callback (e.g., for Kafka publishing)
-			if pw.onSuccess != nil {
+			if pw.onSuccess != nil || pw.auditLogger != nil || pw.logger != nil {
 				go func() {
 					defer func() {
 						if r := recover(); r != nil {
@@ -276,12 +269,42 @@ func (pw *PersistenceWorker) processTask(ctx context.Context, task *PersistenceT
 						}
 					}()
 
-					// Fix: Gap 2 - Extract anomaly IDs from block transactions
-					anomalyIDs := extractAnomalyIDs(task.Block, pw.logger)
+					meta := extractCommitMetadata(task.Block, pw.logger)
 
-					// Call callback with block metadata + anomaly IDs
-					pw.onSuccess(ctx, task.Block.GetHeight(), bh, task.StateRoot, task.Block.GetTransactionCount(), task.Block.GetTimestamp().Unix(), anomalyIDs)
+					if pw.auditLogger != nil {
+						_ = pw.auditLogger.Info("block_persisted_async", map[string]interface{}{
+							"height":            task.Block.GetHeight(),
+							"hash":              fmt.Sprintf("%x", bh[:8]),
+							"attempts":          attempt + 1,
+							"state_root":        fmt.Sprintf("%x", task.StateRoot[:8]),
+							"anomaly_count":     meta.anomalyCount,
+							"evidence_count":    meta.evidenceCount,
+							"policy_count":      meta.policyCount,
+							"tracked_anomalies": len(meta.anomalyIDs),
+						})
+					}
+
+					if len(meta.anomalyIDs) == 0 && pw.logger != nil {
+						pw.logger.Debug("no anomaly ids extracted for commit metadata",
+							utils.ZapUint64("height", task.Block.GetHeight()),
+							utils.ZapInt("anomaly_count", meta.anomalyCount))
+					}
+
+					if pw.onSuccess == nil {
+						return
+					}
+
+					pw.onSuccess(ctx, task.Block.GetHeight(), bh, task.StateRoot, task.Block.GetTransactionCount(), task.Block.GetTimestamp().Unix(), meta.anomalyCount, meta.evidenceCount, meta.policyCount, meta.anomalyIDs)
 				}()
+			}
+
+			if pw.auditLogger != nil && pw.onSuccess == nil {
+				_ = pw.auditLogger.Info("block_persisted_async", map[string]interface{}{
+					"height":     task.Block.GetHeight(),
+					"hash":       fmt.Sprintf("%x", bh[:8]),
+					"attempts":   attempt + 1,
+					"state_root": fmt.Sprintf("%x", task.StateRoot[:8]),
+				})
 			}
 
 			return
@@ -380,44 +403,158 @@ func (pw *PersistenceWorker) GetStats() map[string]interface{} {
 
 // extractAnomalyIDs extracts anomaly IDs from EventTx transactions in a block
 // Fix: Gap 2 - Enable COMMITTED state tracking by extracting anomaly UUIDs
-func extractAnomalyIDs(block *block.AppBlock, logger *utils.Logger) []string {
+type commitMetadata struct {
+	anomalyIDs    []string
+	anomalyCount  int
+	evidenceCount int
+	policyCount   int
+}
+
+func extractCommitMetadata(block *block.AppBlock, logger *utils.Logger) commitMetadata {
 	if block == nil {
-		return nil
+		return commitMetadata{}
 	}
 
 	txs := block.Transactions()
 	if len(txs) == 0 {
-		return nil
+		return commitMetadata{}
 	}
 
-	var anomalyIDs []string
+	meta := commitMetadata{}
+	limitReached := false
+
 	for _, tx := range txs {
-		// Only process EventTx (anomaly transactions)
-		if tx.Type() != state.TxEvent {
-			continue
-		}
+		switch tx.Type() {
+		case state.TxEvent:
+			meta.anomalyCount++
 
-		eventTx, ok := tx.(*state.EventTx)
-		if !ok {
-			continue
-		}
-
-		// Decode the protobuf AnomalyEvent from payload
-		msg, err := kafka.DecodeAnomalyMsg(eventTx.Data)
-		if err != nil {
-			// Not an anomaly message or decode error - skip
-			if logger != nil {
-				logger.Debug("Failed to decode EventTx as AnomalyMsg",
-					utils.ZapError(err))
+			eventTx, ok := tx.(*state.EventTx)
+			if !ok {
+				continue
 			}
-			continue
-		}
 
-		// Extract anomaly ID
-		if msg.ID != "" {
-			anomalyIDs = append(anomalyIDs, msg.ID)
+			anomalyID, usedFallback := extractAnomalyID(eventTx.Data, logger)
+			if anomalyID == "" {
+				continue
+			}
+
+			if len(meta.anomalyIDs) >= maxCommitAnomalyIDs {
+				if !limitReached && logger != nil {
+					logger.Warn("anomaly id limit reached for commit metadata",
+						utils.ZapInt("limit", maxCommitAnomalyIDs))
+				}
+				limitReached = true
+				continue
+			}
+
+			if !isValidUUIDv4(anomalyID) {
+				if logger != nil {
+					logger.Warn("invalid anomaly uuid dropped",
+						utils.ZapString("id", anomalyID))
+				}
+				continue
+			}
+
+			if usedFallback && logger != nil {
+				logger.Debug("anomaly id resolved via payload fallback")
+			}
+
+			meta.anomalyIDs = append(meta.anomalyIDs, anomalyID)
+		case state.TxEvidence:
+			meta.evidenceCount++
+		case state.TxPolicy:
+			meta.policyCount++
 		}
 	}
 
-	return anomalyIDs
+	return meta
+}
+
+func extractAnomalyID(data []byte, logger *utils.Logger) (string, bool) {
+	msg, err := kafka.DecodeAnomalyMsg(data)
+	if err == nil {
+		anomalyID, usedFallback, resolveErr := resolveAnomalyID(msg)
+		if resolveErr != nil {
+			if logger != nil {
+				logger.Debug("unable to resolve anomaly id for commit metadata",
+					utils.ZapError(resolveErr))
+			}
+			return "", false
+		}
+		return anomalyID, usedFallback
+	}
+
+	if logger != nil {
+		logger.Debug("failed to decode anomaly for commit metadata",
+			utils.ZapError(err))
+	}
+
+	id, jsonErr := extractAnomalyIDFromJSON(data)
+	if jsonErr != nil {
+		if logger != nil {
+			logger.Debug("unable to extract anomaly id from json payload",
+				utils.ZapError(jsonErr))
+		}
+		return "", false
+	}
+
+	return id, true
+}
+
+func extractAnomalyIDFromJSON(data []byte) (string, error) {
+	var payload struct {
+		AnomalyID string `json:"anomaly_id"`
+		ID        string `json:"id"`
+	}
+
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return "", err
+	}
+
+	if payload.AnomalyID != "" {
+		return payload.AnomalyID, nil
+	}
+	if payload.ID != "" {
+		return payload.ID, nil
+	}
+
+	return "", fmt.Errorf("anomaly id missing from payload")
+}
+
+func isValidUUIDv4(id string) bool {
+	u, err := uuid.Parse(id)
+	if err != nil {
+		return false
+	}
+	return u.Version() == 4
+}
+
+// resolveAnomalyID attempts to obtain the anomaly UUID from the decoded message.
+// Primary source is the protobuf field, with a JSON payload fallback for legacy messages.
+func resolveAnomalyID(msg *kafka.AnomalyMsg) (string, bool, error) {
+	if msg == nil {
+		return "", false, fmt.Errorf("nil anomaly message")
+	}
+
+	if msg.ID != "" {
+		return msg.ID, false, nil
+	}
+
+	if len(msg.Payload) == 0 {
+		return "", false, fmt.Errorf("empty anomaly payload")
+	}
+
+	var payload struct {
+		AnomalyID string `json:"anomaly_id"`
+	}
+
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return "", false, fmt.Errorf("payload decode failed: %w", err)
+	}
+
+	if payload.AnomalyID == "" {
+		return "", true, fmt.Errorf("payload missing anomaly_id field")
+	}
+
+	return payload.AnomalyID, true, nil
 }

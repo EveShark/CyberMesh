@@ -136,9 +136,9 @@ func NewStorage(
 // Safe to call before Start(); after Start(), it will take effect for subsequent
 // persistence operations. Restoration occurs in Start() when backend is present.
 func (s *Storage) SetBackend(backend StorageBackend) {
-    s.mu.Lock()
-    defer s.mu.Unlock()
-    s.backend = backend
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.backend = backend
 }
 
 // Start initializes storage and loads persisted state
@@ -694,8 +694,19 @@ func (s *Storage) encodeQC(qc QC) ([]byte, error) {
 	if s.encMode == nil {
 		return nil, fmt.Errorf("cbor encoder not initialized")
 	}
-	messagesQC, ok := qc.(*messages.QC)
-	if !ok {
+	// Support both wire-format (*messages.QC) and internal (*pbft.QuorumCertificate)
+	var messagesQC *messages.QC
+	switch typed := any(qc).(type) {
+	case *messages.QC:
+		messagesQC = typed
+	case *QuorumCertificate:
+		// Reuse converter from pbft package
+		converted, err := convertToMessageQC(typed)
+		if err != nil {
+			return nil, fmt.Errorf("convert qc: %w", err)
+		}
+		messagesQC = converted
+	default:
 		return nil, fmt.Errorf("unsupported qc type %T", qc)
 	}
 	data, err := s.encMode.Marshal(messagesQC)

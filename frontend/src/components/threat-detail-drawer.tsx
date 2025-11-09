@@ -6,8 +6,7 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Separator } from "@/components/ui/separator"
 import { ThreatAggregate } from "./threats-table"
-import { Cross2Icon } from "@radix-ui/react-icons"
-import { TrendingUp, Shield, AlertTriangle, Info, CheckCircle, XCircle } from "lucide-react"
+import { TrendingUp, Shield, AlertTriangle, Info, CheckCircle, XCircle, X } from "lucide-react"
 
 interface ThreatDetailDrawerProps {
   threat: ThreatAggregate | null
@@ -28,7 +27,7 @@ export function ThreatDetailDrawer({ threat, open, onClose, lastDetectionTime }:
           <div className="flex items-center justify-between">
             <SheetTitle className="text-xl font-semibold capitalize">{threat.threatType.replaceAll("_", " ")}</SheetTitle>
             <Button variant="ghost" size="sm" onClick={onClose} className="h-8 w-8 p-0 hover:bg-white/10">
-              <Cross2Icon className="h-4 w-4" />
+              <X className="h-4 w-4" />
             </Button>
           </div>
           <SheetDescription className="text-left">

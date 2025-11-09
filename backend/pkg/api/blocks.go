@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -73,6 +74,7 @@ func (s *Server) handleBlockLatest(w http.ResponseWriter, r *http.Request) {
 
 	// Convert to response DTO
 	response := s.blockToResponse(block)
+	s.applyBlockSize(ctx, &response, nil, 0)
 
 	writeJSONResponse(w, r, NewSuccessResponse(response), http.StatusOK)
 }
@@ -147,6 +149,8 @@ func (s *Server) handleBlockByHeight(w http.ResponseWriter, r *http.Request, hei
 		}
 		response.Transactions = txs
 	}
+
+	s.applyBlockSize(ctx, &response, response.Transactions, 0)
 
 	writeJSONResponse(w, r, NewSuccessResponse(response), http.StatusOK)
 }
@@ -285,15 +289,16 @@ func (s *Server) blockToResponse(b *block.AppBlock) BlockResponse {
 	proposer := b.Proposer()
 
 	resp := BlockResponse{
-		Height:           b.GetHeight(),
-		Hash:             encodeHex(h[:]),
-		ParentHash:       encodeHex(ph[:]),
-		StateRoot:        encodeHex(sr[:]),
-		Timestamp:        b.GetTimestamp().Unix(),
-		Proposer:         encodeHex(proposer[:]),
-		TransactionCount: b.GetTransactionCount(),
-		AnomalyCount:     0, // Set separately via batchGetAnomalyCounts
-		SizeBytes:        0, // unknown without full serialization; keep 0
+		Height:             b.GetHeight(),
+		Hash:               encodeHex(h[:]),
+		ParentHash:         encodeHex(ph[:]),
+		StateRoot:          encodeHex(sr[:]),
+		Timestamp:          b.GetTimestamp().Unix(),
+		Proposer:           encodeHex(proposer[:]),
+		TransactionCount:   b.GetTransactionCount(),
+		AnomalyCount:       0, // Set separately via batchGetAnomalyCounts
+		SizeBytes:          0,
+		SizeBytesEstimated: false,
 	}
 
 	return resp
@@ -354,4 +359,220 @@ func (s *Server) batchGetAnomalyCounts(ctx context.Context, heights []uint64) (m
 	}
 
 	return result, nil
+}
+
+func (s *Server) fetchLatestBlocks(ctx context.Context, limit int, avgBlockSize float64) ([]BlockResponse, error) {
+	if limit <= 0 {
+		limit = 1
+	}
+	if limit > 50 {
+		limit = 50
+	}
+
+	queryCtx, cancel := context.WithTimeout(ctx, s.config.RequestTimeout)
+	defer cancel()
+
+	latestHeight, err := s.storage.GetLatestHeight(queryCtx)
+	if err != nil {
+		return nil, err
+	}
+
+	startHeight := uint64(0)
+	if latestHeight+1 > uint64(limit) {
+		startHeight = latestHeight - uint64(limit) + 1
+	}
+
+	blocks := make([]BlockResponse, 0, limit)
+	blockHeights := make([]uint64, 0, limit)
+
+	for height := startHeight; height <= latestHeight; height++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		blockCtx, cancelBlock := context.WithTimeout(ctx, 2*time.Second)
+		blk, err := s.storage.GetBlock(blockCtx, height)
+		cancelBlock()
+		if err != nil {
+			if errors.Is(err, cockroach.ErrBlockNotFound) {
+				continue
+			}
+			return nil, err
+		}
+
+		blocks = append(blocks, s.blockToResponse(blk))
+		blockHeights = append(blockHeights, height)
+	}
+
+	anomalyCounts, err := s.batchGetAnomalyCounts(ctx, blockHeights)
+	if err != nil {
+		anomalyCounts = make(map[uint64]int)
+	}
+
+	for i := range blocks {
+		blocks[i].AnomalyCount = anomalyCounts[blocks[i].Height]
+	}
+
+	transactionMap, err := s.batchGetTransactions(ctx, blockHeights)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.WarnContext(ctx, "failed to batch load block transactions", utils.ZapError(err))
+		}
+		transactionMap = make(map[uint64][]TransactionResponse)
+	}
+
+	for i := range blocks {
+		txs, ok := transactionMap[blocks[i].Height]
+		if ok {
+			blocks[i].Transactions = txs
+		}
+		s.applyBlockSize(ctx, &blocks[i], txs, avgBlockSize)
+	}
+
+	return blocks, nil
+}
+
+func (s *Server) batchGetTransactions(ctx context.Context, heights []uint64) (map[uint64][]TransactionResponse, error) {
+	result := make(map[uint64][]TransactionResponse, len(heights))
+	if len(heights) == 0 {
+		return result, nil
+	}
+
+	adapter, ok := s.storage.(interface {
+		GetDB() *sql.DB
+	})
+	if !ok {
+		return result, nil
+	}
+
+	db := adapter.GetDB()
+	if db == nil {
+		return result, nil
+	}
+
+	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	heightsInt64 := make([]int64, len(heights))
+	for i, h := range heights {
+		heightsInt64[i] = int64(h)
+	}
+
+	rows, err := db.QueryContext(queryCtx, `
+		SELECT block_height, tx_hash, tx_type, length(payload::text) AS size_bytes
+		FROM transactions
+		WHERE block_height = ANY($1::bigint[])
+		ORDER BY block_height DESC, tx_index ASC
+	`, pq.Array(heightsInt64))
+	if err != nil {
+		return nil, fmt.Errorf("failed to query transactions: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			height    uint64
+			hashBytes []byte
+			txType    sql.NullString
+			sizeBytes int64
+		)
+		if err := rows.Scan(&height, &hashBytes, &txType, &sizeBytes); err != nil {
+			return nil, fmt.Errorf("failed to scan transaction row: %w", err)
+		}
+
+		resp := TransactionResponse{
+			Hash:      encodeHex(hashBytes),
+			SizeBytes: int(sizeBytes),
+		}
+		if txType.Valid {
+			resp.Type = txType.String
+		}
+
+		result[height] = append(result[height], resp)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate transaction rows: %w", err)
+	}
+
+	return result, nil
+}
+
+func (s *Server) estimateBlockSize(ctx context.Context, height uint64, txCount int, avgBlockSize float64) (int, string) {
+	if txCount <= 0 {
+		return 0, ""
+	}
+
+	if adapter, ok := s.storage.(interface{ GetDB() *sql.DB }); ok {
+		db := adapter.GetDB()
+		if db != nil {
+			queryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			defer cancel()
+
+			var total sql.NullInt64
+			err := db.QueryRowContext(queryCtx, `
+				SELECT COALESCE(SUM(length(payload::text)), 0)
+				FROM transactions
+				WHERE block_height = $1
+			`, height).Scan(&total)
+			if err == nil && total.Valid && total.Int64 > 0 {
+				return int(total.Int64), "payload_sum"
+			}
+		}
+	}
+
+	if avgBlockSize > 0 {
+		estimate := int(math.Round(avgBlockSize))
+		if estimate > 0 {
+			return estimate, "chain_average"
+		}
+	}
+
+	estimate := txCount*512 + 256
+	if estimate < 0 {
+		estimate = txCount * 512
+	}
+	return estimate, "tx_heuristic"
+}
+
+func (s *Server) applyBlockSize(ctx context.Context, block *BlockResponse, txs []TransactionResponse, avgBlockSize float64) {
+	if block == nil {
+		return
+	}
+
+	if len(txs) > 0 {
+		sizeTotal := 0
+		for _, tx := range txs {
+			sizeTotal += tx.SizeBytes
+		}
+		if sizeTotal > 0 {
+			block.SizeBytes = sizeTotal
+			block.SizeBytesEstimated = false
+			if block.Metadata == nil {
+				block.Metadata = make(map[string]interface{})
+			}
+			block.Metadata["size_source"] = "transaction_sum"
+			return
+		}
+	}
+
+	if block.SizeBytes > 0 || block.TransactionCount <= 0 {
+		return
+	}
+
+	estimate, method := s.estimateBlockSize(ctx, block.Height, block.TransactionCount, avgBlockSize)
+	if estimate <= 0 {
+		return
+	}
+
+	block.SizeBytes = estimate
+	block.SizeBytesEstimated = true
+	if method != "" {
+		if block.Metadata == nil {
+			block.Metadata = make(map[string]interface{})
+		}
+		block.Metadata["size_source"] = method
+	}
 }

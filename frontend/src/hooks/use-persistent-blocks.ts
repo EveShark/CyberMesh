@@ -1,50 +1,28 @@
 "use client"
 
-import { useState, useEffect } from "react"
-import useSWR from "swr"
+import { useEffect, useMemo, useState } from "react"
 
-import type { BlockSummary } from "@/lib/api"
+import type { BlockSummary, DashboardBlockPagination } from "@/lib/api"
 import { BlockStore } from "@/lib/block-store"
 
-interface BlocksResponse {
-  blocks: BlockSummary[]
-  pagination: {
-    start: number
-    limit: number
-    total: number
-    next?: string
-  }
-}
+import { useDashboardData } from "./use-dashboard-data"
 
-const fetcher = async <T>(url: string): Promise<T> => {
-  const res = await fetch(url, { cache: "no-store" })
-  if (!res.ok) {
-    const text = await res.text().catch(() => "")
-    throw new Error(`Request failed: ${res.status} ${res.statusText}${text ? ` - ${text}` : ""}`)
-  }
-  return (await res.json()) as T
-}
+const DEFAULT_PERSISTENT_BLOCK_REFRESH_MS = 20000
 
 export function usePersistentBlocks(limit = 20) {
   const [blockStore] = useState(() => new BlockStore())
   const [localBlocks, setLocalBlocks] = useState<BlockSummary[]>([])
 
-  const { data, error, isLoading, mutate } = useSWR<BlocksResponse>(
-    `/api/blocks?start=0&limit=${limit}`,
-    fetcher,
-    {
-      refreshInterval: 10000,
-      dedupingInterval: 5000,
-      revalidateOnFocus: false,
-      revalidateOnReconnect: true,
-      onSuccess: (newData) => {
-        if (newData?.blocks && newData.blocks.length > 0) {
-          blockStore.addBlocks(newData.blocks)
-          setLocalBlocks(blockStore.getLatest(limit))
-        }
-      },
-    }
-  )
+  const { data: dashboard, error, isLoading, mutate } = useDashboardData(DEFAULT_PERSISTENT_BLOCK_REFRESH_MS)
+
+  const recentBlocks = useMemo(() => dashboard?.blocks.recent ?? [], [dashboard])
+  const pagination: DashboardBlockPagination | undefined = dashboard?.blocks.pagination
+
+  useEffect(() => {
+    if (recentBlocks.length === 0) return
+    blockStore.addBlocks(recentBlocks)
+    setLocalBlocks(blockStore.getLatest(limit))
+  }, [blockStore, recentBlocks, limit])
 
   useEffect(() => {
     setLocalBlocks(blockStore.getLatest(limit))
@@ -52,8 +30,8 @@ export function usePersistentBlocks(limit = 20) {
 
   return {
     blocks: localBlocks,
-    pagination: data?.pagination,
-    isLoading,
+    pagination,
+    isLoading: !dashboard && isLoading,
     error,
     refresh: mutate,
   }

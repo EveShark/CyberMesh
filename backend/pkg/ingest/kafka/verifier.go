@@ -178,12 +178,14 @@ func VerifyAnomalyMsg(msg *AnomalyMsg, cfg VerifierConfig, log *utils.Logger) (*
 		log.Info("[DEBUG] Creating state.EventTx")
 	}
 
+	// Preserve the original payload bytes validated above so the envelope
+	// content hash remains intact for downstream state validation.
+	commitPayload := append([]byte(nil), msg.Payload...)
+
 	// Convert to state.EventTx
-	// Note: EventTx.Data will contain the full message payload
-	// When protobuf is available, this will be the serialized protobuf message
 	tx := &state.EventTx{
 		Ts:   msg.TS,
-		Data: msg.Payload, // Full message payload
+		Data: commitPayload,
 		Env: state.Envelope{
 			ProducerID:  msg.ProducerID,
 			Nonce:       msg.Nonce,

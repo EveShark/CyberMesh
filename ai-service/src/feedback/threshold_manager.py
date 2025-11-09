@@ -278,10 +278,21 @@ class ThresholdManager:
                     continue
                 
                 # Adjust based on acceptance rate
+                sample_count = getattr(metrics, "published_count", None)
+                if sample_count is None:
+                    self.logger.warning(
+                        "Acceptance metrics missing published_count",
+                        extra={
+                            "anomaly_type": anomaly_type,
+                            "window": window,
+                        },
+                    )
+                    continue
+
                 adjustment = self.adjust_threshold(
                     anomaly_type,
                     metrics.acceptance_rate,
-                    metrics.total_published,
+                    int(sample_count),
                     window
                 )
                 

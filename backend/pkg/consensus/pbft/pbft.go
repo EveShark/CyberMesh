@@ -17,6 +17,11 @@ const (
 	DomainEvidence = "CONSENSUS_EVIDENCE_V1"
 )
 
+const (
+	createProposalMaxSyncRetries = 50
+	createProposalRetryDelay     = 50 * time.Millisecond
+)
+
 // HotStuff implements the HotStuff consensus protocol (2-chain variant)
 type HotStuff struct {
 	validatorSet types.ValidatorSet
@@ -759,8 +764,11 @@ func (hs *HotStuff) commitBlock(ctx context.Context, block types.Block, qc types
 
 // CreateProposal creates a new proposal (leader path)
 func (hs *HotStuff) CreateProposal(ctx context.Context, block types.Block) (*messages.Proposal, error) {
-	for {
+	var lastPacemakerView uint64
+	var lastHotStuffView uint64
+	for attempt := 0; attempt < createProposalMaxSyncRetries; attempt++ {
 		currentView := hs.pacemaker.GetCurrentView()
+		lastPacemakerView = currentView
 
 		isLeader, err := hs.rotation.IsLeader(ctx, hs.crypto.GetKeyID(), currentView)
 		if err != nil {
@@ -778,10 +786,13 @@ func (hs *HotStuff) CreateProposal(ctx context.Context, block types.Block) (*mes
 		hotStuffHeight := hs.currentHeight
 		hs.mu.RUnlock()
 
+		lastHotStuffView = hotStuffView
 		if hotStuffView != currentView {
 			hs.logger.InfoContext(ctx, "[CREATE_PROPOSAL] view advanced before proposal assembled",
 				"expected_view", currentView,
-				"actual_view", hotStuffView)
+				"actual_view", hotStuffView,
+				"attempt", attempt+1)
+			time.Sleep(createProposalRetryDelay)
 			continue
 		}
 
@@ -860,6 +871,8 @@ func (hs *HotStuff) CreateProposal(ctx context.Context, block types.Block) (*mes
 		}
 		return proposal, nil
 	}
+
+	return nil, fmt.Errorf("create proposal aborted: view sync timeout after %d attempts (pacemaker=%d hotstuff=%d)", createProposalMaxSyncRetries, lastPacemakerView, lastHotStuffView)
 }
 
 // convertToMessageQC converts any implementation of types.QC to the wire-format messages.QC.

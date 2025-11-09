@@ -1,13 +1,18 @@
 package api
 
 import (
+	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"runtime"
-	"runtime/metrics"
+	runtimeMetrics "runtime/metrics"
+	"strings"
 	"time"
 
 	"backend/pkg/storage/cockroach"
@@ -23,21 +28,118 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 	// Set content type to Prometheus text format
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-	w.WriteHeader(http.StatusOK)
 
-	// Write metrics in Prometheus format
-	s.writePrometheusMetrics(w)
+	var buf bytes.Buffer
+	s.writePrometheusMetrics(&buf)
+	filtered := s.filterPrometheusMetrics(buf.Bytes())
+	useGzip := s.config.MetricsCompress && strings.Contains(r.Header.Get("Accept-Encoding"), "gzip")
+
+	if useGzip {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.WriteHeader(http.StatusOK)
+		gz := gzip.NewWriter(w)
+		if _, err := gz.Write(filtered); err != nil {
+			gz.Close()
+			s.logger.Warn("failed to write gzip metrics", utils.ZapError(err))
+			return
+		}
+		if err := gz.Close(); err != nil {
+			s.logger.Warn("failed to finalize gzip metrics", utils.ZapError(err))
+		}
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(filtered); err != nil {
+		s.logger.Warn("failed to write metrics response", utils.ZapError(err))
+	}
+}
+
+func (s *Server) filterPrometheusMetrics(data []byte) []byte {
+	if len(s.config.MetricsAllowedPrefixes) == 0 {
+		return data
+	}
+	allowMetric := func(name string) bool {
+		for _, prefix := range s.config.MetricsAllowedPrefixes {
+			if strings.HasPrefix(name, prefix) {
+				return true
+			}
+		}
+		return false
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner.Buffer(make([]byte, 0, 1024), 4*1024*1024)
+	var currentMetric string
+	include := false
+	var filtered bytes.Buffer
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		trimmed := strings.TrimSpace(line)
+
+		switch {
+		case strings.HasPrefix(trimmed, "# HELP"):
+			fields := strings.Fields(trimmed)
+			if len(fields) >= 3 {
+				currentMetric = fields[2]
+				include = allowMetric(currentMetric)
+			} else {
+				include = false
+			}
+			if include {
+				filtered.WriteString(line)
+				filtered.WriteByte('\n')
+			}
+		case strings.HasPrefix(trimmed, "# TYPE"):
+			fields := strings.Fields(trimmed)
+			if len(fields) >= 3 {
+				currentMetric = fields[2]
+				include = allowMetric(currentMetric)
+			}
+			if include {
+				filtered.WriteString(line)
+				filtered.WriteByte('\n')
+			}
+		case trimmed == "":
+			if include {
+				filtered.WriteByte('\n')
+			}
+		default:
+			metricName := trimmed
+			if idx := strings.IndexAny(metricName, " {"); idx >= 0 {
+				metricName = metricName[:idx]
+			}
+			if allowMetric(metricName) {
+				currentMetric = metricName
+				include = true
+			} else if metricName != currentMetric {
+				include = false
+			}
+
+			if include {
+				filtered.WriteString(line)
+				filtered.WriteByte('\n')
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil && s.logger != nil {
+		s.logger.Warn("failed to filter prometheus metrics", utils.ZapError(err))
+	}
+
+	return filtered.Bytes()
 }
 
 // writePrometheusMetrics writes metrics in Prometheus text format
-func (s *Server) writePrometheusMetrics(w http.ResponseWriter) {
+func (s *Server) writePrometheusMetrics(w io.Writer) {
 	readMetric := func(name string) (float64, bool) {
-		samples := []metrics.Sample{{Name: name}}
-		metrics.Read(samples)
+		samples := []runtimeMetrics.Sample{{Name: name}}
+		runtimeMetrics.Read(samples)
 		switch samples[0].Value.Kind() {
-		case metrics.KindFloat64:
+		case runtimeMetrics.KindFloat64:
 			return samples[0].Value.Float64(), true
-		case metrics.KindUint64:
+		case runtimeMetrics.KindUint64:
 			return float64(samples[0].Value.Uint64()), true
 		default:
 			return 0, false
@@ -217,6 +319,14 @@ func (s *Server) writePrometheusMetrics(w http.ResponseWriter) {
 		}
 	}
 
+	// Consensus wiring/validation metrics
+	if s.engine != nil {
+		snap := s.engine.GetMetrics()
+		fmt.Fprintf(w, "# HELP consensus_parent_hash_mismatches_total Total parent-hash validation mismatches observed by the node.\n")
+		fmt.Fprintf(w, "# TYPE consensus_parent_hash_mismatches_total counter\n")
+		fmt.Fprintf(w, "consensus_parent_hash_mismatches_total %d\n", snap.ParentHashMismatches)
+	}
+
 	if s.p2pRouter != nil {
 		netStats := s.p2pRouter.GetNetworkStats()
 		inboundRate, outboundRate := s.computeP2PThroughput(nowTime, netStats)
@@ -261,6 +371,31 @@ func (s *Server) writePrometheusMetrics(w http.ResponseWriter) {
 	fmt.Fprintf(w, "# HELP cybermesh_api_request_errors_total Total HTTP requests that returned error status codes (>=400).\n")
 	fmt.Fprintf(w, "# TYPE cybermesh_api_request_errors_total counter\n")
 	fmt.Fprintf(w, "cybermesh_api_request_errors_total %d\n", s.apiRequestErrors.Load())
+
+	routeSnapshots := s.snapshotRouteMetrics()
+	if len(routeSnapshots) > 0 {
+		fmt.Fprintf(w, "# HELP api_route_requests_total Total HTTP requests per method/path.\n")
+		fmt.Fprintf(w, "# TYPE api_route_requests_total counter\n")
+		fmt.Fprintf(w, "# HELP api_route_request_errors_total Total error responses per method/path.\n")
+		fmt.Fprintf(w, "# TYPE api_route_request_errors_total counter\n")
+		fmt.Fprintf(w, "# HELP api_route_request_duration_seconds_sum Total request duration in seconds per method/path.\n")
+		fmt.Fprintf(w, "# TYPE api_route_request_duration_seconds_sum counter\n")
+		fmt.Fprintf(w, "# HELP api_route_response_bytes_total Total response bytes per method/path.\n")
+		fmt.Fprintf(w, "# TYPE api_route_response_bytes_total counter\n")
+		fmt.Fprintf(w, "# HELP api_route_cache_hits_total Cache hits observed per method/path.\n")
+		fmt.Fprintf(w, "# TYPE api_route_cache_hits_total counter\n")
+		fmt.Fprintf(w, "# HELP api_route_cache_misses_total Cache misses observed per method/path.\n")
+		fmt.Fprintf(w, "# TYPE api_route_cache_misses_total counter\n")
+		for _, snap := range routeSnapshots {
+			labels := fmt.Sprintf("method=\"%s\",path=\"%s\"", sanitizeLabelValue(snap.method), sanitizeLabelValue(snap.path))
+			fmt.Fprintf(w, "api_route_requests_total{%s} %d\n", labels, snap.requests)
+			fmt.Fprintf(w, "api_route_request_errors_total{%s} %d\n", labels, snap.errors)
+			fmt.Fprintf(w, "api_route_request_duration_seconds_sum{%s} %.6f\n", labels, float64(snap.latencyMicros)/1_000_000.0)
+			fmt.Fprintf(w, "api_route_response_bytes_total{%s} %d\n", labels, snap.bytes)
+			fmt.Fprintf(w, "api_route_cache_hits_total{%s} %d\n", labels, snap.cacheHits)
+			fmt.Fprintf(w, "api_route_cache_misses_total{%s} %d\n", labels, snap.cacheMisses)
+		}
+	}
 
 	// Rate limiter metrics
 	if s.rateLimiter != nil {
@@ -431,6 +566,14 @@ func (s *Server) writePrometheusMetrics(w http.ResponseWriter) {
 	fmt.Fprintf(w, "api_build_info{version=\"%s\",environment=\"%s\"} 1\n", apiVersion, s.config.Environment)
 }
 
+func sanitizeLabelValue(value string) string {
+	if value == "" {
+		return value
+	}
+	replacer := strings.NewReplacer("\\", "\\\\", "\"", "\\\"", "\n", "", "\r", "")
+	return replacer.Replace(value)
+}
+
 func convertToInt64(v interface{}) int64 {
 	switch val := v.(type) {
 	case int:
@@ -450,7 +593,7 @@ func convertToInt64(v interface{}) int64 {
 	}
 }
 
-func writePrometheusHistogram(w http.ResponseWriter, name string, buckets []utils.HistogramBucket, count uint64, sumMs float64) {
+func writePrometheusHistogram(w io.Writer, name string, buckets []utils.HistogramBucket, count uint64, sumMs float64) {
 	var cumulative uint64
 	for _, bucket := range buckets {
 		cumulative += bucket.Count

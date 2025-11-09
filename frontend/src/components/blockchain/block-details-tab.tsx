@@ -65,6 +65,10 @@ export function BlockDetailsTab({ block, onVerifyClick }: BlockDetailsTabProps) 
   }
 
   const transactions = displayBlock.transactions ?? []
+  const sizeBytes = Number.isFinite(displayBlock.size_bytes) ? displayBlock.size_bytes : 0
+  const sizePrefix = displayBlock.size_bytes_estimated ? "≈" : ""
+  const rawSizeSource = displayBlock.metadata?.["size_source"]
+  const sizeSource = typeof rawSizeSource === "string" ? rawSizeSource.replace(/_/g, " ") : undefined
 
   return (
     <div className="space-y-6">
@@ -118,7 +122,22 @@ export function BlockDetailsTab({ block, onVerifyClick }: BlockDetailsTabProps) 
           />
           <InfoRow label="Proposer" value={formatHash(displayBlock.proposer, 10)} mono />
           <InfoRow label="Transactions" value={displayBlock.transaction_count.toLocaleString()} />
-          <InfoRow label="Estimated Size" value={`${(displayBlock.size_bytes / 1024).toFixed(2)} KB`} />
+          <InfoRow
+            label="Size"
+            value={
+              <span className="flex items-center gap-2">
+                <span>
+                  {sizePrefix}
+                  {(sizeBytes / 1024).toFixed(2)} KB
+                </span>
+                {displayBlock.size_bytes_estimated ? (
+                  <Badge variant="outline" className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                    {sizeSource ?? "estimated"}
+                  </Badge>
+                ) : null}
+              </span>
+            }
+          />
         </div>
         {copyError ? (
           <p className="mt-3 text-xs text-status-critical">Copy failed: {copyError}</p>

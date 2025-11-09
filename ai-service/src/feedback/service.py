@@ -16,15 +16,20 @@ Security:
 
 import logging
 import time
-from typing import Optional
+from typing import Optional, Callable
 from .tracker import AnomalyLifecycleTracker
+import os
+from typing import TYPE_CHECKING
+
 from .calibrator import ConfidenceCalibrator
 from .policy_manager import PolicyManager
 from .threshold_manager import ThresholdManager
 from .storage import RedisStorage
 from ..config.settings import Settings, FeedbackConfig
-from ..kafka.consumer import AIConsumer
-from ..contracts import PolicyUpdateEvent
+from ..contracts import PolicyUpdateEvent, CommitEvent
+
+if TYPE_CHECKING:  # pragma: no cover
+    from ..kafka.consumer import AIConsumer
 
 
 class FeedbackService:
@@ -42,19 +47,34 @@ class FeedbackService:
     def __init__(
         self,
         config: Settings,
-        logger: Optional[logging.Logger] = None
+        logger: Optional[logging.Logger] = None,
+        *,
+        extra_commit_handler: Optional[Callable[[CommitEvent], None]] = None,
     ):
         self.config = config
         self.logger = logger or logging.getLogger(__name__)
         
-        self.storage = RedisStorage()
-        self.feedback_config = FeedbackConfig()
+        feedback_cfg = getattr(config, "feedback", None)
+        if feedback_cfg is None:
+            env_flag = os.getenv("FEEDBACK_DISABLE_PERSISTENCE")
+            disable_persistence = False
+            if env_flag is not None:
+                disable_persistence = env_flag.lower() in ("true", "1", "yes", "on")
+            feedback_cfg = FeedbackConfig(disable_persistence=disable_persistence)
+        else:
+            disable_persistence = getattr(feedback_cfg, "disable_persistence", False)
+
+        self.storage = RedisStorage(disabled=disable_persistence)
+        self.feedback_config = feedback_cfg
         
         self.tracker = AnomalyLifecycleTracker(
             self.storage,
             self.feedback_config,
             self.logger
         )
+
+        if disable_persistence:
+            self.logger.warning("Feedback persistence disabled; tracker data kept in-memory only")
         
         self.calibrator = ConfidenceCalibrator(
             self.tracker,
@@ -71,11 +91,20 @@ class FeedbackService:
             self.feedback_config
         )
         
+        from ..kafka.consumer import AIConsumer
+
         self.consumer = AIConsumer(
             config,
             tracker=self.tracker,
-            logger=self.logger
+            logger=self.logger,
+            storage=self.storage,
+            feedback_config=self.feedback_config,
+            disable_persistence=disable_persistence,
         )
+        # Preserve the consumer's built-in commit handler so anomaly lifecycle
+        # transitions to COMMITTED continue to flow through the tracker.
+        self._tracker_commit_handler = self.consumer.handlers.get("commit")
+        self._extra_commit_handler = extra_commit_handler
         
         self._register_handlers()
         
@@ -127,10 +156,37 @@ class FeedbackService:
         - Calibration check (should we retrain?)
         - Threshold adjustment check
         """
+        tracker_errors = False
+        if self._tracker_commit_handler:
+            # Let the original tracker handler run first so any failures prevent
+            # offset commits and the message is retried.
+            try:
+                self._tracker_commit_handler(msg)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                tracker_errors = True
+                if self.logger:
+                    self.logger.error(
+                        "Tracker commit handler failed",
+                        exc_info=True,
+                        extra={"error": str(exc)},
+                    )
+                raise
+
+        if self._extra_commit_handler and not tracker_errors:
+            try:
+                self._extra_commit_handler(msg)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                if self.logger:
+                    self.logger.error(
+                        "Secondary commit handler failed",
+                        exc_info=True,
+                        extra={"error": str(exc)},
+                    )
+                raise
+
         try:
             self._check_calibration()
             self._check_threshold_adjustment()
-            
         except Exception as e:
             self.logger.error(f"Commit handling error: {e}", exc_info=True)
     

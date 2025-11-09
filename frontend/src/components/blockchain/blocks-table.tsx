@@ -4,19 +4,20 @@ import { memo } from "react"
 import { AlertTriangle, ChevronRight } from "lucide-react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
-import type { BlockSummary } from "@/lib/api"
+import type { BlockSummary, DashboardBlockPagination } from "@/lib/api"
 
 interface BlocksTableProps {
   blocks: BlockSummary[]
-  onBlockSelect: (block: BlockSummary) => void
+  onBlockSelect?: (block: BlockSummary) => void
   selectedBlock?: BlockSummary | null
   isLoading?: boolean
   className?: string
+  pagination?: DashboardBlockPagination
 }
 
 interface BlockTableRowProps {
   block: BlockSummary
-  onClick: () => void
+  onClick?: () => void
   isSelected: boolean
 }
 
@@ -40,12 +41,18 @@ const BlockTableRow = memo(function BlockTableRow({ block, onClick, isSelected }
 
   const hasAnomalies = (block.anomaly_count ?? 0) > 0
 
+  const interactive = typeof onClick === "function"
+
   return (
-    <tr 
-      className={`blocks-table-row ${isSelected ? 'bg-primary/5' : ''} cursor-pointer`}
-      onClick={onClick}
-      tabIndex={0}
-      onKeyDown={(e) => e.key === 'Enter' && onClick()}
+    <tr
+      className={`blocks-table-row ${isSelected ? "bg-primary/5" : ""} ${interactive ? "cursor-pointer" : ""}`}
+      onClick={interactive ? onClick : undefined}
+      tabIndex={interactive ? 0 : -1}
+      onKeyDown={(e) => {
+        if (interactive && e.key === "Enter") {
+          onClick?.()
+        }
+      }}
       role="row"
       aria-label={`Block ${block.height}, ${block.transaction_count} transactions`}
     >
@@ -86,12 +93,13 @@ const BlockTableRow = memo(function BlockTableRow({ block, onClick, isSelected }
   )
 })
 
-export const BlocksTable = memo(function BlocksTable({ 
-  blocks, 
-  onBlockSelect, 
+export const BlocksTable = memo(function BlocksTable({
+  blocks,
+  onBlockSelect,
   selectedBlock,
-  isLoading = false, 
-  className = "" 
+  isLoading = false,
+  className = "",
+  pagination,
 }: BlocksTableProps) {
   if (isLoading && blocks.length === 0) {
     return (
@@ -130,6 +138,15 @@ export const BlocksTable = memo(function BlocksTable({
     <Card className={`glass-card border border-border/30 ${className}`}>
       <CardHeader>
         <CardTitle className="text-lg text-foreground">Latest Blocks</CardTitle>
+        {pagination ? (
+          <p className="text-xs text-muted-foreground">
+            Showing {pagination.start ? `#${pagination.start.toLocaleString()}` : "latest"}
+            {pagination.end && pagination.end !== pagination.start
+              ? ` - #${pagination.end.toLocaleString()}`
+              : ""}
+            {typeof pagination.total === "number" && pagination.total > 0 ? ` of ~${pagination.total.toLocaleString()}` : ""}
+          </p>
+        ) : null}
       </CardHeader>
       <CardContent>
         <div className="blocks-table-container overflow-x-auto">
@@ -145,25 +162,28 @@ export const BlocksTable = memo(function BlocksTable({
               </tr>
             </thead>
             <tbody>
-              {blocks.map((block) => (
-                <BlockTableRow
-                  key={block.height}
-                  block={block}
-                  onClick={() => onBlockSelect(block)}
-                  isSelected={selectedBlock?.height === block.height}
-                />
-              ))}
+              {blocks.map((block) => {
+                const handleSelect = onBlockSelect ? () => onBlockSelect(block) : undefined
+                return (
+                  <BlockTableRow
+                    key={block.height}
+                    block={block}
+                    onClick={handleSelect}
+                    isSelected={selectedBlock?.height === block.height}
+                  />
+                )
+              })}
             </tbody>
           </table>
         </div>
         
-        {blocks.length >= 15 && (
+        {pagination?.has_more ? (
           <div className="flex justify-center pt-4 mt-4 border-t border-border/20">
-            <Button variant="outline" size="sm">
-              Load More Blocks
+            <Button variant="outline" size="sm" disabled title="Server currently limits dashboard snapshot depth">
+              Load more (limited to {pagination.limit})
             </Button>
           </div>
-        )}
+        ) : null}
       </CardContent>
     </Card>
   )

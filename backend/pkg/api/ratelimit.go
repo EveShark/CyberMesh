@@ -31,6 +31,10 @@ type tokenBucket struct {
 
 // NewRateLimiter creates a new rate limiter
 func NewRateLimiter(config RateLimiterConfig) *RateLimiter {
+    if config.Burst <= 0 {
+        config.Burst = config.RequestsPerMinute
+    }
+
 	return &RateLimiter{
 		config:  config,
 		buckets: make(map[string]*tokenBucket),
@@ -47,10 +51,14 @@ func (rl *RateLimiter) Allow(clientID string) (bool, int64) {
 	// Get or create bucket
 	bucket, exists := rl.buckets[clientID]
 	if !exists {
+		capacity := float64(rl.config.Burst)
+		if capacity <= 0 {
+			capacity = float64(rl.config.RequestsPerMinute)
+		}
 		bucket = &tokenBucket{
-			tokens:   float64(rl.config.RequestsPerMinute),
+			tokens:   capacity,
 			lastTime: now,
-			capacity: float64(rl.config.RequestsPerMinute),
+			capacity: capacity,
 			refill:   float64(rl.config.RequestsPerMinute) / 60.0, // per second
 		}
 		rl.buckets[clientID] = bucket

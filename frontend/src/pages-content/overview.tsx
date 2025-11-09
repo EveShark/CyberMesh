@@ -20,7 +20,7 @@ import { Card, CardContent } from "@/components/ui/card"
 import { NetworkSummaryCompact } from "@/components/network-summary-compact"
 import { ThreatSummaryCompact } from "@/components/threat-summary-compact"
 import { InfrastructureSummaryCompact } from "@/components/infrastructure-summary-compact"
-import BlocksTable from "@/components/blocks-table"
+import { BlocksTable } from "@/components/blockchain/blocks-table"
 import { useOverviewData } from "@/hooks/use-overview-data"
 import { PageContainer } from "@/components/page-container"
 
@@ -38,6 +38,19 @@ function formatMilliseconds(ms?: number) {
   if (ms === undefined || Number.isNaN(ms)) return "--"
   if (ms >= 1000) return `${(ms / 1000).toFixed(2)} s`
   return `${ms.toFixed(1)} ms`
+}
+
+function formatBytes(bytes?: number) {
+  if (bytes === undefined || bytes === null || Number.isNaN(bytes)) return "--"
+  if (bytes === 0) return "0 B"
+  const units = ["B", "KB", "MB", "GB", "TB"]
+  let value = bytes
+  let index = 0
+  while (value >= 1024 && index < units.length - 1) {
+    value /= 1024
+    index++
+  }
+  return `${value.toFixed(value >= 10 || index === 0 ? 0 : 1)} ${units[index]}`
 }
 
 function formatTime(timestampMs?: number) {
@@ -132,6 +145,7 @@ export default function OverviewPage() {
     trendStats,
     alerts,
     refresh,
+    blockPagination,
   } = useOverviewData()
 
   const backendStatus = overviewKpis.readiness.status === "ready" ? "READY" : "DEGRADED"
@@ -241,6 +255,48 @@ export default function OverviewPage() {
           ))}
         </section>
 
+        {data.ledger ? (
+          <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+            <Card className="glass-card border border-border/30">
+              <CardContent className="p-6 space-y-2">
+                <p className="text-sm text-muted-foreground">Ledger Height</p>
+                <p className="text-3xl font-bold text-foreground">
+                  {formatNumber(data.ledger.latest_height)}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  State version {formatNumber(data.ledger.state_version)}
+                </p>
+              </CardContent>
+            </Card>
+            <Card className="glass-card border border-border/30">
+              <CardContent className="p-6 space-y-2">
+                <p className="text-sm text-muted-foreground">Pending Transactions</p>
+                <p className="text-3xl font-bold text-foreground">
+                  {formatNumber(data.ledger.pending_transactions ?? 0)}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  Mempool size {formatBytes(data.ledger.mempool_size_bytes ?? undefined)}
+                </p>
+              </CardContent>
+            </Card>
+            <Card className="glass-card border border-border/30">
+              <CardContent className="p-6 space-y-2">
+                <p className="text-sm text-muted-foreground">Snapshot</p>
+                <p className="text-3xl font-bold text-foreground">
+                  {data.ledger.snapshot_block_height
+                    ? `#${formatNumber(data.ledger.snapshot_block_height)}`
+                    : "—"}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  {data.ledger.snapshot_timestamp
+                    ? new Date(data.ledger.snapshot_timestamp * 1000).toLocaleString()
+                    : "Snapshot not captured"}
+                </p>
+              </CardContent>
+            </Card>
+          </section>
+        ) : null}
+
         <section className="grid gap-6 md:grid-cols-3">
           <NetworkSummaryCompact
             peerCount={network?.peerCount}
@@ -323,7 +379,7 @@ export default function OverviewPage() {
         </section>
 
         <section>
-          <BlocksTable blocks={latestBlocks} isLoading={isLoading} />
+          <BlocksTable blocks={latestBlocks} isLoading={isLoading} pagination={blockPagination} />
         </section>
       </PageContainer>
     </div>

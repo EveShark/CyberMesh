@@ -45,12 +45,18 @@ type aiDetectionStatsPayload struct {
 	State         string `json:"state"`
 	Message       string `json:"message"`
 	DetectionLoop *struct {
-		Running                   bool     `json:"running"`
-		AvgLatencyMs              float64  `json:"avg_latency_ms"`
-		LastLatencyMs             float64  `json:"last_latency_ms"`
-		SecondsSinceLastDetection *float64 `json:"seconds_since_last_detection"`
-		SecondsSinceLastIteration *float64 `json:"seconds_since_last_iteration"`
-		CacheAgeSeconds           *float64 `json:"cache_age_seconds"`
+		Running                   bool               `json:"running"`
+		Status                    string             `json:"status"`
+		Message                   string             `json:"message"`
+		Issues                    []string           `json:"issues"`
+		Blocking                  bool               `json:"blocking"`
+		Healthy                   bool               `json:"healthy"`
+		AvgLatencyMs              float64            `json:"avg_latency_ms"`
+		LastLatencyMs             float64            `json:"last_latency_ms"`
+		SecondsSinceLastDetection *float64           `json:"seconds_since_last_detection"`
+		SecondsSinceLastIteration *float64           `json:"seconds_since_last_iteration"`
+		CacheAgeSeconds           *float64           `json:"cache_age_seconds"`
+		Metrics                   map[string]float64 `json:"metrics"`
 	} `json:"detection_loop"`
 	Derived *struct {
 		DetectionsPerMinute  *float64 `json:"detections_per_minute"`
@@ -73,7 +79,11 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
 	defer cancel()
 
-	// Build statistics response
+	response := s.buildStatsResponse(ctx)
+	writeJSONResponse(w, r, NewSuccessResponse(response), http.StatusOK)
+}
+
+func (s *Server) buildStatsResponse(ctx context.Context) StatsResponse {
 	response := StatsResponse{
 		Chain:     s.getChainStats(ctx),
 		Consensus: s.getConsensusStats(ctx),
@@ -99,7 +109,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	sanitizeStatsResponse(&response)
 
-	writeJSONResponse(w, r, NewSuccessResponse(response), http.StatusOK)
+	return response
 }
 
 // getChainStats returns blockchain statistics
@@ -155,7 +165,8 @@ func (s *Server) getConsensusStats(ctx context.Context) *ConsensusStats {
 	validators := s.engine.ListValidators()
 	stats.ValidatorCount = len(validators)
 	if stats.ValidatorCount > 0 {
-		stats.QuorumSize = (stats.ValidatorCount*2)/3 + 1
+		// Use the same PBFT quorum calculation as consensus_overview (2f+1 where f=floor((n-1)/3))
+		stats.QuorumSize = computeQuorumSize(stats.ValidatorCount)
 	}
 
 	var zeroLeader types.ValidatorID
@@ -471,11 +482,20 @@ func (s *Server) getAIStats(ctx context.Context) *AIStats {
 	stats.State = payload.State
 	if payload.DetectionLoop != nil {
 		stats.DetectionLoopRunning = payload.DetectionLoop.Running
+		stats.DetectionLoopStatus = payload.DetectionLoop.Status
+		stats.DetectionLoopBlocking = payload.DetectionLoop.Blocking
+		stats.DetectionLoopHealthy = payload.DetectionLoop.Healthy
+		if len(payload.DetectionLoop.Issues) > 0 {
+			stats.DetectionLoopIssues = append([]string(nil), payload.DetectionLoop.Issues...)
+		}
 		stats.DetectionLoopLatencyMs = payload.DetectionLoop.AvgLatencyMs
 		stats.DetectionLoopLastMs = payload.DetectionLoop.LastLatencyMs
 		stats.SecondsSinceDetection = payload.DetectionLoop.SecondsSinceLastDetection
 		stats.SecondsSinceIteration = payload.DetectionLoop.SecondsSinceLastIteration
 		stats.CacheAgeSeconds = payload.DetectionLoop.CacheAgeSeconds
+		if stats.Message == "" && payload.DetectionLoop.Message != "" {
+			stats.Message = payload.DetectionLoop.Message
+		}
 	}
 
 	if payload.Derived != nil {
@@ -672,10 +692,16 @@ func (s *Server) calculateAvgBlockTime(ctx context.Context, currentHeight uint64
 	}
 	defer rows.Close()
 
-	var timestamps []int64
+	var timestamps []time.Time
 	for rows.Next() {
-		var ts int64
+		var ts time.Time
 		if err := rows.Scan(&ts); err != nil {
+			if s.logger != nil {
+				s.logger.WarnContext(ctx, "failed to scan block timestamp", utils.ZapError(err))
+			}
+			continue
+		}
+		if ts.IsZero() {
 			continue
 		}
 		timestamps = append(timestamps, ts)
@@ -685,9 +711,15 @@ func (s *Server) calculateAvgBlockTime(ctx context.Context, currentHeight uint64
 		return 0
 	}
 
-	// Calculate average time between consecutive blocks
-	totalDiff := timestamps[len(timestamps)-1] - timestamps[0]
-	avgSeconds := float64(totalDiff) / float64(len(timestamps)-1)
+	elapsed := timestamps[len(timestamps)-1].Sub(timestamps[0])
+	if elapsed <= 0 {
+		return 0
+	}
+
+	avgSeconds := elapsed.Seconds() / float64(len(timestamps)-1)
+	if avgSeconds < 0 {
+		return 0
+	}
 
 	return avgSeconds
 }
@@ -708,14 +740,14 @@ func (s *Server) calculateAvgBlockSize(ctx context.Context, currentHeight uint64
 		startHeight = currentHeight - 100
 	}
 
-	// Query transaction counts and estimate size
 	query := `
-		SELECT tx_count 
-		FROM blocks 
-		WHERE height >= $1 AND height <= $2
+		SELECT b.tx_count, COALESCE(SUM(length(t.payload::text)), 0)
+		FROM blocks b
+		LEFT JOIN transactions t ON t.block_height = b.height
+		WHERE b.height >= $1 AND b.height <= $2
+		GROUP BY b.height, b.tx_count
 	`
 
-	// Get concrete adapter to access database
 	adapter, ok := s.storage.(interface {
 		GetDB() *sql.DB
 	})
@@ -733,26 +765,56 @@ func (s *Server) calculateAvgBlockSize(ctx context.Context, currentHeight uint64
 	}
 	defer rows.Close()
 
-	totalTxs := 0
-	blockCount := 0
+	const (
+		headerBytes    int64 = 256
+		txByteEstimate int64 = 512
+	)
+	var (
+		totalSize  int64
+		blockCount int64
+	)
+
 	for rows.Next() {
-		var txCount int
-		if err := rows.Scan(&txCount); err != nil {
+		var (
+			txCount      int
+			payloadBytes int64
+		)
+		if err := rows.Scan(&txCount, &payloadBytes); err != nil {
+			if s.logger != nil {
+				s.logger.WarnContext(ctx, "failed to scan block size row", utils.ZapError(err))
+			}
 			continue
 		}
-		totalTxs += txCount
+
+		size := payloadBytes
+		if size <= 0 {
+			if txCount > 0 {
+				size = int64(txCount)*txByteEstimate + headerBytes
+			} else {
+				size = headerBytes
+			}
+		} else {
+			size += headerBytes
+		}
+		if size < 0 {
+			size = 0
+		}
+
+		totalSize += size
 		blockCount++
+	}
+
+	if err := rows.Err(); err != nil {
+		if s.logger != nil {
+			s.logger.WarnContext(ctx, "error iterating block size rows", utils.ZapError(err))
+		}
 	}
 
 	if blockCount == 0 {
 		return 0
 	}
 
-	// Rough estimate: avg 500 bytes per transaction + 200 bytes block header
-	avgTxPerBlock := totalTxs / blockCount
-	estimatedSize := (avgTxPerBlock * 500) + 200
-
-	return estimatedSize
+	return int(totalSize / blockCount)
 }
 
 // getTotalTransactionCount returns total number of transactions across all blocks

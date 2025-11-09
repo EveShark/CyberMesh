@@ -1,7 +1,8 @@
 "use client"
 
 import { useEffect, useMemo, useRef, useState } from "react"
-import useSWR from "swr"
+
+import { useDashboardData } from "./use-dashboard-data"
 
 interface ThreatBreakdownEntry {
   threatType: string
@@ -11,10 +12,25 @@ interface ThreatBreakdownEntry {
   total: number
 }
 
+interface ThreatLifetimeTotals {
+  total: number
+  published: number
+  abstained: number
+  rateLimited?: number
+  errors?: number
+}
+
 interface ThreatsApiResponse {
   timestamp: number
+  source?: string
+  fallbackReason?: string
   detectionLoop: {
     running: boolean
+    status: string
+    blocking: boolean
+    healthy: boolean
+    message?: string
+    issues?: string[]
     metrics?: Record<string, number | string>
   } | null
   breakdown: {
@@ -26,13 +42,10 @@ interface ThreatsApiResponse {
       overall: number
     }
   }
-  metrics: {
-    samples: Array<{
-      metric: string
-      value: number
-      labels: Record<string, string>
-    }>
-  }
+  feed: ThreatFeedEntry[]
+  stats?: ThreatStats | null
+  avgResponseTimeMs?: number
+  lifetimeTotals?: ThreatLifetimeTotals
 }
 
 interface ThreatTrendPoint {
@@ -41,78 +54,87 @@ interface ThreatTrendPoint {
   totalDelta: number
 }
 
-const fetcher = async <T>(url: string): Promise<T> => {
-  const res = await fetch(url, { cache: "no-store" })
-  if (!res.ok) {
-    const text = await res.text().catch(() => "")
-    throw new Error(`Request failed: ${res.status} ${res.statusText}${text ? ` - ${text}` : ""}`)
-  }
-  return (await res.json()) as T
+interface ThreatFeedEntry {
+  id: string
+  type: string
+  severity: "critical" | "high" | "medium" | "low"
+  title: string
+  description: string
+  source: string
+  block_height: number
+  timestamp: number
+  confidence: number
+  tx_hash: string
 }
 
-interface BackendStatsResponse {
-  stats: {
-    chain?: {
-      height: number
-      state_version: number
-      total_transactions?: number
-      success_rate: number
-      avg_block_time_seconds?: number
-      avg_block_size_bytes?: number
-    }
-    consensus?: {
-      view: number
-      round: number
-      validator_count: number
-      quorum_size: number
-      current_leader?: string
-    }
-    mempool?: {
-      pending_transactions: number
-      size_bytes: number
-    }
-  }
+interface ThreatStats {
+  critical_count: number
+  high_count: number
+  medium_count: number
+  low_count: number
+  total_count: number
 }
 
-export function useThreatsData(refreshInterval = 5000) {
-  const { data, error, isLoading, mutate } = useSWR<ThreatsApiResponse>('/api/threats', fetcher, {
-    refreshInterval,
-  })
+const DEFAULT_THREATS_REFRESH_MS = 10000
 
-  // Fetch backend stats for additional metrics (validators, response time, etc)
-  const { data: backendStats, error: backendError, isLoading: backendLoading } = useSWR<BackendStatsResponse>(
-    '/api/backend/stats',
-    fetcher,
-    {
-      refreshInterval,
-      // Don't fail if backend stats unavailable - graceful degradation
-      shouldRetryOnError: false,
-    }
-  )
+export function useThreatsData(refreshInterval = DEFAULT_THREATS_REFRESH_MS) {
+  const { data: dashboard, error, isLoading, mutate } = useDashboardData(refreshInterval)
 
   const previousTotalsRef = useRef<{
     timestamp: number
     published: number
     overall: number
+    kind: "lifetime" | "window"
   } | null>(null)
 
   const [trend, setTrend] = useState<ThreatTrendPoint[]>([])
 
   useEffect(() => {
-    if (!data) return
+    if (!dashboard) return
 
-    const totals = data.breakdown.totals
+    const windowTotals = dashboard.threats.breakdown.totals
+    const loopCounters = dashboard.threats.detection_loop?.counters ?? dashboard.ai.metrics?.loop?.counters
+    const lifetimeTotals = dashboard.threats.lifetime_totals
+
+    let totalsSource = {
+      published: windowTotals.published,
+      overall: windowTotals.overall,
+      kind: "window" as const,
+    }
+
+    if (lifetimeTotals) {
+      totalsSource = {
+        published: lifetimeTotals.published,
+        overall: lifetimeTotals.total,
+        kind: "lifetime" as const,
+      }
+    } else if (loopCounters) {
+      const published = typeof loopCounters.detections_published === "number" ? loopCounters.detections_published : 0
+      const total = typeof loopCounters.detections_total === "number" ? loopCounters.detections_total : 0
+      totalsSource = {
+        published,
+        overall: Math.max(total, published),
+        kind: "lifetime" as const,
+      }
+    }
+
     const prev = previousTotalsRef.current
-    if (prev) {
-      const elapsedSeconds = Math.max(1, (data.timestamp - prev.timestamp) / 1000)
-      const publishedDelta = Math.max(0, totals.published - prev.published)
-      const overallDelta = Math.max(0, totals.overall - prev.overall)
+    if (prev && prev.kind !== totalsSource.kind) {
+      previousTotalsRef.current = null
+      setTrend([])
+    }
+
+    const reference = previousTotalsRef.current
+    if (reference) {
+      const elapsedSeconds = Math.max(1, (dashboard.threats.timestamp - reference.timestamp) / 1000)
+      const publishedDelta = Math.max(0, totalsSource.published - reference.published)
+      const overallDelta = Math.max(0, totalsSource.overall - reference.overall)
 
       setTrend((history) => {
         const next = [
           ...history,
           {
-            timestamp: data.timestamp,
+            timestamp: dashboard.threats.timestamp,
             publishedDelta: publishedDelta / elapsedSeconds,
             totalDelta: overallDelta / elapsedSeconds,
           },
@@ -122,46 +144,137 @@ export function useThreatsData(refreshInterval = 5000) {
     }
 
     previousTotalsRef.current = {
-      timestamp: data.timestamp,
-      published: totals.published,
-      overall: totals.overall,
+      timestamp: dashboard.threats.timestamp,
+      published: totalsSource.published,
+      overall: totalsSource.overall,
+      kind: totalsSource.kind,
     }
-  }, [data])
+  }, [dashboard])
+
+  const feed = useMemo(() => dashboard?.threats.feed ?? [], [dashboard?.threats.feed])
+  const threatStats = useMemo(() => dashboard?.threats.stats ?? null, [dashboard?.threats.stats])
+  const lifetimeTotals = useMemo<ThreatLifetimeTotals | undefined>(() => {
+    if (!dashboard) return undefined
+
+    const direct = dashboard.threats.lifetime_totals
+    if (direct) {
+      return {
+        total: direct.total,
+        published: direct.published,
+        abstained: direct.abstained,
+        rateLimited: direct.rate_limited,
+        errors: direct.errors,
+      }
+    }
+
+    const counters = dashboard.threats.detection_loop?.counters ?? dashboard.ai.metrics?.loop?.counters
+    if (counters) {
+      const published = typeof counters.detections_published === "number" ? counters.detections_published : 0
+      const total = typeof counters.detections_total === "number" ? counters.detections_total : published
+      const abstained = Math.max(0, total - published)
+      return {
+        total,
+        published,
+        abstained,
+        rateLimited: typeof counters.detections_rate_limited === "number" ? counters.detections_rate_limited : undefined,
+        errors: typeof counters.errors === "number" ? counters.errors : undefined,
+      }
+    }
+
+    return undefined
+  }, [dashboard])
+  const threatTypes = useMemo<ThreatBreakdownEntry[]>(() => {
+    if (!dashboard) return []
+    return dashboard.threats.breakdown.threat_types.map((entry) => ({
+      threatType: entry.threat_type,
+      severity: entry.severity,
+      published: entry.published,
+      abstained: entry.abstained,
+      total: entry.total,
+    }))
+  }, [dashboard])
 
   const severitySeries = useMemo(() => {
-    if (!data) return []
-    return Object.entries(data.breakdown.severity).map(([name, value]) => ({
+    if (!dashboard) return []
+    return Object.entries(dashboard.threats.breakdown.severity).map(([name, value]) => ({
       name,
       value,
     }))
-  }, [data])
-
-  const threatTypes = data?.breakdown.threatTypes ?? []
+  }, [dashboard])
 
   const lastDetectionTime = useMemo(() => {
-    const metrics = data?.detectionLoop?.metrics
-    if (!metrics) return undefined
-    const value = metrics.last_detection_time
-    if (typeof value === "number") {
-      return new Date(value * 1000)
+    const loop = dashboard?.ai.metrics?.loop
+    const secondsSince = loop?.seconds_since_last_detection
+    if (typeof secondsSince === "number") {
+      const millis = dashboard?.timestamp ?? Date.now()
+      return new Date(millis - secondsSince * 1000)
     }
     return undefined
-  }, [data])
+  }, [dashboard])
+
+  const threatsData = useMemo<ThreatsApiResponse | undefined>(() => {
+    if (!dashboard) return undefined
+    const loop = dashboard.ai.metrics?.loop
+    const derived = dashboard.ai.metrics?.derived
+
+    const loopMetrics: Record<string, number | string> = {}
+    if (loop?.avg_latency_ms !== undefined) loopMetrics.avg_latency_ms = loop.avg_latency_ms
+    if (loop?.last_latency_ms !== undefined) loopMetrics.last_latency_ms = loop.last_latency_ms
+    if (derived?.detections_per_minute !== undefined) loopMetrics.detections_per_minute = derived.detections_per_minute
+    if (derived?.publish_rate_per_minute !== undefined) loopMetrics.publish_rate_per_minute = derived.publish_rate_per_minute
+    if (loop?.seconds_since_last_detection !== undefined) loopMetrics.seconds_since_last_detection = loop.seconds_since_last_detection
+    if (loop?.counters?.detections_total !== undefined) loopMetrics.detections_total = loop.counters.detections_total
+    if (loop?.counters?.detections_published !== undefined) loopMetrics.detections_published = loop.counters.detections_published
+    if (loop?.counters?.detections_rate_limited !== undefined) loopMetrics.detections_rate_limited = loop.counters.detections_rate_limited
+    if (loop?.counters?.errors !== undefined) loopMetrics.errors = loop.counters.errors
+
+    return {
+      timestamp: dashboard.threats.timestamp,
+      source: dashboard.threats.source,
+      fallbackReason: dashboard.threats.fallback_reason,
+      detectionLoop: loop
+        ? {
+            running: loop.running,
+            status: loop.status ?? (loop.running ? "ok" : "stopped"),
+            blocking: Boolean(loop.blocking),
+            healthy: loop.healthy ?? loop.running,
+            message: loop.message ?? undefined,
+            issues: loop.issues ?? [],
+            metrics: loopMetrics,
+          }
+        : null,
+      breakdown: {
+        threatTypes,
+        severity: dashboard.threats.breakdown.severity,
+        totals: dashboard.threats.breakdown.totals,
+      },
+      feed,
+      stats: threatStats,
+      avgResponseTimeMs: dashboard.threats.avg_response_time_ms,
+      lifetimeTotals,
+    }
+  }, [dashboard, feed, threatStats, lifetimeTotals, threatTypes])
+
+  const backendStats = dashboard?.backend.stats
+
+  const primaryLoading = !dashboard && isLoading
 
   return {
-    data,
+    data: threatsData,
     error,
-    isLoading,
+    isLoading: primaryLoading,
     mutate,
     severitySeries,
     trend,
     threatTypes,
+    feed,
+    threatStats,
     lastDetectionTime,
     // Backend stats for hero metrics
     backendStats,
-    backendError,
-    backendLoading,
+    backendError: undefined,
+    backendLoading: false,
     // Combined loading state
-    isLoadingAny: isLoading || backendLoading,
+    isLoadingAny: primaryLoading,
   }
 }

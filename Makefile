@@ -186,6 +186,9 @@ build-ai-image:
 build-frontend-image:
 	@echo "$(GREEN)==> Stage 5.3: Building frontend Docker image...$(NC)"
 	@docker build -f docker/frontend/Dockerfile \
+		--build-arg FRONTEND_BACKEND_API_BASE=$(FRONTEND_API_BASE) \
+		--build-arg FRONTEND_BACKEND_INTERNAL_API_BASE=$(FRONTEND_API_BASE) \
+		--build-arg FRONTEND_AI_API_BASE=$(AI_API_BASE) \
 		--build-arg NEXT_PUBLIC_BACKEND_API_BASE=$(FRONTEND_API_BASE) \
 		--build-arg NEXT_PUBLIC_AI_API_BASE=$(AI_API_BASE) \
 		-t $(FRONTEND_IMAGE) .

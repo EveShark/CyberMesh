@@ -33,6 +33,15 @@ spec:
       labels:
         app: postgres
     spec:
+      # Topology spread: keep postgres in specific zone (stateful)
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: postgres
+      
       # Prefer stateless node for better distribution
       affinity:
         nodeAffinity:
@@ -126,7 +135,7 @@ spec:
         - -c
         - |
           echo "Downloading CSV from GCS..."
-          gsutil cp gs://cybermesh-test-datasets-476310/phase1_balanced_500k_50_50.csv /data/dataset.csv
+          gsutil cp gs://cybermesh-test-datasets-476310/ddos_3m_balanced.csv /data/dataset.csv
           echo "CSV downloaded: $(du -h /data/dataset.csv)"
         volumeMounts:
         - name: data
@@ -142,7 +151,6 @@ spec:
           echo "Creating table..."
           psql -h postgres.cybermesh.svc.cluster.local -U aiservice -d telemetry << 'EOF'
           CREATE TABLE IF NOT EXISTS flows (
-            col INTEGER,
             flow_id TEXT,
             src_ip TEXT,
             src_port FLOAT,
@@ -228,7 +236,7 @@ spec:
             idle_min FLOAT,
             label TEXT,
             source_file TEXT,
-            load_ts TEXT
+            split_rand FLOAT
           );
           EOF
           

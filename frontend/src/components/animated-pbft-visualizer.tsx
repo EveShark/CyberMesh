@@ -1,21 +1,16 @@
 "use client"
 
-import useSWR from "swr"
+import { useMemo } from "react"
 import { motion } from "framer-motion"
 import { Card, CardContent } from "@/components/ui/card"
 import { CheckCircle2, Clock } from "lucide-react"
 
-type VoteTally = { node: string; vote: "pre-prepare" | "prepare" | "commit" | "decide" | "none" }
-type ConsensusStatus = {
-  phase: "pre-prepare" | "prepare" | "commit" | "decide"
-  leader: string
-  round: number
-  term?: number
-  votes: VoteTally[]
-  updatedAt: string
-}
+import { useDashboardData } from "@/hooks/use-dashboard-data"
 
-const fetcher = (url: string) => fetch(url).then((r) => r.json())
+type VotePhase = "pre-prepare" | "prepare" | "commit" | "decide" | "none"
+type VoteTally = { node: string; vote: VotePhase }
+
+const DASHBOARD_REFRESH_MS = 1500
 
 const phases = ["pre-prepare", "prepare", "commit", "decide"] as const
 const phaseDescriptions: Record<string, string> = {
@@ -32,25 +27,62 @@ const phaseColors: Record<string, string> = {
   decide: "var(--status-healthy)",
 }
 
+const votePhaseMap: Record<string, VotePhase> = {
+  proposal: "pre-prepare",
+  pre_prepare: "pre-prepare",
+  prepare: "prepare",
+  vote: "prepare",
+  precommit: "commit",
+  commit: "commit",
+  decide: "decide",
+  view_change: "none",
+}
+
 export default function AnimatedPbftVisualizer() {
-  const { data, error, isLoading } = useSWR<ConsensusStatus>("/api/consensus/status", fetcher, {
-    refreshInterval: 1500,
-    revalidateOnFocus: false,
-  })
+  const { data: dashboard, error, isLoading } = useDashboardData(DASHBOARD_REFRESH_MS)
 
-  const currentPhase = data?.phase ?? "pre-prepare"
-  const currentPhaseIndex = phases.indexOf(currentPhase)
-  const votes = data?.votes ?? []
+  const consensus = dashboard?.consensus
 
-  // Count votes by phase
-  const voteCounts = {
-    "pre-prepare": votes.filter((v) => v.vote === "pre-prepare").length,
-    prepare: votes.filter((v) => v.vote === "prepare").length,
-    commit: votes.filter((v) => v.vote === "commit").length,
-    decide: votes.filter((v) => v.vote === "decide").length,
-  }
+  const currentPhase = (consensus?.phase as VotePhase) ?? "pre-prepare"
+  const currentPhaseIndex = phases.indexOf(currentPhase as (typeof phases)[number])
 
-  const totalVotes = votes.length || 1
+  const voteTallies = useMemo<VoteTally[]>(() => {
+    const entries = consensus?.votes ?? []
+    const tallies: VoteTally[] = []
+    entries.forEach((vote) => {
+      const phase = votePhaseMap[vote.type] ?? "none"
+      const sampleSize = Math.min(vote.count, 12)
+      for (let i = 0; i < sampleSize; i += 1) {
+        tallies.push({ node: `${vote.type}-${i + 1}`, vote: phase })
+      }
+    })
+    return tallies
+  }, [consensus?.votes])
+
+  const voteCounts = useMemo(() => {
+    const counts: Record<(typeof phases)[number], number> = {
+      "pre-prepare": 0,
+      prepare: 0,
+      commit: 0,
+      decide: 0,
+    }
+    ;(consensus?.votes ?? []).forEach((vote) => {
+      const phase = votePhaseMap[vote.type]
+      if (phase && phase !== "none") {
+        counts[phase as (typeof phases)[number]] += vote.count
+      }
+    })
+    return counts
+  }, [consensus?.votes])
+
+  const totalVotes = useMemo(() => {
+    const tallySum = (Object.values(voteCounts) as number[]).reduce((sum, value) => sum + value, 0)
+    return Math.max(consensus?.quorum_size ?? 0, tallySum, voteTallies.length, 1)
+  }, [consensus?.quorum_size, voteCounts, voteTallies.length])
+
+  const leaderLabel = consensus?.leader ?? consensus?.leader_id ?? "—"
+  const updatedAt = consensus?.updated_at ? new Date(consensus.updated_at).toLocaleTimeString() : null
+  const primaryLoading = !dashboard && isLoading
 
   return (
     <Card className="glass-card overflow-hidden">
@@ -59,11 +91,13 @@ export default function AnimatedPbftVisualizer() {
         <div className="text-center mb-8">
           <h3 className="text-xl font-semibold text-foreground">PBFT Consensus Flow</h3>
           <p className="text-sm text-muted-foreground mt-2">
-            {isLoading
+            {primaryLoading
               ? "Loading consensus state..."
               : error
                 ? "Error loading consensus"
-                : `Round ${data?.round ?? "—"} • Term ${data?.term ?? "—"} • Leader: ${data?.leader ?? "—"}`}
+                : `Term ${consensus?.term ?? "—"} • Leader: ${leaderLabel}${
+                    updatedAt ? ` • Updated ${updatedAt}` : ""
+                  }`}
           </p>
         </div>
 
@@ -73,8 +107,8 @@ export default function AnimatedPbftVisualizer() {
             {phases.map((phase, idx) => {
               const isActive = idx === currentPhaseIndex
               const isCompleted = idx < currentPhaseIndex
-              const phaseVotes = voteCounts[phase]
-              const votePercentage = (phaseVotes / totalVotes) * 100
+              const phaseVotes = voteCounts[phase] ?? 0
+              const votePercentage = totalVotes > 0 ? (phaseVotes / totalVotes) * 100 : 0
 
               return (
                 <motion.div
@@ -145,7 +179,7 @@ export default function AnimatedPbftVisualizer() {
                   {/* Phase label */}
                   <div className="text-center">
                     <p className="text-xs font-semibold text-foreground capitalize">{phase}</p>
-                    <p className="text-[10px] text-muted-foreground mt-1">{phaseDescriptions[phase]}</p>
+                    <p className="text-2xs text-muted-foreground mt-1">{phaseDescriptions[phase]}</p>
                   </div>
 
                   {/* Vote progress bar */}
@@ -206,7 +240,9 @@ export default function AnimatedPbftVisualizer() {
             transition={{ delay: 0.5 }}
           >
             <p className="text-xs text-muted-foreground">Leader</p>
-            <p className="font-semibold text-foreground mt-1 text-sm">{data?.leader?.slice(0, 8) ?? "—"}...</p>
+            <p className="font-semibold text-foreground mt-1 text-sm truncate">
+              {leaderLabel && leaderLabel.length > 10 ? `${leaderLabel.slice(0, 8)}…` : leaderLabel}
+            </p>
           </motion.div>
 
           <motion.div
@@ -216,7 +252,7 @@ export default function AnimatedPbftVisualizer() {
             transition={{ delay: 0.6 }}
           >
             <p className="text-xs text-muted-foreground">Round</p>
-            <p className="font-semibold text-foreground mt-1">{data?.round ?? "—"}</p>
+            <p className="font-semibold text-foreground mt-1">{consensus?.term ?? "—"}</p>
           </motion.div>
 
           <motion.div

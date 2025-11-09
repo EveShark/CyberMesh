@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -13,36 +14,20 @@ import (
 	"backend/pkg/utils"
 )
 
-func (s *Server) handleAIMetrics(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeErrorResponse(w, r, "METHOD_NOT_ALLOWED", "only GET method allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
+func (s *Server) collectAIMetrics(ctx context.Context) (*AIMetricsResponse, error) {
 	if s.aiClient == nil || strings.TrimSpace(s.aiBaseURL) == "" {
-		writeErrorResponse(w, r, "AI_SERVICE_DISABLED", "ai service integration disabled", http.StatusServiceUnavailable)
-		return
+		return nil, fmt.Errorf("ai service integration disabled")
 	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
-	defer cancel()
 
 	payload, err := s.fetchAIDetectionStats(ctx)
 	if err != nil {
-		if s.logger != nil {
-			s.logger.ErrorContext(ctx, "failed to fetch AI detection stats",
-				utils.ZapError(err))
-		}
-		writeErrorResponse(w, r, "AI_SERVICE_UNAVAILABLE", "failed to fetch detection stats", http.StatusBadGateway)
-		return
+		return nil, err
 	}
-
 	if payload == nil {
-		writeErrorResponse(w, r, "AI_SERVICE_NO_DATA", "ai service returned empty payload", http.StatusBadGateway)
-		return
+		return nil, fmt.Errorf("ai service returned empty payload")
 	}
 
-	response := AIMetricsResponse{
+	response := &AIMetricsResponse{
 		Status:   payload.Status,
 		State:    payload.State,
 		Message:  payload.Message,
@@ -51,13 +36,25 @@ func (s *Server) handleAIMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if payload.DetectionLoop != nil {
+		var issues []string
+		if len(payload.DetectionLoop.Issues) > 0 {
+			issues = append([]string(nil), payload.DetectionLoop.Issues...)
+		}
 		response.Loop = &AiDetectionLoopSummary{
 			Running:                   payload.DetectionLoop.Running,
+			Status:                    payload.DetectionLoop.Status,
+			Message:                   payload.DetectionLoop.Message,
+			Issues:                    issues,
+			Blocking:                  payload.DetectionLoop.Blocking,
+			Healthy:                   payload.DetectionLoop.Healthy,
 			AvgLatencyMs:              payload.DetectionLoop.AvgLatencyMs,
 			LastLatencyMs:             payload.DetectionLoop.LastLatencyMs,
 			SecondsSinceLastDetection: payload.DetectionLoop.SecondsSinceLastDetection,
 			SecondsSinceLastIteration: payload.DetectionLoop.SecondsSinceLastIteration,
 			CacheAgeSeconds:           payload.DetectionLoop.CacheAgeSeconds,
+		}
+		if counters := mapAIDetectionLoopCounters(payload.DetectionLoop.Metrics); counters != nil {
+			response.Loop.Counters = counters
 		}
 	}
 
@@ -71,7 +68,29 @@ func (s *Server) handleAIMetrics(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSONResponse(w, r, NewSuccessResponse(response), http.StatusOK)
+	return response, nil
+}
+
+func (s *Server) handleAIMetrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeErrorResponse(w, r, "METHOD_NOT_ALLOWED", "only GET method allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
+	defer cancel()
+
+	metrics, err := s.collectAIMetrics(ctx)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.ErrorContext(ctx, "failed to fetch AI detection stats",
+				utils.ZapError(err))
+		}
+		writeErrorResponse(w, r, "AI_SERVICE_UNAVAILABLE", "failed to fetch detection stats", http.StatusBadGateway)
+		return
+	}
+
+	writeJSONResponse(w, r, NewSuccessResponse(metrics), http.StatusOK)
 }
 
 func (s *Server) handleAIVariants(w http.ResponseWriter, r *http.Request) {
@@ -329,6 +348,53 @@ func mapAiVariantMetrics(payload []aiDetectionVariantEntry) []AiVariantMetric {
 		})
 	}
 	return variants
+}
+
+func mapAIDetectionLoopCounters(metrics map[string]float64) *AiDetectionLoopCounters {
+	if len(metrics) == 0 {
+		return nil
+	}
+
+	var counters AiDetectionLoopCounters
+	found := false
+
+	if value, ok := extractUintCounter(metrics, "detections_total"); ok {
+		counters.DetectionsTotal = value
+		found = true
+	}
+	if value, ok := extractUintCounter(metrics, "detections_published"); ok {
+		counters.DetectionsPublished = value
+		found = true
+	}
+	if value, ok := extractUintCounter(metrics, "detections_rate_limited"); ok {
+		counters.DetectionsRateLimited = value
+		found = true
+	}
+	if value, ok := extractUintCounter(metrics, "errors"); ok {
+		counters.Errors = value
+		found = true
+	}
+	if value, ok := extractUintCounter(metrics, "loop_iterations"); ok {
+		counters.LoopIterations = value
+		found = true
+	}
+
+	if !found {
+		return nil
+	}
+
+	return &counters
+}
+
+func extractUintCounter(metrics map[string]float64, key string) (uint64, bool) {
+	value, ok := metrics[key]
+	if !ok || math.IsNaN(value) {
+		return 0, false
+	}
+	if value < 0 {
+		return 0, false
+	}
+	return uint64(math.Trunc(value + 1e-9)), true
 }
 
 func clampIntValue(value, min, max int) int {

@@ -1,9 +1,10 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useMemo } from "react"
 
-import { backendApi } from "@/lib/api"
 import type { BlockSummary } from "@/lib/api"
+
+import { useDashboardData } from "./use-dashboard-data"
 
 interface UseBlockDetailsOptions {
   includeTransactions?: boolean
@@ -19,62 +20,44 @@ interface UseBlockDetailsResult {
 
 export function useBlockDetails(
   height?: number,
-  { includeTransactions = true, enabled = true }: UseBlockDetailsOptions = {},
+  { includeTransactions: _includeTransactions = true, enabled = true }: UseBlockDetailsOptions = {},
 ): UseBlockDetailsResult {
-  const [block, setBlock] = useState<BlockSummary | null>(null)
-  const [isLoading, setIsLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const abortRef = useRef<AbortController | null>(null)
+  const { data: dashboard, error: dashboardError, isLoading, mutate } = useDashboardData(15000)
 
-  const shouldFetch = useMemo(() => enabled && typeof height === "number" && height >= 0, [enabled, height])
+  void _includeTransactions
 
-  const cancelOngoing = useCallback(() => {
-    abortRef.current?.abort()
-    abortRef.current = null
-  }, [])
+  const shouldLookup = useMemo(() => enabled && typeof height === "number" && height >= 0, [enabled, height])
 
-  const load = useCallback(async () => {
-    if (!shouldFetch) {
-      setBlock(null)
-      setError(null)
-      return
+  const block = useMemo<BlockSummary | null>(() => {
+    if (!shouldLookup || !dashboard) {
+      return null
     }
 
-    cancelOngoing()
-    const controller = new AbortController()
-    abortRef.current = controller
-    setIsLoading(true)
-    setError(null)
+    const recent = dashboard.blocks?.recent ?? []
+    const match = recent.find((candidate) => candidate.height === height)
+    return match ?? null
+  }, [dashboard, height, shouldLookup])
 
-    try {
-      const result = await backendApi.getBlockByHeight(height!, includeTransactions)
-      if (!controller.signal.aborted) {
-        setBlock(result)
-      }
-    } catch (err) {
-      if (!controller.signal.aborted) {
-        setError(err instanceof Error ? err.message : "Failed to load block details")
-        setBlock(null)
-      }
-    } finally {
-      if (!controller.signal.aborted) {
-        setIsLoading(false)
-      }
+  const error = useMemo(() => {
+    if (!shouldLookup) {
+      return null
     }
-  }, [cancelOngoing, height, includeTransactions, shouldFetch])
-
-  useEffect(() => {
-    load()
-    return cancelOngoing
-  }, [load, cancelOngoing])
+    if (dashboardError) {
+      return dashboardError instanceof Error ? dashboardError.message : String(dashboardError)
+    }
+    if (dashboard && !block) {
+      return "Block not found in dashboard snapshot"
+    }
+    return null
+  }, [block, dashboard, dashboardError, shouldLookup])
 
   const refresh = useCallback(async () => {
-    await load()
-  }, [load])
+    await mutate()
+  }, [mutate])
 
   return {
     block,
-    isLoading,
+    isLoading: shouldLookup && (isLoading || (!dashboard && !block)),
     error,
     refresh,
   }

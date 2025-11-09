@@ -36,6 +36,7 @@ type AnomalyMsg struct {
 	PubKey       []byte   // Public key (32 bytes Ed25519)
 	Alg          string   // "Ed25519"
 	ContentHash  [32]byte // SHA-256 of canonical content
+	Raw          []byte   // Original protobuf bytes
 }
 
 // EvidenceMsg represents ai.evidence.v1 message from AI service
@@ -278,6 +279,9 @@ func DecodeAnomalyMsg(data []byte) (*AnomalyMsg, error) {
 		return nil, fmt.Errorf("protobuf unmarshal failed: %w", err)
 	}
 
+	raw := make([]byte, len(data))
+	copy(raw, data)
+
 	var contentHash [32]byte
 	if len(p.ContentHash) == 32 {
 		copy(contentHash[:], p.ContentHash)
@@ -298,6 +302,7 @@ func DecodeAnomalyMsg(data []byte) (*AnomalyMsg, error) {
 		PubKey:       p.Pubkey,
 		Alg:          p.Alg,
 		ContentHash:  contentHash,
+		Raw:          raw,
 	}
 	return msg, nil
 }

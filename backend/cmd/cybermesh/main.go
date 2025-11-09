@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -38,49 +39,164 @@ import (
 )
 
 type validatorSet struct {
-	index   map[ctypes.ValidatorID]ctypes.ValidatorInfo
-	ordered []ctypes.ValidatorInfo
+	mu         sync.RWMutex
+	index      map[ctypes.ValidatorID]*ctypes.ValidatorInfo
+	ordered    []*ctypes.ValidatorInfo
+	activity   map[ctypes.ValidatorID]*validatorActivity
+	inactivity time.Duration
 }
 
-func newValidatorSet(infos []ctypes.ValidatorInfo) *validatorSet {
-	idx := make(map[ctypes.ValidatorID]ctypes.ValidatorInfo, len(infos))
-	ord := make([]ctypes.ValidatorInfo, 0, len(infos))
-	for _, info := range infos {
-		idx[info.ID] = info
-		ord = append(ord, info)
+type validatorActivity struct {
+	active   bool
+	lastSeen time.Time
+}
+
+func newValidatorSet(infos []ctypes.ValidatorInfo, inactivity time.Duration) *validatorSet {
+	if inactivity <= 0 {
+		inactivity = 90 * time.Second
 	}
-	return &validatorSet{index: idx, ordered: ord}
+	idx := make(map[ctypes.ValidatorID]*ctypes.ValidatorInfo, len(infos))
+	ord := make([]*ctypes.ValidatorInfo, 0, len(infos))
+	activity := make(map[ctypes.ValidatorID]*validatorActivity, len(infos))
+	for _, info := range infos {
+		copy := info
+		idx[info.ID] = &copy
+		ord = append(ord, &copy)
+		activity[info.ID] = &validatorActivity{active: info.IsActive, lastSeen: info.LastSeen}
+	}
+	return &validatorSet{index: idx, ordered: ord, activity: activity, inactivity: inactivity}
 }
 
 func (s *validatorSet) IsValidator(id ctypes.ValidatorID) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	_, ok := s.index[id]
 	return ok
 }
 
 func (s *validatorSet) GetValidator(id ctypes.ValidatorID) (*ctypes.ValidatorInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if v, ok := s.index[id]; ok {
-		copy := v
+		s.applyInactivityLocked(id, time.Now())
+		copy := *v
 		return &copy, nil
 	}
 	return nil, fmt.Errorf("validator not found")
 }
 
 func (s *validatorSet) GetValidators() []ctypes.ValidatorInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
 	out := make([]ctypes.ValidatorInfo, len(s.ordered))
-	copy(out, s.ordered)
+	for i, ptr := range s.ordered {
+		if ptr == nil {
+			continue
+		}
+		id := ptr.ID
+		s.applyInactivityLocked(id, now)
+		out[i] = *ptr
+	}
 	return out
 }
 
 func (s *validatorSet) GetValidatorCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return len(s.ordered)
 }
 
 func (s *validatorSet) IsActive(id ctypes.ValidatorID) bool {
-	return s.IsValidator(id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.applyInactivityLocked(id, time.Now())
 }
 
 func (s *validatorSet) IsActiveInView(id ctypes.ValidatorID, _ uint64) bool {
-	return s.IsValidator(id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.applyInactivityLocked(id, time.Now())
+}
+
+func (s *validatorSet) MarkActive(id ctypes.ValidatorID, when time.Time) {
+	if when.IsZero() {
+		when = time.Now()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if v, ok := s.index[id]; ok && v != nil {
+		v.IsActive = true
+		if !when.IsZero() {
+			v.LastSeen = when
+		}
+	}
+	act, ok := s.activity[id]
+	if !ok {
+		act = &validatorActivity{}
+		s.activity[id] = act
+	}
+	act.active = true
+	if !when.IsZero() {
+		act.lastSeen = when
+	}
+}
+
+func (s *validatorSet) MarkInactive(id ctypes.ValidatorID, when time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if v, ok := s.index[id]; ok && v != nil {
+		v.IsActive = false
+		if !when.IsZero() {
+			v.LastSeen = when
+		}
+	}
+	act, ok := s.activity[id]
+	if !ok {
+		act = &validatorActivity{}
+		s.activity[id] = act
+	}
+	act.active = false
+	if !when.IsZero() {
+		act.lastSeen = when
+	}
+}
+
+func (s *validatorSet) LastActivity(id ctypes.ValidatorID) (time.Time, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	act, ok := s.activity[id]
+	if !ok || act == nil {
+		return time.Time{}, false
+	}
+	return act.lastSeen, true
+}
+
+func (s *validatorSet) applyInactivityLocked(id ctypes.ValidatorID, now time.Time) bool {
+	entry, ok := s.activity[id]
+	if !ok || entry == nil {
+		return false
+	}
+	if !entry.active {
+		if v := s.index[id]; v != nil {
+			v.IsActive = false
+		}
+		return false
+	}
+	if s.inactivity > 0 && !entry.lastSeen.IsZero() && now.Sub(entry.lastSeen) > s.inactivity {
+		entry.active = false
+		if v := s.index[id]; v != nil {
+			v.IsActive = false
+		}
+		return false
+	}
+	if v := s.index[id]; v != nil {
+		v.IsActive = entry.active
+		if !entry.lastSeen.IsZero() {
+			v.LastSeen = entry.lastSeen
+		}
+	}
+	return entry.active
 }
 
 func main() {
@@ -167,7 +283,12 @@ func main() {
 		log.Fatalf("load validator infos failed: %v", err)
 	}
 
-	vSet := newValidatorSet(validatorInfos)
+	inactivityTTL := cfgMgr.GetDuration("CONSENSUS_VALIDATOR_INACTIVITY_TIMEOUT", 2*time.Minute)
+	if inactivityTTL <= 0 {
+		inactivityTTL = 2 * time.Minute
+	}
+
+	vSet := newValidatorSet(validatorInfos, inactivityTTL)
 	// Build crypto adapter with validator registry so verification can use peers' public keys (fixes BUG-032)
 	cryptoAdapter := api.NewCryptoAdapter(cryptoSvc, vSet)
 	localValidatorID := deriveValidatorID(localPublicKey)
@@ -661,16 +782,50 @@ func loadValidatorInfos(cfgMgr *utils.ConfigManager, consensusNodes []int, local
 			return nil, fmt.Errorf("duplicate validator id derived for node %d", node)
 		}
 		seen[id] = struct{}{}
+
+		active := cfgMgr.GetBool(fmt.Sprintf("VALIDATOR_%d_BOOTSTRAP_ACTIVE", node), node == localNodeID)
+		lastSeen := time.Time{}
+		if node == localNodeID {
+			lastSeen = time.Now().UTC()
+		}
+		peerID, err := deriveConfiguredPeerID(cfgMgr, node, pubKey)
+		if err != nil {
+			return nil, err
+		}
+
 		infos = append(infos, ctypes.ValidatorInfo{
 			ID:         id,
 			PublicKey:  append([]byte(nil), pubKey...),
+			PeerID:     peerID,
 			Reputation: 1.0,
-			IsActive:   true,
+			IsActive:   active,
 			JoinedView: 0,
+			LastSeen:   lastSeen,
 		})
 	}
 
 	return infos, nil
+}
+
+func deriveConfiguredPeerID(cfgMgr *utils.ConfigManager, node int, pubKey []byte) (string, error) {
+	seedKey := fmt.Sprintf("P2P_ID_SEED_%d", node)
+	seedHex := strings.TrimSpace(cfgMgr.GetString(seedKey, ""))
+	if seedHex != "" {
+		seed, err := hex.DecodeString(seedHex)
+		if err != nil {
+			return "", fmt.Errorf("invalid %s: %w", seedKey, err)
+		}
+		pid, err := p2p.DerivePeerIDFromSeed(seed)
+		if err != nil {
+			return "", fmt.Errorf("derive peer id from %s failed: %w", seedKey, err)
+		}
+		return pid.String(), nil
+	}
+	pid, err := p2p.DerivePeerIDFromPublicKey(pubKey)
+	if err != nil {
+		return "", fmt.Errorf("derive peer id from public key for node %d failed: %w", node, err)
+	}
+	return pid.String(), nil
 }
 
 func ensureLocalPublicKeyConsistency(cfgMgr *utils.ConfigManager, node int, pubKey []byte) error {
@@ -758,6 +913,7 @@ func buildWiringConfig(
 		TimestampSkew:     cfgMgr.GetDuration("STATE_TIMESTAMP_SKEW", 30*time.Second),
 		GenesisHash:       [32]byte{},
 		BlockTimeout:      cfgMgr.GetDuration("CONSENSUS_BLOCK_TIMEOUT", 5*time.Second),
+		AllowSoloProposal: cfgMgr.GetBool("CONSENSUS_ALLOW_SOLO_PROPOSAL", false),
 		EnablePersistence: false,
 		EnableKafka:       enableKafka,
 		ConfigManager:     cfgMgr,
@@ -782,6 +938,9 @@ func buildWiringConfig(
 			VerifierCfg: kafka.VerifierConfig{
 				MaxTimestampSkew: cfgMgr.GetDuration("KAFKA_MAX_TIMESTAMP_SKEW", 5*time.Minute),
 			},
+			RetryMax:         cfgMgr.GetInt("KAFKA_CONSUMER_RETRY_MAX", 5),
+			RetryBackoffBase: time.Duration(cfgMgr.GetInt("KAFKA_CONSUMER_RETRY_BACKOFF_MS", 100)) * time.Millisecond,
+			RetryBackoffMax:  time.Duration(cfgMgr.GetInt("KAFKA_CONSUMER_RETRY_BACKOFF_MAX_MS", 5000)) * time.Millisecond,
 		}
 
 		logger.Info("Kafka consumer configured",

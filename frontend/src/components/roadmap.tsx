@@ -1,8 +1,7 @@
 "use client"
 
 import { Card, CardContent } from "@/components/ui/card"
-import { CheckCircle2 } from "lucide-react"
-import { DotFilledIcon } from "@radix-ui/react-icons"
+import { CheckCircle2, Dot } from "lucide-react"
 
 interface RoadmapProps {
   detectionTotal?: number
@@ -59,7 +58,7 @@ export function Roadmap({ detectionTotal }: RoadmapProps) {
                   {phase.completed ? (
                     <CheckCircle2 className="h-5 w-5 text-emerald-400" />
                   ) : (
-                    <DotFilledIcon className="h-5 w-5 text-muted-foreground" />
+                    <Dot className="h-5 w-5 text-muted-foreground" />
                   )}
                   <span className="text-sm font-semibold text-muted-foreground">{phase.quarter}</span>
                 </div>

@@ -6,8 +6,7 @@ import { SuspiciousNodesTable } from "@/components/suspicious-nodes-table"
 import { ConsensusCharts } from "@/components/consensus-charts"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
-import { RefreshCw } from "lucide-react"
-import { GearIcon } from "@radix-ui/react-icons"
+import { RefreshCw, Settings } from "lucide-react"
 import { useConsensusData } from "@/hooks/use-consensus-data"
 import PbftLiveVisualizer, { type VotePhase } from "@/components/pbft-live-visualizer"
 import { PageContainer } from "@/components/page-container"
@@ -123,7 +122,7 @@ export default function ConsensusPage() {
                 Refresh
               </Button>
               <Button variant="outline" size="sm">
-                <GearIcon className="h-4 w-4 mr-2" />
+                <Settings className="h-4 w-4 mr-2" />
                 Settings
               </Button>
             </div>

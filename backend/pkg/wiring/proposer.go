@@ -125,6 +125,7 @@ func (s *Service) tryPropose(ctx context.Context) {
 		// Get validator count to calculate Byzantine quorum
 		validators := s.eng.ListValidators()
 		totalValidators := len(validators)
+		overrideQuorum := false
 
 		// Calculate Byzantine fault tolerance: f = (N-1)/3, quorum = 2f+1
 		var requiredQuorum int
@@ -141,33 +142,59 @@ func (s *Service) tryPropose(ctx context.Context) {
 
 		connectedPeers := s.router.GetConnectedPeerCount()
 		if connectedPeers < requiredPeers {
-			s.log.WarnContext(ctx, "skipping proposal: insufficient peer quorum",
-				utils.ZapInt("connected_peers", connectedPeers),
-				utils.ZapInt("required_peers", requiredPeers),
-				utils.ZapInt("total_validators", totalValidators),
-				utils.ZapInt("byzantine_f", (totalValidators-1)/3),
-				utils.ZapInt("quorum_2f+1", requiredQuorum),
-				utils.ZapUint64("view", currentView))
-			return
+			if s.cfg.AllowSoloProposal {
+				s.log.WarnContext(ctx, "peer quorum override enabled - proceeding without required peers",
+					utils.ZapInt("connected_peers", connectedPeers),
+					utils.ZapInt("required_peers", requiredPeers),
+					utils.ZapInt("total_validators", totalValidators),
+					utils.ZapInt("byzantine_f", (totalValidators-1)/3),
+					utils.ZapInt("quorum_2f+1", requiredQuorum),
+					utils.ZapUint64("view", currentView))
+				overrideQuorum = true
+			} else {
+				s.log.WarnContext(ctx, "skipping proposal: insufficient peer quorum",
+					utils.ZapInt("connected_peers", connectedPeers),
+					utils.ZapInt("required_peers", requiredPeers),
+					utils.ZapInt("total_validators", totalValidators),
+					utils.ZapInt("byzantine_f", (totalValidators-1)/3),
+					utils.ZapInt("quorum_2f+1", requiredQuorum),
+					utils.ZapUint64("view", currentView))
+				return
+			}
 		}
 
 		// Verify peers are active, not just connected
 		activePeers := s.router.GetActivePeerCount(20 * time.Second)
 		if activePeers < requiredPeers {
-			s.log.WarnContext(ctx, "skipping proposal: peers connected but inactive",
-				utils.ZapInt("connected_peers", connectedPeers),
-				utils.ZapInt("active_peers", activePeers),
-				utils.ZapInt("required_peers", requiredPeers),
-				utils.ZapInt("total_validators", totalValidators),
-				utils.ZapUint64("view", currentView))
-			return
+			if s.cfg.AllowSoloProposal {
+				s.log.WarnContext(ctx, "peer activity override enabled - proceeding despite inactive peers",
+					utils.ZapInt("connected_peers", connectedPeers),
+					utils.ZapInt("active_peers", activePeers),
+					utils.ZapInt("required_peers", requiredPeers),
+					utils.ZapInt("total_validators", totalValidators),
+					utils.ZapUint64("view", currentView))
+				overrideQuorum = true
+			} else {
+				s.log.WarnContext(ctx, "skipping proposal: peers connected but inactive",
+					utils.ZapInt("connected_peers", connectedPeers),
+					utils.ZapInt("active_peers", activePeers),
+					utils.ZapInt("required_peers", requiredPeers),
+					utils.ZapInt("total_validators", totalValidators),
+					utils.ZapUint64("view", currentView))
+				return
+			}
 		}
 
-		s.log.InfoContext(ctx, "quorum check passed",
+		msg := "quorum check passed"
+		if overrideQuorum {
+			msg = "quorum check override active"
+		}
+		s.log.InfoContext(ctx, msg,
 			utils.ZapInt("connected_peers", connectedPeers),
 			utils.ZapInt("active_peers", activePeers),
 			utils.ZapInt("required_quorum", requiredQuorum),
-			utils.ZapInt("total_validators", totalValidators))
+			utils.ZapInt("total_validators", totalValidators),
+			utils.ZapBool("override", overrideQuorum))
 	}
 
 	// Check leadership

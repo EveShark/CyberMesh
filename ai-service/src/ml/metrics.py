@@ -13,7 +13,7 @@ No secrets in metrics - security-first.
 import time
 
 from prometheus_client import Histogram, Counter, Gauge
-from typing import Dict
+from typing import Dict, Optional
 from .types import EnsembleDecision
 
 
@@ -23,9 +23,17 @@ class PrometheusMetrics:
     
     All metrics prefixed with 'ml_' to avoid collisions.
     """
+
+    _shared_metrics: Dict[str, object] = {}
+    _initialized: bool = False
     
     def __init__(self):
         """Initialize all Prometheus metrics."""
+
+        if PrometheusMetrics._initialized:
+            for name, metric in PrometheusMetrics._shared_metrics.items():
+                setattr(self, name, metric)
+            return
         
         # Latency histograms (milliseconds)
         self.telemetry_latency = Histogram(
@@ -116,6 +124,36 @@ class PrometheusMetrics:
             'Detection loop errors'
         )
 
+        self.telemetry_connect_latency = Histogram(
+            'ml_telemetry_connect_ms',
+            'PostgreSQL connect latency in milliseconds',
+            buckets=[1, 5, 10, 25, 50, 100, 250, 500, 1000]
+        )
+
+        self.telemetry_query_latency = Histogram(
+            'ml_telemetry_query_ms',
+            'PostgreSQL query latency in milliseconds',
+            buckets=[1, 5, 10, 25, 50, 100, 250, 500, 1000]
+        )
+
+        self.telemetry_fetch_latency = Histogram(
+            'ml_telemetry_fetch_ms',
+            'PostgreSQL fetch latency in milliseconds',
+            buckets=[1, 5, 10, 25, 50, 100, 250, 500, 1000]
+        )
+
+        self.telemetry_convert_latency = Histogram(
+            'ml_telemetry_convert_ms',
+            'Telemetry conversion latency in milliseconds',
+            buckets=[1, 5, 10, 25, 50, 100, 250, 500, 1000]
+        )
+
+        self.telemetry_total_latency = Histogram(
+            'ml_telemetry_total_ms',
+            'Total telemetry pipeline latency in milliseconds',
+            buckets=[5, 10, 25, 50, 100, 250, 500, 1000, 2000]
+        )
+
         self.engine_candidates = Counter(
             'ml_engine_candidates_total',
             'Detection candidates produced per engine',
@@ -197,6 +235,44 @@ class PrometheusMetrics:
             'DLQ actions for variant validation failures',
             ['variant', 'reason']
         )
+
+        PrometheusMetrics._shared_metrics = {
+            'telemetry_latency': self.telemetry_latency,
+            'feature_latency': self.feature_latency,
+            'engine_latency': self.engine_latency,
+            'ensemble_latency': self.ensemble_latency,
+            'evidence_latency': self.evidence_latency,
+            'total_latency': self.total_latency,
+            'detections': self.detections,
+            'abstentions': self.abstentions,
+            'pipeline_runs': self.pipeline_runs,
+            'detection_loop_running': self.detection_loop_running,
+            'detection_loop_last_iteration': self.detection_loop_last_iteration,
+            'detection_loop_last_detection': self.detection_loop_last_detection,
+            'detection_iteration_latency': self.detection_iteration_latency,
+            'detection_decisions': self.detection_decisions,
+            'detection_errors': self.detection_errors,
+            'telemetry_connect_latency': self.telemetry_connect_latency,
+            'telemetry_query_latency': self.telemetry_query_latency,
+            'telemetry_fetch_latency': self.telemetry_fetch_latency,
+            'telemetry_convert_latency': self.telemetry_convert_latency,
+            'telemetry_total_latency': self.telemetry_total_latency,
+            'engine_candidates': self.engine_candidates,
+            'engine_published': self.engine_published,
+            'engine_confidence_sum': self.engine_confidence_sum,
+            'engine_confidence_count': self.engine_confidence_count,
+            'confidence_dist': self.confidence_dist,
+            'llr_dist': self.llr_dist,
+            'quality_score_dist': self.quality_score_dist,
+            'engine_ready': self.engine_ready,
+            'candidate_count': self.candidate_count,
+            'feature_count': self.feature_count,
+            'variant_inference_latency': self.variant_inference_latency,
+            'variant_inferences': self.variant_inferences,
+            'variant_dlq': self.variant_dlq,
+        }
+
+        PrometheusMetrics._initialized = True
     
     def record_pipeline_result(
         self,
@@ -337,5 +413,28 @@ class PrometheusMetrics:
                 self.engine_confidence_count.labels(engine_type=engine_type).inc(candidates)
             if published > 0:
                 self.engine_published.labels(engine_type=engine_type).inc(published)
+        except Exception:
+            pass
+
+    def record_db_timings(
+        self,
+        *,
+        connect_ms: Optional[float] = None,
+        query_ms: Optional[float] = None,
+        fetch_ms: Optional[float] = None,
+        convert_ms: Optional[float] = None,
+        total_ms: Optional[float] = None,
+    ) -> None:
+        try:
+            if connect_ms is not None:
+                self.telemetry_connect_latency.observe(connect_ms)
+            if query_ms is not None:
+                self.telemetry_query_latency.observe(query_ms)
+            if fetch_ms is not None:
+                self.telemetry_fetch_latency.observe(fetch_ms)
+            if convert_ms is not None:
+                self.telemetry_convert_latency.observe(convert_ms)
+            if total_ms is not None:
+                self.telemetry_total_latency.observe(total_ms)
         except Exception:
             pass

@@ -35,6 +35,15 @@ spec:
     spec:
       serviceAccountName: ai-service-sa
       
+      # Topology spread: spread AI service across zones
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: ai-service
+      
       # Prefer stateless node for better distribution
       affinity:
         nodeAffinity:

@@ -7,10 +7,10 @@ AI consumer: src/kafka/consumer.py
 
 Security: Ed25519 signature verification from trusted backend validators
 """
-import hashlib
 import json
+import uuid
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives import serialization
 
@@ -124,6 +124,7 @@ class CommitEvent:
     """
     
     DOMAIN = "control.commits.v1"
+    MAX_ANOMALY_IDS = 10_000
     
     # Class-level trust store (shared across all instances)
     _trust_store: Optional[BackendValidatorTrustStore] = None
@@ -150,6 +151,7 @@ class CommitEvent:
         anomaly_count: int,
         evidence_count: int,
         policy_count: int,
+        anomaly_ids: Optional[Sequence[str]],
         timestamp: int,
         producer_id: bytes,
         signature: bytes,
@@ -179,10 +181,23 @@ class CommitEvent:
         if self._trust_store is None:
             raise ContractError("Trust store not initialized. Call CommitEvent.initialize_trust_store() first.")
         
+        if anomaly_ids is None:
+            anomaly_ids = []
+
         self._validate_inputs(
-            height, block_hash, state_root, tx_count, anomaly_count,
-            evidence_count, policy_count, timestamp, producer_id,
-            signature, pubkey, alg
+            height,
+            block_hash,
+            state_root,
+            tx_count,
+            anomaly_count,
+            evidence_count,
+            policy_count,
+            anomaly_ids,
+            timestamp,
+            producer_id,
+            signature,
+            pubkey,
+            alg,
         )
         
         self.height = height
@@ -192,6 +207,7 @@ class CommitEvent:
         self.anomaly_count = anomaly_count
         self.evidence_count = evidence_count
         self.policy_count = policy_count
+        self.anomaly_ids = list(anomaly_ids)
         self.timestamp = timestamp
         self.producer_id = producer_id
         self.signature = signature
@@ -210,6 +226,7 @@ class CommitEvent:
         anomaly_count: int,
         evidence_count: int,
         policy_count: int,
+        anomaly_ids: Sequence[str],
         timestamp: int,
         producer_id: bytes,
         signature: bytes,
@@ -241,6 +258,30 @@ class CommitEvent:
             
             if policy_count < 0:
                 raise ContractError(f"Invalid policy_count: {policy_count}")
+
+            if isinstance(anomaly_ids, (str, bytes)):
+                raise ContractError("Invalid anomaly_ids: expected iterable of strings")
+
+            if len(anomaly_ids) > self.MAX_ANOMALY_IDS:
+                raise ContractError(
+                    f"Too many anomaly_ids: {len(anomaly_ids)} > {self.MAX_ANOMALY_IDS}"
+                )
+
+            for idx, anomaly_id in enumerate(anomaly_ids):
+                if not isinstance(anomaly_id, str) or not anomaly_id:
+                    raise ContractError(
+                        f"Invalid anomaly_id at index {idx}: {anomaly_id!r}"
+                    )
+                try:
+                    parsed_uuid = uuid.UUID(anomaly_id)
+                except ValueError as exc:
+                    raise ContractError(
+                        f"Invalid anomaly_id format at index {idx}: {anomaly_id!r}"
+                    ) from exc
+                if parsed_uuid.version != 4:
+                    raise ContractError(
+                        f"Invalid anomaly_id version at index {idx}: {anomaly_id!r}"
+                    )
             
             # Sanity check: sum of typed counts shouldn't exceed total
             typed_sum = anomaly_count + evidence_count + policy_count
@@ -278,22 +319,32 @@ class CommitEvent:
         """
         Verify Ed25519 signature from backend validator.
         
-        Signature format: domain||height||block_hash||state_root||timestamp
+        Signature format: domain||protobuf_marshaled(CommitEvent without signature fields)
         
         Raises:
             ContractError: Signature verification failure
         """
         try:
             # Build signed payload (matching backend's signing logic)
-            # Backend signs: domain + height + block_hash + state_root + timestamp
-            import struct
+            # Backend signs: domain + protobuf_bytes(CommitEvent)
+            # Reconstruct the protobuf message that was signed
+            sign_msg = control_commits_pb2.CommitEvent()
+            sign_msg.height = self.height
+            sign_msg.block_hash = self.block_hash
+            sign_msg.state_root = self.state_root
+            sign_msg.tx_count = self.tx_count
+            sign_msg.anomaly_count = self.anomaly_count
+            sign_msg.evidence_count = self.evidence_count
+            sign_msg.policy_count = self.policy_count
+            sign_msg.anomaly_ids.extend(self.anomaly_ids)
+            sign_msg.timestamp = self.timestamp
+            sign_msg.producer_id = self.producer_id
             
-            sign_bytes = b""
-            sign_bytes += self.DOMAIN.encode('utf-8')
-            sign_bytes += struct.pack('>q', self.height)  # int64 big-endian
-            sign_bytes += self.block_hash
-            sign_bytes += self.state_root
-            sign_bytes += struct.pack('>q', self.timestamp)  # int64 big-endian
+            # Marshal to protobuf bytes
+            payload = sign_msg.SerializeToString()
+            
+            # Build signature message: domain + payload
+            sign_bytes = self.DOMAIN.encode('utf-8') + payload
             
             # Load validator public key from trust store
             # Producer_id is the raw public key bytes, find matching validator
@@ -347,6 +398,7 @@ class CommitEvent:
                 anomaly_count=msg.anomaly_count,
                 evidence_count=msg.evidence_count,
                 policy_count=msg.policy_count,
+                anomaly_ids=msg.anomaly_ids,
                 timestamp=msg.timestamp,
                 producer_id=msg.producer_id,
                 signature=msg.signature,
@@ -366,6 +418,7 @@ class CommitEvent:
             "state_root": self.state_root.hex(),
             "tx_count": self.tx_count,
             "anomaly_count": self.anomaly_count,
+            "anomaly_ids": list(self.anomaly_ids),
             "evidence_count": self.evidence_count,
             "policy_count": self.policy_count,
             "timestamp": self.timestamp,

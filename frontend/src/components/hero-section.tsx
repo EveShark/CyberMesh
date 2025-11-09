@@ -1,8 +1,7 @@
 "use client"
 
 import { Button } from "@/components/ui/button"
-import { Zap } from "lucide-react"
-import { ArrowRightIcon } from "@radix-ui/react-icons"
+import { ArrowRight, Zap } from "lucide-react"
 
 interface HeroSectionProps {
   detectionAccuracy?: number
@@ -41,7 +40,7 @@ export function HeroSection({ detectionAccuracy, latencyMs, uptimePercentage }: 
         <div className="flex flex-col sm:flex-row gap-4 justify-center pt-4">
           <Button size="lg" className="gap-2 bg-primary hover:bg-primary/90">
             Schedule Demo
-            <ArrowRightIcon className="h-4 w-4" />
+            <ArrowRight className="h-4 w-4" />
           </Button>
           <Button size="lg" variant="outline" className="border-border/30 hover:bg-accent/10 bg-transparent">
             View Metrics

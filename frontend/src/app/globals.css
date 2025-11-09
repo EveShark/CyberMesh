@@ -493,6 +493,11 @@ html.dark {
 }
 
 @layer utilities {
+  .text-2xs {
+    font-size: 0.625rem;
+    line-height: 1rem;
+  }
+
   .glass {
     background: var(--glass-bg);
     border: 1px solid var(--glass-border);

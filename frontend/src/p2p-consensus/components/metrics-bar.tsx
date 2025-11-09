@@ -67,19 +67,14 @@ export default function MetricsBar({
         >
           <div className="flex items-start justify-between mb-3">
             <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{label}</span>
-            <Icon className="h-4 w-4 text-network/80" />
+            <Icon className="h-4 w-4 text-muted-foreground" />
           </div>
           <div className="flex items-baseline gap-1">
-            <span className="text-2xl font-semibold text-foreground">
-              <span className="font-mono text-network">{value ?? "--"}</span>
-            </span>
+            <span className="font-mono text-2xl font-semibold text-foreground">{value ?? "--"}</span>
             {unit ? <span className="text-sm text-muted-foreground">{unit}</span> : null}
           </div>
-          <div
-            className="mt-3 inline-flex items-center gap-1 rounded-full px-2 py-1 text-xs font-medium text-network"
-            style={{ backgroundColor: "color-mix(in oklch, var(--color-network) 12%, transparent)" }}
-          >
-            <TrendingUp className="h-3 w-3" />
+          <div className="mt-3 inline-flex items-center gap-1 rounded-full bg-muted/40 px-2 py-1 text-xs font-medium text-muted-foreground">
+            <TrendingUp className="h-3 w-3 text-muted-foreground" />
             Live telemetry
           </div>
         </Card>

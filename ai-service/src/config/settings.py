@@ -39,6 +39,10 @@ class DetectionConfig:
     malware_confidence_threshold: float = 0.90
     enable_ddos_pipeline: bool = True
     enable_malware_pipeline: bool = True
+    tracker_sample_window_size: int = 500
+    tracker_sample_cap: int = 100
+    tracker_batch_size: int = 50
+    tracker_flush_interval_seconds: int = 5
     
     def validate(self):
         """Validate detection configuration."""
@@ -177,6 +181,9 @@ class FeedbackConfig:
     calibration_model_path: str = "data/models/calibration"
     calibration_save_to_redis: bool = True
     calibration_redis_key: str = "calibration:model:current"
+
+    # Storage controls
+    disable_persistence: bool = False  # If true, feedback loop keeps data in-memory only
     
     def validate(self):
         """Validate feedback configuration."""
@@ -267,6 +274,17 @@ class Settings:
     detection_timeout: int = 30                  # Max seconds for single detection run
     telemetry_batch_size: int = 1000             # Flows per poll
     max_detections_per_second: int = 100         # Rate limit for publishing
+    max_flows_per_iteration: int = 100           # Max flows per detection loop iteration
+    detection_summary_interval: int = 10         # Iterations between summary logs
+    max_iteration_lag_seconds: int = 20          # Acceptable delay beyond interval
+    max_detection_gap_seconds: int = 600         # Warn if no detections within this window
+    max_loop_latency_warning_ms: int = 3000      # Warn if loop latency exceeds this threshold
+    detection_publish_flush: bool = False        # Force producer flush after publish
+    timestamp_skew_tolerance_seconds: int = 600  # Future timestamp tolerance for detections
+    tracker_sample_window_size: int = 500        # Detection events per sampling window
+    tracker_sample_cap: int = 100                # Max events persisted per window
+    tracker_batch_size: int = 50                 # Batch size for Redis writes
+    tracker_flush_interval_seconds: int = 5      # Max seconds between batch flushes
     
     # ML ensemble
     min_confidence: float = 0.85                 # Ensemble minimum confidence threshold
@@ -441,7 +459,11 @@ def load_settings() -> LegacySettings:
         ddos_confidence_threshold=_get_float_env("DETECTION_DDOS_CONFIDENCE_THRESHOLD", 0.85),
         malware_confidence_threshold=_get_float_env("DETECTION_MALWARE_CONFIDENCE_THRESHOLD", 0.90),
         enable_ddos_pipeline=_get_bool_env("DETECTION_ENABLE_DDOS", True),
-        enable_malware_pipeline=_get_bool_env("DETECTION_ENABLE_MALWARE", True)
+        enable_malware_pipeline=_get_bool_env("DETECTION_ENABLE_MALWARE", True),
+        tracker_sample_window_size=_get_int_env("TRACKER_SAMPLE_WINDOW_SIZE", 500),
+        tracker_sample_cap=_get_int_env("TRACKER_SAMPLE_CAP", 100),
+        tracker_batch_size=_get_int_env("TRACKER_BATCH_SIZE", 50),
+        tracker_flush_interval_seconds=_get_int_env("TRACKER_FLUSH_INTERVAL_SECONDS", 5),
     )
     
     limits = LimitsConfig(
@@ -503,7 +525,8 @@ def load_settings() -> LegacySettings:
         calibration_acceptance_threshold=_get_float_env("FEEDBACK_CALIBRATION_ACCEPTANCE_THRESHOLD", 0.60),
         calibration_model_path=_get_env("FEEDBACK_CALIBRATION_MODEL_PATH", "data/models/calibration"),
         calibration_save_to_redis=_get_bool_env("FEEDBACK_CALIBRATION_SAVE_TO_REDIS", True),
-        calibration_redis_key=_get_env("FEEDBACK_CALIBRATION_REDIS_KEY", "calibration:model:current")
+        calibration_redis_key=_get_env("FEEDBACK_CALIBRATION_REDIS_KEY", "calibration:model:current"),
+        disable_persistence=_get_bool_env("FEEDBACK_DISABLE_PERSISTENCE", False)
     )
     
     try:

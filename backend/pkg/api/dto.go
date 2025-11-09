@@ -61,23 +61,25 @@ type ReadinessResponse struct {
 	Timestamp int64                           `json:"timestamp"`
 	Details   map[string]interface{}          `json:"details,omitempty"`
 	Phase     string                          `json:"phase,omitempty"`
+	Warnings  []string                        `json:"warnings,omitempty"`
 }
 
 // Block DTOs
 
 // BlockResponse represents a block
 type BlockResponse struct {
-	Height           uint64                 `json:"height"`
-	Hash             string                 `json:"hash"`
-	ParentHash       string                 `json:"parent_hash"`
-	StateRoot        string                 `json:"state_root"`
-	Timestamp        int64                  `json:"timestamp"`
-	Proposer         string                 `json:"proposer"`
-	TransactionCount int                    `json:"transaction_count"`
-	AnomalyCount     int                    `json:"anomaly_count"`
-	SizeBytes        int                    `json:"size_bytes"`
-	Transactions     []TransactionResponse  `json:"transactions,omitempty"`
-	Metadata         map[string]interface{} `json:"metadata,omitempty"`
+	Height             uint64                 `json:"height"`
+	Hash               string                 `json:"hash"`
+	ParentHash         string                 `json:"parent_hash"`
+	StateRoot          string                 `json:"state_root"`
+	Timestamp          int64                  `json:"timestamp"`
+	Proposer           string                 `json:"proposer"`
+	TransactionCount   int                    `json:"transaction_count"`
+	AnomalyCount       int                    `json:"anomaly_count"`
+	SizeBytes          int                    `json:"size_bytes"`
+	SizeBytesEstimated bool                   `json:"size_bytes_estimated,omitempty"`
+	Transactions       []TransactionResponse  `json:"transactions,omitempty"`
+	Metadata           map[string]interface{} `json:"metadata,omitempty"`
 }
 
 // TransactionResponse represents a transaction in a block
@@ -287,6 +289,10 @@ type AIStats struct {
 	ReadyLatencyMs         float64  `json:"ready_latency_ms"`
 	State                  string   `json:"state,omitempty"`
 	DetectionLoopRunning   bool     `json:"detection_loop_running"`
+	DetectionLoopStatus    string   `json:"detection_loop_status,omitempty"`
+	DetectionLoopBlocking  bool     `json:"detection_loop_blocking,omitempty"`
+	DetectionLoopHealthy   bool     `json:"detection_loop_healthy,omitempty"`
+	DetectionLoopIssues    []string `json:"detection_loop_issues,omitempty"`
 	DetectionLoopLatencyMs float64  `json:"detection_loop_avg_latency_ms,omitempty"`
 	DetectionLoopLastMs    float64  `json:"detection_loop_last_latency_ms,omitempty"`
 	DetectionsPerMinute    *float64 `json:"detections_per_minute,omitempty"`
@@ -313,12 +319,26 @@ type AIMetricsResponse struct {
 
 // AiDetectionLoopSummary captures runtime loop metrics
 type AiDetectionLoopSummary struct {
-	Running                   bool     `json:"running"`
-	AvgLatencyMs              float64  `json:"avg_latency_ms"`
-	LastLatencyMs             float64  `json:"last_latency_ms"`
-	SecondsSinceLastDetection *float64 `json:"seconds_since_last_detection,omitempty"`
-	SecondsSinceLastIteration *float64 `json:"seconds_since_last_iteration,omitempty"`
-	CacheAgeSeconds           *float64 `json:"cache_age_seconds,omitempty"`
+	Running                   bool                     `json:"running"`
+	Status                    string                   `json:"status,omitempty"`
+	Message                   string                   `json:"message,omitempty"`
+	Issues                    []string                 `json:"issues,omitempty"`
+	Blocking                  bool                     `json:"blocking,omitempty"`
+	Healthy                   bool                     `json:"healthy,omitempty"`
+	AvgLatencyMs              float64                  `json:"avg_latency_ms"`
+	LastLatencyMs             float64                  `json:"last_latency_ms"`
+	SecondsSinceLastDetection *float64                 `json:"seconds_since_last_detection,omitempty"`
+	SecondsSinceLastIteration *float64                 `json:"seconds_since_last_iteration,omitempty"`
+	CacheAgeSeconds           *float64                 `json:"cache_age_seconds,omitempty"`
+	Counters                  *AiDetectionLoopCounters `json:"counters,omitempty"`
+}
+
+type AiDetectionLoopCounters struct {
+	DetectionsTotal       uint64 `json:"detections_total"`
+	DetectionsPublished   uint64 `json:"detections_published"`
+	DetectionsRateLimited uint64 `json:"detections_rate_limited"`
+	Errors                uint64 `json:"errors"`
+	LoopIterations        uint64 `json:"loop_iterations"`
 }
 
 // AiMetricsDerived contains derived KPIs
@@ -491,6 +511,235 @@ type ConsensusOverviewResponse struct {
 type SuspiciousNodesResponse struct {
 	Nodes     []SuspiciousNodeDTO `json:"nodes"`
 	UpdatedAt time.Time           `json:"updated_at"`
+}
+
+// DashboardOverviewResponse is the single snapshot consumed by the dashboard UI.
+// It merges runtime health, ledger state, validator/consensus insights, recent blocks
+// (including transaction metadata), and threat/AI telemetry into one payload so the
+// frontend can hydrate every tab without additional polling.
+type DashboardOverviewResponse struct {
+	Timestamp  int64                       `json:"timestamp"`
+	Backend    DashboardBackendSection     `json:"backend"`
+	Ledger     *DashboardLedgerSection     `json:"ledger,omitempty"`
+	Validators *DashboardValidatorsSection `json:"validators,omitempty"`
+	Network    *NetworkOverviewResponse    `json:"network,omitempty"`
+	Consensus  *ConsensusOverviewResponse  `json:"consensus,omitempty"`
+	Blocks     DashboardBlocksSection      `json:"blocks"`
+	Threats    DashboardThreatsSection     `json:"threats"`
+	AI         DashboardAISection          `json:"ai"`
+}
+
+// DashboardLedgerSection captures the current ledger snapshot derived from the
+// latest state version along with mempool pressure indicators.
+type DashboardLedgerSection struct {
+	LatestHeight             uint64  `json:"latest_height"`
+	StateVersion             uint64  `json:"state_version"`
+	TotalTransactions        uint64  `json:"total_transactions"`
+	AvgBlockTimeSeconds      float64 `json:"avg_block_time_seconds"`
+	AvgBlockSizeBytes        int     `json:"avg_block_size_bytes"`
+	StateRoot                string  `json:"state_root,omitempty"`
+	LastBlockHash            string  `json:"last_block_hash,omitempty"`
+	SnapshotBlockHeight      uint64  `json:"snapshot_block_height"`
+	SnapshotTransactionCount int     `json:"snapshot_transaction_count"`
+	SnapshotTimestamp        int64   `json:"snapshot_timestamp"`
+	ReputationChanges        int     `json:"reputation_changes"`
+	PolicyChanges            int     `json:"policy_changes"`
+	QuarantineChanges        int     `json:"quarantine_changes"`
+	PendingTransactions      int     `json:"pending_transactions"`
+	MempoolSizeBytes         int64   `json:"mempool_size_bytes"`
+	MempoolOldestTxAgeMs     float64 `json:"mempool_oldest_tx_age_ms"`
+}
+
+// DashboardValidatorsSection summarizes validator activity and exposes a
+// lightweight snapshot for UI drill-downs.
+type DashboardValidatorsSection struct {
+	Total      int                          `json:"total"`
+	Active     int                          `json:"active"`
+	Inactive   int                          `json:"inactive"`
+	Validators []DashboardValidatorSnapshot `json:"validators"`
+	UpdatedAt  int64                        `json:"updated_at"`
+}
+
+// DashboardValidatorSnapshot extends the public validator payload with alias,
+// uptime, and liveness metadata needed for the consolidated dashboard views.
+type DashboardValidatorSnapshot struct {
+	ValidatorResponse
+	Alias        string `json:"alias"`
+	PeerID       string `json:"peer_id,omitempty"`
+	LastSeenUnix int64  `json:"last_seen_unix,omitempty"`
+}
+
+type DashboardBackendSection struct {
+	Health    HealthResponse                  `json:"health"`
+	Readiness ReadinessResponse               `json:"readiness"`
+	Stats     StatsResponse                   `json:"stats"`
+	Metrics   DashboardBackendMetrics         `json:"metrics"`
+	Derived   DashboardBackendDerived         `json:"derived"`
+	History   []DashboardBackendHistorySample `json:"history"`
+}
+type DashboardBackendDerived struct {
+	MempoolLatencyMs      *float64 `json:"mempool_latency_ms,omitempty"`
+	ConsensusLatencyMs    *float64 `json:"consensus_latency_ms,omitempty"`
+	P2PLatencyMs          *float64 `json:"p2p_latency_ms,omitempty"`
+	AiLoopStatus          string   `json:"ai_loop_status,omitempty"`
+	AiLoopStatusUpdatedAt *int64   `json:"ai_loop_status_updated_at,omitempty"`
+	AiLoopBlocking        *bool    `json:"ai_loop_blocking,omitempty"`
+	AiLoopIssues          string   `json:"ai_loop_issues,omitempty"`
+	ThreatDataSource      string   `json:"threat_data_source,omitempty"`
+	ThreatSourceUpdatedAt *int64   `json:"threat_source_updated_at,omitempty"`
+	ThreatFallbackCount   *uint64  `json:"threat_fallback_count,omitempty"`
+	ThreatFallbackReason  string   `json:"threat_fallback_reason,omitempty"`
+	ThreatFallbackAt      *int64   `json:"threat_fallback_at,omitempty"`
+}
+
+type DashboardBackendHistorySample struct {
+	Timestamp            int64   `json:"timestamp"`
+	CPUSecondsTotal      float64 `json:"cpu_seconds_total"`
+	CPUPercent           float64 `json:"cpu_percent"`
+	ResidentMemoryBytes  uint64  `json:"resident_memory_bytes"`
+	HeapAllocBytes       uint64  `json:"heap_alloc_bytes"`
+	NetworkBytesSent     uint64  `json:"network_bytes_sent"`
+	NetworkBytesReceived uint64  `json:"network_bytes_received"`
+	MempoolSizeBytes     int64   `json:"mempool_size_bytes"`
+}
+
+type DashboardBackendMetrics struct {
+	Summary   DashboardRuntimeMetrics   `json:"summary"`
+	Requests  DashboardRequestMetrics   `json:"requests"`
+	Kafka     DashboardKafkaMetrics     `json:"kafka"`
+	Redis     DashboardRedisMetrics     `json:"redis"`
+	Cockroach DashboardCockroachMetrics `json:"cockroach"`
+}
+
+type DashboardRuntimeMetrics struct {
+	CPUSecondsTotal         float64 `json:"cpu_seconds_total"`
+	ResidentMemoryBytes     uint64  `json:"resident_memory_bytes"`
+	VirtualMemoryBytes      uint64  `json:"virtual_memory_bytes"`
+	HeapAllocBytes          uint64  `json:"heap_alloc_bytes"`
+	HeapSysBytes            uint64  `json:"heap_sys_bytes"`
+	Goroutines              uint64  `json:"goroutines"`
+	Threads                 uint64  `json:"threads"`
+	GCPauseSeconds          float64 `json:"gc_pause_seconds"`
+	GCCount                 uint64  `json:"gc_count"`
+	ProcessStartTimeSeconds float64 `json:"process_start_time_seconds"`
+}
+
+type DashboardRequestMetrics struct {
+	Total  uint64 `json:"total"`
+	Errors uint64 `json:"errors"`
+}
+
+type DashboardKafkaMetrics struct {
+	PublishSuccess uint64 `json:"publish_success"`
+	PublishFailure uint64 `json:"publish_failure"`
+	BrokerCount    uint64 `json:"broker_count"`
+}
+
+type DashboardRedisMetrics struct {
+	PoolHits            uint64  `json:"pool_hits"`
+	PoolMisses          uint64  `json:"pool_misses"`
+	TotalConnections    uint64  `json:"total_connections"`
+	IdleConnections     uint64  `json:"idle_connections"`
+	Timeouts            uint64  `json:"timeouts"`
+	CommandErrors       uint64  `json:"command_errors"`
+	CommandLatencyP95Ms float64 `json:"command_latency_p95_ms"`
+	OpsPerSec           int     `json:"ops_per_sec"`
+	ConnectedClients    int     `json:"connected_clients"`
+}
+
+type DashboardCockroachMetrics struct {
+	OpenConnections int64   `json:"open_connections"`
+	InUse           int64   `json:"in_use"`
+	Idle            int64   `json:"idle"`
+	WaitSeconds     float64 `json:"wait_seconds"`
+	WaitTotal       int64   `json:"wait_total"`
+}
+
+// DashboardBlocksSection provides recent block metadata, transaction slices, and
+// derived KPIs so blockchain-centric screens can render without extra requests.
+type DashboardBlocksSection struct {
+	Recent           []BlockResponse             `json:"recent"`
+	DecisionTimeline []DashboardDecisionTimeline `json:"decision_timeline"`
+	Metrics          DashboardBlockMetrics       `json:"metrics"`
+	Pagination       DashboardBlockPagination    `json:"pagination"`
+}
+
+type DashboardDecisionTimeline struct {
+	Time     string `json:"time"`
+	Height   uint64 `json:"height"`
+	Hash     string `json:"hash"`
+	Proposer string `json:"proposer"`
+	Approved int    `json:"approved"`
+	Rejected int    `json:"rejected"`
+	Timeout  int    `json:"timeout"`
+}
+
+type DashboardBlockMetrics struct {
+	LatestHeight        uint64        `json:"latest_height"`
+	TotalTransactions   uint64        `json:"total_transactions"`
+	AvgBlockTimeSeconds float64       `json:"avg_block_time_seconds"`
+	AvgBlockSizeBytes   int           `json:"avg_block_size_bytes,omitempty"`
+	SuccessRate         float64       `json:"success_rate"`
+	AnomalyCount        int           `json:"anomaly_count"`
+	Network             *NetworkStats `json:"network,omitempty"`
+}
+
+type DashboardBlockPagination struct {
+	Limit   int    `json:"limit"`
+	Start   uint64 `json:"start"`
+	End     uint64 `json:"end"`
+	Total   uint64 `json:"total"`
+	HasMore bool   `json:"has_more"`
+}
+
+// DashboardThreatsSection delivers anomaly detections, feed items, and severity
+// statistics surfaced from the AI service.
+type DashboardThreatsSection struct {
+	Timestamp         int64                          `json:"timestamp"`
+	DetectionLoop     *AiDetectionLoopSummary        `json:"detection_loop,omitempty"`
+	Source            string                         `json:"source,omitempty"`
+	FallbackReason    string                         `json:"fallback_reason,omitempty"`
+	Breakdown         DashboardThreatBreakdown       `json:"breakdown"`
+	Feed              []AnomalyResponse              `json:"feed,omitempty"`
+	Stats             *AnomalyStatsResponse          `json:"stats,omitempty"`
+	AvgResponseTimeMs *float64                       `json:"avg_response_time_ms,omitempty"`
+	LifetimeTotals    *DashboardThreatLifetimeTotals `json:"lifetime_totals,omitempty"`
+}
+
+type DashboardThreatBreakdown struct {
+	ThreatTypes []DashboardThreatTypeSummary `json:"threat_types"`
+	Severity    map[string]int               `json:"severity"`
+	Totals      DashboardThreatTotals        `json:"totals"`
+}
+
+type DashboardThreatTypeSummary struct {
+	ThreatType string `json:"threat_type"`
+	Published  int    `json:"published"`
+	Abstained  int    `json:"abstained"`
+	Total      int    `json:"total"`
+	Severity   string `json:"severity"`
+}
+
+type DashboardThreatTotals struct {
+	Published int `json:"published"`
+	Abstained int `json:"abstained"`
+	Overall   int `json:"overall"`
+}
+
+type DashboardThreatLifetimeTotals struct {
+	Total       uint64 `json:"total"`
+	Published   uint64 `json:"published"`
+	Abstained   uint64 `json:"abstained"`
+	RateLimited uint64 `json:"rate_limited"`
+	Errors      uint64 `json:"errors"`
+}
+
+type DashboardAISection struct {
+	Metrics    *AIMetricsResponse          `json:"metrics,omitempty"`
+	History    *AiDetectionHistoryResponse `json:"history,omitempty"`
+	Suspicious *AiSuspiciousNodesResponse  `json:"suspicious,omitempty"`
+	Health     map[string]interface{}      `json:"health,omitempty"`
+	Ready      map[string]interface{}      `json:"ready,omitempty"`
 }
 
 // Request parameter DTOs

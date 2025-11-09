@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -26,13 +27,35 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response := HealthResponse{
-		Status:    "healthy",
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	readiness, _ := s.buildReadinessResponse(ctx)
+	response := healthResponseFromReadiness(readiness)
+
+	writeJSONResponse(w, r, NewSuccessResponse(response), http.StatusOK)
+}
+
+func healthResponseFromReadiness(readiness ReadinessResponse) HealthResponse {
+	status := "healthy"
+	if !readiness.Ready {
+		status = "degraded"
+	} else if len(readiness.Checks) == 0 {
+		status = "unknown"
+	} else {
+		for _, check := range readiness.Checks {
+			if !isReadinessPassing(check.Status) {
+				status = "degraded"
+				break
+			}
+		}
+	}
+
+	return HealthResponse{
+		Status:    status,
 		Timestamp: time.Now().Unix(),
 		Version:   apiVersion,
 	}
-
-	writeJSONResponse(w, r, NewSuccessResponse(response), http.StatusOK)
 }
 
 // handleReadiness handles GET /ready
@@ -45,10 +68,16 @@ func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
+	response, statusCode := s.buildReadinessResponse(ctx)
+	writeJSONResponse(w, r, NewSuccessResponse(response), statusCode)
+}
+
+func (s *Server) buildReadinessResponse(ctx context.Context) (ReadinessResponse, int) {
 	checks := make(map[string]ReadinessCheckResult)
 	details := make(map[string]interface{})
 	phase := ""
 	allReady := true
+	warnings := make([]string, 0, 4)
 
 	mergeDetail := func(key string, val interface{}) {
 		if val == nil {
@@ -69,6 +98,16 @@ func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 		checks[name] = res
 		if !isReadinessPassing(res.Status) {
 			allReady = false
+		}
+		switch res.Status {
+		case "genesis", "single_node", "degraded", "warning":
+			warning := res.Message
+			if warning == "" {
+				warning = fmt.Sprintf("%s status: %s", name, res.Status)
+			} else {
+				warning = fmt.Sprintf("%s: %s", name, warning)
+			}
+			warnings = append(warnings, warning)
 		}
 		if detailVal != nil {
 			mergeDetail(detailKey, detailVal)
@@ -147,15 +186,16 @@ func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 		statusCode = http.StatusServiceUnavailable
 	}
 
-	writeJSONResponse(w, r, NewSuccessResponse(response), statusCode)
+	if len(warnings) > 0 {
+		response.Warnings = warnings
+	}
+
+	return response, statusCode
 }
 
 func isReadinessPassing(status string) bool {
 	switch status {
-	case "ok", "single_node":
-		return true
-	case "genesis":
-		// Treat genesis as transitional (not fatal) for readiness signal.
+	case "ok", "degraded", "warning":
 		return true
 	case "not configured":
 		return false
@@ -336,9 +376,13 @@ func (s *Server) runP2PCheck(ctx context.Context) (ReadinessCheckResult, interfa
 
 	switch {
 	case activation.GenesisPhase:
-		return buildCheckResult(start, "genesis", nil), details
+		res := buildCheckResult(start, "genesis", nil)
+		res.Message = "consensus still in genesis activation phase"
+		return res, details
 	case totalValidators <= 1:
-		return buildCheckResult(start, "single_node", nil), details
+		res := buildCheckResult(start, "single_node", nil)
+		res.Message = "single-node topology; quorum disabled"
+		return res, details
 	case activation.ConnectedPeers >= activation.RequiredPeers:
 		return buildCheckResult(start, "ok", nil), details
 	case activation.ConnectedPeers == 0:
@@ -362,6 +406,15 @@ func (s *Server) runKafkaCheck(ctx context.Context) ReadinessCheckResult {
 	}
 	res := buildCheckResult(start, status, err)
 	s.recordKafkaLatency(res.LatencyMs)
+	if err == nil {
+		kafkaLatency := s.getKafkaReadyLatencyMs()
+		if res.LatencyMs > 1000 || kafkaLatency > 2000 {
+			res.Status = "degraded"
+			if res.Message == "" {
+				res.Message = fmt.Sprintf("kafka latency %.0fms", math.Max(res.LatencyMs, kafkaLatency))
+			}
+		}
+	}
 	return res
 }
 
@@ -383,6 +436,42 @@ func (s *Server) runRedisCheck(ctx context.Context) (ReadinessCheckResult, map[s
 	}
 
 	info := s.collectRedisInfo(ctx)
+	if err == nil {
+		if res.LatencyMs > 500 {
+			res.Status = "degraded"
+			if res.Message == "" {
+				res.Message = fmt.Sprintf("redis ping %.0fms", res.LatencyMs)
+			}
+		} else {
+			var opsPerSec float64
+			switch v := info["ops_per_sec"].(type) {
+			case int:
+				opsPerSec = float64(v)
+			case int64:
+				opsPerSec = float64(v)
+			case float64:
+				opsPerSec = v
+			}
+
+			var clients float64
+			switch v := info["connected_clients"].(type) {
+			case int:
+				clients = float64(v)
+			case int64:
+				clients = float64(v)
+			case float64:
+				clients = v
+			}
+
+			if clients > 0 && opsPerSec == 0 {
+				res.Status = "degraded"
+				if res.Message == "" {
+					res.Message = "redis ops/sec stalled"
+				}
+			}
+		}
+	}
+
 	if len(info) == 0 {
 		return res, nil
 	}
@@ -492,6 +581,22 @@ func (s *Server) runAIServiceCheck(ctx context.Context) ReadinessCheckResult {
 	if finalErr == nil && msg != "" {
 		res.Message = msg
 	}
+
+	if finalErr == nil {
+		metricsCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		aiMetrics, degraded := s.loadAIMetricsSnapshot(metricsCtx)
+		cancel()
+		if degraded {
+			status = "degraded"
+			if aiMetrics != nil && aiMetrics.Message != "" {
+				res.Message = aiMetrics.Message
+			} else if res.Message == "" {
+				res.Message = "ai service metrics degraded"
+			}
+		}
+	}
+
+	res.Status = status
 	return res
 }
 

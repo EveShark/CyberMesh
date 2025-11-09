@@ -6,8 +6,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Alert, AlertDescription } from "@/components/ui/alert"
-import { CheckCircle, XCircle } from "lucide-react"
-import { MagnifyingGlassIcon } from "@radix-ui/react-icons"
+import { CheckCircle, Search, XCircle } from "lucide-react"
 
 import { useBlockVerification } from "@/hooks/use-block-verification"
 
@@ -47,7 +46,7 @@ export function BlockVerificationForm() {
               {isVerifying ? (
                 <div className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
               ) : (
-                <MagnifyingGlassIcon className="h-4 w-4" />
+                <Search className="h-4 w-4" />
               )}
               {isVerifying ? "Verifying..." : "Verify"}
             </Button>

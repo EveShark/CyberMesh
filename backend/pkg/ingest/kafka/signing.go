@@ -124,6 +124,7 @@ func (s *CommitSigner) Sign(evt *pb.CommitEvent) error {
 		AnomalyCount:  evt.AnomalyCount,
 		EvidenceCount: evt.EvidenceCount,
 		PolicyCount:   evt.PolicyCount,
+		AnomalyIds:    append([]string(nil), evt.AnomalyIds...),
 		Timestamp:     evt.Timestamp,
 		ProducerId:    evt.ProducerId,
 	}

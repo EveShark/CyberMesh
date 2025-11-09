@@ -1,64 +1,90 @@
 "use client"
 
-import useSWR from "swr"
+import { useCallback, useMemo } from "react"
 
 import type {
   AiDetectionHistoryResponse,
   AiMetricsResponse,
   AiSuspiciousNodesResponse,
 } from "@/lib/api"
+import { resolveDisplayName } from "@/lib/node-alias"
 
-interface AiMetricsEnvelope {
-  metrics: AiMetricsResponse
-}
-
-interface AiDetectionsEnvelope {
-  history: AiDetectionHistoryResponse
-  suspicious: AiSuspiciousNodesResponse
-}
+import { useDashboardData } from "./use-dashboard-data"
 
 interface AiHealthResponse {
-  health: Record<string, unknown>
-  ready: Record<string, unknown>
+  health: Record<string, unknown> | null
+  ready: Record<string, unknown> | null
 }
 
-const fetcher = async <T>(url: string): Promise<T> => {
-  const res = await fetch(url, { cache: "no-store" })
-  if (!res.ok) {
-    const text = await res.text().catch(() => "")
-    throw new Error(`Request failed: ${res.status} ${res.statusText}${text ? ` - ${text}` : ""}`)
-  }
-  return (await res.json()) as T
-}
+const DEFAULT_AI_REFRESH_MS = 15000
 
-export function useAiEngineData(refreshInterval = 5000) {
-  const {
-    data: metrics,
-    error: metricsError,
-    isLoading: metricsLoading,
-  } = useSWR<AiMetricsEnvelope>("/api/ai/metrics", fetcher, { refreshInterval })
+export function useAiEngineData(refreshInterval = DEFAULT_AI_REFRESH_MS) {
+  const { data: dashboard, error, isLoading } = useDashboardData(refreshInterval)
 
-  const {
-    data: detections,
-    error: detectionsError,
-    isLoading: detectionsLoading,
-  } = useSWR<AiDetectionsEnvelope>("/api/ai/detections", fetcher, { refreshInterval })
+  const validatorAliasMap = useMemo(() => {
+    const map = new Map<string, string>()
+    const validators = dashboard?.validators?.validators ?? []
+    validators.forEach((validator) => {
+      if (!validator.id) return
+      const key = validator.id.toLowerCase()
+      const alias = validator.alias || validator.id
+      map.set(key, alias)
+    })
+    return map
+  }, [dashboard?.validators?.validators])
 
-  const {
-    data: health,
-    error: healthError,
-    isLoading: healthLoading,
-  } = useSWR<AiHealthResponse>("/api/ai/health", fetcher, { refreshInterval })
+  const resolveAlias = useCallback(
+    (id?: string | null, fallback?: string) => {
+      if (!id) return fallback
+      const key = id.toLowerCase()
+      if (validatorAliasMap.has(key)) {
+        return validatorAliasMap.get(key) ?? fallback ?? id
+      }
+      return resolveDisplayName(id, fallback ?? id)
+    },
+    [validatorAliasMap],
+  )
 
-  const isLoading = metricsLoading || detectionsLoading || healthLoading
-  const error = metricsError || detectionsError || healthError
+  const health = useMemo<AiHealthResponse | undefined>(() => {
+    if (!dashboard) return undefined
+    return {
+      health: (dashboard.ai.health as Record<string, unknown> | undefined) ?? null,
+      ready: (dashboard.ai.ready as Record<string, unknown> | undefined) ?? null,
+    }
+  }, [dashboard])
+
+  const suspicious = useMemo<AiSuspiciousNodesResponse | undefined>(() => {
+    const source = dashboard?.ai.suspicious as AiSuspiciousNodesResponse | undefined
+    if (!source) return undefined
+    const nodes = (source.nodes ?? []).map((node) => ({
+      ...node,
+      alias: resolveAlias(node.id, node.id),
+    }))
+    return {
+      ...source,
+      nodes,
+    }
+  }, [dashboard?.ai.suspicious, resolveAlias])
+
+  const history = useMemo<AiDetectionHistoryResponse | undefined>(() => {
+    const source = dashboard?.ai.history as AiDetectionHistoryResponse | undefined
+    if (!source) return undefined
+    const detections = (source.detections ?? []).map((entry) => ({
+      ...entry,
+      validator_alias: entry.validator_id ? resolveAlias(entry.validator_id, entry.validator_id) : undefined,
+    }))
+    return {
+      ...source,
+      detections,
+    }
+  }, [dashboard?.ai.history, resolveAlias])
 
   return {
-    isLoading,
+    isLoading: !dashboard && isLoading,
     error,
-    metrics: metrics?.metrics,
-    history: detections?.history,
-    suspicious: detections?.suspicious,
+    metrics: dashboard?.ai.metrics as AiMetricsResponse | undefined,
+    history,
+    suspicious,
     health,
   }
 }

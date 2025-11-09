@@ -14,7 +14,7 @@ Security:
 - Metrics tracked for monitoring
 """
 import threading
-from typing import Dict, Any
+from typing import Dict, Any, Optional, TYPE_CHECKING
 from ..contracts import (
     CommitEvent,
     ReputationEvent,
@@ -27,6 +27,29 @@ import time
 import hashlib
 from ..utils.tokens import token_ip, token_flow_key
 from ..contracts import EvidenceMessage
+
+if TYPE_CHECKING:  # pragma: no cover
+    from ..feedback.tracker import AnomalyLifecycleTracker
+
+
+def _extract_raw_score(decision) -> Optional[float]:
+    if not decision or not getattr(decision, "candidates", None):
+        return None
+
+    try:
+        from ..ml.types import DetectionCandidate  # local import to avoid cycle
+
+        typed_candidates = [
+            c for c in decision.candidates
+            if isinstance(c, DetectionCandidate) and c.threat_type == decision.threat_type
+        ]
+        target = typed_candidates[0] if typed_candidates else decision.candidates[0]
+        raw = getattr(target, "raw_score", None)
+        if raw is None:
+            return None
+        return float(raw)
+    except Exception:
+        return None
 
 
 class MessageHandlers:
@@ -66,6 +89,49 @@ class MessageHandlers:
             "evidence_request": {"processed": 0, "failed": 0},
         }
         self._metrics_lock = threading.Lock()
+
+    def _tracker(self) -> Optional["AnomalyLifecycleTracker"]:
+        if not self.service_manager or not getattr(self.service_manager, "feedback_service", None):
+            return None
+        return getattr(self.service_manager.feedback_service, "tracker", None)
+
+    def _record_lifecycle_events(
+        self,
+        *,
+        anomaly_id: str,
+        anomaly_type: str,
+        severity: int,
+        confidence: float,
+        raw_score: Optional[float],
+        timestamp: float,
+    ) -> None:
+        tracker = self._tracker()
+        if tracker is None:
+            return
+
+        try:
+            tracker.record_detected(
+                anomaly_id=anomaly_id,
+                anomaly_type=anomaly_type,
+                confidence=confidence,
+                severity=severity,
+                raw_score=raw_score,
+                timestamp=timestamp,
+            )
+        except Exception as err:
+            self.logger.warning(
+                "Tracker detected-state failure",
+                extra={"anomaly_id": anomaly_id, "error": str(err)}
+            )
+            return
+
+        try:
+            tracker.record_published(anomaly_id=anomaly_id, timestamp=timestamp)
+        except Exception as err:
+            self.logger.warning(
+                "Tracker published-state failure",
+                extra={"anomaly_id": anomaly_id, "error": str(err)}
+            )
     
     def handle_commit_event(self, event: CommitEvent):
         """
@@ -88,8 +154,8 @@ class MessageHandlers:
                     "height": event.height,
                     "block_hash": event.block_hash[:16].hex() if event.block_hash else None,
                     "timestamp": event.timestamp,
-                    "validator_id": event.validator_id,
-                    "transaction_count": event.transaction_count,
+                    "producer_id": event.producer_id.hex() if event.producer_id else None,
+                    "tx_count": event.tx_count,
                 }
             )
             
@@ -216,8 +282,9 @@ class MessageHandlers:
         detection_ts = getattr(event, 'timestamp', None) or int(time.time())
 
         # Build JSON payload with required metadata + pseudonymous tokens
+        anomaly_uuid = str(uuid.uuid4())
         payload_obj = {
-            'anomaly_id': str(uuid.uuid4()),
+            'anomaly_id': anomaly_uuid,
             'detection_timestamp': int(detection_ts),
             'threat_type': decision.threat_type.value if decision.threat_type else 'unknown',
             'severity': int(severity),
@@ -234,27 +301,51 @@ class MessageHandlers:
         # Pre-compute anomaly content hash (for evidence linking)
         anomaly_content_hash = hashlib.sha256(payload_bytes).digest()
 
+        raw_score = _extract_raw_score(decision)
+
         # Publish anomaly (payload must be JSON)
-        anomaly_id = self.service_manager.publisher.publish_anomaly(
-            anomaly_id=payload_obj['anomaly_id'],
-            anomaly_type=decision.threat_type.value,
-            source='ml_pipeline',
-            severity=severity,
-            confidence=decision.confidence,
-            payload=payload_bytes,
-            model_version=model_version
-        )
+        message_id = None
+        try:
+            message_id = self.service_manager.publisher.publish_anomaly(
+                anomaly_id=anomaly_uuid,
+                anomaly_type=decision.threat_type.value,
+                source='ml_pipeline',
+                severity=severity,
+                confidence=decision.confidence,
+                payload=payload_bytes,
+                model_version=model_version
+            )
+        except Exception as err:
+            self.logger.error(
+                "Failed to publish anomaly detection",
+                exc_info=True,
+                extra={
+                    'anomaly_id': anomaly_uuid,
+                    'error': str(err)
+                }
+            )
+            return
         
         self.logger.info(
             "Published anomaly detection",
             extra={
-                'anomaly_id': anomaly_id,
+                'anomaly_id': anomaly_uuid,
+                'message_id': message_id,
                 'threat_type': decision.threat_type.value,
                 'score': decision.final_score,
                 'confidence': decision.confidence,
                 'llr': decision.llr,
                 'latency_ms': result.total_latency_ms
             }
+        )
+
+        self._record_lifecycle_events(
+            anomaly_id=anomaly_uuid,
+            anomaly_type=decision.threat_type.value if decision.threat_type else 'unknown',
+            severity=int(severity),
+            confidence=float(decision.confidence),
+            raw_score=raw_score,
+            timestamp=float(detection_ts),
         )
 
         # Publish supporting evidence linked to anomaly (Option 1)
@@ -272,7 +363,7 @@ class MessageHandlers:
                 )
                 self.logger.info(
                     "Published supporting evidence",
-                    extra={'anomaly_id': anomaly_id}
+                    extra={'anomaly_id': anomaly_uuid}
                 )
         except Exception as e:
             # Do not fail handler on evidence publication errors

@@ -9,10 +9,11 @@ Topics:
 - control.policy.v1
 - control.evidence.v1
 """
+import os
 from confluent_kafka import Consumer, Producer, KafkaException, KafkaError as ConfluentKafkaError
 import threading
 import time
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, List
 from ..contracts import (
     CommitEvent,
     ReputationEvent,
@@ -23,10 +24,9 @@ from ..utils.errors import ContractError, KafkaError, ValidationError, StorageEr
 from ..utils.metrics import get_metrics_collector
 import hashlib
 import json
-from ..config.settings import Settings
+from ..config.settings import Settings, FeedbackConfig
 from ..feedback.storage import RedisStorage
 from ..feedback.tracker import AnomalyLifecycleTracker, AnomalyState
-from ..config.settings import FeedbackConfig
 
 
 class AIConsumer:
@@ -48,25 +48,55 @@ class AIConsumer:
         self,
         config: Settings,
         tracker: Optional[AnomalyLifecycleTracker] = None,
-        logger=None
+        logger=None,
+        *,
+        storage: Optional[RedisStorage] = None,
+        feedback_config: Optional[FeedbackConfig] = None,
+        disable_persistence: Optional[bool] = None,
+        topics: Optional[List[str]] = None,
     ):
         self.config = config
         self.logger = logger
         
         # Initialize lifecycle tracker
+        feedback_cfg = feedback_config or getattr(config, "feedback", None)
+
+        effective_disable = disable_persistence
+        if feedback_cfg is None:
+            if effective_disable is None:
+                env_flag = os.getenv("FEEDBACK_DISABLE_PERSISTENCE")
+                if env_flag is None:
+                    effective_disable = False
+                else:
+                    effective_disable = env_flag.lower() in ("true", "1", "yes", "on")
+            feedback_cfg = FeedbackConfig(disable_persistence=bool(effective_disable))
+        else:
+            if effective_disable is None:
+                effective_disable = bool(getattr(feedback_cfg, "disable_persistence", False))
+
         if tracker is None:
-            storage = RedisStorage()
-            feedback_config = FeedbackConfig()
-            tracker = AnomalyLifecycleTracker(storage, feedback_config, logger)
+            storage = storage or RedisStorage(disabled=effective_disable)
+            tracker = AnomalyLifecycleTracker(storage, feedback_cfg, logger)
+        else:
+            if storage is None:
+                storage = getattr(tracker, "storage", None)
+                if storage is None:
+                    storage = RedisStorage(disabled=effective_disable)
+                    tracker.storage = storage
+            else:
+                tracker.storage = storage
+
+        self.storage = storage
         self.tracker = tracker
         
         # Topics from settings
-        self.topic_list = [
+        default_topics = [
             config.kafka_topics.control_commits,
             config.kafka_topics.control_reputation,
             config.kafka_topics.control_policy,
             config.kafka_topics.control_evidence,
         ]
+        self.topic_list = topics if topics is not None else default_topics
         
         # Build confluent-kafka config
         kafka_config = self._build_config(config)

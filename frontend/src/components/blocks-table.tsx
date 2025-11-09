@@ -56,7 +56,20 @@ export default function BlocksTable({ blocks, isLoading, error }: BlocksTablePro
                     <span className="text-foreground">{block.transaction_count ?? block.transactions?.length ?? 0}</span>
                   </td>
                   <td className="py-2 pr-4">
-                    <span className="text-foreground">{block.size_bytes}</span>
+                    {(() => {
+                      const rawSource = block.metadata?.["size_source"]
+                      const sizeSource = typeof rawSource === "string" ? rawSource : undefined
+                      const prefix = block.size_bytes_estimated ? "≈" : ""
+                      return (
+                        <span className="text-foreground" title={sizeSource ? `Size source: ${sizeSource}` : undefined}>
+                          {prefix}
+                          {Number.isFinite(block.size_bytes) ? block.size_bytes.toLocaleString() : "--"}
+                          {block.size_bytes_estimated ? (
+                            <span className="ml-1 text-[10px] uppercase tracking-wide text-muted-foreground">est</span>
+                          ) : null}
+                        </span>
+                      )
+                    })()}
                   </td>
                   <td className="py-2 pr-4 text-muted-foreground">{block.proposer}</td>
                 </tr>

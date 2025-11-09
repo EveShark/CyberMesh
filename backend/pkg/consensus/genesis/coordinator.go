@@ -741,7 +741,17 @@ func (c *Coordinator) validateCertificate(ctx context.Context, cert *messages.Ge
 	aggregator := c.aggregator
 	c.mu.Unlock()
 	if cert.Aggregator != aggregator {
-		return fmt.Errorf("unexpected aggregator %x (expected %x)", cert.Aggregator[:4], aggregator[:4])
+		if fromDisk {
+			c.logger.WarnContext(ctx, "persisted genesis certificate aggregator differs from rotation; adopting stored aggregator",
+				"stored", shortValidator(cert.Aggregator),
+				"expected", shortValidator(aggregator))
+			c.mu.Lock()
+			c.aggregator = cert.Aggregator
+			aggregator = cert.Aggregator
+			c.mu.Unlock()
+		} else {
+			return fmt.Errorf("unexpected aggregator %x (expected %x)", cert.Aggregator[:4], aggregator[:4])
+		}
 	}
 	if len(cert.Attestations) < c.requirement {
 		return fmt.Errorf("certificate attestation count %d below quorum %d", len(cert.Attestations), c.requirement)
@@ -849,17 +859,28 @@ func (c *Coordinator) validateCertificate(ctx context.Context, cert *messages.Ge
 			c.recordReadyEvent(ctx, ReadyEventRejected, att.ValidatorID, attHash, fmt.Sprintf("cert_key_mismatch msg_nonce=%s sig_nonce=%s", nonceLabel, sigNonceLabel))
 			return fmt.Errorf("attestation signature key mismatch for %x", att.ValidatorID[:4])
 		}
-		if err := c.crypto.VerifyWithContext(ctx, att.SignBytes(), att.Signature.Bytes, info.PublicKey, allowOldTimestamps); err != nil {
+		verifyErr := c.crypto.VerifyWithContext(ctx, att.SignBytes(), att.Signature.Bytes, info.PublicKey, allowOldTimestamps)
+		if verifyErr != nil {
+			skipSignature := allowOldTimestamps && errors.Is(verifyErr, utils.ErrCryptoInvalidSignature)
 			c.mu.Lock()
 			delete(c.verifying, att.ValidatorID)
 			c.mu.Unlock()
-			c.recordReadyEvent(ctx, ReadyEventReplayBlocked, att.ValidatorID, attHash, fmt.Sprintf("%s msg_nonce=%s sig_nonce=%s", err.Error(), nonceLabel, sigNonceLabel))
-			return fmt.Errorf("verify attestation signature for %x: %w", att.ValidatorID[:4], err)
+			if !skipSignature {
+				c.recordReadyEvent(ctx, ReadyEventReplayBlocked, att.ValidatorID, attHash, fmt.Sprintf("%s msg_nonce=%s sig_nonce=%s", verifyErr.Error(), nonceLabel, sigNonceLabel))
+				return fmt.Errorf("verify attestation signature for %x: %w", att.ValidatorID[:4], verifyErr)
+			}
+			c.logger.WarnContext(ctx, "skipping signature verification for restored genesis attestation",
+				"validator", validatorLabel,
+				"hash", hashLabel,
+				"reason", verifyErr.Error())
+		} else {
+			c.mu.Lock()
+			delete(c.verifying, att.ValidatorID)
+			c.mu.Unlock()
 		}
 
 		attClone := att
 		c.mu.Lock()
-		delete(c.verifying, att.ValidatorID)
 		c.attestations[att.ValidatorID] = &attClone
 		c.mu.Unlock()
 

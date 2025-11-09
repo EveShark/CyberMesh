@@ -156,9 +156,6 @@ func (s *State) OnConnect(pid peer.ID, labels map[string]string) {
 func (s *State) OnDisconnect(pid peer.ID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if ps, ok := s.peers[pid]; ok {
-		ps.LastSeen = time.Now()
-	}
 	s.observeCounts()
 
 	s.log.Debug("peer disconnected", utils.ZapString("peer_id", pid.String()))
@@ -303,17 +300,21 @@ func (s *State) TouchPeer(pid peer.ID, ts time.Time) {
 
 // RecordLatencySample incorporates an external latency measurement into the peer's EMA.
 func (s *State) RecordLatencySample(pid peer.ID, latency time.Duration) {
-	if latency <= 0 {
-		return
-	}
+	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ps := s.ensure(pid)
-	seconds := latency.Seconds()
-	if ps.LatencyEMA == 0 {
-		ps.LatencyEMA = seconds
-	} else {
-		ps.LatencyEMA = ps.LatencyEMA*0.8 + seconds*0.2
+	if !ps.Quarantined {
+		ps.LastSeen = now
+		s.seen[pid] = now
+	}
+	if latency > 0 {
+		seconds := latency.Seconds()
+		if ps.LatencyEMA == 0 {
+			ps.LatencyEMA = seconds
+		} else {
+			ps.LatencyEMA = ps.LatencyEMA*0.8 + seconds*0.2
+		}
 	}
 }
 

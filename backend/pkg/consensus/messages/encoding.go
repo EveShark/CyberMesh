@@ -679,6 +679,26 @@ func (e *Encoder) ClearCache() {
 	e.verifyCache.Purge()
 }
 
+// CacheQCSignatures marks all signatures in the provided QC as verified. It should only
+// be used for locally restored certificates that were previously validated before
+// persistence.
+func (e *Encoder) CacheQCSignatures(qc *QC) {
+	if qc == nil {
+		return
+	}
+
+	for _, sig := range qc.Signatures {
+		if len(sig.Bytes) == 0 {
+			continue
+		}
+		voteBytes := buildVoteSignBytesFromQC(qc, sig.KeyID, sig.Timestamp)
+		sigKey := e.getSigCacheKey(voteBytes, sig.KeyID)
+		e.mu.Lock()
+		e.verifySigCache.Add(sigKey, true)
+		e.mu.Unlock()
+	}
+}
+
 // GetCacheStats returns cache statistics
 func (e *Encoder) GetCacheStats() (size, capacity int) {
 	e.mu.RLock()

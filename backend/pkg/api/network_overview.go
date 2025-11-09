@@ -14,7 +14,6 @@ import (
 	"backend/pkg/p2p"
 	"backend/pkg/utils"
 
-	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
@@ -68,12 +67,19 @@ func (s *Server) buildNetworkOverview(ctx context.Context, now time.Time) (*Netw
 		routerStats = s.p2pRouter.GetNetworkStats()
 	}
 
-	totalPeers := len(validators)
+	var validatorPeerStats map[types.ValidatorID]p2p.RouterPeerStats
+	if s.p2pRouter != nil {
+		validatorPeerStats = s.p2pRouter.ValidatorPeerStats(validators)
+	}
+
+	localID := status.NodeID
+	remoteValidatorCount := countRemoteValidators(validators, localID)
+	totalPeers := remoteValidatorCount
 	if routerStats.PeerCount > totalPeers {
 		totalPeers = routerStats.PeerCount
 	}
 
-	nodes, peerResolver := s.buildNetworkNodes(validators, routerStats, now)
+	nodes, peerResolver := s.buildNetworkNodes(validators, routerStats, validatorPeerStats, now)
 	edges := toNetworkEdges(routerStats.Edges, peerResolver)
 	selfID := ""
 	if routerStats.Self != "" {
@@ -88,9 +94,10 @@ func (s *Server) buildNetworkOverview(ctx context.Context, now time.Time) (*Netw
 	leaderID := encodeValidatorID(status.CurrentLeader)
 
 	overview := &NetworkOverviewResponse{
+		// ConnectedPeers, TotalPeers, and ExpectedPeers all represent remote validators only.
 		ConnectedPeers:   routerStats.PeerCount,
 		TotalPeers:       totalPeers,
-		ExpectedPeers:    len(validators),
+		ExpectedPeers:    remoteValidatorCount,
 		AverageLatencyMs: routerStats.AvgLatencyMs,
 		ConsensusRound:   status.Height,
 		LeaderStability:  computeLeaderStability(status.Metrics.ViewChanges),
@@ -109,12 +116,7 @@ func (s *Server) buildNetworkOverview(ctx context.Context, now time.Time) (*Netw
 	return overview, nil
 }
 
-func (s *Server) buildNetworkNodes(validators []types.ValidatorInfo, stats p2p.RouterStats, now time.Time) ([]NetworkNodeDTO, map[string]string) {
-	peerMetrics := make(map[string]p2p.RouterPeerStats, len(stats.Peers))
-	for _, peerStat := range stats.Peers {
-		peerMetrics[strings.ToLower(peerStat.ID.String())] = peerStat
-	}
-
+func (s *Server) buildNetworkNodes(validators []types.ValidatorInfo, stats p2p.RouterStats, validatorStats map[types.ValidatorID]p2p.RouterPeerStats, now time.Time) ([]NetworkNodeDTO, map[string]string) {
 	nodes := make([]NetworkNodeDTO, 0, len(validators))
 	peerResolver := make(map[string]string, len(validators))
 	for idx, v := range validators {
@@ -122,11 +124,11 @@ func (s *Server) buildNetworkNodes(validators []types.ValidatorInfo, stats p2p.R
 		status := deriveNodeStatus(uptime, v.IsActive)
 		alias := s.resolveValidatorAlias(v, idx)
 
-		peerID := strings.ToLower(derivePeerIDFromPublicKey(v.PublicKey))
+		peerID := resolveValidatorPeerID(v)
 		if peerID != "" {
 			peerResolver[peerID] = encodeValidatorID(v.ID)
 		}
-		peerStat, ok := peerMetrics[peerID]
+		peerStat, ok := validatorStats[v.ID]
 		latencyMs := 0.0
 		throughput := uint64(0)
 		lastSeen := v.LastSeen
@@ -135,16 +137,14 @@ func (s *Server) buildNetworkNodes(validators []types.ValidatorInfo, stats p2p.R
 			if peerStat.Status != "" {
 				status = peerStat.Status
 			}
-			if peerStat.LatencyMs > 0 {
-				latencyMs = peerStat.LatencyMs
-			}
+			latencyMs = peerStat.LatencyMs
 			throughput = peerStat.BytesIn
-			if peerStat.RateBps > 0 {
-				inRate = peerStat.RateBps
-			}
+			inRate = peerStat.RateBps
 			if !peerStat.LastSeen.IsZero() {
 				lastSeen = peerStat.LastSeen
 			}
+		} else {
+			status = classifyOfflineStatus(lastSeen, now)
 		}
 
 		var lastSeenPtr *time.Time
@@ -185,6 +185,10 @@ func toNetworkEdges(edges []p2p.RouterEdge, resolver map[string]string) []Networ
 		target := edge.Target.String()
 		if mapped, ok := resolver[strings.ToLower(target)]; ok && mapped != "" {
 			target = mapped
+		}
+		// Only include edges that map to validator IDs on both ends
+		if !looksLikeValidatorID(source) || !looksLikeValidatorID(target) {
+			continue
 		}
 		direction := edge.Direction
 		if direction == "" {
@@ -240,7 +244,7 @@ func (s *Server) mergeInferredEdges(edges []NetworkEdgeDTO, resolver map[string]
 			selfLabel = selfPeer.String()
 		}
 	}
-	if selfLabel == "" {
+	if selfLabel == "" || !looksLikeValidatorID(selfLabel) {
 		return edges
 	}
 
@@ -293,19 +297,15 @@ func buildVotingStatus(validators []types.ValidatorInfo) []VotingStatusDTO {
 	return statuses
 }
 
-func derivePeerIDFromPublicKey(pub []byte) string {
-	if len(pub) == 0 {
-		return ""
+func resolveValidatorPeerID(info types.ValidatorInfo) string {
+	if strings.TrimSpace(info.PeerID) != "" {
+		return strings.ToLower(info.PeerID)
 	}
-	key, err := crypto.UnmarshalEd25519PublicKey(pub)
+	pid, err := p2p.DerivePeerIDFromPublicKey(info.PublicKey)
 	if err != nil {
 		return ""
 	}
-	pid, err := peer.IDFromPublicKey(key)
-	if err != nil {
-		return ""
-	}
-	return pid.String()
+	return strings.ToLower(pid.String())
 }
 
 func (s *Server) resolveValidatorAlias(info types.ValidatorInfo, index int) string {
@@ -324,7 +324,7 @@ func (s *Server) resolveValidatorAlias(info types.ValidatorInfo, index int) stri
 	if alias := s.nodeAliases[pubHex]; alias != "" {
 		return alias
 	}
-	peerID := strings.ToLower(derivePeerIDFromPublicKey(info.PublicKey))
+	peerID := resolveValidatorPeerID(info)
 	if alias := s.nodeAliases[peerID]; alias != "" {
 		return alias
 	}
@@ -418,6 +418,21 @@ func deriveNodeStatus(uptime float64, active bool) string {
 	}
 }
 
+func classifyOfflineStatus(lastSeen time.Time, now time.Time) string {
+	if lastSeen.IsZero() {
+		return "offline"
+	}
+	elapsed := now.Sub(lastSeen)
+	switch {
+	case elapsed >= suspiciousStaleDuration2:
+		return "critical"
+	case elapsed >= suspiciousStaleDuration1:
+		return "warning"
+	default:
+		return "offline"
+	}
+}
+
 func clampFloat(value, minVal, maxVal float64) float64 {
 	if value < minVal {
 		return minVal
@@ -426,4 +441,30 @@ func clampFloat(value, minVal, maxVal float64) float64 {
 		return maxVal
 	}
 	return value
+}
+
+// looksLikeValidatorID performs a light check for hex-encoded IDs starting with 0x.
+func looksLikeValidatorID(s string) bool {
+	if s == "" {
+		return false
+	}
+	if !strings.HasPrefix(strings.ToLower(s), "0x") {
+		return false
+	}
+	// Require a reasonable length to avoid matching short aliases
+	return len(s) >= 10
+}
+
+func countRemoteValidators(validators []types.ValidatorInfo, localID types.ValidatorID) int {
+	count := 0
+	for _, v := range validators {
+		if !isZeroValidatorID(localID) && v.ID == localID {
+			continue
+		}
+		count++
+	}
+	if count == 0 {
+		return len(validators)
+	}
+	return count
 }

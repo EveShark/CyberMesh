@@ -49,6 +49,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// Network & consensus overviews
 	mux.HandleFunc(basePath+"/network/overview", s.handleNetworkOverview)
 	mux.HandleFunc(basePath+"/consensus/overview", s.handleConsensusOverview)
+	mux.HandleFunc(basePath+"/dashboard/overview", s.handleDashboardOverview)
 
 	// Anomaly endpoints
 	mux.HandleFunc(basePath+"/anomalies/stats", s.handleAnomalyStats)
@@ -66,7 +67,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 
 	s.logger.Info("routes registered",
 		utils.ZapString("base_path", basePath),
-		utils.ZapInt("endpoint_count", 18))
+		utils.ZapInt("endpoint_count", 19))
 }
 
 // middlewareChain applies middleware in order
@@ -195,6 +196,9 @@ func (s *Server) getRequiredRole(path string) string {
 		return "validator_reader"
 	}
 	if strings.HasPrefix(path, basePath+"/stats") {
+		return "stats_reader"
+	}
+	if strings.HasPrefix(path, basePath+"/dashboard/overview") {
 		return "stats_reader"
 	}
 	if strings.HasPrefix(path, basePath+"/metrics") {

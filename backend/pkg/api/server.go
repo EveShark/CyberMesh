@@ -23,6 +23,7 @@ import (
 	"backend/pkg/utils"
 
 	redis "github.com/redis/go-redis/v9"
+	"go.uber.org/zap"
 )
 
 // Server provides read-only API access to backend state
@@ -55,11 +56,14 @@ type Server struct {
 	p2pLastSample        time.Time
 	apiRequestsTotal     atomic.Uint64
 	apiRequestErrors     atomic.Uint64
+	routeMetricsMu       sync.RWMutex
+	routeMetrics         map[requestMetricKey]*routeMetric
 
 	// Middleware components
-	rateLimiter *RateLimiter
-	ipAllowlist *utils.IPAllowlist
-	sem         chan struct{}
+	rateLimiter   *RateLimiter
+	ipAllowlist   *utils.IPAllowlist
+	sem           chan struct{}
+	routeLimiters map[rateLimitKey]*routeLimiter
 
 	aiClient    *http.Client
 	aiBaseURL   string
@@ -71,6 +75,69 @@ type Server struct {
 	stopCh           chan struct{}
 	wg               sync.WaitGroup
 	processStartTime int64 // Unix timestamp when server started
+
+	metricsHistory      []DashboardBackendHistorySample
+	lastHistorySnapshot *backendHistorySnapshot
+	dashboardCacheMu    sync.RWMutex
+	dashboardCache      dashboardCacheEntry
+
+	loopStatus            atomic.Value
+	loopStatusUpdated     atomic.Int64
+	loopBlocking          atomic.Bool
+	loopIssues            atomic.Value
+	threatDataSource      atomic.Value
+	threatSourceUpdated   atomic.Int64
+	threatFallbackCount   atomic.Uint64
+	threatFallbackUpdated atomic.Int64
+	threatFallbackReason  atomic.Value
+}
+
+type rateLimitKey struct {
+	method string
+	path   string
+}
+
+type routeLimiter struct {
+	config  RateLimiterConfig
+	limiter *RateLimiter
+}
+
+type requestMetricKey struct {
+	method string
+	path   string
+}
+
+type routeMetric struct {
+	totalRequests atomic.Uint64
+	errorRequests atomic.Uint64
+	bytesTotal    atomic.Uint64
+	latencyMicros atomic.Uint64
+	cacheHits     atomic.Uint64
+	cacheMisses   atomic.Uint64
+}
+
+type routeMetricSnapshot struct {
+	method        string
+	path          string
+	requests      uint64
+	errors        uint64
+	bytes         uint64
+	latencyMicros uint64
+	cacheHits     uint64
+	cacheMisses   uint64
+}
+
+type backendHistorySnapshot struct {
+	timestamp            int64
+	cpuSecondsTotal      float64
+	networkBytesSent     uint64
+	networkBytesReceived uint64
+	mempoolSizeBytes     int64
+}
+
+type dashboardCacheEntry struct {
+	snapshot    *DashboardOverviewResponse
+	generatedAt time.Time
 }
 
 // Dependencies holds server dependencies
@@ -128,6 +195,26 @@ func NewServer(deps Dependencies) (*Server, error) {
 		kafkaCons:        deps.KafkaCons,
 		stopCh:           make(chan struct{}),
 		processStartTime: time.Now().Unix(),
+		routeMetrics:     make(map[requestMetricKey]*routeMetric),
+	}
+
+	s.loopStatus.Store("unknown")
+	s.loopIssues.Store("")
+	s.threatDataSource.Store("unknown")
+	s.threatFallbackReason.Store("")
+
+	if deps.Logger != nil {
+		if deps.Config.DashboardCacheTTL > 0 {
+			deps.Logger.Info("dashboard cache enabled",
+				utils.ZapDuration("dashboard_cache_ttl", deps.Config.DashboardCacheTTL))
+		} else {
+			deps.Logger.Info("dashboard cache disabled",
+				utils.ZapDuration("dashboard_cache_ttl", deps.Config.DashboardCacheTTL))
+		}
+	}
+
+	if deps.Config.MaxConcurrentReqs > 0 {
+		s.sem = make(chan struct{}, deps.Config.MaxConcurrentReqs)
 	}
 
 	if len(deps.NodeAliases) > 0 {
@@ -155,6 +242,22 @@ func NewServer(deps Dependencies) (*Server, error) {
 			Burst:             deps.Config.RateLimitBurst,
 			Logger:            deps.Logger,
 		})
+		s.routeLimiters = make(map[rateLimitKey]*routeLimiter)
+		for rawKey, override := range deps.Config.RouteRateLimits {
+			key := parseRateLimitKey(rawKey)
+			if key.path == "" {
+				continue
+			}
+			config := RateLimiterConfig{
+				RequestsPerMinute: override.RequestsPerMinute,
+				Burst:             override.Burst,
+				Logger:            deps.Logger,
+			}
+			s.routeLimiters[key] = &routeLimiter{
+				config:  config,
+				limiter: NewRateLimiter(config),
+			}
+		}
 	}
 
 	// Initialize IP allowlist if configured
@@ -175,10 +278,6 @@ func NewServer(deps Dependencies) (*Server, error) {
 				utils.ZapBool("dns_disabled", allowlistCfg.DisableDNS))
 		}
 
-		// Initialize concurrency limiter
-		if deps.Config.MaxConcurrentReqs > 0 {
-			s.sem = make(chan struct{}, deps.Config.MaxConcurrentReqs)
-		}
 	}
 
 	// Create HTTP server
@@ -250,6 +349,37 @@ func (s *Server) createHTTPServer() error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
+	return nil
+}
+
+func parseRateLimitKey(raw string) rateLimitKey {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return rateLimitKey{}
+	}
+	method := "*"
+	path := raw
+	if idx := strings.Index(raw, " "); idx >= 0 {
+		methodCandidate := strings.TrimSpace(raw[:idx])
+		if methodCandidate != "" {
+			method = strings.ToUpper(methodCandidate)
+		}
+		path = strings.TrimSpace(raw[idx+1:])
+	}
+	return rateLimitKey{method: method, path: path}
+}
+
+func (s *Server) lookupRouteLimiter(method, path string) *routeLimiter {
+	if s.routeLimiters == nil {
+		return nil
+	}
+	method = strings.ToUpper(method)
+	if rl, ok := s.routeLimiters[rateLimitKey{method: method, path: path}]; ok {
+		return rl
+	}
+	if rl, ok := s.routeLimiters[rateLimitKey{method: "*", path: path}]; ok {
+		return rl
+	}
 	return nil
 }
 
@@ -420,6 +550,209 @@ func (s *Server) recordAPIRequest(status int) {
 	if status >= 400 {
 		s.apiRequestErrors.Add(1)
 	}
+}
+
+func (s *Server) recordRouteMetrics(method, path string, status int, duration time.Duration, bytes int64) {
+	key := requestMetricKey{method: strings.ToUpper(method), path: path}
+	metric := s.getOrCreateRouteMetric(key)
+	metric.totalRequests.Add(1)
+	if status >= 400 {
+		metric.errorRequests.Add(1)
+	}
+	if duration > 0 {
+		metric.latencyMicros.Add(uint64(duration / time.Microsecond))
+	}
+	if bytes > 0 {
+		metric.bytesTotal.Add(uint64(bytes))
+	}
+}
+
+func (s *Server) recordRouteCacheHit(method, path string) {
+	key := requestMetricKey{method: strings.ToUpper(method), path: path}
+	metric := s.getOrCreateRouteMetric(key)
+	metric.cacheHits.Add(1)
+}
+
+func (s *Server) recordRouteCacheMiss(method, path string) {
+	key := requestMetricKey{method: strings.ToUpper(method), path: path}
+	metric := s.getOrCreateRouteMetric(key)
+	metric.cacheMisses.Add(1)
+}
+
+func (s *Server) getDashboardCache(now time.Time) (*DashboardOverviewResponse, bool) {
+	if s == nil || s.config == nil || s.config.DashboardCacheTTL <= 0 {
+		return nil, false
+	}
+
+	s.dashboardCacheMu.RLock()
+	entry := s.dashboardCache
+	s.dashboardCacheMu.RUnlock()
+
+	if entry.snapshot == nil {
+		return nil, false
+	}
+
+	if now.Sub(entry.generatedAt) > s.config.DashboardCacheTTL {
+		return nil, false
+	}
+
+	return entry.snapshot, true
+}
+
+func (s *Server) setDashboardCache(snapshot *DashboardOverviewResponse, now time.Time) {
+	if s == nil || s.config == nil || s.config.DashboardCacheTTL <= 0 || snapshot == nil {
+		return
+	}
+
+	s.dashboardCacheMu.Lock()
+	s.dashboardCache = dashboardCacheEntry{
+		snapshot:    snapshot,
+		generatedAt: now,
+	}
+	s.dashboardCacheMu.Unlock()
+}
+
+func (s *Server) recordLoopStatus(ctx context.Context, status string, blocking bool, issues []string) {
+	if s == nil {
+		return
+	}
+	normalized := strings.ToLower(strings.TrimSpace(status))
+	if normalized == "" {
+		normalized = "unknown"
+	}
+	prev := "unknown"
+	if val := s.loopStatus.Load(); val != nil {
+		if cast, ok := val.(string); ok && cast != "" {
+			prev = cast
+		}
+	}
+	issuesSummary := ""
+	if len(issues) > 0 {
+		issuesSummary = strings.Join(issues, "; ")
+		s.loopIssues.Store(issuesSummary)
+	} else {
+		s.loopIssues.Store("")
+	}
+	prevBlocking := s.loopBlocking.Load()
+	s.loopBlocking.Store(blocking)
+	now := time.Now().Unix()
+
+	if prev != normalized {
+		s.loopStatus.Store(normalized)
+		s.loopStatusUpdated.Store(now)
+		if s.logger != nil {
+			fields := []zap.Field{
+				utils.ZapString("from", prev),
+				utils.ZapString("to", normalized),
+				utils.ZapBool("blocking", blocking),
+			}
+			if issuesSummary != "" {
+				fields = append(fields, utils.ZapString("issues", issuesSummary))
+			}
+			if normalized == "critical" || normalized == "stopped" || blocking {
+				s.logger.WarnContext(ctx, "ai detection loop status changed", fields...)
+			} else {
+				s.logger.InfoContext(ctx, "ai detection loop status changed", fields...)
+			}
+		}
+		return
+	}
+
+	if blocking && !prevBlocking {
+		s.loopStatusUpdated.Store(now)
+		if s.logger != nil {
+			fields := []zap.Field{utils.ZapString("status", normalized)}
+			if issuesSummary != "" {
+				fields = append(fields, utils.ZapString("issues", issuesSummary))
+			}
+			s.logger.WarnContext(ctx, "ai detection loop entered blocking state", fields...)
+		}
+		return
+	}
+
+	if issuesSummary != "" && s.logger != nil && (normalized == "degraded" || normalized == "critical" || normalized == "stopped") {
+		s.logger.WarnContext(ctx, "ai detection loop issues detected",
+			utils.ZapString("status", normalized),
+			utils.ZapString("issues", issuesSummary))
+	}
+}
+
+func (s *Server) recordThreatSource(ctx context.Context, source string, fallbackReason string) {
+	if s == nil {
+		return
+	}
+	normalized := strings.ToLower(strings.TrimSpace(source))
+	if normalized == "" {
+		normalized = "unknown"
+	}
+	prev := "unknown"
+	if val := s.threatDataSource.Load(); val != nil {
+		if cast, ok := val.(string); ok && cast != "" {
+			prev = cast
+		}
+	}
+	now := time.Now().Unix()
+
+	if prev != normalized {
+		s.threatDataSource.Store(normalized)
+		s.threatSourceUpdated.Store(now)
+		if normalized == "feed_fallback" || normalized == "empty" {
+			s.threatFallbackCount.Add(1)
+			s.threatFallbackUpdated.Store(now)
+			s.threatFallbackReason.Store(fallbackReason)
+			if s.logger != nil {
+				s.logger.WarnContext(ctx, "threat dashboard using fallback data",
+					utils.ZapString("source", normalized),
+					utils.ZapString("reason", fallbackReason))
+			}
+		} else if s.logger != nil && (prev == "feed_fallback" || prev == "empty") {
+			s.logger.InfoContext(ctx, "threat dashboard restored to history source",
+				utils.ZapString("source", normalized))
+		}
+		return
+	}
+
+	if (normalized == "feed_fallback" || normalized == "empty") && fallbackReason != "" {
+		s.threatFallbackReason.Store(fallbackReason)
+	}
+}
+
+func (s *Server) getOrCreateRouteMetric(key requestMetricKey) *routeMetric {
+	s.routeMetricsMu.RLock()
+	if metric, ok := s.routeMetrics[key]; ok {
+		s.routeMetricsMu.RUnlock()
+		return metric
+	}
+	s.routeMetricsMu.RUnlock()
+
+	metric := &routeMetric{}
+	s.routeMetricsMu.Lock()
+	if existing, ok := s.routeMetrics[key]; ok {
+		s.routeMetricsMu.Unlock()
+		return existing
+	}
+	s.routeMetrics[key] = metric
+	s.routeMetricsMu.Unlock()
+	return metric
+}
+
+func (s *Server) snapshotRouteMetrics() []routeMetricSnapshot {
+	s.routeMetricsMu.RLock()
+	defer s.routeMetricsMu.RUnlock()
+	snapshots := make([]routeMetricSnapshot, 0, len(s.routeMetrics))
+	for key, metric := range s.routeMetrics {
+		snapshots = append(snapshots, routeMetricSnapshot{
+			method:        key.method,
+			path:          key.path,
+			requests:      metric.totalRequests.Load(),
+			errors:        metric.errorRequests.Load(),
+			bytes:         metric.bytesTotal.Load(),
+			latencyMicros: metric.latencyMicros.Load(),
+			cacheHits:     metric.cacheHits.Load(),
+			cacheMisses:   metric.cacheMisses.Load(),
+		})
+	}
+	return snapshots
 }
 
 func (s *Server) getStorageLatencyMs() float64 {

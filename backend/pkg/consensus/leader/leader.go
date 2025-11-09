@@ -577,6 +577,9 @@ func (pm *Pacemaker) advanceView(ctx context.Context, newView uint64, highestQC 
 	pm.mu.Lock()
 	oldView := pm.currentView
 	oldTime := pm.lastViewTime
+	oldHighestQC := pm.highestQC
+	oldHeight := pm.currentHeight
+	oldNewViewSent := pm.newViewSent
 	pm.currentView = newView
 	pm.lastViewTime = now
 	if !isNilQC(highestQC) {
@@ -586,8 +589,24 @@ func (pm *Pacemaker) advanceView(ctx context.Context, newView uint64, highestQC 
 		}
 	}
 	pm.newViewSent = false
-	height := pm.currentHeight
 	pm.mu.Unlock()
+
+	if pm.callbacks != nil {
+		if err := pm.callbacks.OnViewChange(newView, highestQC); err != nil {
+			pm.mu.Lock()
+			pm.currentView = oldView
+			pm.lastViewTime = oldTime
+			pm.highestQC = oldHighestQC
+			pm.currentHeight = oldHeight
+			pm.newViewSent = oldNewViewSent
+			pm.mu.Unlock()
+			return fmt.Errorf("view change callback failed: %w", err)
+		}
+	}
+
+	pm.mu.RLock()
+	height := pm.currentHeight
+	pm.mu.RUnlock()
 
 	viewDuration := now.Sub(oldTime)
 
@@ -624,12 +643,6 @@ func (pm *Pacemaker) advanceView(ctx context.Context, newView uint64, highestQC 
 		"height":  height,
 		"timeout": timeoutStr,
 	})
-
-	if pm.callbacks != nil {
-		if err := pm.callbacks.OnViewChange(newView, highestQC); err != nil {
-			return fmt.Errorf("view change callback failed: %w", err)
-		}
-	}
 
 	return nil
 }
@@ -1054,6 +1067,35 @@ func (pm *Pacemaker) GetCurrentHeight() uint64 {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 	return pm.currentHeight
+}
+
+// SetCurrentView updates the pacemaker's current view to match recovered HotStuff state.
+func (pm *Pacemaker) SetCurrentView(view uint64) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	if view == pm.currentView {
+		return
+	}
+
+	if view < pm.currentView {
+		pm.logger.WarnContext(context.Background(), "ignoring request to decrease pacemaker view",
+			"current_view", pm.currentView,
+			"requested_view", view)
+		return
+	}
+
+	oldView := pm.currentView
+	pm.currentView = view
+	pm.lastViewTime = time.Now()
+
+	if pm.viewTimer != nil {
+		pm.resetTimerLocked()
+	}
+
+	pm.logger.InfoContext(context.Background(), "pacemaker view updated",
+		"old_view", oldView,
+		"new_view", view)
 }
 
 // SetCurrentHeight updates the pacemaker's current height when recovering state.

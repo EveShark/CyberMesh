@@ -171,6 +171,7 @@ type EngineMetrics struct {
 	BlocksCommitted       uint64
 	ViewChanges           uint64
 	EquivocationsDetected uint64
+    ParentHashMismatches  uint64
 	LastCommitTime        time.Time
 	AverageCommitLatency  time.Duration
 
@@ -289,15 +290,35 @@ func (e *ConsensusEngine) SetPersistence(worker PersistenceWorker) {
 // consensus storage if available. Intended for wiring scenarios where the
 // persistence worker is constructed after the engine.
 func (e *ConsensusEngine) AttachPersistence(worker PersistenceWorker) {
-    e.mu.Lock()
-    defer e.mu.Unlock()
-    e.persistence = worker
-    if e.storage != nil && worker != nil {
-        backend := worker.GetStorageBackend()
-        if backend != nil {
-            e.storage.SetBackend(backend)
-        }
-    }
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.persistence = worker
+	if e.storage != nil && worker != nil {
+		backend := worker.GetStorageBackend()
+		if backend != nil {
+			e.storage.SetBackend(backend)
+		}
+	}
+}
+
+type noopNetworkPublisher struct {
+	logger Logger
+}
+
+// NewNoopNetworkPublisher returns a NetworkPublisher that simply logs the publish
+// attempt. It is used to keep single-node deployments running when networking is disabled.
+func NewNoopNetworkPublisher(logger Logger) NetworkPublisher {
+	return noopNetworkPublisher{logger: logger}
+}
+
+func (p noopNetworkPublisher) Publish(ctx context.Context, topic string, data []byte) error {
+	if p.logger != nil {
+		p.logger.InfoContext(ctx, "[NETWORK] skipping publish (network disabled)",
+			utils.ZapString("topic", topic),
+			utils.ZapInt("bytes", len(data)),
+		)
+	}
+	return nil
 }
 
 // DefaultEngineConfig returns secure defaults
@@ -345,6 +366,10 @@ func NewConsensusEngine(
 		readyValidators:   make(map[ctypes.ValidatorID]time.Time),
 		genesisBackend:    genesisBackend,
 	}
+
+	// Default to a no-op network publisher so single-node deployments continue running
+	// even when P2P networking is disabled. Multi-node wiring overrides this via SetNetwork.
+	engine.net = NewNoopNetworkPublisher(logger)
 
 	// Initialize components
 	if err := engine.initializeComponents(); err != nil {
@@ -596,12 +621,7 @@ func (e *ConsensusEngine) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start HotStuff: %w", err)
 	}
 
-	if e.pacemaker != nil {
-		hotstuffHeight := e.hotstuff.GetCurrentHeight()
-		e.pacemaker.SetCurrentHeight(hotstuffHeight)
-		e.logger.InfoContext(ctx, "pacemaker height synchronized with HotStuff",
-			"height", hotstuffHeight)
-	}
+	e.syncPacemakerWithHotStuff(ctx, "pre_pacemaker_start")
 
 	if e.genesis == nil {
 		e.MarkValidatorReady(e.config.NodeID)
@@ -757,8 +777,16 @@ func (e *ConsensusEngine) SubmitBlock(ctx context.Context, block Block) error {
 		return fmt.Errorf("failed to process proposal: %w", err)
 	}
 
-	// Broadcast would happen here via network layer
-	// For now, just audit the event
+	// Broadcast proposal to peers so validators can vote (no-op publisher handles disabled networking)
+	if err := e.publishMessage(ctx, proposal); err != nil {
+		e.logger.ErrorContext(ctx, "[SUBMIT_BLOCK] proposal broadcast failed",
+			"error", err,
+			"height", proposal.Height,
+			"view", proposal.View,
+		)
+		return fmt.Errorf("failed to broadcast proposal: %w", err)
+	}
+
 	h2 := block.GetHash()
 	e.audit.Info("block_submitted", map[string]interface{}{
 		"height": block.GetHeight(),
@@ -825,16 +853,19 @@ func (e *ConsensusEngine) OnMessageReceived(ctx context.Context, peerAddr string
 	case messages.TypeProposal:
 		e.metrics.incrementProposalsReceived()
 		proposal := msg.(*messages.Proposal)
+		e.markValidatorActive(proposal.ProposerID, time.Now())
 		return e.hotstuff.OnProposal(ctx, proposal)
 
 	case messages.TypeVote:
 		e.metrics.incrementVotesReceived()
 		vote := msg.(*messages.Vote)
+		e.markValidatorActive(vote.VoterID, time.Now())
 		return e.hotstuff.OnVote(ctx, vote)
 
 	case messages.TypeViewChange:
 		e.metrics.incrementViewChanges()
 		vc := msg.(*messages.ViewChange)
+		e.markValidatorActive(vc.SenderID, time.Now())
 		// Avoid typed-nil QC in interface: only assign when non-nil
 		var hqc QC
 		if vc.HighestQC != nil {
@@ -858,6 +889,7 @@ func (e *ConsensusEngine) OnMessageReceived(ctx context.Context, peerAddr string
 		e.logger.InfoContext(ctx, "received newview message", "peer", peerAddr)
 		nv := msg.(*messages.NewView)
 		e.logger.InfoContext(ctx, "newview decoded", "view", nv.View, "leader", nv.LeaderID)
+		e.markValidatorActive(nv.LeaderID, nv.Timestamp)
 
 		// Convert ViewChanges
 		vcl := make([]*leader.ViewChangeMsg, 0, len(nv.ViewChanges))
@@ -919,6 +951,7 @@ func (e *ConsensusEngine) OnMessageReceived(ctx context.Context, peerAddr string
 		if hb.Signature.Bytes != nil {
 			lhb.Signature = hb.Signature.Bytes
 		}
+		e.markValidatorActive(hb.LeaderID, hb.Timestamp)
 		err := e.heartbeat.OnHeartbeat(ctx, lhb)
 		if err != nil {
 			e.logger.ErrorContext(ctx, "Heartbeat.OnHeartbeat FAILED", "error", err)
@@ -955,11 +988,13 @@ func (e *ConsensusEngine) OnMessageReceived(ctx context.Context, peerAddr string
 
 	case messages.TypeProposalIntent:
 		pi := msg.(*messages.ProposalIntent)
+		e.markValidatorActive(pi.LeaderID, pi.Timestamp)
 		e.handleProposalIntent(ctx, pi)
 		return nil
 
 	case messages.TypeReadyToVote:
 		rtv := msg.(*messages.ReadyToVote)
+		e.markValidatorActive(rtv.ValidatorID, rtv.Timestamp)
 		e.recordReadyToVote(rtv)
 		return nil
 
@@ -1118,11 +1153,17 @@ func (e *ConsensusEngine) OnHeartbeatTimeout(view uint64, lastSeen time.Time) er
 		"view", view,
 		"last_seen", lastSeen,
 	)
+	if e.rotation != nil {
+		if leaderID, err := e.rotation.GetLeaderForView(context.Background(), view); err == nil {
+			e.markValidatorInactive(leaderID, time.Now())
+		}
+	}
 	return nil
 }
 
 // OnLeaderAlive is called when leader heartbeat received
 func (e *ConsensusEngine) OnLeaderAlive(view uint64, leaderID ValidatorID) error {
+	e.markValidatorActive(leaderID, time.Now())
 	return nil
 }
 
@@ -1179,6 +1220,14 @@ func (e *ConsensusEngine) GetStatus() EngineStatus {
 // GetMetrics returns current metrics
 func (e *ConsensusEngine) GetMetrics() MetricsSnapshot {
 	return e.metrics.snapshot()
+}
+
+// RecordParentHashMismatch increments the metric tracking parent-hash validation mismatches.
+func (e *ConsensusEngine) RecordParentHashMismatch() {
+    if e == nil || e.metrics == nil {
+        return
+    }
+    e.metrics.incrementParentHashMismatches()
 }
 
 // GetGenesisReadyMetrics returns aggregated genesis readiness telemetry counters.
@@ -1280,6 +1329,33 @@ func (e *ConsensusEngine) logMetrics(ctx context.Context) {
 // SetNetwork configures the outbound publisher.
 func (e *ConsensusEngine) SetNetwork(p NetworkPublisher) { e.net = p }
 
+func (e *ConsensusEngine) syncPacemakerWithHotStuff(ctx context.Context, stage string) {
+	if e.pacemaker == nil || e.hotstuff == nil {
+		return
+	}
+
+	hotstuffHeight := e.hotstuff.GetCurrentHeight()
+	hotstuffView := e.hotstuff.GetCurrentView()
+	e.pacemaker.SetCurrentHeight(hotstuffHeight)
+	e.pacemaker.SetCurrentView(hotstuffView)
+
+	if lockedQC := e.hotstuff.GetLockedQC(); lockedQC != nil {
+		e.pacemaker.SetHighestQC(lockedQC)
+		if mqc, ok := lockedQC.(*messages.QC); ok {
+			e.encoder.CacheQCSignatures(mqc)
+			for _, sig := range mqc.Signatures {
+				e.markValidatorActive(ctypes.ValidatorID(sig.KeyID), time.Now())
+			}
+		}
+	}
+
+	e.logger.InfoContext(ctx, "pacemaker synchronized with HotStuff",
+		"stage", stage,
+		"height", hotstuffHeight,
+		"view", hotstuffView,
+	)
+}
+
 // SetGenesisCoordinator wires the genesis ceremony coordinator into the engine.
 func (e *ConsensusEngine) SetGenesisCoordinator(coord *genesis.Coordinator) {
 	e.mu.Lock()
@@ -1293,9 +1369,13 @@ func (e *ConsensusEngine) LeaderRotation() ctypes.LeaderRotation {
 }
 
 func (e *ConsensusEngine) startConsensusComponents(ctx context.Context) error {
+	e.syncPacemakerWithHotStuff(ctx, "pre_pacemaker_run")
+
 	if err := e.pacemaker.Start(ctx); err != nil {
 		return fmt.Errorf("failed to start pacemaker: %w", err)
 	}
+
+	e.syncPacemakerWithHotStuff(ctx, "post_pacemaker_start")
 	if err := e.heartbeat.Start(ctx); err != nil {
 		_ = e.pacemaker.Stop()
 		return fmt.Errorf("failed to start heartbeat: %w", err)
@@ -1842,6 +1922,36 @@ func (e *ConsensusEngine) publishMessage(ctx context.Context, msg ctypes.Message
 	return nil
 }
 
+func (e *ConsensusEngine) markValidatorActive(id ctypes.ValidatorID, when time.Time) {
+	if e.validatorSet == nil {
+		return
+	}
+	var zero ctypes.ValidatorID
+	if id == zero {
+		return
+	}
+	if tracker, ok := e.validatorSet.(interface {
+		MarkActive(ctypes.ValidatorID, time.Time)
+	}); ok {
+		tracker.MarkActive(id, when)
+	}
+}
+
+func (e *ConsensusEngine) markValidatorInactive(id ctypes.ValidatorID, when time.Time) {
+	if e.validatorSet == nil {
+		return
+	}
+	var zero ctypes.ValidatorID
+	if id == zero {
+		return
+	}
+	if tracker, ok := e.validatorSet.(interface {
+		MarkInactive(ctypes.ValidatorID, time.Time)
+	}); ok {
+		tracker.MarkInactive(id, when)
+	}
+}
+
 func (e *ConsensusEngine) topicFor(t messages.MessageType) string {
 	if e.config != nil && e.config.Topics != nil {
 		if s, ok := e.config.Topics[t]; ok && s != "" {
@@ -1928,6 +2038,12 @@ func (m *EngineMetrics) incrementViewChanges() {
 	m.ViewChanges++
 }
 
+func (m *EngineMetrics) incrementParentHashMismatches() {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+    m.ParentHashMismatches++
+}
+
 func (m *EngineMetrics) updateLastCommitTime() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1947,6 +2063,7 @@ func (m *EngineMetrics) snapshot() MetricsSnapshot {
 		BlocksCommitted:       m.BlocksCommitted,
 		ViewChanges:           m.ViewChanges,
 		EquivocationsDetected: m.EquivocationsDetected,
+        ParentHashMismatches:  m.ParentHashMismatches,
 		LastCommitTime:        m.LastCommitTime,
 	}
 }
@@ -1974,6 +2091,7 @@ type MetricsSnapshot struct {
 	BlocksCommitted       uint64
 	ViewChanges           uint64
 	EquivocationsDetected uint64
+    ParentHashMismatches  uint64
 	LastCommitTime        time.Time
 }
 

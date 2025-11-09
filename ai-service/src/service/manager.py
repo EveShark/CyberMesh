@@ -14,14 +14,16 @@ Security:
     - Thread-safe operations
 """
 import math
+import os
 import threading
 import time
 from collections import deque
 from datetime import datetime
 from enum import Enum
-from typing import Optional, Dict, Any, Callable, List
+from typing import Optional, Dict, Any, Callable, List, Tuple
 
 from ..config import Settings
+from ..config.settings import FeedbackConfig
 from ..logging import get_logger
 from ..utils import Signer, NonceManager, CircuitBreaker
 from ..utils.errors import ServiceError
@@ -141,7 +143,23 @@ class ServiceManager:
             "last_updated": None,
         }
 
+        self._cached_detection_snapshot = {
+            "running": False,
+            "status": "unknown",
+            "healthy": False,
+            "blocking": False,
+            "issues": [],
+            "message": "",
+            "metrics": self._cached_detection_metrics["metrics"],
+            "last_updated": None,
+            "history_staleness_seconds": None,
+        }
+        self._last_loop_status = "unknown"
+        self._last_loop_blocking = False
+
         # Detection history (for API exposure)
+
+        self._history_staleness_seconds = int(os.getenv("DETECTION_HISTORY_STALE_SECONDS", "900"))
         self._history_lock = threading.Lock()
         self._detection_history = deque(maxlen=500)
 
@@ -150,6 +168,8 @@ class ServiceManager:
         self._engine_metrics = {}
         self._variant_metrics_lock = threading.RLock()
         self._variant_metrics = {}
+        self._timestamp_skew_tolerance = 600
+        self._timestamp_backlog_tolerance = 3600
     
     @property
     def state(self) -> ServiceState:
@@ -238,9 +258,16 @@ class ServiceManager:
                 
                 # Initialize Kafka consumer
                 self.logger.info("Initializing Kafka consumer")
+                consumer_topics = [
+                    settings.kafka_topics.control_reputation,
+                    settings.kafka_topics.control_policy,
+                    settings.kafka_topics.control_evidence,
+                ]
+
                 self.consumer = AIConsumer(
                     config=settings,
-                    logger=self.logger
+                    logger=self.logger,
+                    topics=consumer_topics,
                 )
                 
                 # Initialize message handlers (will set service_manager after ML pipeline init)
@@ -248,7 +275,6 @@ class ServiceManager:
                 self.handlers = MessageHandlers(logger=self.logger, service_manager=None)
                 
                 # Register handlers with consumer
-                self.consumer.register_handler("commit", self.handlers.handle_commit_event)
                 self.consumer.register_handler("reputation", self.handlers.handle_reputation_event)
                 self.consumer.register_handler("policy_update", self.handlers.handle_policy_update_event)
                 self.consumer.register_handler("evidence_request", self.handlers.handle_evidence_request_event)
@@ -470,6 +496,19 @@ class ServiceManager:
                             exc_info=True,
                             extra={"error": str(e)}
                         )
+
+                # Close telemetry resources
+                if self.detection_pipeline:
+                    telemetry = getattr(self.detection_pipeline, "telemetry", None)
+                    if telemetry and hasattr(telemetry, "close"):
+                        try:
+                            telemetry.close()
+                        except Exception as e:
+                            self.logger.debug(
+                                "Error closing telemetry source",
+                                exc_info=True,
+                                extra={"error": str(e)}
+                            )
                 
                 # Check if we exceeded timeout
                 elapsed = time.time() - shutdown_start
@@ -694,26 +733,81 @@ class ServiceManager:
             
             # Detection loop metrics (Phase 8)
             if self.detection_loop:
-                loop_metrics = self.detection_loop.get_metrics()
-                snapshot = {
-                    "running": self.detection_loop.is_healthy(),
-                    "metrics": loop_metrics,
-                    "last_updated": time.time(),
+                snapshot = self.detection_loop.get_health_snapshot()
+
+                metrics_copy = dict(snapshot.get("metrics", {}))
+                issues_copy = list(snapshot.get("issues", []))
+
+                cache_entry = {
+                    "running": snapshot.get("running", False),
+                    "metrics": metrics_copy,
+                    "last_updated": snapshot.get("last_updated"),
                 }
-                self._cached_detection_metrics = {
-                    "running": snapshot["running"],
-                    "metrics": dict(loop_metrics),
-                    "last_updated": snapshot["last_updated"],
+                self._cached_detection_metrics = cache_entry
+
+                snapshot_copy = {
+                    "running": snapshot.get("running", False),
+                    "status": snapshot.get("status", "unknown"),
+                    "healthy": snapshot.get("healthy", False),
+                    "blocking": snapshot.get("blocking", False),
+                    "issues": issues_copy,
+                    "message": snapshot.get("message", ""),
+                    "metrics": metrics_copy,
+                    "last_updated": snapshot.get("last_updated"),
+                    "history_staleness_seconds": None,
+                    "seconds_since_last_iteration": snapshot.get("seconds_since_last_iteration"),
+                    "seconds_since_last_detection": snapshot.get("seconds_since_last_detection"),
                 }
-                health["detection_loop"] = snapshot
+
+                history_issue, history_staleness = self._evaluate_history_health(metrics_copy)
+                snapshot_copy["history_staleness_seconds"] = history_staleness
+                if history_issue:
+                    if history_issue not in issues_copy:
+                        issues_copy.append(history_issue)
+                    if snapshot_copy["status"] == "ok":
+                        snapshot_copy["status"] = "degraded"
+                    if snapshot_copy["message"]:
+                        snapshot_copy["message"] = f"{snapshot_copy['message']}; {history_issue}"
+                    else:
+                        snapshot_copy["message"] = history_issue
+
+                self._cached_detection_snapshot = snapshot_copy
+
+                if self.logger and (
+                    snapshot_copy["status"] != self._last_loop_status
+                    or snapshot_copy["blocking"] != self._last_loop_blocking
+                ):
+                    log_extra = {
+                        "status": snapshot_copy["status"],
+                        "issues": issues_copy,
+                        "blocking": snapshot_copy["blocking"],
+                    }
+                    if snapshot_copy["status"] in ("critical", "stopped") or snapshot_copy["blocking"]:
+                        self.logger.warning("Detection loop status changed", extra=log_extra)
+                    else:
+                        self.logger.info("Detection loop status changed", extra=log_extra)
+                self._last_loop_status = snapshot_copy["status"]
+                self._last_loop_blocking = snapshot_copy["blocking"]
+
+                health["detection_loop"] = snapshot_copy
             else:
-                # Serve cached metrics when loop not initialized or stopped
-                cached = {
-                    "running": self._cached_detection_metrics.get("running", False),
+                # Serve cached snapshot when loop not initialized or stopped
+                cached_snapshot = {
+                    "running": self._cached_detection_snapshot.get("running", False),
+                    "status": self._cached_detection_snapshot.get("status", "unknown"),
+                    "healthy": self._cached_detection_snapshot.get("healthy", False),
+                    "blocking": self._cached_detection_snapshot.get("blocking", False),
+                    "issues": list(self._cached_detection_snapshot.get("issues", [])),
+                    "message": self._cached_detection_snapshot.get("message", ""),
                     "metrics": dict(self._cached_detection_metrics.get("metrics", {})),
-                    "last_updated": self._cached_detection_metrics.get("last_updated"),
+                    "last_updated": self._cached_detection_snapshot.get("last_updated"),
+                    "history_staleness_seconds": self._cached_detection_snapshot.get("history_staleness_seconds"),
+                    "seconds_since_last_iteration": self._cached_detection_snapshot.get("seconds_since_last_iteration"),
+                    "seconds_since_last_detection": self._cached_detection_snapshot.get("seconds_since_last_detection"),
                 }
-                health["detection_loop"] = cached
+                health["detection_loop"] = cached_snapshot
+                self._last_loop_status = cached_snapshot["status"]
+                self._last_loop_blocking = cached_snapshot["blocking"]
             
             # Rate limiter stats (Phase 8)
             if self.rate_limiter:
@@ -731,10 +825,45 @@ class ServiceManager:
         """Return latest detection loop metrics snapshot."""
         with self._state_lock:
             return {
-                "running": self._cached_detection_metrics.get("running", False),
+                "running": self._cached_detection_snapshot.get("running", False),
+                "status": self._cached_detection_snapshot.get("status", "unknown"),
+                "healthy": self._cached_detection_snapshot.get("healthy", False),
+                "blocking": self._cached_detection_snapshot.get("blocking", False),
+                "issues": list(self._cached_detection_snapshot.get("issues", [])),
+                "message": self._cached_detection_snapshot.get("message", ""),
                 "metrics": dict(self._cached_detection_metrics.get("metrics", {})),
-                "last_updated": self._cached_detection_metrics.get("last_updated"),
+                "last_updated": self._cached_detection_snapshot.get("last_updated"),
+                "history_staleness_seconds": self._cached_detection_snapshot.get("history_staleness_seconds"),
+                "seconds_since_last_iteration": self._cached_detection_snapshot.get("seconds_since_last_iteration"),
+                "seconds_since_last_detection": self._cached_detection_snapshot.get("seconds_since_last_detection"),
             }
+
+    def _evaluate_history_health(self, loop_metrics: Dict[str, Any]) -> Tuple[Optional[str], Optional[float]]:
+        now = time.time()
+        with self._history_lock:
+            if not self._detection_history:
+                iterations = loop_metrics.get("loop_iterations", 0) or 0
+                published = loop_metrics.get("detections_published", 0) or 0
+                if iterations >= 5 or published > 0:
+                    return ("detection history empty (no events persisted)", None)
+                return (None, None)
+
+            latest_event = self._detection_history[0]
+            timestamp = latest_event.get("timestamp")
+
+        try:
+            last_ts = float(timestamp)
+        except (TypeError, ValueError):
+            return ("detection history entry missing timestamp", None)
+
+        staleness = max(0.0, now - last_ts)
+        if staleness > self._history_staleness_seconds:
+            message = (
+                f"detection history stale ({staleness:.0f}s > {self._history_staleness_seconds}s)"
+            )
+            return (message, staleness)
+
+        return (None, staleness)
 
     def get_handler_metrics(self) -> Dict[str, Any]:
         """
@@ -809,6 +938,7 @@ class ServiceManager:
             'TELEMETRY_FLOWS_PATH': get_config('TELEMETRY_FLOWS_PATH', 'data/telemetry/flows'),
             'TELEMETRY_FILES_PATH': get_config('TELEMETRY_FILES_PATH', 'data/telemetry/files'),
             'MODELS_PATH': get_config('MODELS_PATH', 'data/models'),
+            'TELEMETRY_BATCH_SIZE': int(get_config('TELEMETRY_BATCH_SIZE', getattr(settings, 'telemetry_batch_size', 1000))),
             'ML_WEIGHT': float(get_config('ML_WEIGHT', 0.5)),
             'RULES_WEIGHT': float(get_config('RULES_WEIGHT', 0.3)),
             'MATH_WEIGHT': float(get_config('MATH_WEIGHT', 0.2)),
@@ -821,6 +951,8 @@ class ServiceManager:
             'MALWARE_ENTROPY_THRESHOLD': float(get_config('MALWARE_ENTROPY_THRESHOLD', 7.5)),
             'BASELINE_STATS_PATH': get_config('BASELINE_STATS_PATH', 'data/models/baseline_stats.json'),
         }
+        ml_config['MAX_FLOWS_PER_ITERATION'] = int(get_config('MAX_FLOWS_PER_ITERATION', getattr(settings, 'max_flows_per_iteration', 100)))
+        ml_config['STAGE_WARN_THRESHOLD_MS'] = float(get_config('STAGE_WARN_THRESHOLD_MS', getattr(settings, 'max_loop_latency_warning_ms', 3000)))
         
         # 1. Telemetry source - use PostgreSQL if configured
         telemetry_source_type = get_config('TELEMETRY_SOURCE_TYPE', 'file')
@@ -832,15 +964,50 @@ class ServiceManager:
                 'user': get_config('DB_USER', 'postgres'),
                 'password': get_config('DB_PASSWORD', 'postgres'),
             }
+            sslmode = get_config('DB_SSLMODE', None)
+            if sslmode:
+                db_config['sslmode'] = sslmode
+            sslrootcert = get_config('DB_SSLROOTCERT', None)
+            if sslrootcert:
+                db_config['sslrootcert'] = sslrootcert
+            sslcert = get_config('DB_SSLCERT', None)
+            if sslcert:
+                db_config['sslcert'] = sslcert
+            sslkey = get_config('DB_SSLKEY', None)
+            if sslkey:
+                db_config['sslkey'] = sslkey
             table_name = get_config('DB_TABLE', 'test_ddos_binary')
             schema = 'curated' if 'test' in table_name else 'public'
+            sample_table = get_config('DB_SAMPLE_TABLE', None)
+            sample_strategy = get_config('DB_SAMPLE_STRATEGY', 'tablesample')
+            sample_percent = float(get_config('DB_SAMPLE_PERCENT', 5.0))
+            pool_min = int(get_config('DB_POOL_MIN_CONN', 1))
+            pool_max = int(get_config('DB_POOL_MAX_CONN', 4))
+            prefetch_enabled = str(get_config('DB_PREFETCH_ENABLED', 'false')).lower() in ('1', 'true', 'yes', 'on')
             telemetry_source = PostgresTelemetrySource(
                 db_config=db_config, 
                 sample_size=100,
                 table_name=table_name,
-                schema=schema
+                schema=schema,
+                sample_table=sample_table if sample_table else None,
+                sample_strategy=sample_strategy,
+                sample_percent=sample_percent,
+                pool_min=pool_min,
+                pool_max=pool_max,
+                prefetch_enabled=prefetch_enabled,
             )
-            self.logger.info('Using PostgreSQL telemetry source')
+            self.logger.info(
+                'Using PostgreSQL telemetry source',
+                extra={
+                    'table': f"{schema}.{table_name}",
+                    'sample_strategy': sample_strategy,
+                    'sample_table': sample_table,
+                    'sample_percent': sample_percent,
+                    'pool_min': pool_min,
+                    'pool_max': pool_max,
+                    'prefetch_enabled': prefetch_enabled,
+                }
+            )
         else:
             telemetry_source = FileTelemetrySource(
                 flows_path=ml_config['TELEMETRY_FLOWS_PATH'],
@@ -884,6 +1051,9 @@ class ServiceManager:
                 if self.logger:
                     self.logger.warning("ML DLQ emit failed; logged only")
 
+        # 7. Prometheus metrics
+        self.ml_metrics = PrometheusMetrics()
+
         engines = [
             RulesEngine(config=ml_config),
             MathEngine(config=ml_config, baseline_path=ml_config['BASELINE_STATS_PATH']),
@@ -905,9 +1075,6 @@ class ServiceManager:
             node_id=settings.node_id
         )
         
-        # 7. Prometheus metrics
-        self.ml_metrics = PrometheusMetrics()
-        
         # 8. Detection pipeline
         self.detection_pipeline = DetectionPipeline(
             telemetry_source=telemetry_source,
@@ -916,7 +1083,8 @@ class ServiceManager:
             ensemble=ensemble,
             evidence_generator=evidence_generator,
             circuit_breaker=self.circuit_breaker,
-            config=ml_config
+            config=ml_config,
+            metrics=self.ml_metrics,
         )
         
         # Record engine status in metrics
@@ -946,7 +1114,11 @@ class ServiceManager:
         from ..feedback.service import FeedbackService
         from ..ml.adaptive import AdaptiveDetection
         
-        self.feedback_service = FeedbackService(settings, self.logger)
+        self.feedback_service = FeedbackService(
+            settings,
+            self.logger,
+            extra_commit_handler=self.handlers.handle_commit_event,
+        )
         
         # Wire AdaptiveDetection into existing ensemble
         if self.detection_pipeline and self.detection_pipeline.ensemble:
@@ -954,6 +1126,15 @@ class ServiceManager:
             self.detection_pipeline.ensemble.adaptive = adaptive
             self.logger.info("Adaptive detection wired into ensemble")
         
+        if self.detection_loop:
+            try:
+                self.detection_loop.set_tracker(self.feedback_service.tracker)
+            except Exception as err:
+                self.logger.warning(
+                    "Failed to attach tracker to detection loop",
+                    extra={"error": str(err)}
+                )
+
         self.logger.info("Feedback service components initialized")
     
     def _initialize_detection_loop(self, settings: Settings, ml_config: Dict) -> None:
@@ -983,8 +1164,66 @@ class ServiceManager:
         detection_config = {
             'DETECTION_INTERVAL': getattr(settings, 'detection_interval', 5),
             'DETECTION_TIMEOUT': getattr(settings, 'detection_timeout', 30),
-            'TELEMETRY_BATCH_SIZE': getattr(settings, 'telemetry_batch_size', 1000)
+            'TELEMETRY_BATCH_SIZE': getattr(settings, 'telemetry_batch_size', 1000),
+            'MAX_FLOWS_PER_ITERATION': getattr(settings, 'max_flows_per_iteration', 100),
+            'DETECTION_SUMMARY_INTERVAL': getattr(settings, 'detection_summary_interval', 10),
+            'MAX_ITERATION_LAG_SECONDS': getattr(settings, 'max_iteration_lag_seconds', 20),
+            'MAX_DETECTION_GAP_SECONDS': getattr(settings, 'max_detection_gap_seconds', 600),
+            'MAX_LOOP_LATENCY_WARNING_MS': getattr(settings, 'max_loop_latency_warning_ms', 3000),
+            'DETECTION_PUBLISH_FLUSH': getattr(settings, 'detection_publish_flush', False),
+            'TRACKER_SAMPLE_WINDOW_SIZE': getattr(settings, 'tracker_sample_window_size', 500),
+            'TRACKER_SAMPLE_CAP': getattr(settings, 'tracker_sample_cap', 100),
+            'TRACKER_BATCH_SIZE': getattr(settings, 'tracker_batch_size', 50),
+            'TRACKER_FLUSH_INTERVAL_SECONDS': getattr(settings, 'tracker_flush_interval_seconds', 5),
         }
+
+        # Align sampling configuration with calibration requirements to avoid
+        # starving the feedback loop of training samples. When persistence is
+        # disabled we can safely capture every event in-memory; otherwise ensure
+        # the sampler can gather at least the minimum needed for calibration.
+        feedback_cfg = getattr(settings, "feedback", None)
+        if feedback_cfg is None:
+            env_flag = os.getenv("FEEDBACK_DISABLE_PERSISTENCE")
+            disable_persistence = env_flag.lower() in ("true", "1", "yes", "on") if env_flag else False
+            feedback_cfg = FeedbackConfig(disable_persistence=disable_persistence)
+        else:
+            disable_persistence = getattr(feedback_cfg, "disable_persistence", False)
+
+        sample_window = int(detection_config['TRACKER_SAMPLE_WINDOW_SIZE'])
+        sample_cap = int(detection_config['TRACKER_SAMPLE_CAP'])
+        calibration_min = max(1, getattr(feedback_cfg, 'calibration_min_samples', 1000))
+
+        effective_window = sample_window
+        effective_cap = sample_cap
+
+        if disable_persistence:
+            effective_window = max(sample_window, calibration_min)
+            effective_cap = effective_window
+        else:
+            if sample_window < calibration_min:
+                effective_window = calibration_min
+            required_cap = min(effective_window, calibration_min)
+            if sample_cap < required_cap:
+                effective_cap = required_cap
+
+        detection_config['TRACKER_SAMPLE_WINDOW_SIZE'] = int(effective_window)
+        detection_config['TRACKER_SAMPLE_CAP'] = int(effective_cap)
+
+        if effective_window != sample_window or effective_cap != sample_cap:
+            self.logger.info(
+                "Adjusted tracker sampling parameters",
+                extra={
+                    "disable_persistence": disable_persistence,
+                    "calibration_min_samples": calibration_min,
+                    "sample_window_original": sample_window,
+                    "sample_cap_original": sample_cap,
+                    "sample_window_effective": effective_window,
+                    "sample_cap_effective": effective_cap,
+                },
+            )
+
+        self._timestamp_skew_tolerance = getattr(settings, 'timestamp_skew_tolerance_seconds', 600)
+        self._timestamp_backlog_tolerance = max(self._timestamp_skew_tolerance * 6, 3600)
         
         self.detection_loop = DetectionLoop(
             pipeline=self.detection_pipeline,
@@ -1193,8 +1432,11 @@ class ServiceManager:
         if validator_id is not None and isinstance(validator_id, bytes):
             validator_id = validator_id.hex()
 
+        now = time.time()
+        event_timestamp = self._resolve_event_timestamp(metadata)
+
         event = {
-            "timestamp": time.time(),
+            "timestamp": event_timestamp if event_timestamp is not None else now,
             "source": source,
             "validator_id": validator_id,
             "threat_type": threat_type,
@@ -1230,6 +1472,43 @@ class ServiceManager:
         events.sort(key=lambda evt: evt["timestamp"], reverse=True)
 
         return [self._format_detection_entry(evt) for evt in events[:limit]]
+
+    def _resolve_event_timestamp(self, metadata: Optional[Dict[str, Any]]) -> Optional[float]:
+        """Normalize event timestamps to guard against clock skew."""
+
+        if not metadata:
+            return None
+
+        candidate = metadata.get("timestamp") or metadata.get("detection_timestamp") or metadata.get("commit_timestamp")
+        if candidate is None and isinstance(metadata.get("latency_ms"), (int, float)):
+            try:
+                base = metadata.get("commit_height_timestamp")
+                if isinstance(base, (int, float)):
+                    candidate = float(base)
+            except Exception:
+                candidate = None
+
+        ts: Optional[float]
+        if isinstance(candidate, (int, float)):
+            ts = float(candidate)
+        elif isinstance(candidate, str):
+            try:
+                ts = float(candidate)
+            except ValueError:
+                ts = None
+        else:
+            ts = None
+
+        if ts is None:
+            return None
+
+        now = time.time()
+        # Clamp timestamps that are wildly out of range (beyond +-10 minutes)
+        future_tolerance = float(getattr(self, "_timestamp_skew_tolerance", 600))
+        past_tolerance = float(getattr(self, "_timestamp_backlog_tolerance", 3600))
+        if ts > now + future_tolerance or ts < now - past_tolerance:
+            return now
+        return ts
 
     def get_ai_suspicious_nodes(self, limit: int = 10) -> list:
         """Compute AI-driven suspicious validator scores."""

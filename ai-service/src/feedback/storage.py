@@ -20,6 +20,7 @@ Environment Variables:
 import os
 import json
 import redis
+from collections import defaultdict
 from typing import Optional, Any, Dict, List
 from contextlib import contextmanager
 
@@ -46,7 +47,7 @@ class RedisStorage:
         data = storage.get("key")
     """
     
-    def __init__(self):
+    def __init__(self, disabled: bool = False):
         """Initialize Redis client with environment config."""
         self.host = os.getenv("REDIS_HOST", "localhost")
         self.port = int(os.getenv("REDIS_PORT", "6379"))
@@ -54,6 +55,7 @@ class RedisStorage:
         self.db = int(os.getenv("REDIS_DB", "0"))
         self.tls_enabled = os.getenv("REDIS_TLS_ENABLED", "false").lower() == "true"
         self.max_connections = int(os.getenv("REDIS_MAX_CONNECTIONS", "10"))
+        self._disabled = disabled
         
         # Circuit breaker (fail-fast after 5 failures, 60s recovery)
         self.circuit_breaker = CircuitBreaker(
@@ -72,7 +74,11 @@ class RedisStorage:
         self._pool: Optional[redis.ConnectionPool] = None
         self._client: Optional[redis.Redis] = None
         
-        self._initialize_connection()
+        if self._disabled:
+            # When persistence is disabled we swap in a lightweight in-memory stub.
+            self._client = _InMemoryRedisClient()
+        else:
+            self._initialize_connection()
     
     def _initialize_connection(self):
         """Initialize Redis connection pool."""
@@ -211,7 +217,7 @@ class RedisStorage:
         """
         try:
             return self._client.incrby(key, amount)
-        except redis.RedisError as e:
+        except Exception as e:
             raise StorageError(f"Failed to increment key {key}: {e}") from e
     
     def get_many(self, keys: List[str]) -> Dict[str, Any]:
@@ -239,7 +245,7 @@ class RedisStorage:
                         result[key] = value
             
             return result
-        except redis.RedisError as e:
+        except Exception as e:
             raise StorageError(f"Failed to get multiple keys: {e}") from e
     
     def keys_by_pattern(self, pattern: str) -> List[str]:
@@ -257,7 +263,7 @@ class RedisStorage:
         """
         try:
             return self._client.keys(pattern)
-        except redis.RedisError as e:
+        except Exception as e:
             raise StorageError(f"Failed to get keys by pattern {pattern}: {e}") from e
     
     def health_check(self) -> bool:
@@ -277,3 +283,144 @@ class RedisStorage:
         """Close Redis connection."""
         if self._client:
             self._client.close()
+
+
+class _InMemoryPipeline:
+    """Minimal pipeline stub that executes commands immediately."""
+
+    def __init__(self, client: "_InMemoryRedisClient"):
+        self._client = client
+        self._responses: List[Any] = []
+
+    def hset(self, key: str, *args, **kwargs):
+        self._responses.append(self._client.hset(key, *args, **kwargs))
+        return self
+
+    def expire(self, key: str, ttl: int):
+        self._responses.append(self._client.expire(key, ttl))
+        return self
+
+    def zadd(self, key: str, mapping: Dict[str, float]):
+        self._responses.append(self._client.zadd(key, mapping))
+        return self
+
+    def hincrby(self, key: str, field: str, amount: int):
+        self._responses.append(self._client.hincrby(key, field, amount))
+        return self
+
+    def execute(self):
+        resp, self._responses = self._responses, []
+        return resp
+
+
+class _InMemoryRedisClient:
+    """Drop-in subset of redis.Redis used for local feedback buffering."""
+
+    def __init__(self):
+        self._strings: Dict[str, str] = {}
+        self._hashes: Dict[str, Dict[str, str]] = defaultdict(dict)
+        self._sorted_sets: Dict[str, Dict[str, float]] = defaultdict(dict)
+
+    # Basic string operations -------------------------------------------------
+    def set(self, key: str, value: Any):
+        self._strings[key] = str(value)
+        return True
+
+    def setex(self, key: str, ttl: int, value: Any):
+        self._strings[key] = str(value)
+        return True
+
+    def get(self, key: str):
+        return self._strings.get(key)
+
+    def mget(self, keys: List[str]):
+        return [self._strings.get(k) for k in keys]
+
+    def delete(self, key: str):
+        existed = key in self._strings
+        self._strings.pop(key, None)
+        self._hashes.pop(key, None)
+        self._sorted_sets.pop(key, None)
+        return 1 if existed else 0
+
+    def incrby(self, key: str, amount: int):
+        current = int(self._strings.get(key, "0")) + amount
+        self._strings[key] = str(current)
+        return current
+
+    def keys(self, pattern: str):
+        import fnmatch
+
+        all_keys = set(self._strings) | set(self._hashes) | set(self._sorted_sets)
+        return [k for k in all_keys if fnmatch.fnmatch(k, pattern)]
+
+    def ping(self):
+        return True
+
+    def close(self):
+        return True
+
+    # Hash operations ---------------------------------------------------------
+    def hset(self, key: str, field: Optional[str] = None, value: Optional[str] = None, mapping: Optional[Dict[str, Any]] = None):
+        if mapping:
+            for f, v in mapping.items():
+                self._hashes[key][f] = str(v)
+            return True
+        if field is None:
+            return False
+        self._hashes[key][field] = str(value)
+        return True
+
+    def hget(self, key: str, field: str):
+        return self._hashes.get(key, {}).get(field)
+
+    def hgetall(self, key: str):
+        return dict(self._hashes.get(key, {}))
+
+    def hincrby(self, key: str, field: str, amount: int):
+        current = int(self._hashes[key].get(field, "0")) + amount
+        self._hashes[key][field] = str(current)
+        return current
+
+    # Sorted set operations ---------------------------------------------------
+    def zadd(self, key: str, mapping: Dict[str, float]):
+        added = 0
+        for member, score in mapping.items():
+            if member not in self._sorted_sets[key]:
+                added += 1
+            self._sorted_sets[key][str(member)] = float(score)
+        return added
+
+    def zrangebyscore(self, key: str, min_score: float, max_score: float):
+        def _parse(value: Any) -> float:
+            if isinstance(value, (int, float)):
+                return float(value)
+            if isinstance(value, str):
+                if value in {"-inf", "-infinity"}:
+                    return float("-inf")
+                if value in {"+inf", "inf", "infinity"}:
+                    return float("inf")
+                return float(value)
+            return float(value)
+
+        min_val = _parse(min_score)
+        max_val = _parse(max_score)
+        items = self._sorted_sets.get(key, {})
+        return [
+            member
+            for member, score in sorted(items.items(), key=lambda item: (item[1], item[0]))
+            if min_val <= score <= max_val
+        ]
+
+    def zadd_incr(self, key: str, mapping: Dict[str, float]):
+        return self.zadd(key, mapping)
+
+    # Misc operations ---------------------------------------------------------
+    def expire(self, key: str, ttl: int):
+        return True
+
+    def exists(self, key: str):
+        return key in self._strings or key in self._hashes or key in self._sorted_sets
+
+    def pipeline(self, transaction: bool = False):
+        return _InMemoryPipeline(self)

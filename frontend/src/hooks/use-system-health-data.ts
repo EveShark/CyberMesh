@@ -1,9 +1,18 @@
 "use client"
 
-import { useEffect, useMemo, useRef, useState } from "react"
-import useSWR from "swr"
+import { useMemo } from "react"
 
-import type { BackendReady, BackendHealth, StatsSummary, PrometheusSample, AiMetricsResponse } from "@/lib/api"
+import type {
+  BackendReady,
+  BackendHealth,
+  StatsSummary,
+  PrometheusSample,
+  AiMetricsResponse,
+  DashboardRuntimeMetrics,
+  DashboardBackendDerived,
+} from "@/lib/api"
+
+import { useDashboardData } from "./use-dashboard-data"
 
 interface BackendMetricsSummary {
   cpuSecondsTotal?: number
@@ -32,6 +41,15 @@ interface SystemHealthApiResponse {
       mempoolLatencyMs?: number
       consensusLatencyMs?: number
       p2pLatencyMs?: number
+      aiLoopStatus?: string
+      aiLoopStatusUpdatedAt?: number
+      aiLoopBlocking?: boolean
+      aiLoopIssues?: string
+      threatDataSource?: string
+      threatSourceUpdatedAt?: number
+      threatFallbackCount?: number
+      threatFallbackReason?: string
+      threatFallbackAt?: number
     }
   }
   ai: {
@@ -54,110 +72,132 @@ interface InfrastructurePoint {
   mempoolSizeBytes?: number
 }
 
-const fetcher = async <T>(url: string): Promise<T> => {
-  const res = await fetch(url, { cache: "no-store" })
-  if (!res.ok) {
-    const text = await res.text().catch(() => "")
-    throw new Error(`Request failed: ${res.status} ${res.statusText}${text ? ` - ${text}` : ""}`)
+const DEFAULT_SYSTEM_HEALTH_REFRESH_MS = 15000
+
+const normalizeMetricsSummary = (summary?: DashboardRuntimeMetrics): BackendMetricsSummary => {
+  if (!summary) {
+    return {}
   }
-  return (await res.json()) as T
+  return {
+    cpuSecondsTotal: summary.cpu_seconds_total,
+    residentMemoryBytes: summary.resident_memory_bytes,
+    virtualMemoryBytes: summary.virtual_memory_bytes,
+    heapAllocBytes: summary.heap_alloc_bytes,
+    heapSysBytes: summary.heap_sys_bytes,
+    goroutines: summary.goroutines,
+    threads: summary.threads,
+    gcPauseSeconds: summary.gc_pause_seconds,
+    gcCount: summary.gc_count,
+    processStartTimeSeconds: summary.process_start_time_seconds,
+  }
 }
 
-export function useSystemHealthData(refreshInterval = 5000) {
-  const { data, error, isLoading, mutate } = useSWR<SystemHealthApiResponse>('/api/system-health', fetcher, {
-    refreshInterval,
-  })
+const buildDerivedMetrics = (
+  stats: StatsSummary | undefined,
+  provided?: DashboardBackendDerived,
+): SystemHealthApiResponse["backend"]["derived"] => {
+  const mempoolSeconds = stats?.mempool?.oldest_tx_age_seconds
+  const mempoolMs = stats?.mempool?.oldest_tx_age_ms
+  const consensusSeconds = stats?.chain?.avg_block_time_seconds
+  const p2pLatencyMs = stats?.network?.avg_latency_ms
 
-  const previousSampleRef = useRef<{
-    timestamp: number
-    cpuSecondsTotal?: number
-    networkBytesSent?: number
-    networkBytesReceived?: number
-    mempoolSizeBytes?: number
-  } | null>(null)
+  return {
+    mempoolLatencyMs:
+      provided?.mempool_latency_ms ??
+      (typeof mempoolMs === "number"
+        ? mempoolMs
+        : typeof mempoolSeconds === "number"
+        ? mempoolSeconds * 1000
+        : undefined),
+    consensusLatencyMs:
+      provided?.consensus_latency_ms ??
+      (typeof consensusSeconds === "number" ? consensusSeconds * 1000 : undefined),
+    p2pLatencyMs: provided?.p2p_latency_ms ?? p2pLatencyMs,
+    aiLoopStatus: provided?.ai_loop_status,
+    aiLoopStatusUpdatedAt: provided?.ai_loop_status_updated_at,
+    aiLoopBlocking: provided?.ai_loop_blocking,
+    aiLoopIssues: provided?.ai_loop_issues,
+    threatDataSource: provided?.threat_data_source,
+    threatSourceUpdatedAt: provided?.threat_source_updated_at,
+    threatFallbackCount: provided?.threat_fallback_count,
+    threatFallbackReason: provided?.threat_fallback_reason,
+    threatFallbackAt: provided?.threat_fallback_at,
+  }
+}
 
-  const [history, setHistory] = useState<InfrastructurePoint[]>([])
+export function useSystemHealthData(refreshInterval = DEFAULT_SYSTEM_HEALTH_REFRESH_MS) {
+  const { data: dashboard, error, isLoading: dashboardLoading, mutate } = useDashboardData(refreshInterval)
 
-  useEffect(() => {
-    if (!data) return
-
-    const now = data.timestamp
-    const summary = data.backend.metrics.summary
-    const stats = data.backend.stats
-
-    const prev = previousSampleRef.current
-    let cpuPercent: number | undefined
-    let networkBytesSentDelta: number | undefined
-    let networkBytesReceivedDelta: number | undefined
-    let mempoolBytes: number | undefined
-
-    if (summary.cpuSecondsTotal !== undefined && prev?.cpuSecondsTotal !== undefined) {
-      const deltaSeconds = summary.cpuSecondsTotal - prev.cpuSecondsTotal
-      const elapsed = (now - prev.timestamp) / 1000
-      if (elapsed > 0 && deltaSeconds >= 0) {
-        cpuPercent = Math.min(100, Math.max(0, (deltaSeconds / elapsed) * 100))
-      }
+  const data: SystemHealthApiResponse | undefined = useMemo(() => {
+    if (!dashboard) {
+      return undefined
     }
 
-    if (stats.network) {
-      const sent = stats.network.bytes_sent
-      const received = stats.network.bytes_received
+    const summary = normalizeMetricsSummary(dashboard.backend.metrics.summary)
+    const derived = buildDerivedMetrics(dashboard.backend.stats, dashboard.backend.derived)
+    const detectionLatencyMs = dashboard.ai.metrics?.loop?.avg_latency_ms
 
-      if (typeof sent === "number" && prev?.networkBytesSent !== undefined) {
-        const delta = sent - prev.networkBytesSent
-        if (delta >= 0) {
-          networkBytesSentDelta = delta
-        }
-      }
-
-      if (typeof received === "number" && prev?.networkBytesReceived !== undefined) {
-        const delta = received - prev.networkBytesReceived
-        if (delta >= 0) {
-          networkBytesReceivedDelta = delta
-        }
-      }
+    return {
+      timestamp: dashboard.timestamp,
+      backend: {
+        health: dashboard.backend.health,
+        readiness: dashboard.backend.readiness,
+        stats: dashboard.backend.stats,
+        metrics: {
+          summary,
+          samples: [],
+        },
+        derived,
+      },
+      ai: {
+        health: (dashboard.ai.health as Record<string, unknown> | undefined) ?? null,
+        ready: (dashboard.ai.ready as Record<string, unknown> | undefined) ?? null,
+        detectionStats: dashboard.ai.metrics,
+        derived: {
+          detectionLatencyMs: typeof detectionLatencyMs === "number" ? detectionLatencyMs : undefined,
+        },
+      },
     }
+  }, [dashboard])
 
-    if (stats.mempool && typeof stats.mempool.size_bytes === "number") {
-      mempoolBytes = stats.mempool.size_bytes
-    }
+  const history = useMemo<InfrastructurePoint[]>(() => {
+    const samples = dashboard?.backend?.history
+    if (!samples || samples.length === 0) return []
 
-    const point: InfrastructurePoint = {
-      timestamp: now,
-      cpuPercent,
-      residentMemoryBytes: summary.residentMemoryBytes,
-      heapAllocBytes: summary.heapAllocBytes,
-      networkBytesSent: networkBytesSentDelta,
-      networkBytesReceived: networkBytesReceivedDelta,
-      mempoolSizeBytes: mempoolBytes,
-    }
-
-    setHistory((prevHistory) => {
-      const next = [...prevHistory, point]
-      return next.slice(-50)
-    })
-
-    previousSampleRef.current = {
-      timestamp: now,
-      cpuSecondsTotal: summary.cpuSecondsTotal,
-      networkBytesSent: stats.network?.bytes_sent,
-      networkBytesReceived: stats.network?.bytes_received,
-      mempoolSizeBytes: mempoolBytes,
-    }
-  }, [data])
+    return samples.map((sample) => ({
+      timestamp: sample.timestamp,
+      cpuPercent: sample.cpu_percent,
+      residentMemoryBytes: sample.resident_memory_bytes,
+      heapAllocBytes: sample.heap_alloc_bytes,
+      networkBytesSent: sample.network_bytes_sent,
+      networkBytesReceived: sample.network_bytes_received,
+      mempoolSizeBytes: sample.mempool_size_bytes,
+    }))
+  }, [dashboard?.backend?.history])
 
   const latestHistory = history[history.length - 1]
 
   const keyMetrics = useMemo(() => {
+    if (!data) {
+      return {
+        uptimeSeconds: undefined,
+        aiUptimeSeconds: undefined,
+        cpuPercent: undefined,
+        residentMemoryBytes: undefined,
+        heapAllocBytes: undefined,
+        mempoolBytes: undefined,
+      }
+    }
+
     const uptimeSeconds = (() => {
-      const processStart = data?.backend.metrics.summary.processStartTimeSeconds
+      const processStart = data.backend.metrics.summary.processStartTimeSeconds
       if (!processStart) return undefined
       const nowSeconds = Math.floor(data.timestamp / 1000)
       return nowSeconds - processStart
     })()
 
     const aiUptimeSeconds = (() => {
-      const uptime = data?.ai.health && typeof data.ai.health === "object" ? (data.ai.health as Record<string, unknown>).uptime_seconds : undefined
+      const uptime = data.ai.health && typeof data.ai.health === "object" ? (data.ai.health as Record<string, unknown>).uptime_seconds : undefined
       return typeof uptime === "number" ? uptime : undefined
     })()
 
@@ -178,19 +218,19 @@ export function useSystemHealthData(refreshInterval = 5000) {
       storageLatencyMs: undefined,
       stateLatencyMs: undefined,
       mempoolLatencyMs:
-        derived.mempoolLatencyMs ??
+        derived?.mempoolLatencyMs ??
         (typeof data?.backend.stats.mempool?.oldest_tx_age_seconds === "number"
           ? data.backend.stats.mempool.oldest_tx_age_seconds * 1000
           : undefined),
       consensusLatencyMs:
-        derived.consensusLatencyMs ??
+        derived?.consensusLatencyMs ??
         (typeof data?.backend.stats.chain?.avg_block_time_seconds === "number"
           ? data.backend.stats.chain.avg_block_time_seconds * 1000
           : undefined),
       p2pLatencyMs:
-        derived.p2pLatencyMs ??
+        derived?.p2pLatencyMs ??
         (typeof data?.backend.stats.network?.avg_latency_ms === "number"
-          ? data.backend.stats.network.avg_latency_ms
+          ? data.backend.stats.network?.avg_latency_ms
           : undefined),
     }
   }, [data?.backend])
@@ -205,7 +245,7 @@ export function useSystemHealthData(refreshInterval = 5000) {
   return {
     data,
     error,
-    isLoading,
+    isLoading: !data && dashboardLoading,
     mutate,
     keyMetrics,
     history,

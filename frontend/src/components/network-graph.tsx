@@ -115,7 +115,7 @@ export default function NetworkGraph({ nodes, isLoading, error, updatedAt }: Net
                 x={positions[i].x}
                 y={positions[i].y + 52}
                 textAnchor="middle"
-                className="text-[10px]"
+                className="text-2xs"
                 fill="var(--muted-foreground)"
               >
                 {n.id}

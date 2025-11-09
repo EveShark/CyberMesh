@@ -92,6 +92,7 @@ func (s *Server) middlewareLogging(next http.Handler) http.Handler {
 		}
 
 		s.recordAPIRequest(wrapped.statusCode)
+		s.recordRouteMetrics(r.Method, r.URL.Path, wrapped.statusCode, duration, wrapped.bytesWritten)
 
 		// Audit logging for sensitive endpoints
 		if s.audit != nil && !s.isPublicEndpoint(r.URL.Path) {
@@ -175,13 +176,22 @@ func (s *Server) middlewareIPAllowlist(next http.Handler) http.Handler {
 // middlewareRateLimit enforces rate limiting
 func (s *Server) middlewareRateLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		limiter := s.rateLimiter
+		config := RateLimiterConfig{
+			RequestsPerMinute: s.config.RateLimitPerMinute,
+			Burst:             s.config.RateLimitBurst,
+		}
+		if route := s.lookupRouteLimiter(r.Method, r.URL.Path); route != nil {
+			limiter = route.limiter
+			config = route.config
+		}
 		// Use client cert fingerprint or IP as identifier
 		clientID := getClientIdentifier(r)
 
-		allowed, resetTime := s.rateLimiter.Allow(clientID)
+		allowed, resetTime := limiter.Allow(clientID)
 
 		// Set rate limit headers
-		w.Header().Set(HeaderRateLimitLimit, fmt.Sprintf("%d", s.config.RateLimitPerMinute))
+		w.Header().Set(HeaderRateLimitLimit, fmt.Sprintf("%d", config.RequestsPerMinute))
 		w.Header().Set(HeaderRateLimitReset, fmt.Sprintf("%d", resetTime))
 
 		if !allowed {
@@ -335,6 +345,9 @@ func (s *Server) middlewareGlobalAuth(next http.Handler) http.Handler {
 		authenticated := false
 		clientRole := "anonymous"
 
+		// Determine if auth is required based on environment and feature flag
+		requireAuth := s.config.Environment == "production" || s.config.RequireAuth
+
 		// Method 1: mTLS Certificate Authentication (production)
 		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
 			cert := r.TLS.PeerCertificates[0]
@@ -347,17 +360,19 @@ func (s *Server) middlewareGlobalAuth(next http.Handler) http.Handler {
 				utils.ZapString("cn", cert.Subject.CommonName))
 		}
 
-		// Method 2: JWT Token Authentication (fallback)
+		// Method 2: Bearer token / JWT Authentication
 		if !authenticated {
 			authHeader := r.Header.Get("Authorization")
 			if strings.HasPrefix(authHeader, "Bearer ") {
-				_ = strings.TrimPrefix(authHeader, "Bearer ") // token for future JWT validation
-				// TODO: Implement JWT validation with token
-				// For now, accept any token in development mode
-				if s.config.Environment != "production" {
+				token := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+				if token != "" && s.validateBearerToken(token) {
+					authenticated = true
+					clientRole = "api_client"
+				} else if !requireAuth && s.config.Environment != "production" {
+					// Dev convenience when auth not required: accept any token
 					authenticated = true
 					clientRole = "developer"
-					s.logger.WarnContext(r.Context(), "JWT auth not fully implemented, accepting token in dev mode")
+					s.logger.WarnContext(r.Context(), "dev mode token accepted (API_REQUIRE_AUTH=false)")
 				}
 			}
 		}
@@ -376,22 +391,20 @@ func (s *Server) middlewareGlobalAuth(next http.Handler) http.Handler {
 			}
 		}
 
-		// SECURITY: Block unauthenticated requests in production
+		// SECURITY: Block unauthenticated requests when required
 		if !authenticated {
-			if s.config.Environment == "production" {
+			if requireAuth {
 				s.logger.WarnContext(r.Context(), "unauthenticated request blocked",
 					utils.ZapString("path", r.URL.Path),
 					utils.ZapString("client_ip", getClientIP(r)))
-
 				writeErrorFromUtils(w, r, NewUnauthorizedError("authentication required"))
 				return
-			} else {
-				// Development mode: Allow but log warning
-				s.logger.WarnContext(r.Context(), "unauthenticated request allowed in dev mode",
-					utils.ZapString("path", r.URL.Path))
-				authenticated = true
-				clientRole = "developer"
 			}
+			// Dev mode and auth not required: allow with warning
+			s.logger.WarnContext(r.Context(), "unauthenticated request allowed (API_REQUIRE_AUTH=false)",
+				utils.ZapString("path", r.URL.Path))
+			authenticated = true
+			clientRole = "developer"
 		}
 
 		// Check role-based access control
@@ -419,6 +432,49 @@ func (s *Server) middlewareGlobalAuth(next http.Handler) http.Handler {
 		ctx := context.WithValue(r.Context(), ctxKeyClientRole, clientRole)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// validateBearerToken checks provided token against configured static tokens (constant-time)
+func (s *Server) validateBearerToken(token string) bool {
+	if len(s.config.BearerTokens) == 0 || token == "" {
+		return false
+	}
+	// Constant-time compare
+	for _, t := range s.config.BearerTokens {
+		if subtleConstantTimeCompare(token, strings.TrimSpace(t)) {
+			return true
+		}
+	}
+	return false
+}
+
+// subtleConstantTimeCompare performs constant-time string equality
+func subtleConstantTimeCompare(a, b string) bool {
+	if len(a) != len(b) {
+		// still perform loop to avoid timing leakage on length
+		var mismatch byte = 0
+		la, lb := len(a), len(b)
+		max := la
+		if lb > max {
+			max = lb
+		}
+		for i := 0; i < max; i++ {
+			var ca, cb byte
+			if i < la {
+				ca = a[i]
+			}
+			if i < lb {
+				cb = b[i]
+			}
+			mismatch |= ca ^ cb
+		}
+		return mismatch == 0
+	}
+	var v byte = 0
+	for i := 0; i < len(a); i++ {
+		v |= a[i] ^ b[i]
+	}
+	return v == 0
 }
 
 // extractRoleFromCert extracts role from certificate CN

@@ -1,10 +1,12 @@
 "use client"
 
-import useSWR from "swr"
+import { useMemo } from "react"
 
 import type { BackendNetworkEdge, BackendNetworkOverview } from "@/lib/api"
 import { resolveNodeAlias, resolveDisplayName } from "@/lib/node-alias"
 import type { NetworkEdge, NetworkNode, NetworkOverview, VotingStatusEntry } from "@/p2p-consensus/lib/types"
+
+import { useDashboardData } from "./use-dashboard-data"
 
 const mapNetworkNodes = (nodes: BackendNetworkOverview["nodes"]): NetworkNode[] =>
   nodes.map((node) => ({
@@ -74,27 +76,20 @@ const toNetworkOverview = (source: BackendNetworkOverview): NetworkOverview => {
   }
 }
 
-const fetchNetworkOverview = async (): Promise<NetworkOverview> => {
-  const response = await fetch("/api/network/overview", { cache: "no-store" })
-  if (!response.ok) {
-    const text = await response.text().catch(() => "")
-    throw new Error(`Network overview request failed: ${response.status} ${response.statusText}${text ? ` - ${text}` : ""}`)
-  }
-  const backendOverview = (await response.json()) as BackendNetworkOverview
-  return toNetworkOverview(backendOverview)
-}
+const DEFAULT_NETWORK_REFRESH_MS = 15000
 
-export function useNetworkData(refreshInterval = 5000) {
-  const { data, error, isLoading, mutate } = useSWR<NetworkOverview>(
-    "network-overview",
-    fetchNetworkOverview,
-    { refreshInterval }
-  )
+export function useNetworkData(refreshInterval = DEFAULT_NETWORK_REFRESH_MS) {
+  const { data: dashboard, error, isLoading, mutate } = useDashboardData(refreshInterval)
+
+  const overview = useMemo(() => {
+    if (!dashboard?.network) return undefined
+    return toNetworkOverview(dashboard.network)
+  }, [dashboard?.network])
 
   return {
-    data,
+    data: overview,
     error,
-    isLoading,
+    isLoading: !overview && isLoading,
     refresh: mutate,
   }
 }

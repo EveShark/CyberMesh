@@ -119,7 +119,7 @@ export function SidebarNav() {
               {!isCollapsed && (
                 <div className="flex items-center justify-between px-2 text-xs font-semibold uppercase tracking-wider text-sidebar-foreground/60">
                   <span>{section.label}</span>
-                  <span className="text-[10px] text-sidebar-foreground/40">{section.items.length}</span>
+                  <span className="text-2xs text-sidebar-foreground/40">{section.items.length}</span>
                 </div>
               )}
               <div className="space-y-1">
@@ -204,7 +204,7 @@ export function SidebarNav() {
               </Tooltip>
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <div className="flex items-center justify-center rounded-full border border-sidebar-border px-2 py-1 text-[10px] uppercase tracking-widest">
+                  <div className="flex items-center justify-center rounded-full border border-sidebar-border px-2 py-1 text-2xs uppercase tracking-widest">
                     <HelpCircle className="mr-1 h-3.5 w-3.5" />
                     HUD
                   </div>

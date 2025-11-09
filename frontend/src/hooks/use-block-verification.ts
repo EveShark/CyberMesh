@@ -2,6 +2,8 @@
 
 import { useState, useCallback } from "react"
 
+import { useDashboardData } from "./use-dashboard-data"
+
 interface VerificationResponse {
   found: boolean
   message: string
@@ -17,6 +19,7 @@ export function useBlockVerification() {
   const [isVerifying, setIsVerifying] = useState(false)
   const [result, setResult] = useState<VerificationResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const { data: dashboard, mutate } = useDashboardData(15000)
 
   const verify = useCallback(async (identifier: string) => {
     if (!identifier) return
@@ -26,33 +29,50 @@ export function useBlockVerification() {
     setError(null)
 
     try {
-      const response = await fetch(`/api/ledger/verify?id=${encodeURIComponent(identifier)}`, {
-        method: "GET",
-        cache: "no-store",
-      })
-
-      if (!response.ok) {
-        const text = await response.text().catch(() => "")
-        let message = text
-        try {
-          const parsed = JSON.parse(text)
-          if (typeof parsed.message === "string") {
-            message = parsed.message
-          }
-        } catch {
-          // ignore JSON parse errors
-        }
-        throw new Error(message || `Verification failed (${response.status})`)
+      const snapshot = dashboard ?? (await mutate())
+      if (!snapshot) {
+        throw new Error("Dashboard snapshot unavailable")
       }
 
-      const verification = (await response.json()) as VerificationResponse
-      setResult(verification)
+      const blocks = snapshot.blocks?.recent ?? []
+      if (blocks.length === 0) {
+        throw new Error("No blocks available in snapshot")
+      }
+
+      const normalized = identifier.toLowerCase()
+      let match = null
+
+      const numericHeight = Number.parseInt(identifier, 10)
+      if (!Number.isNaN(numericHeight)) {
+        match = blocks.find((block) => block.height === numericHeight) ?? null
+      }
+
+      if (!match) {
+        match = blocks.find((block) => block.hash.toLowerCase() === normalized) ?? null
+      }
+
+      if (!match) {
+        setResult(null)
+        setError("Block not found in recent snapshot")
+        return
+      }
+
+      setResult({
+        found: true,
+        message: `Block ${match.height} verified`,
+        block: {
+          height: match.height,
+          hash: match.hash,
+          proposer: match.proposer,
+          timestamp: match.timestamp,
+        },
+      })
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unknown verification error")
     } finally {
       setIsVerifying(false)
     }
-  }, [])
+  }, [dashboard, mutate])
 
   return {
     verify,

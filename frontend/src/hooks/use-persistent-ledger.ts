@@ -1,61 +1,53 @@
 "use client"
 
-import { useState, useEffect } from "react"
-import useSWR from "swr"
+import { useEffect, useMemo, useState } from "react"
 
 import type { BlockSummary } from "@/lib/api"
 import { BlockStore } from "@/lib/block-store"
 import { TimelineStore, type DecisionPoint } from "@/lib/timeline-store"
 
-interface LedgerSummaryResponse {
-  recentBlocks: BlockSummary[]
-  decisionTimeline: DecisionPoint[]
-}
+import { useDashboardData } from "./use-dashboard-data"
 
-const fetcher = async <T>(url: string): Promise<T> => {
-  const res = await fetch(url, { cache: "no-store" })
-  if (!res.ok) {
-    const text = await res.text().catch(() => "")
-    throw new Error(`Request failed: ${res.status} ${res.statusText}${text ? ` - ${text}` : ""}`)
-  }
-  return (await res.json()) as T
-}
+const DEFAULT_LEDGER_REFRESH_MS = 10000
 
-export function usePersistentLedger(refreshInterval = 10000) {
+export function usePersistentLedger(refreshInterval = DEFAULT_LEDGER_REFRESH_MS) {
   const [blockStore] = useState(() => new BlockStore())
   const [timelineStore] = useState(() => new TimelineStore())
-  const [localBlocks, setLocalBlocks] = useState<BlockSummary[]>([])
-  const [localTimeline, setLocalTimeline] = useState<DecisionPoint[]>([])
+  const [recentBlocks, setRecentBlocks] = useState<BlockSummary[]>([])
+  const [decisionTimeline, setDecisionTimeline] = useState<DecisionPoint[]>([])
 
-  const { error, isLoading, mutate } = useSWR<LedgerSummaryResponse>("/api/ledger/summary", fetcher, {
-    refreshInterval,
-    dedupingInterval: 5000,
-    revalidateOnFocus: false,
-    revalidateOnReconnect: true,
-    onSuccess: (newData) => {
-      if (newData?.recentBlocks && newData.recentBlocks.length > 0) {
-        blockStore.addBlocks(newData.recentBlocks)
-        setLocalBlocks(blockStore.getLatest(20))
-      }
-      if (newData?.decisionTimeline && newData.decisionTimeline.length > 0) {
-        timelineStore.addPoints(newData.decisionTimeline)
-        setLocalTimeline(timelineStore.getAll())
-      }
-    },
-  })
+  const { data: dashboard, error, isLoading, mutate } = useDashboardData(refreshInterval)
+
+  const latestSnapshot = useMemo(() => {
+    return {
+      blocks: dashboard?.blocks.recent ?? [],
+      timeline: dashboard?.blocks.decision_timeline ?? [],
+    }
+  }, [dashboard])
 
   useEffect(() => {
-    setLocalBlocks(blockStore.getLatest(20))
-    setLocalTimeline(timelineStore.getAll())
+    setRecentBlocks(blockStore.getLatest(20))
+    setDecisionTimeline(timelineStore.getAll())
   }, [blockStore, timelineStore])
+
+  useEffect(() => {
+    if (latestSnapshot.blocks.length > 0) {
+      blockStore.addBlocks(latestSnapshot.blocks)
+      setRecentBlocks(blockStore.getLatest(20))
+    }
+    if (latestSnapshot.timeline.length > 0) {
+      timelineStore.addPoints(latestSnapshot.timeline)
+      setDecisionTimeline(timelineStore.getAll())
+    }
+  }, [blockStore, timelineStore, latestSnapshot])
 
   return {
     data: {
-      recentBlocks: localBlocks,
-      decisionTimeline: localTimeline,
+      recentBlocks,
+      decisionTimeline,
     },
     error,
-    isLoading,
+    isLoading: !dashboard && isLoading,
     refresh: mutate,
   }
 }

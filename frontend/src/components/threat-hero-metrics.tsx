@@ -12,6 +12,7 @@ interface ThreatHeroMetricsProps {
   quorumSize?: number
   isLoading?: boolean
   lastUpdated?: number
+  scopeLabel?: string
 }
 
 export function ThreatHeroMetrics({
@@ -23,6 +24,7 @@ export function ThreatHeroMetrics({
   quorumSize,
   isLoading = false,
   lastUpdated,
+  scopeLabel,
 }: ThreatHeroMetricsProps) {
   const publishedPercent = totalDetected > 0 ? Math.round((published / totalDetected) * 100) : 0
   const abstainedPercent = totalDetected > 0 ? Math.round((abstained / totalDetected) * 100) : 0
@@ -42,7 +44,7 @@ export function ThreatHeroMetrics({
     {
       title: "Threats Detected",
       value: formatNumber(totalDetected),
-      subtitle: "Total detections",
+      subtitle: scopeLabel ?? "Total detections",
       icon: Activity,
       iconColor: "text-blue-500",
       bgGradient: "from-blue-500/10 to-blue-500/5",
@@ -92,6 +94,11 @@ export function ThreatHeroMetrics({
 
   return (
     <div className="space-y-4">
+      {scopeLabel && (
+        <div className="flex items-center justify-between text-xs uppercase tracking-wide text-muted-foreground">
+          <span>{scopeLabel}</span>
+        </div>
+      )}
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
         {metrics.map((metric, index) => {
           const Icon = metric.icon

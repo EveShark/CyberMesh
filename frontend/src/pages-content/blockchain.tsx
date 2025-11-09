@@ -1,8 +1,7 @@
 "use client"
 
 import { useEffect, useMemo, useState } from "react"
-import { Activity, AlertCircle, AlertTriangle, BarChart3, Blocks, ChevronRight, FileText, Loader2, RefreshCw, Search } from "lucide-react"
-import Link from "next/link"
+import { Activity, AlertCircle, AlertTriangle, Blocks, Loader2, RefreshCw, Search } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -21,8 +20,48 @@ import { PageContainer } from "@/components/page-container"
 type BlockTypeFilter = "all" | "anomalies" | "normal"
 type TimeRangeFilter = "all" | "1h" | "6h" | "24h" | "7d"
 
+function formatNumber(value?: number | null, fractionDigits = 0) {
+  if (value === undefined || value === null || Number.isNaN(value)) return "--"
+  return value.toLocaleString(undefined, { maximumFractionDigits: fractionDigits })
+}
+
+function formatBytes(bytes?: number | null) {
+  if (bytes === undefined || bytes === null || Number.isNaN(bytes)) return "--"
+  if (bytes === 0) return "0 B"
+  const units = ["B", "KB", "MB", "GB", "TB"]
+  let value = bytes
+  let index = 0
+  while (value >= 1024 && index < units.length - 1) {
+    value /= 1024
+    index++
+  }
+  const precision = value >= 10 || index === 0 ? 0 : 1
+  return `${value.toFixed(precision)} ${units[index]}`
+}
+
+function formatTimestampSeconds(seconds?: number | null) {
+  if (!seconds) return "--"
+  return new Date(seconds * 1000).toLocaleString()
+}
+
+function formatSeconds(seconds?: number | null) {
+  if (seconds === undefined || seconds === null || Number.isNaN(seconds)) return "--"
+  if (seconds === 0) return "0 s"
+  const precision = seconds >= 10 ? 1 : 2
+  return `${seconds.toFixed(precision)} s`
+}
+
+function truncateHash(hash?: string | null, length = 12) {
+  if (!hash) return "--"
+  if (hash.length <= length * 2) return hash
+  if (hash.startsWith("0x")) {
+    return `${hash.slice(0, length + 2)}…${hash.slice(-length)}`
+  }
+  return `${hash.slice(0, length)}…${hash.slice(-length)}`
+}
+
 export default function BlockchainActivityContent() {
-  const { blocks, metrics, isLoading, error, refreshData } = useBlockchainData(true, 6000)
+  const { blocks, metrics, pagination, ledger, isLoading, error, refreshData } = useBlockchainData(true, 6000)
 
   const [searchQuery, setSearchQuery] = useState("")
   const [blockTypeFilter, setBlockTypeFilter] = useState<BlockTypeFilter>("all")
@@ -158,8 +197,8 @@ export default function BlockchainActivityContent() {
       </header>
 
       <div className="space-y-6">
-        {/* Top 4 KPIs */}
-        <section className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
+        {/* Block & Execution KPIs */}
+        <section className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-5">
         <MetricCard
           label="Latest Height"
           helper="Most recent committed block"
@@ -176,11 +215,55 @@ export default function BlockchainActivityContent() {
           value={metrics?.avgBlockTime ? `${metrics.avgBlockTime.toFixed(2)}s` : "--"}
         />
         <MetricCard
+          label="Avg Block Size"
+          helper="Mean block payload size (last 100 blocks)"
+          value={metrics ? formatBytes(metrics.avgBlockSize) : "--"}
+        />
+        <MetricCard
           label="Success Rate"
           helper="Backend execution success rate"
           value={metrics ? `${(metrics.successRate * 100).toFixed(1)}%` : "--"}
         />
         </section>
+
+        {ledger ? (
+          <section className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+            <MetricCard
+              label="Pending Transactions"
+              helper="Transactions waiting in mempool"
+              value={formatNumber(ledger.pending_transactions)}
+            />
+            <MetricCard
+              label="Mempool Size"
+              helper="Total bytes queued for inclusion"
+              value={formatBytes(ledger.mempool_size_bytes)}
+            />
+            <MetricCard
+              label="Snapshot Height"
+              helper="Last persisted state snapshot"
+              value={ledger.snapshot_block_height ? `#${formatNumber(ledger.snapshot_block_height)}` : "--"}
+            />
+          </section>
+        ) : null}
+
+        {ledger ? (
+          <Card className="glass-card border border-border/30">
+            <CardHeader className="pb-3">
+              <CardTitle className="text-lg font-semibold text-foreground">Ledger Snapshot</CardTitle>
+            </CardHeader>
+            <CardContent className="grid gap-3 md:grid-cols-2 lg:grid-cols-4">
+              <LedgerDetail label="State Version" value={formatNumber(ledger.state_version)} helper="Deterministic state machine version" />
+              <LedgerDetail label="Average Block Time" value={formatSeconds(ledger.avg_block_time_seconds)} helper="Rolling average across recent blocks" />
+              <LedgerDetail label="Average Block Size" value={formatBytes(ledger.avg_block_size_bytes)} helper="Rolling average block payload" />
+              <LedgerDetail label="State Root" value={truncateHash(ledger.state_root)} helper="Latest Merkle root" />
+              <LedgerDetail label="Last Block Hash" value={truncateHash(ledger.last_block_hash)} helper="Committed block reference" />
+              <LedgerDetail label="Snapshot Captured" value={formatTimestampSeconds(ledger.snapshot_timestamp)} helper="Wall clock time of last snapshot" />
+              <LedgerDetail label="Reputation Changes" value={formatNumber(ledger.reputation_changes)} helper="Validators promoted/demoted" />
+              <LedgerDetail label="Policy Updates" value={formatNumber(ledger.policy_changes)} helper="Policy mutations included" />
+              <LedgerDetail label="Quarantine Updates" value={formatNumber(ledger.quarantine_changes)} helper="Validators entering/leaving quarantine" />
+            </CardContent>
+          </Card>
+        ) : null}
 
         {/* Transaction Analysis Timeline */}
         <section>
@@ -282,7 +365,8 @@ export default function BlockchainActivityContent() {
             blocks={filteredBlocks}
             onBlockSelect={handleBlockSelect}
             selectedBlock={selectedBlock}
-            isLoading={isLoading && !sortedBlocks.length}
+            isLoading={isLoading}
+            pagination={pagination}
           />
           {error && (
             <div className="flex items-center gap-2 rounded-lg border border-red-500/20 bg-red-500/5 p-3 text-sm text-red-600 dark:text-red-400 mt-4">
@@ -318,27 +402,27 @@ function MetricCard({ label, helper, value }: MetricCardProps) {
   )
 }
 
-interface SnapshotRowProps {
-  label: string
-  metric: string
-  helper: string
-}
-
-function SnapshotRow({ label, metric, helper }: SnapshotRowProps) {
-  return (
-    <div className="rounded-lg border border-border/20 bg-background/60 px-4 py-3">
-      <p className="text-sm text-muted-foreground">{label}</p>
-      <p className="text-2xl font-semibold text-foreground">{metric}</p>
-      <p className="text-xs text-muted-foreground mt-1">{helper}</p>
-    </div>
-  )
-}
-
 interface FilterSelectProps {
   label: string
   value: string
   onValueChange: (value: string) => void
   options: Array<{ value: string; label: string }>
+}
+
+interface LedgerDetailProps {
+  label: string
+  value: string
+  helper: string
+}
+
+function LedgerDetail({ label, value, helper }: LedgerDetailProps) {
+  return (
+    <div className="space-y-1 rounded-lg border border-border/30 bg-background/60 p-4">
+      <p className="text-xs uppercase tracking-wide text-muted-foreground">{label}</p>
+      <p className="text-base font-semibold text-foreground break-all">{value}</p>
+      <p className="text-xs text-muted-foreground/80">{helper}</p>
+    </div>
+  )
 }
 
 function FilterSelect({ label, value, onValueChange, options }: FilterSelectProps) {

@@ -141,10 +141,8 @@ func (p *Producer) HealthCheck(ctx context.Context) error {
 	}
 }
 
-// PublishCommit publishes a block commit event to control.commits.v1
-// Called after durable persistence completes
-// Fix: Gap 2 - Added anomalyIDs parameter to enable COMMITTED state tracking
-func (p *Producer) PublishCommit(ctx context.Context, height uint64, hash [32]byte, stateRoot [32]byte, txCount int, ts int64, anomalyIDs []string) error {
+// PublishCommit publishes a block commit event to control.commits.v1.
+func (p *Producer) PublishCommit(ctx context.Context, height uint64, hash [32]byte, stateRoot [32]byte, txCount int, ts int64, anomalyCount int, evidenceCount int, policyCount int, anomalyIDs []string) error {
 	p.mu.RLock()
 	if p.closed {
 		p.mu.RUnlock()
@@ -162,14 +160,16 @@ func (p *Producer) PublishCommit(ctx context.Context, height uint64, hash [32]by
 	copy(stateRootCopy, stateRoot[:])
 
 	// Build protobuf CommitEvent
-	// Fix: Gap 2 - Include anomaly IDs for individual tracking
 	evt := &pb.CommitEvent{
-		Height:     int64(height),
-		BlockHash:  blockHash,
-		StateRoot:  stateRootCopy,
-		TxCount:    uint32(txCount),
-		AnomalyIds: anomalyIDs, // New field
-		Timestamp:  ts,
+		Height:        int64(height),
+		BlockHash:     blockHash,
+		StateRoot:     stateRootCopy,
+		TxCount:       uint32(txCount),
+		AnomalyCount:  uint32(anomalyCount),
+		EvidenceCount: uint32(evidenceCount),
+		PolicyCount:   uint32(policyCount),
+		AnomalyIds:    anomalyIDs,
+		Timestamp:     ts,
 	}
 
 	if err := p.signer.Sign(evt); err != nil {

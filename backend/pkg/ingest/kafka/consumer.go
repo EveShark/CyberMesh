@@ -37,6 +37,8 @@ type Consumer struct {
 	messagesVerified   uint64
 	messagesAdmitted   uint64
 	messagesFailed     uint64
+	messagesRetried    uint64
+	transientFailures  uint64
 	groupID            string
 	partitionOffsets   map[string]int64
 	partitionLag       map[string]int64
@@ -46,6 +48,11 @@ type Consumer struct {
 	lastMessageUnix    int64
 	ingestLatencyHist  *utils.LatencyHistogram
 	processLatencyHist *utils.LatencyHistogram
+
+	// Retry/backoff policy
+	retryMax         int
+	retryBackoffBase time.Duration
+	retryBackoffMax  time.Duration
 }
 
 // ConsumerConfig holds configuration for creating a consumer
@@ -55,6 +62,10 @@ type ConsumerConfig struct {
 	Topics      []string       // ai.anomalies.v1, ai.evidence.v1, ai.policy.v1
 	DLQTopic    string         // DLQ topic for failed messages (optional)
 	VerifierCfg VerifierConfig // Timestamp skew configuration
+	// Retry configuration for transient processing errors
+	RetryMax         int           // Maximum attempts per message (default: 5)
+	RetryBackoffBase time.Duration // Initial backoff (default: 100ms)
+	RetryBackoffMax  time.Duration // Max backoff cap (default: 5s)
 }
 
 // NewConsumer creates a new Kafka consumer for ai.* topics
@@ -115,6 +126,20 @@ func NewConsumer(ctx context.Context, cfg ConsumerConfig, saramaCfg *sarama.Conf
 	}
 	c.ingestLatencyHist = utils.NewLatencyHistogram([]float64{5, 20, 50, 100, 250, 500, 1000, math.Inf(1)})
 	c.processLatencyHist = utils.NewLatencyHistogram([]float64{1, 5, 20, 50, 100, 250, 500, math.Inf(1)})
+
+	// Configure retry/backoff with safe defaults
+	c.retryMax = cfg.RetryMax
+	if c.retryMax <= 0 {
+		c.retryMax = 5
+	}
+	c.retryBackoffBase = cfg.RetryBackoffBase
+	if c.retryBackoffBase <= 0 {
+		c.retryBackoffBase = 100 * time.Millisecond
+	}
+	c.retryBackoffMax = cfg.RetryBackoffMax
+	if c.retryBackoffMax <= 0 {
+		c.retryBackoffMax = 5 * time.Second
+	}
 
 	if audit != nil {
 		_ = audit.Info("kafka_consumer_created", map[string]interface{}{
@@ -331,7 +356,7 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 			}
 			h.consumer.trackPartitionStats(message.Topic, message.Partition, message.Offset, lag, highwater)
 
-			// Process message
+			// Process message (with retry/backoff for transient errors)
 			h.consumer.incrementConsumed()
 			if !message.Timestamp.IsZero() {
 				latency := time.Since(message.Timestamp)
@@ -340,23 +365,78 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 				}
 				h.consumer.observeIngestLatency(latency)
 			}
-			startProcess := time.Now()
-			err := h.consumer.processMessage(ctx, session, message)
-			h.consumer.observeProcessLatency(time.Since(startProcess))
-			if err != nil {
-				// Message processing failed (already logged)
-				h.consumer.incrementFailed()
-				// Mark message to advance offset (prevents infinite reprocessing)
-				// Poisoned messages already routed to DLQ in processMessage
-				session.MarkMessage(message, "")
-				continue
+
+			backoff := h.consumer.retryBackoffBase
+			var attempts int
+			for attempts = 1; attempts <= h.consumer.retryMax; attempts++ {
+				startProcess := time.Now()
+				err := h.consumer.processMessage(ctx, session, message)
+				h.consumer.observeProcessLatency(time.Since(startProcess))
+
+				if err == nil {
+					// Success: mark and move on
+					session.MarkMessage(message, "")
+					h.consumer.incrementAdmitted()
+					break
+				}
+
+				if isPermanentErr(err) {
+					// Permanent failure (decode/verify already DLQ'ed, or duplicate/invalid): mark and skip
+					session.MarkMessage(message, "")
+					h.consumer.incrementFailed()
+					break
+				}
+
+				// Transient failure (e.g., mempool backpressure): backoff then retry without committing
+				if h.consumer.logger != nil {
+					h.consumer.logger.WarnContext(ctx, "Transient processing error; will retry",
+						utils.ZapInt("attempt", attempts),
+						utils.ZapDuration("backoff", backoff),
+						utils.ZapError(err))
+				}
+				// Count retry and backoff
+				h.consumer.incrementRetried()
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(backoff):
+				}
+				// Exponential backoff with cap
+				backoff *= 2
+				if backoff > h.consumer.retryBackoffMax {
+					backoff = h.consumer.retryBackoffMax
+				}
 			}
 
-			// Success - mark message as processed (commit offset)
-			session.MarkMessage(message, "")
-			h.consumer.incrementAdmitted()
+			// If we exhausted retries on transient errors, leave uncommitted
+			if attempts > h.consumer.retryMax {
+				h.consumer.incrementTransientFailure()
+				if h.consumer.logger != nil {
+					h.consumer.logger.WarnContext(ctx, "Transient error retries exhausted; leaving offset uncommitted",
+						utils.ZapInt("attempts", attempts-1))
+				}
+			}
 		}
 	}
+}
+
+// isPermanentErr classifies processing errors for offset commit policy.
+// Permanent: decode/verify failures (processMessage routes to DLQ), duplicates/invalid tx.
+// Transient: mempool backpressure (rate limited, full) which should be retried.
+func isPermanentErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Transient mempool conditions
+	if errors.Is(err, mempool.ErrRateLimited) || errors.Is(err, mempool.ErrMempoolFull) {
+		return false
+	}
+	// Duplicates and invalid tx are safe to skip
+	if errors.Is(err, mempool.ErrDuplicate) || errors.Is(err, mempool.ErrInvalidTx) {
+		return true
+	}
+	// Default to permanent to avoid infinite retries on unknown errors
+	return true
 }
 
 // processMessage handles a single Kafka message: decode → verify → mempool.Admit
@@ -693,6 +773,18 @@ func (c *Consumer) incrementFailed() {
 	c.mu.Unlock()
 }
 
+func (c *Consumer) incrementRetried() {
+	c.mu.Lock()
+	c.messagesRetried++
+	c.mu.Unlock()
+}
+
+func (c *Consumer) incrementTransientFailure() {
+	c.mu.Lock()
+	c.transientFailures++
+	c.mu.Unlock()
+}
+
 func (c *Consumer) observeIngestLatency(d time.Duration) {
 	if c.ingestLatencyHist == nil {
 		return
@@ -721,6 +813,8 @@ func (c *Consumer) Stats() ConsumerStats {
 	stats.MessagesVerified = c.messagesVerified
 	stats.MessagesAdmitted = c.messagesAdmitted
 	stats.MessagesFailed = c.messagesFailed
+	stats.MessagesRetried = c.messagesRetried
+	stats.TransientFailures = c.transientFailures
 	stats.LastMessageUnix = c.lastMessageUnix
 	c.mu.RUnlock()
 	buckets, total, sum := c.ingestLatencyHist.Snapshot()
@@ -810,6 +904,8 @@ type ConsumerStats struct {
 	MessagesVerified      uint64
 	MessagesAdmitted      uint64
 	MessagesFailed        uint64
+	MessagesRetried       uint64
+	TransientFailures     uint64
 	LastMessageUnix       int64
 	IngestLatencyBuckets  []utils.HistogramBucket
 	IngestLatencyP95Ms    float64

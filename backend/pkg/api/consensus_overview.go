@@ -124,9 +124,16 @@ func (s *Server) loadRecentProposals(ctx context.Context, now time.Time, latestH
 
 	proposals := make([]ConsensusProposalDTO, 0, len(records))
 	for _, rec := range records {
-		var proposal messages.Proposal
-		if err := utils.CBORUnmarshal(rec.Data, &proposal); err != nil {
+		var meta struct {
+			Timestamp time.Time `cbor:"7,keyasint"`
+		}
+		if err := utils.CBORUnmarshal(rec.Data, &meta); err != nil {
 			continue
+		}
+
+		ts := meta.Timestamp
+		if ts.IsZero() {
+			ts = now
 		}
 
 		proposals = append(proposals, ConsensusProposalDTO{
@@ -134,7 +141,7 @@ func (s *Server) loadRecentProposals(ctx context.Context, now time.Time, latestH
 			View:      rec.View,
 			Hash:      encodeHex(rec.Hash),
 			Proposer:  encodeHex(rec.Proposer),
-			Timestamp: proposal.Timestamp.UnixMilli(),
+			Timestamp: ts.UnixMilli(),
 		})
 	}
 

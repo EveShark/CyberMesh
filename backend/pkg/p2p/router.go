@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -38,6 +39,7 @@ import (
 
 	// project-local packages
 	"backend/pkg/config"
+	"backend/pkg/consensus/types"
 	"backend/pkg/utils"
 )
 
@@ -89,6 +91,12 @@ type Router struct {
 	peerRateSnapshots    map[peer.ID]peerRateSample
 	reportedAdjacency    map[peer.ID]reportedEdges
 	reportedExpiry       time.Duration
+	adjMu                sync.RWMutex
+	adjTopic             string
+	adjBroadcastInterval time.Duration
+	adjMaxEdges          int
+	observationsExpiry   time.Duration
+	peerObservations     map[peer.ID]observedPeerStat
 }
 
 // RouterStats summarizes live network telemetry for API exposure.
@@ -149,6 +157,35 @@ type peerRateSample struct {
 type reportedEdges struct {
 	Edges     []RouterEdge
 	Collected time.Time
+}
+
+type observedPeerStat struct {
+	Stats     RouterPeerStats
+	Collected time.Time
+}
+
+type adjacencyPayload struct {
+	Reporter   string                 `json:"reporter"`
+	ObservedAt int64                  `json:"observed_at"`
+	Edges      []adjacencyEdgePayload `json:"edges,omitempty"`
+	Peers      []adjacencyPeerPayload `json:"peers,omitempty"`
+}
+
+type adjacencyEdgePayload struct {
+	Target     string `json:"target"`
+	Direction  string `json:"direction,omitempty"`
+	Status     string `json:"status,omitempty"`
+	Confidence string `json:"confidence,omitempty"`
+	UpdatedAt  int64  `json:"updated_at,omitempty"`
+}
+
+type adjacencyPeerPayload struct {
+	Peer      string  `json:"peer"`
+	Status    string  `json:"status,omitempty"`
+	RateBps   float64 `json:"rate_bps,omitempty"`
+	LatencyMs float64 `json:"latency_ms,omitempty"`
+	LastSeen  int64   `json:"last_seen,omitempty"`
+	BytesIn   uint64  `json:"bytes_in,omitempty"`
 }
 
 // RouterOptions allows fine-grained tuning without hardcoding.
@@ -358,27 +395,40 @@ func NewRouter(parent context.Context, nodeCfg *config.NodeConfig, secCfg *confi
 	}
 
 	r := &Router{
-		ctx:               ctx,
-		cancel:            cancel,
-		log:               log,
-		Host:              host,
-		DHT:               ipfsDHT,
-		Gossip:            ps,
-		Topics:            map[string]*pubsub.Topic{},
-		Subs:              map[string]*pubsub.Subscription{},
-		Handlers:          map[string][]Handler{},
-		Discovery:         rd,
-		nodeCfg:           nodeCfg,
-		secCfg:            secCfg,
-		configMgr:         configMgr,
-		state:             st,
-		opts:              opts,
-		peerLatency:       make(map[peer.ID]time.Duration),
-		peerRateSnapshots: make(map[peer.ID]peerRateSample),
-		reportedAdjacency: make(map[peer.ID]reportedEdges),
-		reportedExpiry:    configMgr.GetDuration("P2P_REPORTED_EDGE_TTL", 60*time.Second),
+		ctx:                  ctx,
+		cancel:               cancel,
+		log:                  log,
+		Host:                 host,
+		DHT:                  ipfsDHT,
+		Gossip:               ps,
+		Topics:               map[string]*pubsub.Topic{},
+		Subs:                 map[string]*pubsub.Subscription{},
+		Handlers:             map[string][]Handler{},
+		Discovery:            rd,
+		nodeCfg:              nodeCfg,
+		secCfg:               secCfg,
+		configMgr:            configMgr,
+		state:                st,
+		opts:                 opts,
+		peerLatency:          make(map[peer.ID]time.Duration),
+		peerRateSnapshots:    make(map[peer.ID]peerRateSample),
+		reportedAdjacency:    make(map[peer.ID]reportedEdges),
+		reportedExpiry:       configMgr.GetDuration("P2P_REPORTED_EDGE_TTL", 60*time.Second),
+		adjTopic:             configMgr.GetString("P2P_ADJ_TOPIC", "cybermesh/p2p/adjacency"),
+		adjBroadcastInterval: configMgr.GetDuration("P2P_ADJ_BROADCAST_INTERVAL", 20*time.Second),
+		adjMaxEdges:          configMgr.GetIntRange("P2P_ADJ_MAX_EDGES", 128, 1, 2048),
+		observationsExpiry:   configMgr.GetDuration("P2P_REPORTED_METRIC_TTL", 45*time.Second),
+		peerObservations:     make(map[peer.ID]observedPeerStat),
 	}
 	r.reportedExpiry = clampDuration(r.reportedExpiry, 10*time.Second, 5*time.Minute)
+	if r.adjTopic == "" {
+		r.adjTopic = "cybermesh/p2p/adjacency"
+	}
+	r.adjBroadcastInterval = clampDuration(r.adjBroadcastInterval, 5*time.Second, 2*time.Minute)
+	if r.adjMaxEdges <= 0 {
+		r.adjMaxEdges = 128
+	}
+	r.observationsExpiry = clampDuration(r.observationsExpiry, 5*time.Second, 5*time.Minute)
 	r.pingService = ping.NewPingService(host)
 	r.latencyProbeInterval = configMgr.GetDuration("P2P_LATENCY_PROBE_INTERVAL", 30*time.Second)
 	if r.latencyProbeInterval <= 0 {
@@ -460,6 +510,14 @@ func NewRouter(parent context.Context, nodeCfg *config.NodeConfig, secCfg *confi
 
 	if r.pingService != nil {
 		go r.monitorPeerLatency()
+	}
+
+	if r.Gossip != nil && r.adjTopic != "" {
+		if err := r.Subscribe(r.adjTopic, r.handleAdjacencyMessage); err != nil {
+			r.log.Warn("adjacency gossip subscribe failed", utils.ZapError(err))
+		} else {
+			go r.adjacencyBroadcastLoop()
+		}
 	}
 
 	return r, nil
@@ -617,6 +675,326 @@ func (r *Router) probePeerLatencies() {
 	}
 }
 
+func (r *Router) adjacencyBroadcastLoop() {
+	interval := r.adjBroadcastInterval
+	if interval <= 0 || r.adjTopic == "" {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	// Emit an initial snapshot to accelerate convergence.
+	r.broadcastAdjacency()
+	for {
+		select {
+		case <-ticker.C:
+			r.broadcastAdjacency()
+		case <-r.ctx.Done():
+			return
+		}
+	}
+}
+
+func (r *Router) broadcastAdjacency() {
+	if r == nil || r.Host == nil || r.Gossip == nil || r.adjTopic == "" {
+		return
+	}
+	stats := r.GetNetworkStats()
+	payload := adjacencyPayload{
+		Reporter:   stats.Self.String(),
+		ObservedAt: stats.Timestamp.Unix(),
+	}
+	localEdges, _, _ := r.collectLocalEdges(stats.Timestamp)
+	if r.adjMaxEdges > 0 && len(localEdges) > r.adjMaxEdges {
+		localEdges = localEdges[:r.adjMaxEdges]
+	}
+	edges := make([]adjacencyEdgePayload, 0, len(localEdges))
+	for _, edge := range localEdges {
+		updated := edge.UpdatedAt.Unix()
+		if edge.UpdatedAt.IsZero() {
+			updated = stats.Timestamp.Unix()
+		}
+		edges = append(edges, adjacencyEdgePayload{
+			Target:     edge.Target.String(),
+			Direction:  edge.Direction,
+			Status:     edge.Status,
+			Confidence: edge.Confidence,
+			UpdatedAt:  updated,
+		})
+	}
+	payload.Edges = edges
+	peersCopy := append([]RouterPeerStats(nil), stats.Peers...)
+	sort.Slice(peersCopy, func(i, j int) bool {
+		return peersCopy[i].ID.String() < peersCopy[j].ID.String()
+	})
+	peerLimit := len(peersCopy)
+	if r.adjMaxEdges > 0 && peerLimit > r.adjMaxEdges {
+		peerLimit = r.adjMaxEdges
+	}
+	peersPayload := make([]adjacencyPeerPayload, 0, peerLimit)
+	for i := 0; i < peerLimit; i++ {
+		ps := peersCopy[i]
+		lastSeen := int64(0)
+		if !ps.LastSeen.IsZero() {
+			lastSeen = ps.LastSeen.Unix()
+		}
+		status := ps.Status
+		if status == "" {
+			status = "unknown"
+		}
+		peersPayload = append(peersPayload, adjacencyPeerPayload{
+			Peer:      ps.ID.String(),
+			Status:    status,
+			RateBps:   ps.RateBps,
+			LatencyMs: ps.LatencyMs,
+			LastSeen:  lastSeen,
+			BytesIn:   ps.BytesIn,
+		})
+	}
+	payload.Peers = peersPayload
+	data, err := json.Marshal(payload)
+	if err != nil {
+		r.log.Warn("adjacency payload marshal failed", utils.ZapError(err))
+		return
+	}
+	if len(payload.Edges) == 0 && len(payload.Peers) == 0 {
+		return
+	}
+	if err := r.Publish(r.adjTopic, data); err != nil {
+		r.log.Warn("adjacency publish failed", utils.ZapError(err))
+	}
+}
+
+func (r *Router) handleAdjacencyMessage(ctx context.Context, from peer.ID, data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	var payload adjacencyPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return fmt.Errorf("decode adjacency payload: %w", err)
+	}
+	reporter := from
+	if payload.Reporter != "" {
+		if pid, err := peer.Decode(payload.Reporter); err == nil {
+			reporter = pid
+		}
+	}
+	observed := time.Now()
+	if payload.ObservedAt > 0 {
+		observed = time.Unix(payload.ObservedAt, 0)
+	}
+	r.ingestReportedEdges(reporter, payload.Edges, observed)
+	r.ingestPeerObservations(reporter, payload.Peers, observed)
+	return nil
+}
+
+func (r *Router) ingestReportedEdges(reporter peer.ID, edges []adjacencyEdgePayload, observed time.Time) {
+	if len(edges) == 0 {
+		return
+	}
+	sanitized := make([]RouterEdge, 0, len(edges))
+	for _, edge := range edges {
+		targetID, err := peer.Decode(edge.Target)
+		if err != nil {
+			continue
+		}
+		updated := observed
+		if edge.UpdatedAt > 0 {
+			updated = time.Unix(edge.UpdatedAt, 0)
+		}
+		confidence := edge.Confidence
+		if confidence == "" {
+			confidence = "reported"
+		}
+		status := edge.Status
+		if status == "" {
+			status = "unknown"
+		}
+		direction := edge.Direction
+		if direction == "" {
+			direction = "unknown"
+		}
+		sanitized = append(sanitized, RouterEdge{
+			Source:     reporter,
+			Target:     targetID,
+			Direction:  direction,
+			Status:     status,
+			Confidence: confidence,
+			ReportedBy: reporter,
+			UpdatedAt:  updated,
+		})
+	}
+	if len(sanitized) == 0 {
+		return
+	}
+	entry := reportedEdges{Edges: sanitized, Collected: time.Now()}
+	r.adjMu.Lock()
+	r.reportedAdjacency[reporter] = entry
+	r.adjMu.Unlock()
+}
+
+func (r *Router) ingestPeerObservations(reporter peer.ID, peers []adjacencyPeerPayload, observed time.Time) {
+	if len(peers) == 0 {
+		return
+	}
+	now := time.Now()
+	r.adjMu.Lock()
+	if r.peerObservations == nil {
+		r.peerObservations = make(map[peer.ID]observedPeerStat)
+	}
+	for _, p := range peers {
+		targetID, err := peer.Decode(p.Peer)
+		if err != nil {
+			continue
+		}
+		status := p.Status
+		if status == "" {
+			status = "unknown"
+		}
+		lastSeen := observed
+		if p.LastSeen > 0 {
+			lastSeen = time.Unix(p.LastSeen, 0)
+		}
+		stat := RouterPeerStats{
+			ID:        targetID,
+			Status:    status,
+			RateBps:   p.RateBps,
+			LatencyMs: p.LatencyMs,
+			LastSeen:  lastSeen,
+			BytesIn:   p.BytesIn,
+			Labels: map[string]string{
+				"reported_by": reporter.String(),
+			},
+		}
+		r.peerObservations[targetID] = observedPeerStat{Stats: stat, Collected: now}
+	}
+	r.adjMu.Unlock()
+}
+
+func (r *Router) collectLocalEdges(sampleTime time.Time) ([]RouterEdge, int, int) {
+	if r.Host == nil {
+		return nil, 0, 0
+	}
+	edgeFlags := make(map[peer.ID]struct {
+		inbound  bool
+		outbound bool
+	})
+	inboundCount := 0
+	outboundCount := 0
+	for _, conn := range r.Host.Network().Conns() {
+		remote := conn.RemotePeer()
+		flags := edgeFlags[remote]
+		switch conn.Stat().Direction {
+		case network.DirInbound:
+			inboundCount++
+			flags.inbound = true
+		case network.DirOutbound:
+			outboundCount++
+			flags.outbound = true
+		}
+		edgeFlags[remote] = flags
+	}
+	edges := make([]RouterEdge, 0, len(edgeFlags))
+	for pid, flags := range edgeFlags {
+		direction := "unknown"
+		switch {
+		case flags.inbound && flags.outbound:
+			direction = "bidirectional"
+		case flags.inbound:
+			direction = "inbound"
+		case flags.outbound:
+			direction = "outbound"
+		}
+		edges = append(edges, RouterEdge{
+			Source:     r.Host.ID(),
+			Target:     pid,
+			Direction:  direction,
+			Status:     "live",
+			Confidence: "observed",
+			ReportedBy: r.Host.ID(),
+			UpdatedAt:  sampleTime,
+		})
+	}
+	sort.Slice(edges, func(i, j int) bool {
+		if edges[i].Source == edges[j].Source {
+			return edges[i].Target.String() < edges[j].Target.String()
+		}
+		return edges[i].Source.String() < edges[j].Source.String()
+	})
+	return edges, inboundCount, outboundCount
+}
+
+func (r *Router) collectReportedEdges(now time.Time) []RouterEdge {
+	r.adjMu.Lock()
+	defer r.adjMu.Unlock()
+	if len(r.reportedAdjacency) == 0 {
+		return nil
+	}
+	edges := make([]RouterEdge, 0)
+	for reporter, entry := range r.reportedAdjacency {
+		if r.reportedExpiry > 0 && now.Sub(entry.Collected) > r.reportedExpiry {
+			delete(r.reportedAdjacency, reporter)
+			continue
+		}
+		for _, edge := range entry.Edges {
+			copy := edge
+			if copy.ReportedBy == "" {
+				copy.ReportedBy = reporter
+			}
+			if copy.Confidence == "" {
+				copy.Confidence = "reported"
+			}
+			edges = append(edges, copy)
+		}
+	}
+	return edges
+}
+
+func mergeEdgeSets(local, reported []RouterEdge) []RouterEdge {
+	if len(reported) == 0 {
+		if len(local) == 0 {
+			return nil
+		}
+		out := make([]RouterEdge, len(local))
+		copy(out, local)
+		return out
+	}
+	merged := make(map[string]RouterEdge, len(reported)+len(local))
+	for _, edge := range reported {
+		key := edge.Source.String() + "|" + edge.Target.String()
+		merged[key] = edge
+	}
+	for _, edge := range local {
+		key := edge.Source.String() + "|" + edge.Target.String()
+		merged[key] = edge
+	}
+	out := make([]RouterEdge, 0, len(merged))
+	for _, edge := range merged {
+		out = append(out, edge)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Source == out[j].Source {
+			return out[i].Target.String() < out[j].Target.String()
+		}
+		return out[i].Source.String() < out[j].Source.String()
+	})
+	return out
+}
+
+func (r *Router) getObservedPeerStats(pid peer.ID, now time.Time) (RouterPeerStats, bool) {
+	r.adjMu.Lock()
+	defer r.adjMu.Unlock()
+	entry, ok := r.peerObservations[pid]
+	if !ok {
+		return RouterPeerStats{}, false
+	}
+	if r.observationsExpiry > 0 && now.Sub(entry.Collected) > r.observationsExpiry {
+		delete(r.peerObservations, pid)
+		return RouterPeerStats{}, false
+	}
+	stat := entry.Stats
+	return stat, true
+}
+
 func (r *Router) storePeerLatency(pid peer.ID, rtt time.Duration) {
 	r.latencyMu.Lock()
 	r.peerLatency[pid] = rtt
@@ -651,6 +1029,18 @@ func derivePeerStatus(ps PeerState, now time.Time) string {
 	}
 }
 
+func peerIDFromPublicKey(pub []byte) (peer.ID, error) {
+	if len(pub) == 0 {
+		return "", fmt.Errorf("empty public key")
+	}
+	hash := sha256.Sum256(pub)
+	_, pid, err := fromSeed(hash[:])
+	if err != nil {
+		return "", err
+	}
+	return pid, nil
+}
+
 func clampDuration(v, min, max time.Duration) time.Duration {
 	if v <= 0 {
 		return min
@@ -677,51 +1067,11 @@ func (r *Router) GetNetworkStats() RouterStats {
 	if r.Host != nil {
 		out.Self = r.Host.ID()
 		out.PeerCount = len(r.Host.Network().Peers())
-		edgeFlags := make(map[peer.ID]struct {
-			inbound  bool
-			outbound bool
-		})
-		for _, conn := range r.Host.Network().Conns() {
-			stat := conn.Stat().Direction
-			remote := conn.RemotePeer()
-			flags := edgeFlags[remote]
-			switch stat {
-			case network.DirInbound:
-				out.InboundPeers++
-				flags.inbound = true
-			case network.DirOutbound:
-				out.OutboundPeers++
-				flags.outbound = true
-			}
-			edgeFlags[remote] = flags
-		}
-		if len(edgeFlags) > 0 {
-			edges := make([]RouterEdge, 0, len(edgeFlags))
-			for pid, flags := range edgeFlags {
-				direction := "unknown"
-				switch {
-				case flags.inbound && flags.outbound:
-					direction = "bidirectional"
-				case flags.inbound:
-					direction = "inbound"
-				case flags.outbound:
-					direction = "outbound"
-				}
-				edges = append(edges, RouterEdge{
-					Source:     out.Self,
-					Target:     pid,
-					Direction:  direction,
-					Status:     "live",
-					Confidence: "observed",
-					ReportedBy: out.Self,
-					UpdatedAt:  sampleTime,
-				})
-			}
-			sort.Slice(edges, func(i, j int) bool {
-				return edges[i].Target.String() < edges[j].Target.String()
-			})
-			out.Edges = edges
-		}
+		localEdges, inboundCount, outboundCount := r.collectLocalEdges(sampleTime)
+		out.InboundPeers = inboundCount
+		out.OutboundPeers = outboundCount
+		reportedEdges := r.collectReportedEdges(sampleTime)
+		out.Edges = mergeEdgeSets(localEdges, reportedEdges)
 	}
 
 	var elapsed time.Duration
@@ -797,6 +1147,58 @@ func (r *Router) GetNetworkStats() RouterStats {
 	r.recordTrend(out)
 	out.History = r.trendSnapshot()
 	return out
+}
+
+// ValidatorPeerStats returns router peer stats keyed by validator ID. Validators without
+// observed router metrics are marked offline with zeroed transport data.
+func (r *Router) ValidatorPeerStats(validators []types.ValidatorInfo) map[types.ValidatorID]RouterPeerStats {
+	result := make(map[types.ValidatorID]RouterPeerStats, len(validators))
+	if r == nil || len(validators) == 0 {
+		return result
+	}
+
+	netStats := r.GetNetworkStats()
+	peerIndex := make(map[string]RouterPeerStats, len(netStats.Peers))
+	for _, peerStat := range netStats.Peers {
+		peerIndex[strings.ToLower(peerStat.ID.String())] = peerStat
+	}
+	now := time.Now()
+
+	for _, v := range validators {
+		var (
+			pid peer.ID
+			err error
+		)
+		if strings.TrimSpace(v.PeerID) != "" {
+			pid, err = peer.Decode(v.PeerID)
+			if err != nil {
+				r.log.Warn("invalid configured peer id for validator", utils.ZapError(err))
+				continue
+			}
+		} else {
+			pid, err = peerIDFromPublicKey(v.PublicKey)
+			if err != nil {
+				continue
+			}
+		}
+		peerKey := strings.ToLower(pid.String())
+		if stat, ok := peerIndex[peerKey]; ok {
+			result[v.ID] = stat
+			continue
+		}
+		if obs, ok := r.getObservedPeerStats(pid, now); ok {
+			result[v.ID] = obs
+			continue
+		}
+
+		result[v.ID] = RouterPeerStats{
+			ID:       pid,
+			Status:   "offline",
+			LastSeen: v.LastSeen,
+		}
+	}
+
+	return result
 }
 
 func (r *Router) recordTrend(sample RouterStats) {

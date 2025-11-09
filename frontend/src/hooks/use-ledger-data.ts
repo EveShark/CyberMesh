@@ -1,37 +1,43 @@
 "use client"
 
-import useSWR from "swr"
+import { useMemo } from "react"
 
-import type { BlockSummary } from "@/lib/api"
+import type { BlockSummary, DashboardLedgerSection } from "@/lib/api"
+
+import { useDashboardData } from "./use-dashboard-data"
 
 interface LedgerSummaryResponse {
+  summary?: DashboardLedgerSection
   recentBlocks: BlockSummary[]
   decisionTimeline: Array<{
     time: string
+    height: number
+    hash: string
+    proposer: string
     approved: number
     rejected: number
     timeout: number
   }>
 }
 
-const fetcher = async <T>(url: string): Promise<T> => {
-  const res = await fetch(url, { cache: "no-store" })
-  if (!res.ok) {
-    const text = await res.text().catch(() => "")
-    throw new Error(`Request failed: ${res.status} ${res.statusText}${text ? ` - ${text}` : ""}`)
-  }
-  return (await res.json()) as T
-}
+const DEFAULT_LEDGER_REFRESH_MS = 20000
 
-export function useLedgerData(refreshInterval = 5000) {
-  const { data, error, isLoading, mutate } = useSWR<LedgerSummaryResponse>("/api/ledger/summary", fetcher, {
-    refreshInterval,
-  })
+export function useLedgerData(refreshInterval = DEFAULT_LEDGER_REFRESH_MS) {
+  const { data: dashboard, error, isLoading, mutate } = useDashboardData(refreshInterval)
+
+  const data = useMemo<LedgerSummaryResponse | undefined>(() => {
+    if (!dashboard) return undefined
+    return {
+      summary: dashboard.ledger,
+      recentBlocks: dashboard.blocks.recent ?? [],
+      decisionTimeline: dashboard.blocks.decision_timeline ?? [],
+    }
+  }, [dashboard])
 
   return {
     data,
     error,
-    isLoading,
+    isLoading: !data && isLoading,
     refresh: mutate,
   }
 }

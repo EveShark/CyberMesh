@@ -27,7 +27,45 @@ export default function ThreatsPage() {
   const [selectedThreat, setSelectedThreat] = useState<ThreatAggregate | null>(null)
 
   const totals = data?.breakdown.totals
+  const lifetimeTotals = data?.lifetimeTotals ?? (totals
+    ? {
+        total: totals.overall,
+        published: totals.published,
+        abstained: totals.abstained,
+      }
+    : undefined)
   const detectionLoopRunning = data?.detectionLoop?.running ?? false
+  const detectionLoopStatus = data?.detectionLoop?.status ?? (detectionLoopRunning ? "ok" : "stopped")
+  const detectionLoopBlocking = data?.detectionLoop?.blocking ?? false
+  const detectionLoopMessage = data?.detectionLoop?.message || (data?.detectionLoop?.issues?.[0] ?? "")
+  const threatSource = data?.source ?? "history"
+  const fallbackReason = data?.fallbackReason
+  const humanizedSource = threatSource.replace(/_/g, " ")
+  const humanizedFallback = fallbackReason ? fallbackReason.replace(/_/g, " ") : ""
+  const statusVariant = (() => {
+    if (detectionLoopStatus === "critical" || detectionLoopStatus === "stopped" || detectionLoopBlocking) {
+      return "destructive"
+    }
+    if (detectionLoopStatus === "degraded") {
+      return "outline"
+    }
+    return detectionLoopRunning ? "destructive" : "secondary"
+  })()
+
+  const statusLabel = (() => {
+    if (detectionLoopStatus === "critical" || detectionLoopStatus === "stopped" || detectionLoopBlocking) {
+      return "HALTED"
+    }
+    if (detectionLoopStatus === "degraded") {
+      return "DEGRADED"
+    }
+    return detectionLoopRunning ? "LIVE" : "PAUSED"
+  })()
+  const blockedCount = typeof lifetimeTotals?.published === "number"
+    ? lifetimeTotals.published
+    : typeof totals?.published === "number"
+      ? totals.published
+      : null
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-background via-background to-muted/20">
@@ -39,12 +77,22 @@ export default function ThreatsPage() {
               <p className="text-muted-foreground mt-1">Real-time threat monitoring and analysis dashboard</p>
             </div>
             <div className="flex items-center gap-3">
-              <Badge variant={detectionLoopRunning ? "destructive" : "secondary"} className={detectionLoopRunning ? "pulse-ring" : ""}>
+              <Badge variant={statusVariant} className={detectionLoopRunning && statusVariant === "destructive" ? "pulse-ring" : ""}>
                 <AlertTriangle className="h-3 w-3 mr-1" />
-                {detectionLoopRunning ? "LIVE" : "PAUSED"}
+                {statusLabel}
               </Badge>
+              {threatSource === "feed_fallback" ? (
+                <Badge variant="outline" className="text-xs border-yellow-500 text-yellow-500">
+                  Feed fallback
+                </Badge>
+              ) : null}
+              {threatSource === "empty" ? (
+                <Badge variant="secondary" className="text-xs">
+                  No detections
+                </Badge>
+              ) : null}
               <Badge variant="outline" className="text-xs">
-                Blocked: {totals?.published.toFixed?.(0) ?? "--"}
+                Blocked: {blockedCount !== null ? blockedCount.toLocaleString() : "--"}
               </Badge>
               <Button variant="outline" size="sm" onClick={() => mutate()} disabled={isLoading} className="hover-scale">
                 <RefreshCw className={`h-4 w-4 mr-2 ${isLoading ? "animate-spin" : ""}`} /> Refresh
@@ -67,15 +115,19 @@ export default function ThreatsPage() {
             <p className="text-muted-foreground">Real-time threat detection metrics and system performance</p>
           </div>
           <ThreatHeroMetrics
-            totalDetected={totals?.overall ?? 0}
-            published={totals?.published ?? 0}
-            abstained={totals?.abstained ?? 0}
-            avgResponseTimeMs={undefined} // TODO: Backend to provide this
-            validatorCount={backendStats?.stats.consensus?.validator_count}
-            quorumSize={backendStats?.stats.consensus?.quorum_size}
+            totalDetected={lifetimeTotals?.total ?? 0}
+            published={lifetimeTotals?.published ?? 0}
+            abstained={lifetimeTotals?.abstained ?? Math.max(0, (lifetimeTotals?.total ?? 0) - (lifetimeTotals?.published ?? 0))}
+            avgResponseTimeMs={data?.avgResponseTimeMs}
+            validatorCount={backendStats?.consensus?.validator_count}
+            quorumSize={backendStats?.consensus?.quorum_size}
             isLoading={isLoadingAny}
             lastUpdated={data?.timestamp}
+            scopeLabel="Lifetime totals"
           />
+          <p className="text-xs text-muted-foreground/80 mt-2">
+            Charts and tables below reflect the most recent detections snapshot (up to 500 events).
+          </p>
         </section>
 
         {/* 2-Column Layout: Charts + Detection Breakdown with Sidebar */}
@@ -102,7 +154,7 @@ export default function ThreatsPage() {
                 }}
                 detectionLoopRunning={detectionLoopRunning}
                 lastDetectionTime={lastDetectionTime}
-                validatorCount={backendStats?.stats.consensus?.validator_count}
+                validatorCount={backendStats?.consensus?.validator_count}
               />
             </div>
           </div>
@@ -111,6 +163,7 @@ export default function ThreatsPage() {
           <div className="space-y-6">
             <div className="glass-card border border-border/30 rounded-lg p-6">
               <h3 className="text-lg font-semibold text-foreground mb-4">Threat Summary</h3>
+              <p className="text-xs text-muted-foreground mb-3">Recent snapshot (last 500 detections)</p>
               <div className="space-y-4">
                 <div className="flex items-center justify-between p-3 rounded-lg bg-background/60">
                   <span className="text-sm text-muted-foreground">Total Detected</span>
@@ -132,20 +185,29 @@ export default function ThreatsPage() {
               <div className="space-y-3">
                 <div className="flex items-center justify-between">
                   <span className="text-sm text-muted-foreground">Detection Loop</span>
-                  <Badge variant={detectionLoopRunning ? "destructive" : "secondary"}>
-                    {detectionLoopRunning ? "RUNNING" : "PAUSED"}
-                  </Badge>
+                  <Badge variant={statusVariant}>{statusLabel}</Badge>
                 </div>
+                {detectionLoopMessage && (
+                  <div className="text-xs text-muted-foreground border border-border/40 rounded-md bg-background/60 p-2">
+                    {detectionLoopMessage}
+                  </div>
+                )}
+                {threatSource !== "history" ? (
+                  <div className="text-[11px] text-muted-foreground/80">
+                    Data source: {humanizedSource}
+                    {humanizedFallback ? ` (${humanizedFallback})` : ""}
+                  </div>
+                ) : null}
                 <div className="flex items-center justify-between">
                   <span className="text-sm text-muted-foreground">Validator Count</span>
                   <span className="text-sm font-medium text-foreground">
-                    {backendStats?.stats.consensus?.validator_count ?? "--"}
+                    {backendStats?.consensus?.validator_count ?? "--"}
                   </span>
                 </div>
                 <div className="flex items-center justify-between">
                   <span className="text-sm text-muted-foreground">Quorum Size</span>
                   <span className="text-sm font-medium text-foreground">
-                    {backendStats?.stats.consensus?.quorum_size ?? "--"}
+                    {backendStats?.consensus?.quorum_size ?? "--"}
                   </span>
                 </div>
                 <div className="flex items-center justify-between">

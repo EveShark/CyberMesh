@@ -99,6 +99,7 @@ export default function NetworkPageClient() {
             nodes={networkNodes}
             edges={networkEdges}
             leader={networkData?.leader ?? undefined}
+            leaderId={networkData?.leaderId ?? undefined}
             isLoading={networkLoading}
             error={networkGraphError}
           />
@@ -115,6 +116,7 @@ export default function NetworkPageClient() {
       <ValidatorStatusTable
         nodes={networkNodes}
         leader={networkData?.leader}
+        leaderId={networkData?.leaderId ?? null}
         leaderStability={networkData?.leaderStability}
         isLoading={networkLoading}
       />

@@ -59,6 +59,13 @@ data:
 
   # Genesis persistence path (PVC mounted at /app/data)
   GENESIS_STATE_PATH: "/app/data/genesis_state.json"
+  
+  # Genesis Bootstrap - All validators participate in genesis ceremony
+  VALIDATOR_1_BOOTSTRAP_ACTIVE: "true"
+  VALIDATOR_2_BOOTSTRAP_ACTIVE: "true"
+  VALIDATOR_3_BOOTSTRAP_ACTIVE: "true"
+  VALIDATOR_4_BOOTSTRAP_ACTIVE: "true"
+  VALIDATOR_5_BOOTSTRAP_ACTIVE: "true"
 
   # Persistence
   PERSIST_QUEUE_SIZE: "1024"
@@ -118,6 +125,7 @@ data:
   API_CORS_ENABLED: "true"
   API_CORS_ALLOWED_ORIGINS: "*"
   API_REQUEST_TIMEOUT: "30s"
+  DASHBOARD_CACHE_TTL: "3s"
   AI_SERVICE_API_BASE: "http://ai-service.cybermesh.svc.cluster.local:8080"
   AI_SERVICE_API_TIMEOUT: "2s"
 

@@ -28,6 +28,9 @@
 *.jks
 !certs/root.crt
 
+# Key backups
+backend/keys/backupkeys/
+
 # Kubernetes Secrets
 **/secret.yaml
 **/sealed-secret.yaml
@@ -286,3 +289,8 @@ frontend/docs/
 # Temporary gitignore files
 .gitignore.old
 .gitignore.proposed
+
+# Demo directories and backup files
+frontend/src/app/demo/
+frontend/src/p2p-consensus/components/*.v1.tsx
+frontend/src/components/*.v1.tsx

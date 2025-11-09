@@ -56,6 +56,11 @@ export function BlockDetailsPanel({ block, className = "" }: BlockDetailsPanelPr
     )
   }
 
+  const sizeBytes = Number.isFinite(block.size_bytes) ? block.size_bytes : 0
+  const sizePrefix = block.size_bytes_estimated ? "≈" : ""
+  const rawSizeSource = block.metadata?.["size_source"]
+  const sizeSource = typeof rawSizeSource === "string" ? rawSizeSource.replace(/_/g, " ") : undefined
+
   return (
     <Card className={`glass-card border border-border/30 ${className}`}>
       <CardHeader>
@@ -94,7 +99,13 @@ export function BlockDetailsPanel({ block, className = "" }: BlockDetailsPanelPr
             </div>
             <div className="flex items-center justify-between py-2">
               <span className="text-muted-foreground">Size</span>
-              <span className="text-foreground">{(block.size_bytes / 1024).toFixed(2)} KB</span>
+              <span className="text-foreground">
+                {sizePrefix}
+                {(sizeBytes / 1024).toFixed(2)} KB
+                {block.size_bytes_estimated && sizeSource ? (
+                  <span className="ml-2 text-xs text-muted-foreground capitalize">{sizeSource}</span>
+                ) : null}
+              </span>
             </div>
           </div>
 
