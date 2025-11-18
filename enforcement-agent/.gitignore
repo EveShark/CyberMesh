@@ -1,0 +1,140 @@
+# ============================================================
+# Enforcement Agent - .gitignore
+# ============================================================
+
+# ============================================================
+# BUILD OUTPUTS & BINARIES
+# ============================================================
+
+# Binaries
+*.exe
+agent
+agent.exe
+enforcement-agent
+enforcement-agent.exe
+
+# Build output directory
+bin/
+/bin/
+
+# Go test binaries
+*.test
+
+# ============================================================
+# BACKUP FILES
+# ============================================================
+
+*.bak
+*.backup
+*.old
+*.orig
+
+# ============================================================
+# TESTING & COVERAGE
+# ============================================================
+
+# Test directory
+test/
+/test/
+
+# Coverage reports
+*.out
+coverage.txt
+coverage.html
+
+# Test cache
+.test/
+
+# ============================================================
+# LOGS & RUNTIME DATA
+# ============================================================
+
+# Log files
+*.log
+logs/
+
+# Runtime state
+*.pid
+*.pid.lock
+
+# ============================================================
+# ENVIRONMENT & SECRETS
+# ============================================================
+
+# Environment files
+.env
+.env.local
+.env.*
+*.env
+
+# KEEP reference files
+!.env.example
+!.env.template
+
+# Keys and certificates
+*.key
+*.pem
+*.crt
+
+# ============================================================
+# DEPENDENCIES
+# ============================================================
+
+# Vendor directory (if used)
+vendor/
+
+# ============================================================
+# IDE & EDITOR FILES
+# ============================================================
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# JetBrains IDEs
+.idea/
+*.iml
+
+# Vim
+*.swp
+*.swo
+*~
+
+# ============================================================
+# OS FILES
+# ============================================================
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Linux
+*~
+
+# ============================================================
+# TEMPORARY FILES
+# ============================================================
+
+tmp/
+temp/
+*.tmp
+
+# ============================================================
+# DOCUMENTATION & BUILD SCRIPTS
+# ============================================================
+
+# Markdown documentation
+*.md
+
+# Build scripts
+build.sh
+build.ps1
+*.sh
+*.ps1
+
+# KEEP specific files if needed
+!README.md

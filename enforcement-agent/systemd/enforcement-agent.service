@@ -1,0 +1,18 @@
+[Unit]
+Description=CyberMesh Enforcement Agent
+After=network.target
+Wants=network-online.target
+
+[Service]
+User=cybermesh
+Group=cybermesh
+ExecStart=/usr/local/bin/enforcement-agent
+EnvironmentFile=/etc/cybermesh/enforcement-agent.env
+Restart=on-failure
+RestartSec=5s
+AmbientCapabilities=CAP_NET_ADMIN
+NoNewPrivileges=true
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
