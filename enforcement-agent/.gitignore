@@ -8,10 +8,10 @@
 
 # Binaries
 *.exe
-agent
-agent.exe
-enforcement-agent
-enforcement-agent.exe
+/agent
+/agent.exe
+/enforcement-agent
+/enforcement-agent.exe
 
 # Build output directory
 bin/
