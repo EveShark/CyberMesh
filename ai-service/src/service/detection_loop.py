@@ -10,6 +10,8 @@ import threading
 import time
 from typing import Optional, Dict, Any, Callable, List, TYPE_CHECKING
 
+from .policy_emitter import PolicyContext, build_policy_candidate
+
 if TYPE_CHECKING:  # pragma: no cover - avoid runtime dependency cycle
     from ..feedback.tracker import AnomalyLifecycleTracker
 
@@ -105,6 +107,11 @@ class DetectionLoop:
             "loop_iterations": 0,
             "avg_latency_ms": 0.0,
             "last_latency_ms": 0.0,
+            "policy_candidates": 0,
+            "policy_published": 0,
+            "policy_failed": 0,
+            "policy_skipped": 0,
+            "policy_skip_reasons": {},
         }
         self._metrics_lock = threading.Lock()
         self._summary_interval = max(1, int(config.get('DETECTION_SUMMARY_INTERVAL', 10)))
@@ -130,6 +137,8 @@ class DetectionLoop:
         self._sample_window_total = 0
         self._sample_window_taken = 0
         self._rng = random.Random()
+
+        self._policy_cfg = config.get('POLICY_PUBLISHING')
         
         self.logger.info(
             f"DetectionLoop initialized: interval={self._interval}s, "
@@ -414,8 +423,11 @@ class DetectionLoop:
                         # Build JSON payload with FULL security context
                         
                         # Extract network context from metadata/candidates
-                        network_context = {}
-                        if decision.candidates:
+                        # Reuse the context the pipeline already attached
+                        network_context = decision.metadata.get('network_context', {})
+                        
+                        # Fall back to feature-derived map if pipeline didn't attach it
+                        if not network_context and decision.candidates:
                             # Get features from first candidate
                             features = decision.candidates[0].features
                             network_context = {
@@ -478,6 +490,16 @@ class DetectionLoop:
                                 timestamp=detection_ts,
                             )
                         
+                        if published:
+                            self._maybe_publish_policy(
+                                anomaly_id=anomaly_id,
+                                anomaly_type=anomaly_type,
+                                severity=severity,
+                                confidence=float(confidence),
+                                network_context=network_context,
+                                metadata=payload_obj,
+                            )
+
                         if published:
                             # Publish supporting evidence (Fix: Gap 1)
                             self.logger.info(f"[EVIDENCE_DEBUG] Starting evidence publishing attempt for anomaly {anomaly_id}")
@@ -714,6 +736,92 @@ class DetectionLoop:
             current_avg = self._metrics.get("avg_latency_ms", 0.0)
             # EMA with alpha=0.1 (smooth over ~10 samples)
             self._metrics["avg_latency_ms"] = current_avg * 0.9 + latency_ms * 0.1
+
+    def _maybe_publish_policy(
+        self,
+        *,
+        anomaly_id: str,
+        anomaly_type: str,
+        severity: int,
+        confidence: float,
+        network_context: Dict[str, Any],
+        metadata: Dict[str, Any],
+    ) -> None:
+        cfg = self._policy_cfg
+        if cfg is None:
+            return
+
+        decision = build_policy_candidate(
+            PolicyContext(
+                anomaly_id=anomaly_id,
+                anomaly_type=anomaly_type,
+                severity=severity,
+                confidence=confidence,
+                network_context=network_context,
+                metadata=metadata,
+            ),
+            cfg,
+        )
+
+        if decision.candidate is None:
+            reason = decision.reason or "unknown"
+            with self._metrics_lock:
+                self._metrics["policy_skipped"] = self._metrics.get("policy_skipped", 0) + 1
+                reasons = self._metrics.get("policy_skip_reasons")
+                if reasons is None:
+                    reasons = {}
+                    self._metrics["policy_skip_reasons"] = reasons
+                reasons[reason] = reasons.get(reason, 0) + 1
+            return
+
+        candidate = decision.candidate
+        self._increment_metric("policy_candidates")
+
+        try:
+            self.publisher.publish_policy_violation(
+                policy_id=candidate.policy_id,
+                rule_type=candidate.rule_type,
+                enforcement_action=candidate.action,
+                payload=candidate.payload,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            self._increment_metric("policy_failed")
+            self.logger.error(
+                "Failed to publish policy violation",
+                exc_info=True,
+                extra={
+                    "policy_id": candidate.policy_id,
+                    "anomaly_id": anomaly_id,
+                    "error": str(exc),
+                },
+            )
+        else:
+            self._increment_metric("policy_published")
+
+            tracker = self._tracker
+            if tracker is not None:
+                ttl_seconds = getattr(self._policy_cfg, "ttl_seconds", None) if self._policy_cfg is not None else None
+                requires_ack = getattr(self._policy_cfg, "requires_ack", None) if self._policy_cfg is not None else None
+                fast_path = bool(getattr(self._policy_cfg, "canary_scope", False)) if self._policy_cfg is not None else None
+
+                try:
+                    tracker.record_policy_dispatched(
+                        anomaly_id=anomaly_id,
+                        policy_id=candidate.policy_id,
+                        ttl_seconds=int(ttl_seconds) if ttl_seconds is not None else None,
+                        requires_ack=requires_ack,
+                        fast_path=fast_path,
+                        timestamp=time.time(),
+                    )
+                except Exception as tracker_err:  # pragma: no cover - defensive
+                    self.logger.warning(
+                        "Policy dispatch tracker update failed",
+                        extra={
+                            "policy_id": candidate.policy_id,
+                            "anomaly_id": anomaly_id,
+                            "error": str(tracker_err),
+                        },
+                    )
     
     def get_metrics(self) -> Dict[str, Any]:
         """

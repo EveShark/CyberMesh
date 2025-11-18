@@ -19,6 +19,7 @@ from ..contracts import (
     CommitEvent,
     ReputationEvent,
     PolicyUpdateEvent,
+    PolicyAckEvent,
     EvidenceRequestEvent,
 )
 from ..logging import get_logger
@@ -27,6 +28,7 @@ import time
 import hashlib
 from ..utils.tokens import token_ip, token_flow_key
 from ..contracts import EvidenceMessage
+from ..utils.errors import ValidationError, StorageError
 
 if TYPE_CHECKING:  # pragma: no cover
     from ..feedback.tracker import AnomalyLifecycleTracker
@@ -86,6 +88,7 @@ class MessageHandlers:
             "commit": {"processed": 0, "failed": 0},
             "reputation": {"processed": 0, "failed": 0},
             "policy_update": {"processed": 0, "failed": 0},
+            "policy_ack": {"processed": 0, "failed": 0, "applied": 0, "failed_result": 0, "missing_mapping": 0},
             "evidence_request": {"processed": 0, "failed": 0},
         }
         self._metrics_lock = threading.Lock()
@@ -486,6 +489,95 @@ class MessageHandlers:
                     "error": str(e),
                 }
             )
+
+    def handle_policy_ack_event(self, event: PolicyAckEvent):
+        """Handle enforcement acknowledgement from backend agents."""
+
+        tracker = self._tracker()
+        anomaly_id: Optional[str] = None
+        ack_latency_ms: Optional[float] = None
+
+        if event.applied_at and event.acked_at:
+            ack_latency_ms = max(0.0, (event.acked_at - event.applied_at) * 1000.0)
+
+        if tracker is not None:
+            try:
+                anomaly_id = tracker.record_policy_ack(
+                    policy_id=event.policy_id,
+                    result=event.result,
+                    reason=event.reason,
+                    error_code=event.error_code,
+                    applied_at=event.applied_at if event.applied_at else None,
+                    acked_at=event.acked_at if event.acked_at else None,
+                    fast_path=event.fast_path,
+                )
+            except (ValidationError, StorageError) as err:
+                with self._metrics_lock:
+                    self._metrics["policy_ack"]["failed"] += 1
+
+                self.logger.error(
+                    "Failed to persist policy acknowledgement",
+                    exc_info=True,
+                    extra={
+                        "event_type": "policy_ack",
+                        "policy_id": event.policy_id,
+                        "error": str(err),
+                    },
+                )
+                return
+            except Exception as err:  # pragma: no cover
+                with self._metrics_lock:
+                    self._metrics["policy_ack"]["failed"] += 1
+                self.logger.error(
+                    "Unexpected error handling policy acknowledgement",
+                    exc_info=True,
+                    extra={
+                        "event_type": "policy_ack",
+                        "policy_id": event.policy_id,
+                        "error": str(err),
+                    },
+                )
+                return
+
+        with self._metrics_lock:
+            metrics = self._metrics["policy_ack"]
+            metrics["processed"] += 1
+            if event.result == "applied":
+                metrics["applied"] += 1
+            else:
+                metrics["failed_result"] += 1
+            if anomaly_id is None:
+                metrics["missing_mapping"] += 1
+
+        log_extra = {
+            "event_type": "policy_ack",
+            "policy_id": event.policy_id,
+            "result": event.result,
+            "reason": event.reason,
+            "error_code": event.error_code,
+            "controller": event.controller_instance,
+            "scope": event.scope_identifier,
+            "tenant": event.tenant,
+            "region": event.region,
+            "fast_path": event.fast_path,
+            "ack_latency_ms": ack_latency_ms,
+        }
+
+        if anomaly_id:
+            log_extra["anomaly_id"] = anomaly_id
+
+        self.logger.info("Policy enforcement acknowledgement", extra=log_extra)
+
+        if event.result != "applied":
+            self.logger.warning(
+                "Policy enforcement failed",
+                extra={
+                    "policy_id": event.policy_id,
+                    "anomaly_id": anomaly_id,
+                    "reason": event.reason,
+                    "error_code": event.error_code,
+                },
+            )
     
     def get_metrics(self) -> Dict[str, Any]:
         """
@@ -495,10 +587,15 @@ class MessageHandlers:
             Dictionary with processed/failed counts per handler type
         """
         with self._metrics_lock:
-            return {
-                handler_type: {
-                    "processed": counts["processed"],
-                    "failed": counts["failed"],
+            snapshot: Dict[str, Any] = {}
+            for handler_type, counts in self._metrics.items():
+                entry = {
+                    "processed": counts.get("processed", 0),
+                    "failed": counts.get("failed", 0),
                 }
-                for handler_type, counts in self._metrics.items()
-            }
+                if handler_type == "policy_ack":
+                    entry["applied"] = counts.get("applied", 0)
+                    entry["failed_result"] = counts.get("failed_result", 0)
+                    entry["missing_mapping"] = counts.get("missing_mapping", 0)
+                snapshot[handler_type] = entry
+            return snapshot

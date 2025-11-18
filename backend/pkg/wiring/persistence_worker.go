@@ -28,7 +28,7 @@ type PersistenceTask struct {
 
 // PersistenceSuccessCallback is called after successful block persistence
 // Used to trigger downstream actions like Kafka publishing
-type PersistenceSuccessCallback func(ctx context.Context, height uint64, hash [32]byte, stateRoot [32]byte, txCount int, ts int64, anomalyCount int, evidenceCount int, policyCount int, anomalyIDs []string)
+type PersistenceSuccessCallback func(ctx context.Context, height uint64, hash [32]byte, stateRoot [32]byte, txCount int, ts int64, anomalyCount int, evidenceCount int, policyCount int, anomalyIDs []string, policyPayloads [][]byte)
 
 // PersistenceWorkerConfig holds configuration for the persistence worker
 type PersistenceWorkerConfig struct {
@@ -294,7 +294,7 @@ func (pw *PersistenceWorker) processTask(ctx context.Context, task *PersistenceT
 						return
 					}
 
-					pw.onSuccess(ctx, task.Block.GetHeight(), bh, task.StateRoot, task.Block.GetTransactionCount(), task.Block.GetTimestamp().Unix(), meta.anomalyCount, meta.evidenceCount, meta.policyCount, meta.anomalyIDs)
+					pw.onSuccess(ctx, task.Block.GetHeight(), bh, task.StateRoot, task.Block.GetTransactionCount(), task.Block.GetTimestamp().Unix(), meta.anomalyCount, meta.evidenceCount, meta.policyCount, meta.anomalyIDs, meta.policyPayloads)
 				}()
 			}
 
@@ -404,10 +404,11 @@ func (pw *PersistenceWorker) GetStats() map[string]interface{} {
 // extractAnomalyIDs extracts anomaly IDs from EventTx transactions in a block
 // Fix: Gap 2 - Enable COMMITTED state tracking by extracting anomaly UUIDs
 type commitMetadata struct {
-	anomalyIDs    []string
-	anomalyCount  int
-	evidenceCount int
-	policyCount   int
+	anomalyIDs     []string
+	anomalyCount   int
+	evidenceCount  int
+	policyCount    int
+	policyPayloads [][]byte
 }
 
 func extractCommitMetadata(block *block.AppBlock, logger *utils.Logger) commitMetadata {
@@ -464,6 +465,11 @@ func extractCommitMetadata(block *block.AppBlock, logger *utils.Logger) commitMe
 			meta.evidenceCount++
 		case state.TxPolicy:
 			meta.policyCount++
+			if policyTx, ok := tx.(*state.PolicyTx); ok && len(policyTx.Data) > 0 {
+				payloadCopy := make([]byte, len(policyTx.Data))
+				copy(payloadCopy, policyTx.Data)
+				meta.policyPayloads = append(meta.policyPayloads, payloadCopy)
+			}
 		}
 	}
 

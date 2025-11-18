@@ -75,16 +75,17 @@ data:
   TOPIC_CONTROL_COMMITS: "control.commits.v1"
   TOPIC_CONTROL_REPUTATION: "control.reputation.v1"
   TOPIC_CONTROL_POLICY: "control.policy.v1"
+  TOPIC_CONTROL_POLICY_ACK: "control.policy.ack.v1"
   TOPIC_CONTROL_EVIDENCE: "control.evidence.v1"
   TOPIC_DLQ: "ai.dlq.v1"
   
   # ============================================================
   # GCS STORAGE (Models & Datasets)
   # ============================================================
-  GCS_PROJECT_ID: "cybermesh-476310"
+  GCS_PROJECT_ID: "cybermesh-478105"
   GCS_REGION: "asia-southeast1"
-  GCS_BUCKET_MODELS: "cybermesh-ai-models-476310"
-  GCS_BUCKET_DATASETS: "cybermesh-test-datasets-476310"
+  GCS_BUCKET_MODELS: "cybermesh-ai-models-478105"
+  GCS_BUCKET_DATASETS: "cybermesh-test-datasets-478105"
   # Model URLs: gs://cybermesh-ai-models-476310/ddos.pkl
   # Dataset URLs: gs://cybermesh-test-datasets-476310/phase0_smoke_test_10k_50_50.csv
   
@@ -137,9 +138,22 @@ data:
   DETECTION_ENABLE_MALWARE: "true"
   DETECTION_DDOS_CONFIDENCE_THRESHOLD: "0.85"
   DETECTION_MALWARE_CONFIDENCE_THRESHOLD: "0.90"
+
+  # Policy publishing
+  POLICY_PUBLISHING_ENABLED: "true"
+  POLICY_PUBLISHING_SEVERITY_THRESHOLD: "8"
+  POLICY_PUBLISHING_CONFIDENCE_THRESHOLD: "0.90"
+  POLICY_PUBLISHING_TTL_SECONDS: "900"
+  POLICY_PUBLISHING_SCOPE: "cluster"
+  POLICY_PUBLISHING_DIRECTION: "ingress"
+  POLICY_PUBLISHING_REQUIRES_ACK: "false"  # Auto-apply (approval_required driven by guardrails only)
+  POLICY_PUBLISHING_DRY_RUN: "false"
+  POLICY_PUBLISHING_CANARY_SCOPE: "false"
+  POLICY_PUBLISHING_CIDR_MAX_PREFIX: "24"
+  POLICY_PUBLISHING_MAX_TARGETS: "32"
   
   # Detection Loop
-  DETECTION_INTERVAL: "5"
+  DETECTION_INTERVAL: "60"
   DETECTION_TIMEOUT: "30"
   TELEMETRY_BATCH_SIZE: "1000"
   MAX_DETECTIONS_PER_SECOND: "100"

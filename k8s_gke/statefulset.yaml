@@ -38,7 +38,7 @@ spec:
         - -c
         - |
           echo "Waiting for CockroachDB connectivity..."
-          until nc -z cybermesh-threats-9633.jxf.gcp-asia-southeast1.cockroachlabs.cloud 26257; do
+          until nc -z cybermesh-threats-10433.jxf.gcp-asia-southeast1.cockroachlabs.cloud 26257; do
             echo "Waiting for database..."
             sleep 2
           done
@@ -46,7 +46,7 @@ spec:
 
       containers:
       - name: validator
-        image: asia-southeast1-docker.pkg.dev/cybermesh-476310/cybermesh-repo/cybermesh-backend:latest
+        image: asia-southeast1-docker.pkg.dev/cybermesh-478105/cybermesh-repo/cybermesh-backend:latest
         imagePullPolicy: Always
 
         securityContext:

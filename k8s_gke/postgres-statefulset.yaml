@@ -135,7 +135,7 @@ spec:
         - -c
         - |
           echo "Downloading CSV from GCS..."
-          gsutil cp gs://cybermesh-test-datasets-476310/ddos_3m_balanced.csv /data/dataset.csv
+          gsutil cp gs://cybermesh-test-datasets-478105/ddos_3m_balanced.csv /data/dataset.csv
           echo "CSV downloaded: $(du -h /data/dataset.csv)"
         volumeMounts:
         - name: data

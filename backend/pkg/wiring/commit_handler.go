@@ -125,6 +125,12 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 		}
 	} else {
 		s.log.WarnContext(ctx, "persistWorker is nil, cannot persist to database")
+		if s.policyPublisher != nil {
+			meta := extractCommitMetadata(ab, s.log)
+			if meta.policyCount > 0 {
+				s.policyPublisher.Publish(ctx, ab.GetHeight(), ab.GetTimestamp().Unix(), meta.policyCount, meta.policyPayloads)
+			}
+		}
 	}
 
 	return nil

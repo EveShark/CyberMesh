@@ -1,0 +1,18 @@
+# PersistentVolumeClaim for AI service nonce state persistence
+# Ensures nonce state survives pod restarts to prevent replay errors
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ai-service-data
+  namespace: cybermesh
+  labels:
+    app: ai-service
+    component: ml-detection
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: standard-rwo  # Standard HDD (nonce state is small, <1MB)
+  resources:
+    requests:
+      storage: 1Gi  # Small volume for nonce state file

@@ -18,6 +18,7 @@ from ..contracts import (
     CommitEvent,
     ReputationEvent,
     PolicyUpdateEvent,
+    PolicyAckEvent,
     EvidenceRequestEvent,
 )
 from ..utils.errors import ContractError, KafkaError, ValidationError, StorageError, TimestampSkewError
@@ -94,6 +95,7 @@ class AIConsumer:
             config.kafka_topics.control_commits,
             config.kafka_topics.control_reputation,
             config.kafka_topics.control_policy,
+            config.kafka_topics.control_policy_ack,
             config.kafka_topics.control_evidence,
         ]
         self.topic_list = topics if topics is not None else default_topics
@@ -266,6 +268,10 @@ class AIConsumer:
                 # PolicyUpdateEvent auto-verifies signature in __init__ (no param needed)
                 msg = PolicyUpdateEvent.from_bytes(data)
                 handler = self.handlers.get("policy_update")
+
+            elif topic == self.config.kafka_topics.control_policy_ack:
+                msg = PolicyAckEvent.from_bytes(data)
+                handler = self.handlers.get("policy_ack")
                     
             elif topic == self.config.kafka_topics.control_evidence:
                 msg = EvidenceRequestEvent.from_bytes(data, verify_signature=True)

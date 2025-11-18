@@ -53,6 +53,7 @@ def load_settings(env_file: Optional[str] = None) -> Settings:
     kafka_security = _load_kafka_security(is_production)
     kafka_producer = _load_kafka_producer(kafka_security, is_production)
     kafka_consumer = _load_kafka_consumer(kafka_security, is_production)
+    policy_publishing = _load_policy_publishing()
     
     # Cryptographic configuration
     signing_key_path = _require_env("ED25519_SIGNING_KEY_PATH", "Signing key path required")
@@ -100,12 +101,14 @@ def load_settings(env_file: Optional[str] = None) -> Settings:
         model_ddos_path=Path(model_ddos_path) if model_ddos_path else None,
         model_malware_path=Path(model_malware_path) if model_malware_path else None,
         min_confidence=_get_float_env("MIN_CONFIDENCE", 0.85),
+        policy_publishing=policy_publishing,
     )
     
     # Final validation
     kafka_topics.validate()
     kafka_producer.validate(environment)
     kafka_consumer.validate(environment)
+    policy_publishing.validate()
     
     return settings
 
@@ -139,6 +142,7 @@ def _load_kafka_topics() -> KafkaTopicsConfig:
         control_commits=_get_env("TOPIC_CONTROL_COMMITS", "control.commits.v1"),
         control_reputation=_get_env("TOPIC_CONTROL_REPUTATION", "control.reputation.v1"),
         control_policy=_get_env("TOPIC_CONTROL_POLICY", "control.policy.v1"),
+        control_policy_ack=_get_env("TOPIC_CONTROL_POLICY_ACK", "control.policy.ack.v1"),
         control_evidence=_get_env("TOPIC_CONTROL_EVIDENCE", "control.evidence.v1"),
         dlq=_get_env("TOPIC_DLQ", "ai.dlq.v1"),
     )
@@ -230,6 +234,25 @@ def _load_kafka_consumer(security: KafkaSecurityConfig, is_production: bool) -> 
         fetch_min_bytes=_get_int_env("KAFKA_CONSUMER_FETCH_MIN_BYTES", 1),
         fetch_max_wait_ms=_get_int_env("KAFKA_CONSUMER_FETCH_MAX_WAIT_MS", 500),
     )
+
+def _load_policy_publishing() -> "PolicyPublishingConfig":
+    from .settings import PolicyPublishingConfig
+
+    config = PolicyPublishingConfig(
+        enabled=_get_bool_env("POLICY_PUBLISHING_ENABLED", False),
+        severity_threshold=_get_int_env("POLICY_PUBLISHING_SEVERITY_THRESHOLD", 8),
+        confidence_threshold=_get_float_env("POLICY_PUBLISHING_CONFIDENCE_THRESHOLD", 0.9),
+        ttl_seconds=_get_int_env("POLICY_PUBLISHING_TTL_SECONDS", 15 * 60),
+        scope=_get_env("POLICY_PUBLISHING_SCOPE", "cluster"),
+        direction=_get_env("POLICY_PUBLISHING_DIRECTION", "ingress"),
+        requires_ack=_get_bool_env("POLICY_PUBLISHING_REQUIRES_ACK", True),
+        dry_run=_get_bool_env("POLICY_PUBLISHING_DRY_RUN", False),
+        canary_scope=_get_bool_env("POLICY_PUBLISHING_CANARY_SCOPE", False),
+        cidr_max_prefix_len=_get_int_env("POLICY_PUBLISHING_CIDR_MAX_PREFIX", 24),
+        max_targets=_get_int_env("POLICY_PUBLISHING_MAX_TARGETS", 32),
+    )
+
+    return config
 
 
 def _validate_key_path(path: str, is_production: bool):

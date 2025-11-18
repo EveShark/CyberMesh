@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from .security import SecurityConfig, load_security_config
 from .kafka import (
     KafkaTopicsConfig,
@@ -109,6 +109,44 @@ class RateLimitConfig:
         if self.policy_refill_rate <= 0:
             raise ValueError("policy_refill_rate must be positive")
 
+
+@dataclass(frozen=True)
+class PolicyPublishingConfig:
+    """Configuration controlling anomaly-to-policy conversion."""
+
+    enabled: bool = False
+    severity_threshold: int = 8
+    confidence_threshold: float = 0.9
+    ttl_seconds: int = 900
+    scope: str = "cluster"  # cluster|namespace|node
+    direction: str = "ingress"  # ingress|egress
+    requires_ack: bool = True
+    dry_run: bool = False
+    canary_scope: bool = False
+    cidr_max_prefix_len: int = 24
+    max_targets: int = 32
+
+    def validate(self):
+        if not (1 <= self.severity_threshold <= 10):
+            raise ValueError("severity_threshold must be between 1 and 10")
+        if not (0.0 <= self.confidence_threshold <= 1.0):
+            raise ValueError("confidence_threshold must be within [0, 1]")
+        if self.ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be positive")
+
+        valid_scopes = {"cluster", "namespace", "node"}
+        if self.scope not in valid_scopes:
+            raise ValueError(f"scope must be one of {sorted(valid_scopes)}")
+
+        valid_directions = {"ingress", "egress"}
+        if self.direction not in valid_directions:
+            raise ValueError(f"direction must be one of {sorted(valid_directions)}")
+
+        if self.cidr_max_prefix_len <= 0 or self.cidr_max_prefix_len > 128:
+            raise ValueError("cidr_max_prefix_len must be between 1 and 128")
+
+        if self.max_targets <= 0:
+            raise ValueError("max_targets must be positive")
 
 @dataclass(frozen=True)
 class CircuitBreakerConfig:
@@ -288,6 +326,9 @@ class Settings:
     
     # ML ensemble
     min_confidence: float = 0.85                 # Ensemble minimum confidence threshold
+
+    # Policy publishing
+    policy_publishing: PolicyPublishingConfig = field(default_factory=PolicyPublishingConfig)
     
     
 # Legacy Settings class (keep for backward compatibility during migration)

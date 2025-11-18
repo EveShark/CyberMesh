@@ -261,6 +261,7 @@ class ServiceManager:
                 consumer_topics = [
                     settings.kafka_topics.control_reputation,
                     settings.kafka_topics.control_policy,
+                    settings.kafka_topics.control_policy_ack,
                     settings.kafka_topics.control_evidence,
                 ]
 
@@ -277,6 +278,7 @@ class ServiceManager:
                 # Register handlers with consumer
                 self.consumer.register_handler("reputation", self.handlers.handle_reputation_event)
                 self.consumer.register_handler("policy_update", self.handlers.handle_policy_update_event)
+                self.consumer.register_handler("policy_ack", self.handlers.handle_policy_ack_event)
                 self.consumer.register_handler("evidence_request", self.handlers.handle_evidence_request_event)
                 
                 self.logger.info("All message handlers registered")
@@ -1176,6 +1178,10 @@ class ServiceManager:
             'TRACKER_BATCH_SIZE': getattr(settings, 'tracker_batch_size', 50),
             'TRACKER_FLUSH_INTERVAL_SECONDS': getattr(settings, 'tracker_flush_interval_seconds', 5),
         }
+
+        policy_cfg = getattr(settings, "policy_publishing", None)
+        if policy_cfg is not None:
+            detection_config['POLICY_PUBLISHING'] = policy_cfg
 
         # Align sampling configuration with calibration requirements to avoid
         # starving the feedback loop of training samples. When persistence is

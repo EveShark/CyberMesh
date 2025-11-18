@@ -943,6 +943,28 @@ func buildWiringConfig(
 			RetryBackoffMax:  time.Duration(cfgMgr.GetInt("KAFKA_CONSUMER_RETRY_BACKOFF_MAX_MS", 5000)) * time.Millisecond,
 		}
 
+		if allowlistEnv := strings.TrimSpace(cfgMgr.GetString("AI_POLICY_ALLOWED_PUBKEYS", "")); allowlistEnv != "" {
+			entries := strings.Split(allowlistEnv, ",")
+			allowlist := make(map[string]struct{}, len(entries))
+			for _, entry := range entries {
+				trimmed := strings.TrimSpace(entry)
+				if trimmed == "" {
+					continue
+				}
+				decoded, err := hex.DecodeString(trimmed)
+				if err != nil {
+					return wiring.Config{}, nil, nil, nil, fmt.Errorf("invalid AI_POLICY_ALLOWED_PUBKEYS entry %q: %w", trimmed, err)
+				}
+				if len(decoded) != ed25519.PublicKeySize {
+					return wiring.Config{}, nil, nil, nil, fmt.Errorf("AI_POLICY_ALLOWED_PUBKEYS entry %q must be %d bytes", trimmed, ed25519.PublicKeySize)
+				}
+				allowlist[strings.ToLower(trimmed)] = struct{}{}
+			}
+			if len(allowlist) > 0 {
+				wiringCfg.KafkaConsumerCfg.VerifierCfg.PolicyPubKeyAllowlist = allowlist
+			}
+		}
+
 		logger.Info("Kafka consumer configured",
 			utils.ZapString("group_id", consumerGroupID),
 			utils.ZapStringArray("topics", consumerTopics),
@@ -955,6 +977,7 @@ func buildWiringConfig(
 				Reputation: cfgMgr.GetString("CONTROL_REPUTATION_TOPIC", ""),
 				Policy:     cfgMgr.GetString("CONTROL_POLICY_TOPIC", ""),
 				Evidence:   cfgMgr.GetString("CONTROL_EVIDENCE_TOPIC", ""),
+				PolicyDLQ:  cfgMgr.GetString("CONTROL_POLICY_DLQ_TOPIC", ""),
 			},
 		}
 	}

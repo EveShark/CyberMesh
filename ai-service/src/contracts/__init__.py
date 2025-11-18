@@ -19,6 +19,7 @@ from .anomaly import AnomalyMessage
 from .evidence import EvidenceMessage
 from .commit import CommitEvent, BackendValidatorTrustStore
 from .policy import PolicyUpdateEvent, PolicyMessage
+from .policy_ack import PolicyAckEvent
 
 # TODO: These are old placeholder implementations, not yet updated
 from .reputation import ReputationEvent
@@ -32,6 +33,7 @@ __all__ = [
     # Backend -> AI (consumers)
     "CommitEvent",
     "PolicyUpdateEvent",
+    "PolicyAckEvent",
     "BackendValidatorTrustStore",
     # Placeholders (not yet implemented)
     "ReputationEvent",

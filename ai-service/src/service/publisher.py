@@ -19,8 +19,11 @@ Usage:
     publisher = MessagePublisher(producer, signer, nonce_manager, circuit_breaker)
     await publisher.publish_anomaly(anomaly_msg)
 """
+import copy
+import json
 import threading
 import time
+import ipaddress
 from typing import Optional, Dict, Any, Callable
 from datetime import datetime, timezone
 
@@ -32,6 +35,197 @@ from ..contracts import (
 from ..kafka.producer import AIProducer
 from ..utils import Signer, NonceManager, CircuitBreaker
 from ..utils.errors import ValidationError, KafkaError
+from ..utils.validators import validate_uuid
+
+
+def _prepare_policy_payload(
+    policy_id: str,
+    rule_type: str,
+    enforcement_action: str,
+    payload: Any,
+) -> Dict[str, Any]:
+    """Normalize and validate policy payload before publishing."""
+    validate_uuid(policy_id, "policy_id")
+
+    if not rule_type or not isinstance(rule_type, str):
+        raise ValidationError("rule_type is required")
+
+    if not enforcement_action or not isinstance(enforcement_action, str):
+        raise ValidationError("enforcement action is required")
+
+    if isinstance(payload, bytes):
+        try:
+            parsed = json.loads(payload.decode("utf-8"))
+        except Exception as exc:
+            raise ValidationError(f"Failed to decode policy payload: {exc}") from exc
+    elif isinstance(payload, str):
+        try:
+            parsed = json.loads(payload)
+        except Exception as exc:
+            raise ValidationError(f"Failed to decode policy payload: {exc}") from exc
+    elif payload is None:
+        parsed = {}
+    elif isinstance(payload, dict):
+        parsed = copy.deepcopy(payload)
+    else:
+        raise ValidationError(f"Unsupported payload type: {type(payload)}")
+
+    parsed.pop("params", None)
+    parsed.setdefault("schema_version", 1)
+    parsed["policy_id"] = policy_id
+    parsed["rule_type"] = rule_type
+    parsed["action"] = enforcement_action
+
+    _validate_policy_payload(rule_type, parsed)
+    return parsed
+
+
+def _validate_policy_payload(rule_type: str, payload: Dict[str, Any]):
+    if rule_type != "block":
+        raise ValidationError(f"Unsupported rule_type: {rule_type}")
+
+    _validate_block_policy_payload(payload)
+
+
+def _validate_block_policy_payload(payload: Dict[str, Any]):
+    schema_version = payload.get("schema_version")
+    if not isinstance(schema_version, int) or schema_version <= 0:
+        raise ValidationError("schema_version must be positive integer")
+
+    policy_id = payload.get("policy_id")
+    validate_uuid(policy_id, "policy_id")
+
+    if payload.get("rule_type") != "block":
+        raise ValidationError("rule_type must be 'block'")
+
+    action = payload.get("action")
+    if not isinstance(action, str) or not action:
+        raise ValidationError("action is required in payload")
+
+    target = payload.get("target")
+    if not isinstance(target, dict):
+        raise ValidationError("target must be an object")
+
+    ips = target.get("ips", []) or []
+    cidrs = target.get("cidrs", []) or []
+    selectors = target.get("selectors") or {}
+
+    if not isinstance(ips, list) or not all(isinstance(ip, str) for ip in ips):
+        raise ValidationError("target.ips must be a list of strings")
+    if not isinstance(cidrs, list) or not all(isinstance(c, str) for c in cidrs):
+        raise ValidationError("target.cidrs must be a list of strings")
+    if selectors and not isinstance(selectors, dict):
+        raise ValidationError("target.selectors must be an object")
+
+    if not ips and not cidrs and not selectors:
+        raise ValidationError("target must include ips, cidrs, or selectors")
+
+    for ip in ips:
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError as exc:
+            raise ValidationError(f"invalid IP address in target: {ip}") from exc
+
+    for cidr in cidrs:
+        try:
+            network = ipaddress.ip_network(cidr, strict=False)
+        except ValueError as exc:
+            raise ValidationError(f"invalid CIDR in target: {cidr}") from exc
+
+        cidr_limit = payload.get("guardrails", {}).get("cidr_max_prefix_len")
+        if cidr_limit is not None and isinstance(cidr_limit, int):
+            if network.version == 4 and network.prefixlen < cidr_limit:
+                raise ValidationError(
+                    f"CIDR {cidr} prefix length {network.prefixlen} exceeds guardrail /{cidr_limit}"
+                )
+
+        if network.version == 6 and network.prefixlen < PolicyMessage.MIN_IPV6_PREFIX:
+            raise ValidationError(
+                f"CIDR {cidr} IPv6 prefix length {network.prefixlen} exceeds guardrail /{PolicyMessage.MIN_IPV6_PREFIX}"
+            )
+
+    direction = target.get("direction")
+    if direction and direction not in {"ingress", "egress"}:
+        raise ValidationError("target.direction must be 'ingress' or 'egress'")
+
+    scope = target.get("scope")
+    if scope and scope not in {"cluster", "namespace", "node"}:
+        raise ValidationError("target.scope must be cluster|namespace|node")
+
+    guardrails = payload.get("guardrails")
+    if not isinstance(guardrails, dict):
+        raise ValidationError("guardrails must be an object")
+
+    ttl_seconds = guardrails.get("ttl_seconds")
+    if not isinstance(ttl_seconds, int) or ttl_seconds <= 0:
+        raise ValidationError("guardrails.ttl_seconds must be positive integer")
+
+    cidr_max = guardrails.get("cidr_max_prefix_len")
+    if cidr_max is not None and (not isinstance(cidr_max, int) or cidr_max <= 0 or cidr_max > 32):
+        raise ValidationError("guardrails.cidr_max_prefix_len must be 1-32")
+
+    max_targets = guardrails.get("max_targets")
+    if max_targets is not None:
+        if not isinstance(max_targets, int) or max_targets <= 0:
+            raise ValidationError("guardrails.max_targets must be positive integer")
+        if len(ips) + len(cidrs) > max_targets:
+            raise ValidationError("target list exceeds guardrails.max_targets")
+
+    allowlist = guardrails.get("allowlist")
+    if allowlist is not None:
+        if not isinstance(allowlist, list):
+            raise ValidationError("guardrails.allowlist must be a list")
+        if len(allowlist) == 0:
+            raise ValidationError("guardrails.allowlist cannot be empty")
+        for entry in allowlist:
+            if not isinstance(entry, str) or not entry:
+                raise ValidationError("guardrails.allowlist entries must be non-empty strings")
+            try:
+                # Accept CIDRs or single IP addresses
+                if "/" in entry:
+                    network = ipaddress.ip_network(entry, strict=False)
+                    if network.version == 6 and network.prefixlen < PolicyMessage.MIN_IPV6_PREFIX:
+                        raise ValidationError(
+                            f"guardrails.allowlist IPv6 CIDR {entry} is broader than /{PolicyMessage.MIN_IPV6_PREFIX}"
+                        )
+                else:
+                    ipaddress.ip_address(entry)
+            except ValueError as exc:
+                raise ValidationError(f"invalid allowlist entry: {entry}") from exc
+
+    for bool_field in ("dry_run", "canary_scope", "approval_required"):
+        if bool_field in guardrails and not isinstance(guardrails[bool_field], bool):
+            raise ValidationError(f"guardrails.{bool_field} must be boolean")
+
+    criteria = payload.get("criteria")
+    if criteria is not None:
+        if not isinstance(criteria, dict):
+            raise ValidationError("criteria must be an object")
+
+        min_confidence = criteria.get("min_confidence")
+        if min_confidence is not None:
+            if not isinstance(min_confidence, (int, float)) or not (0 <= min_confidence <= 1):
+                raise ValidationError("criteria.min_confidence must be between 0 and 1")
+
+        attempts_per_window = criteria.get("attempts_per_window")
+        if attempts_per_window is not None and (not isinstance(attempts_per_window, int) or attempts_per_window <= 0):
+            raise ValidationError("criteria.attempts_per_window must be positive integer")
+
+        window_s = criteria.get("window_s")
+        if window_s is not None and (not isinstance(window_s, int) or window_s <= 0):
+            raise ValidationError("criteria.window_s must be positive integer")
+
+    audit = payload.get("audit")
+    if audit is not None:
+        if not isinstance(audit, dict):
+            raise ValidationError("audit must be an object")
+        reason_code = audit.get("reason_code")
+        if reason_code is not None and not isinstance(reason_code, str):
+            raise ValidationError("audit.reason_code must be a string")
+        evidence_refs = audit.get("evidence_refs")
+        if evidence_refs is not None:
+            if not isinstance(evidence_refs, list) or not all(isinstance(ref, str) for ref in evidence_refs):
+                raise ValidationError("audit.evidence_refs must be a list of strings")
 from ..logging import get_logger
 
 
@@ -323,9 +517,10 @@ class MessagePublisher:
     def publish_policy_violation(
         self,
         policy_id: str,
-        action: str,
-        timestamp: int,
-        payload: bytes,
+        rule_type: str,
+        enforcement_action: str,
+        payload: Any,
+        timestamp: Optional[int] = None,
         callback: Optional[Callable[[bool, Optional[str]], None]] = None
     ) -> str:
         """
@@ -333,9 +528,10 @@ class MessagePublisher:
         
         Args:
             policy_id: UUIDv4 string
-            action: Action type (e.g., "create", "update", "delete")
-            timestamp: Unix timestamp (seconds)
-            payload: Binary payload data (max 64KB)
+            rule_type: Policy rule type (e.g., "block")
+            enforcement_action: Enforcement action (e.g., "drop", "rate_limit")
+            payload: Dict/JSON payload describing the policy
+            timestamp: Unix timestamp (seconds); defaults to now
             callback: Optional callback(success: bool, error: str) called on delivery
             
         Returns:
@@ -352,15 +548,21 @@ class MessagePublisher:
                 self._metrics["circuit_breaker_trips"] += 1
             raise KafkaError("Circuit breaker is open, rejecting message")
         
+        normalized_payload = _prepare_policy_payload(policy_id, rule_type, enforcement_action, payload)
+        payload_json = json.dumps(normalized_payload, sort_keys=True, separators=(",", ":"))
+
+        ts_value = timestamp if timestamp is not None else int(time.time())
+
         # Create signed policy message using contract
         try:
             policy_msg = PolicyMessage(
                 policy_id=policy_id,
-                action=action,
-                timestamp=timestamp,
-                payload=payload,
+                action=enforcement_action,
+                timestamp=ts_value,
+                payload=payload_json,
                 signer=self.signer,
                 nonce_manager=self.nonce_manager,
+                rule=rule_type,
             )
         except Exception as e:
             with self._metrics_lock:
@@ -393,7 +595,8 @@ class MessagePublisher:
                 extra={
                     "message_id": message_id,
                     "policy_id": policy_id,
-                    "action": action,
+                    "rule_type": rule_type,
+                    "action": enforcement_action,
                 }
             )
             

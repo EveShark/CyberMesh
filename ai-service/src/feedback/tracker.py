@@ -18,6 +18,9 @@ from .storage import RedisStorage
 import logging
 
 
+POLICY_MAPPING_TTL_SECONDS = 24 * 3600
+
+
 class AnomalyState(Enum):
     """Anomaly lifecycle states."""
     DETECTED = "DETECTED"      # AI detected, internal only
@@ -70,6 +73,19 @@ class AnomalyLifecycle:
     validator_id: Optional[str] = None
     block_height: Optional[int] = None
     signature: Optional[str] = None
+    policy_id: Optional[str] = None
+    policy_dispatched_at: Optional[float] = None
+    policy_ttl_seconds: Optional[int] = None
+    policy_requires_ack: Optional[bool] = None
+    policy_fast_path: Optional[bool] = None
+    policy_ack_result: Optional[str] = None
+    policy_ack_reason: Optional[str] = None
+    policy_ack_error_code: Optional[str] = None
+    policy_applied_at: Optional[float] = None
+    policy_ack_at: Optional[float] = None
+    policy_ack_latency_ms: Optional[float] = None
+    policy_ack_failure_count: Optional[int] = None
+    policy_ack_fast_path: Optional[bool] = None
 
 
 @dataclass
@@ -274,6 +290,138 @@ class AnomalyLifecycleTracker:
             timestamp,
             {"published_at": str(timestamp)}
         )
+
+    def record_policy_dispatched(
+        self,
+        anomaly_id: str,
+        policy_id: str,
+        *,
+        ttl_seconds: Optional[int] = None,
+        requires_ack: Optional[bool] = None,
+        fast_path: Optional[bool] = None,
+        timestamp: Optional[float] = None,
+    ) -> bool:
+        """Link anomaly to dispatched policy for downstream ACK correlation."""
+
+        timestamp = timestamp or time.time()
+
+        self._validate_uuid(anomaly_id)
+        self._validate_uuid(policy_id)
+        self._validate_timestamp(timestamp)
+
+        if not self._anomaly_exists(anomaly_id):
+            raise ValidationError(f"Anomaly {anomaly_id} not found for policy linkage")
+
+        key = self._lifecycle_key(anomaly_id)
+
+        updates = {
+            "policy_id": policy_id,
+            "policy_dispatched_at": str(timestamp),
+        }
+
+        if ttl_seconds is not None and ttl_seconds > 0:
+            updates["policy_ttl_seconds"] = str(int(ttl_seconds))
+
+        if requires_ack is not None:
+            updates["policy_requires_ack"] = "1" if requires_ack else "0"
+
+        if fast_path is not None:
+            updates["policy_fast_path"] = "1" if fast_path else "0"
+
+        try:
+            for field, value in updates.items():
+                self.storage._client.hset(key, field, value)
+
+            ttl = ttl_seconds or POLICY_MAPPING_TTL_SECONDS
+            if ttl <= 0:
+                ttl = POLICY_MAPPING_TTL_SECONDS
+
+            index_key = self._policy_index_key(policy_id)
+            self.storage._client.set(index_key, anomaly_id, ex=int(ttl))
+            return True
+        except Exception as exc:
+            raise StorageError(f"Failed to persist policy dispatch mapping: {exc}") from exc
+
+    def resolve_anomaly_for_policy(self, policy_id: str) -> Optional[str]:
+        """Resolve anomaly id associated with a policy."""
+
+        self._validate_uuid(policy_id)
+        try:
+            anomaly_id = self.storage._client.get(self._policy_index_key(policy_id))
+            if anomaly_id:
+                return str(anomaly_id)
+            return None
+        except Exception as exc:
+            raise StorageError(f"Failed to resolve policy mapping: {exc}") from exc
+
+    def record_policy_ack(
+        self,
+        policy_id: str,
+        *,
+        result: str,
+        reason: Optional[str] = None,
+        error_code: Optional[str] = None,
+        applied_at: Optional[int] = None,
+        acked_at: Optional[int] = None,
+        fast_path: Optional[bool] = None,
+    ) -> Optional[str]:
+        """Persist enforcement acknowledgement and return associated anomaly id."""
+
+        self._validate_uuid(policy_id)
+
+        anomaly_id = self.resolve_anomaly_for_policy(policy_id)
+        if not anomaly_id:
+            return None
+
+        if not self._anomaly_exists(anomaly_id):
+            return None
+
+        timestamp = time.time()
+        self._check_rate_limit(anomaly_id)
+
+        key = self._lifecycle_key(anomaly_id)
+
+        updates = {
+            "policy_ack_result": result,
+            "policy_ack_updated_at": str(timestamp),
+        }
+
+        if reason is not None:
+            updates["policy_ack_reason"] = reason
+
+        if error_code is not None:
+            updates["policy_ack_error_code"] = error_code
+
+        if applied_at and applied_at > 0:
+            updates["policy_applied_at"] = str(float(applied_at))
+
+        if acked_at and acked_at > 0:
+            updates["policy_ack_at"] = str(float(acked_at))
+
+        if fast_path is not None:
+            updates["policy_ack_fast_path"] = "1" if fast_path else "0"
+
+        latency_ms: Optional[float] = None
+        if applied_at and applied_at > 0 and acked_at and acked_at > 0:
+            latency_ms = max(0.0, (acked_at - applied_at) * 1000.0)
+            updates["policy_ack_latency_ms"] = f"{latency_ms:.3f}"
+
+        try:
+            for field, value in updates.items():
+                self.storage._client.hset(key, field, value)
+
+            index_key = self._policy_index_key(policy_id)
+            self.storage._client.expire(index_key, POLICY_MAPPING_TTL_SECONDS)
+
+            if result.lower() == "failed":
+                self.storage._client.hincrby(key, "policy_ack_failure_count", 1)
+            else:
+                # Reset failure counter on success for clarity
+                self.storage._client.hset(key, "policy_ack_failure_count", "0")
+
+            return anomaly_id
+        except Exception as exc:
+            raise StorageError(f"Failed to persist policy ACK: {exc}") from exc
 
     def record_batch(self, events: Iterable[Dict[str, Any]]) -> int:
         """Persist a batch of detection events using a single Redis pipeline."""
@@ -605,7 +753,20 @@ class AnomalyLifecycleTracker:
             raw_score=float(data.get("raw_score", 0)) or None,
             validator_id=data.get("validator_id"),
             block_height=int(data.get("block_height", 0)) or None,
-            signature=data.get("signature")
+            signature=data.get("signature"),
+            policy_id=data.get("policy_id"),
+            policy_dispatched_at=self._parse_optional_float(data.get("policy_dispatched_at")),
+            policy_ttl_seconds=self._parse_optional_int(data.get("policy_ttl_seconds")),
+            policy_requires_ack=self._parse_optional_bool(data.get("policy_requires_ack")),
+            policy_fast_path=self._parse_optional_bool(data.get("policy_fast_path")),
+            policy_ack_result=data.get("policy_ack_result"),
+            policy_ack_reason=data.get("policy_ack_reason"),
+            policy_ack_error_code=data.get("policy_ack_error_code"),
+            policy_applied_at=self._parse_optional_float(data.get("policy_applied_at")),
+            policy_ack_at=self._parse_optional_float(data.get("policy_ack_at")),
+            policy_ack_latency_ms=self._parse_optional_float(data.get("policy_ack_latency_ms")),
+            policy_ack_failure_count=self._parse_optional_int(data.get("policy_ack_failure_count")),
+            policy_ack_fast_path=self._parse_optional_bool(data.get("policy_ack_fast_path")),
         )
     
     def get_acceptance_metrics(
@@ -902,8 +1063,18 @@ class AnomalyLifecycleTracker:
         """Validate timestamp is not older than existing timestamps."""
         existing_timestamps = []
         
-        for field in ["detected_at", "published_at", "admitted_at", "committed_at",
-                      "rejected_at", "timeout_at", "expired_at"]:
+        for field in [
+            "detected_at",
+            "published_at",
+            "admitted_at",
+            "committed_at",
+            "rejected_at",
+            "timeout_at",
+            "expired_at",
+            "policy_dispatched_at",
+            "policy_applied_at",
+            "policy_ack_at",
+        ]:
             ts_str = self.storage._client.hget(key, field)
             if ts_str:
                 existing_timestamps.append(float(ts_str))
@@ -940,6 +1111,43 @@ class AnomalyLifecycleTracker:
         """Get Redis key for anomaly lifecycle."""
         return f"anomaly:lifecycle:{anomaly_id}"
     
+    def _policy_index_key(self, policy_id: str) -> str:
+        """Get Redis key for policy-to-anomaly mapping."""
+        return f"anomaly:policy-index:{policy_id}"
+
+    @staticmethod
+    def _parse_optional_float(value) -> Optional[float]:
+        if value is None or value == "":
+            return None
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+        return result if result != 0 else None
+
+    @staticmethod
+    def _parse_optional_int(value) -> Optional[int]:
+        if value is None or value == "":
+            return None
+        try:
+            result = int(float(value))
+        except (TypeError, ValueError):
+            return None
+        return result if result != 0 else None
+
+    @staticmethod
+    def _parse_optional_bool(value) -> Optional[bool]:
+        if value is None or value == "":
+            return None
+        if isinstance(value, bool):
+            return value
+        lowered = str(value).strip().lower()
+        if lowered in ("1", "true", "yes", "on"):  # pragma: no cover - simple mapping
+            return True
+        if lowered in ("0", "false", "no", "off"):
+            return False
+        return None
+
     def _hour_key(self, timestamp: float) -> str:
         """Get hourly bucket key from timestamp."""
         return str(int(timestamp // 3600))

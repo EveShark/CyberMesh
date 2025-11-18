@@ -12,6 +12,7 @@ class KafkaTopicsConfig:
     control_commits: str
     control_reputation: str
     control_policy: str
+    control_policy_ack: str
     control_evidence: str
     dlq: str
     
@@ -24,6 +25,7 @@ class KafkaTopicsConfig:
             self.control_commits,
             self.control_reputation,
             self.control_policy,
+            self.control_policy_ack,
             self.control_evidence,
             self.dlq
         ]

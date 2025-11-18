@@ -1,9 +1,11 @@
 package kafka
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -23,13 +25,15 @@ const (
 
 // VerifierConfig holds configurable verification limits
 type VerifierConfig struct {
-	MaxTimestampSkew time.Duration // Max clock skew allowed (default: 5m)
+	MaxTimestampSkew      time.Duration       // Max clock skew allowed (default: 5m)
+	PolicyPubKeyAllowlist map[string]struct{} // Hex-encoded Ed25519 pubkeys allowed to publish policies
 }
 
 // DefaultVerifierConfig returns default verification configuration
 func DefaultVerifierConfig() VerifierConfig {
 	return VerifierConfig{
-		MaxTimestampSkew: 5 * time.Minute,
+		MaxTimestampSkew:      5 * time.Minute,
+		PolicyPubKeyAllowlist: nil,
 	}
 }
 
@@ -145,6 +149,10 @@ func VerifyAnomalyMsg(msg *AnomalyMsg, cfg VerifierConfig, log *utils.Logger) (*
 			log.Info("[DEBUG] Ed25519 signature verification FAILED")
 		}
 		return nil, fmt.Errorf("signature verification failed")
+	}
+
+	if !bytes.Equal(msg.ProducerID, msg.PubKey) {
+		return nil, fmt.Errorf("producer/pubkey mismatch")
 	}
 	if log != nil {
 		log.Info("[DEBUG] Ed25519 signature verification SUCCESS")
@@ -290,6 +298,10 @@ func VerifyEvidenceMsg(msg *EvidenceMsg, cfg VerifierConfig, log *utils.Logger) 
 		return nil, fmt.Errorf("signature verification failed")
 	}
 
+	if !bytes.Equal(msg.ProducerID, msg.PubKey) {
+		return nil, fmt.Errorf("producer/pubkey mismatch")
+	}
+
 	// Convert CoC entries
 	var coc []state.CoCEntry
 	for _, entry := range msg.CoC {
@@ -354,6 +366,17 @@ func VerifyPolicyMsg(msg *PolicyMsg, cfg VerifierConfig, log *utils.Logger) (*st
 	// Verify Ed25519 signature
 	if !ed25519.Verify(msg.PubKey, signBytes, msg.Signature) {
 		return nil, fmt.Errorf("signature verification failed")
+	}
+
+	if !bytes.Equal(msg.ProducerID, msg.PubKey) {
+		return nil, fmt.Errorf("producer/pubkey mismatch")
+	}
+
+	if len(cfg.PolicyPubKeyAllowlist) > 0 {
+		keyHex := hex.EncodeToString(msg.PubKey)
+		if _, ok := cfg.PolicyPubKeyAllowlist[keyHex]; !ok {
+			return nil, fmt.Errorf("policy producer %s not allowlisted", keyHex)
+		}
 	}
 
 	// Convert to state.PolicyTx

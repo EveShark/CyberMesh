@@ -8,6 +8,7 @@ AI consumer: src/kafka/consumer.py
 Security: Ed25519 signature verification + policy validation
 """
 import hashlib
+import ipaddress
 import json
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -44,6 +45,7 @@ class PolicyUpdateEvent:
     - feature_flag: Enable/disable features
     - rate_limit: Adjust rate limits
     - model_param: Update model parameters
+    - block: Enforce block policies (ingress/egress network controls)
     """
     
     DOMAIN = "control.policy.v1"
@@ -53,9 +55,16 @@ class PolicyUpdateEvent:
     
     # Valid rule types
     VALID_RULE_TYPES = {
-        "threshold", "blacklist", "whitelist",
-        "feature_flag", "rate_limit", "model_param"
+        "threshold",
+        "blacklist",
+        "whitelist",
+        "feature_flag",
+        "rate_limit",
+        "model_param",
+        "block",
     }
+
+    MIN_IPV6_PREFIX = 64
     
     # Validation ranges for threshold rules
     THRESHOLD_RANGES = {
@@ -267,6 +276,8 @@ class PolicyUpdateEvent:
                 self._validate_rate_limit_rule(rule_data)
             elif self.rule_type == "model_param":
                 self._validate_model_param_rule(rule_data)
+            elif self.rule_type == "block":
+                self._validate_block_rule(rule_data)
             
             return rule_data
             
@@ -355,49 +366,169 @@ class PolicyUpdateEvent:
             if isinstance(value, (int, float)):
                 if abs(value) > 1e9:
                     raise ContractError(f"Model param {key} = {value} too large")
+
+    def _validate_block_rule(self, rule_data: dict):
+        """Validate block policy rule data."""
+        schema_version = rule_data.get("schema_version")
+        if not isinstance(schema_version, int) or schema_version <= 0:
+            raise ContractError("block policy schema_version must be positive integer")
+
+        policy_id = rule_data.get("policy_id")
+        if policy_id and policy_id != self.policy_id:
+            raise ContractError("policy_id in rule_data must match envelope policy_id")
+
+        action = rule_data.get("action")
+        if not isinstance(action, str) or not action:
+            raise ContractError("block policy action is required")
+
+        if rule_data.get("rule_type") not in (None, "block"):
+            raise ContractError("block policy rule_type field must be 'block'")
+
+        target = rule_data.get("target")
+        if not isinstance(target, dict):
+            raise ContractError("block policy target must be an object")
+
+        ips = target.get("ips", []) or []
+        cidrs = target.get("cidrs", []) or []
+        selectors = target.get("selectors") or {}
+
+        if not isinstance(ips, list) or not all(isinstance(ip, str) for ip in ips):
+            raise ContractError("block policy target.ips must be list of strings")
+        if not isinstance(cidrs, list) or not all(isinstance(cidr, str) for cidr in cidrs):
+            raise ContractError("block policy target.cidrs must be list of strings")
+        if selectors and not isinstance(selectors, dict):
+            raise ContractError("block policy target.selectors must be object")
+
+        if not ips and not cidrs and not selectors:
+            raise ContractError("block policy target requires ips, cidrs, or selectors")
+
+        for ip in ips:
+            try:
+                ipaddress.ip_address(ip)
+            except ValueError as exc:
+                raise ContractError(f"invalid IP address in target: {ip}") from exc
+
+        guardrails = rule_data.get("guardrails")
+        if not isinstance(guardrails, dict):
+            raise ContractError("block policy guardrails must be object")
+
+        ttl_seconds = guardrails.get("ttl_seconds")
+        if not isinstance(ttl_seconds, int) or ttl_seconds <= 0:
+            raise ContractError("block policy guardrails.ttl_seconds must be positive integer")
+
+        cidr_limit = guardrails.get("cidr_max_prefix_len")
+        if cidr_limit is not None and (not isinstance(cidr_limit, int) or cidr_limit <= 0 or cidr_limit > 32):
+            raise ContractError("guardrails.cidr_max_prefix_len must be 1-32")
+
+        max_targets = guardrails.get("max_targets")
+        if max_targets is not None and (not isinstance(max_targets, int) or max_targets <= 0):
+            raise ContractError("guardrails.max_targets must be positive integer")
+        if max_targets is not None and len(ips) + len(cidrs) > max_targets:
+            raise ContractError("block policy exceeds guardrails.max_targets")
+
+        for cidr in cidrs:
+            try:
+                network = ipaddress.ip_network(cidr, strict=False)
+            except ValueError as exc:
+                raise ContractError(f"invalid CIDR in target: {cidr}") from exc
+
+            if cidr_limit is not None and network.version == 4 and network.prefixlen < cidr_limit:
+                raise ContractError(
+                    f"CIDR {cidr} prefix length {network.prefixlen} exceeds guardrail /{cidr_limit}"
+                )
+
+            if network.version == 6 and network.prefixlen < self.MIN_IPV6_PREFIX:
+                raise ContractError(
+                    f"CIDR {cidr} IPv6 prefix length {network.prefixlen} exceeds guardrail /{self.MIN_IPV6_PREFIX}"
+                )
+
+        direction = target.get("direction")
+        if direction and direction not in {"ingress", "egress"}:
+            raise ContractError("block policy target.direction must be 'ingress' or 'egress'")
+
+        scope = target.get("scope")
+        if scope and scope not in {"cluster", "namespace", "node"}:
+            raise ContractError("block policy target.scope must be cluster|namespace|node")
+
+        criteria = rule_data.get("criteria")
+        if criteria is not None:
+            if not isinstance(criteria, dict):
+                raise ContractError("block policy criteria must be object")
+
+            min_confidence = criteria.get("min_confidence")
+            if min_confidence is not None:
+                if not isinstance(min_confidence, (int, float)) or not (0 <= min_confidence <= 1):
+                    raise ContractError("block policy criteria.min_confidence must be between 0 and 1")
+
+            attempts = criteria.get("attempts_per_window")
+            if attempts is not None and (not isinstance(attempts, int) or attempts <= 0):
+                raise ContractError("block policy criteria.attempts_per_window must be positive integer")
+
+            window_s = criteria.get("window_s")
+            if window_s is not None and (not isinstance(window_s, int) or window_s <= 0):
+                raise ContractError("block policy criteria.window_s must be positive integer")
+
+        audit = rule_data.get("audit")
+        if audit is not None:
+            if not isinstance(audit, dict):
+                raise ContractError("block policy audit must be object")
+            reason_code = audit.get("reason_code")
+            if reason_code is not None and not isinstance(reason_code, str):
+                raise ContractError("block policy audit.reason_code must be string")
+            refs = audit.get("evidence_refs")
+            if refs is not None:
+                if not isinstance(refs, list) or not all(isinstance(ref, str) for ref in refs):
+                    raise ContractError("block policy audit.evidence_refs must be list of strings")
     
     def _verify_signature(self):
         """
         Verify Ed25519 signature from backend validator.
         
-        Signature format: domain||policy_id||action||rule_type||rule_hash||timestamp
+        Backend signer serializes a PolicyUpdateEvent proto (excluding signature fields),
+        prefixes the domain string, and signs the resulting bytes.
         
         Raises:
             ContractError: Signature verification failure
         """
         try:
-            # Build signed payload
-            import struct
-            
-            sign_bytes = b""
-            sign_bytes += self.DOMAIN.encode('utf-8')
-            sign_bytes += self.policy_id.encode('utf-8')
-            sign_bytes += self.action.encode('utf-8')
-            sign_bytes += self.rule_type.encode('utf-8')
-            sign_bytes += self.rule_hash
-            sign_bytes += struct.pack('>q', self.timestamp)
-            
+            # Build the protobuf payload exactly as backend/pkg/ingest/kafka/signing.go does.
+            sign_msg = control_policy_pb2.PolicyUpdateEvent(
+                policy_id=self.policy_id,
+                action=self.action,
+                rule_type=self.rule_type,
+                rule_data=self.rule_data,
+                rule_hash=self.rule_hash,
+                requires_ack=self.requires_ack,
+                rollback_policy_id=self.rollback_policy_id,
+                timestamp=self.timestamp,
+                effective_height=self.effective_height,
+                expiration_height=self.expiration_height,
+                producer_id=self.producer_id,
+            )
+            payload = sign_msg.SerializeToString()
+            message = self.DOMAIN.encode("utf-8") + payload
+
             # Find validator public key in trust store
             from cryptography.hazmat.primitives import serialization
-            
+
             validator_pubkey_obj = None
-            for node_id, pubkey_obj in self._trust_store._public_keys.items():
+            for _, pubkey_obj in self._trust_store._public_keys.items():
                 pubkey_bytes = pubkey_obj.public_bytes(
                     encoding=serialization.Encoding.Raw,
-                    format=serialization.PublicFormat.Raw
+                    format=serialization.PublicFormat.Raw,
                 )
                 if pubkey_bytes == self.pubkey:
                     validator_pubkey_obj = pubkey_obj
                     break
-            
+
             if validator_pubkey_obj is None:
                 raise ContractError(
                     f"Unknown validator public key: {self.pubkey.hex()[:16]}..."
                 )
-            
+
             # Verify Ed25519 signature
-            validator_pubkey_obj.verify(self.signature, sign_bytes)
-            
+            validator_pubkey_obj.verify(self.signature, message)
+
         except ContractError:
             raise
         except Exception as e:
@@ -464,6 +595,7 @@ class PolicyMessage:
 
     DOMAIN = "ai.policy.v1"
     RULE_MAX_LENGTH = 256
+    MIN_IPV6_PREFIX = 64
 
     def __init__(
         self,
@@ -584,17 +716,27 @@ class PolicyMessage:
             raise ContractError(f"Policy message validation failed: {e}") from e
 
     def _build_sign_bytes(self) -> bytes:
-        msg = ai_policy_pb2.PolicyEvent(
-            id=self.policy_id,
-            action=self.action,
-            rule=self.rule,
-            params=self.params,
-            ts=self.timestamp,
-            content_hash=self.content_hash,
-            producer_id=self.pubkey,
-            nonce=self.nonce,
-        )
-        return msg.SerializeToString()
+        import struct
+
+        ts_bytes = struct.pack('>q', self.timestamp)
+        producer_id_len = struct.pack('>H', len(self.pubkey))
+
+        if len(self.nonce) != NonceManager.NONCE_SIZE:
+            raise ContractError(f"nonce must be exactly {NonceManager.NONCE_SIZE} bytes, got {len(self.nonce)}")
+
+        if len(self.content_hash) != hashlib.sha256().digest_size:
+            raise ContractError("content_hash must be 32 bytes")
+
+        parts = [
+            b"\x00",
+            ts_bytes,
+            producer_id_len,
+            self.pubkey,
+            self.nonce,
+            self.content_hash,
+        ]
+
+        return b"".join(parts)
 
     def to_bytes(self) -> bytes:
         msg = ai_policy_pb2.PolicyEvent(
@@ -646,16 +788,18 @@ class PolicyMessage:
         if nonce_manager and not nonce_manager.validate(msg.nonce):
             raise ContractError("Nonce validation failed (replay or expired)")
 
-        sign_bytes = ai_policy_pb2.PolicyEvent(
-            id=msg.id,
-            action=msg.action,
-            rule=msg.rule,
-            params=msg.params,
-            ts=msg.ts,
-            content_hash=msg.content_hash,
-            producer_id=msg.producer_id,
-            nonce=msg.nonce,
-        ).SerializeToString()
+        import struct
+
+        ts_bytes = struct.pack('>q', msg.ts)
+        producer_id_len = struct.pack('>H', len(msg.producer_id))
+        sign_bytes = b"".join([
+            b"\x00",
+            ts_bytes,
+            producer_id_len,
+            msg.producer_id,
+            msg.nonce,
+            msg.content_hash,
+        ])
 
         if not Signer.verify(sign_bytes, msg.signature, msg.pubkey, cls.DOMAIN):
             raise ContractError("Signature verification failed")

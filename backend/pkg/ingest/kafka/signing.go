@@ -143,3 +143,40 @@ func (s *CommitSigner) Sign(evt *pb.CommitEvent) error {
 
 	return nil
 }
+
+// SignPolicy attaches signature and public key fields to the policy update event.
+func (s *CommitSigner) SignPolicy(evt *pb.PolicyUpdateEvent) error {
+	if evt == nil {
+		return fmt.Errorf("commit signer: policy event is nil")
+	}
+
+	evt.ProducerId = s.ProducerID()
+
+	signMsg := &pb.PolicyUpdateEvent{
+		PolicyId:         evt.PolicyId,
+		Action:           evt.Action,
+		RuleType:         evt.RuleType,
+		RuleData:         evt.RuleData,
+		RuleHash:         evt.RuleHash,
+		RequiresAck:      evt.RequiresAck,
+		RollbackPolicyId: evt.RollbackPolicyId,
+		Timestamp:        evt.Timestamp,
+		EffectiveHeight:  evt.EffectiveHeight,
+		ExpirationHeight: evt.ExpirationHeight,
+		ProducerId:       evt.ProducerId,
+	}
+
+	payload, err := proto.Marshal(signMsg)
+	if err != nil {
+		return fmt.Errorf("commit signer: failed to marshal policy sign payload: %w", err)
+	}
+
+	message := append([]byte(s.domain), payload...)
+	signature := ed25519.Sign(s.privKey, message)
+
+	evt.Signature = signature
+	evt.Pubkey = s.PublicKey()
+	evt.Alg = "Ed25519"
+
+	return nil
+}

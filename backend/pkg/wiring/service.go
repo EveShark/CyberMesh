@@ -63,8 +63,9 @@ type Service struct {
 	persistWorker *PersistenceWorker
 
 	// Kafka (optional)
-	kafkaConsumer *kafka.Consumer
-	kafkaProducer *kafka.Producer
+	kafkaConsumer   *kafka.Consumer
+	kafkaProducer   *kafka.Producer
+	policyPublisher *policyPublisher
 
 	// API server (optional)
 	apiServer *apiserver.Server
@@ -154,6 +155,26 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 
 				cfg.KafkaProducerCfg.Signer = signer
 
+				policyKeyPath := cfg.ConfigManager.GetString("CONTROL_POLICY_SIGNING_KEY_PATH", keyPath)
+				if policyKeyPath != "" {
+					policyKeyPath = filepath.Clean(policyKeyPath)
+					policySignerCfg := kafka.CommitSignerConfig{
+						KeyPath:    policyKeyPath,
+						KeyID:      cfg.ConfigManager.GetString("CONTROL_POLICY_SIGNING_KEY_ID", signerCfg.KeyID),
+						Domain:     cfg.ConfigManager.GetString("CONTROL_POLICY_SIGNING_DOMAIN", "control.policy.v1"),
+						ProducerID: cfg.ConfigManager.GetString("CONTROL_POLICY_PRODUCER_ID", cfg.ConfigManager.GetString("CONTROL_PRODUCER_ID", "")),
+						Logger:     log,
+					}
+
+					policySigner, err := kafka.NewCommitSigner(policySignerCfg)
+					if err != nil {
+						return nil, fmt.Errorf("failed to initialize policy signer: %w", err)
+					}
+					cfg.KafkaProducerCfg.PolicySigner = policySigner
+				} else if cfg.KafkaProducerCfg.Topics.Policy != "" && log != nil {
+					log.Warn("Kafka policy publishing disabled: CONTROL_POLICY_SIGNING_KEY_PATH not set")
+				}
+
 				// Build sarama config
 				saramaCfg, err := kafka.BuildSaramaConfig(context.Background(), cfg.ConfigManager, log, cfg.AuditLogger)
 				if err != nil {
@@ -166,6 +187,15 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 					return nil, fmt.Errorf("failed to create Kafka producer: %w", err)
 				}
 				s.kafkaProducer = kafkaProducer
+
+				if cfg.KafkaProducerCfg.Topics.Policy != "" {
+					pp, err := newPolicyPublisher(kafkaProducer, cfg.ConfigManager, cfg.KafkaProducerCfg.Topics.Policy, log, cfg.AuditLogger)
+					if err != nil {
+						kafkaProducer.Close()
+						return nil, fmt.Errorf("failed to initialize policy publisher: %w", err)
+					}
+					s.policyPublisher = pp
+				}
 			}
 		}
 	}
@@ -175,7 +205,7 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 		// Wire Kafka producer as onSuccess callback
 		// Fix: Gap 2 - Updated to pass anomaly IDs for COMMITTED state tracking
 		if kafkaProducer != nil {
-			cfg.PersistenceWorker.OnSuccess = func(ctx context.Context, height uint64, hash [32]byte, stateRoot [32]byte, txCount int, ts int64, anomalyCount int, evidenceCount int, policyCount int, anomalyIDs []string) {
+			cfg.PersistenceWorker.OnSuccess = func(ctx context.Context, height uint64, hash [32]byte, stateRoot [32]byte, txCount int, ts int64, anomalyCount int, evidenceCount int, policyCount int, anomalyIDs []string, policyPayloads [][]byte) {
 				// Publish commit event to Kafka after successful persistence
 				if err := kafkaProducer.PublishCommit(ctx, height, hash, stateRoot, txCount, ts, anomalyCount, evidenceCount, policyCount, anomalyIDs); err != nil {
 					if log != nil {
@@ -183,6 +213,10 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 							utils.ZapError(err),
 							utils.ZapUint64("height", height))
 					}
+				}
+
+				if s.policyPublisher != nil {
+					s.policyPublisher.Publish(ctx, height, ts, policyCount, policyPayloads)
 				}
 			}
 		}

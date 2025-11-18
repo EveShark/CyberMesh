@@ -91,14 +91,14 @@ spec:
           echo "============================================================"
           
           echo "[DEBUG] Testing GCS access..."
-          if ! gsutil ls gs://cybermesh-ai-models-476310/ >/dev/null 2>&1; then
+          if ! gsutil ls gs://cybermesh-ai-models-478105/ >/dev/null 2>&1; then
             echo "ERROR: Cannot access GCS bucket. Checking authentication..."
             echo "Using GKE node default credentials (Compute Engine service account)"
-            gcloud config set project cybermesh-476310 || true
+            gcloud config set project cybermesh-478105 || true
           fi
           
           echo "[1/1] Syncing AI models from GCS..."
-          gsutil -m rsync -r gs://cybermesh-ai-models-476310/ /models/
+          gsutil -m rsync -r gs://cybermesh-ai-models-478105/ /models/
           MODEL_COUNT=$(find /models -type f -name '*.pkl' 2>/dev/null | wc -l)
           echo "✓ Models synced: $MODEL_COUNT files"
           if [ "$MODEL_COUNT" -lt 1 ]; then
@@ -119,7 +119,7 @@ spec:
       
       containers:
       - name: ai-service
-        image: asia-southeast1-docker.pkg.dev/cybermesh-476310/cybermesh-repo/cybermesh-ai-service:latest
+        image: asia-southeast1-docker.pkg.dev/cybermesh-478105/cybermesh-repo/cybermesh-ai-service:latest
         imagePullPolicy: Always
         command: ["/bin/bash", "/opt/cybermesh/entrypoint.sh"]
         
@@ -248,9 +248,10 @@ spec:
       - name: logs
         emptyDir: {}
       
-      # Data directory for nonce state (emptyDir)
+      # Data directory for nonce state (PVC for persistence across restarts)
       - name: data
-        emptyDir: {}
+        persistentVolumeClaim:
+          claimName: ai-service-data
       - name: entrypoint-script
         configMap:
           name: ai-service-entrypoint

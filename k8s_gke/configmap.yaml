@@ -46,7 +46,7 @@ data:
   DYNAMIC_PEER_DISCOVERY: "true"
 
   # Database Connection (CockroachDB Cloud)
-  DB_DSN: "postgresql://lenny:VnF_SqShUO-rcYx0VmnJ9w@cybermesh-threats-9633.jxf.gcp-asia-southeast1.cockroachlabs.cloud:26257/defaultdb?sslmode=require&sslrootcert=./certs/root.crt"
+  DB_DSN: "postgresql://milena:MA6A3sKboADGU7YZcPv9Gg@cybermesh-threats-10433.jxf.gcp-asia-southeast1.cockroachlabs.cloud:26257/defaultdb?sslmode=verify-full"
   DB_MAX_OPEN: "50"
   DB_MAX_IDLE: "10"
   DB_MAX_LIFETIME: "30m"
@@ -91,7 +91,9 @@ data:
   TOPIC_AI_POLICY: "ai.policy.v1"
   TOPIC_CONTROL_COMMITS: "control.commits.v1"
   TOPIC_CONTROL_REPUTATION: "control.reputation.v1"
-  TOPIC_CONTROL_POLICY: "control.policy.v1"
+  CONTROL_POLICY_TOPIC: "control.policy.v1"
+  CONTROL_POLICY_DLQ_TOPIC: "control.policy.dlq.v1"
+  POLICY_DLQ_ENABLED: "true"
   TOPIC_CONTROL_EVIDENCE: "control.evidence.v1"
   TOPIC_DLQ: "ai.dlq.v1"
 
@@ -131,10 +133,10 @@ data:
 
   # Mempool (consolidated - duplicates removed)
   MEMPOOL_MAX_TXS: "1000"
-  MEMPOOL_MAX_BYTES: "10485760"
+  MEMPOOL_MAX_BYTES: "20971520"
   MEMPOOL_NONCE_TTL: "15m"
   MEMPOOL_SKEW_TOLERANCE: "5m"
-  MEMPOOL_RATE_PER_SECOND: "1000"
+  MEMPOOL_RATE_PER_SECOND: "100"
 
   # Consensus
   CONSENSUS_TIMEOUT: "2s"
@@ -237,7 +239,7 @@ data:
   CHAIN_DATA_PATH: "./data/chain"
 
   # Block Building
-  BLOCK_MAX_TXS: "500"
+  BLOCK_MAX_TXS: "200"
   BLOCK_MAX_BYTES: "4194304"
   BLOCK_MIN_MEMPOOL_TXS: "1"
   BLOCK_BUILD_INTERVAL: "500ms"

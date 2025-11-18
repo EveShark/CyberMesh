@@ -49,7 +49,7 @@ spec:
       
       containers:
       - name: frontend
-        image: asia-southeast1-docker.pkg.dev/cybermesh-476310/cybermesh-repo/cybermesh-frontend:latest
+        image: asia-southeast1-docker.pkg.dev/cybermesh-478105/cybermesh-repo/cybermesh-frontend:latest
         imagePullPolicy: Always
         
         securityContext:
