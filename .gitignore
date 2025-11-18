@@ -26,7 +26,9 @@
 *.p12
 *.pfx
 *.jks
-!certs/root.crt
+
+# Certificates directory
+certs/
 
 # Key backups
 backend/keys/backupkeys/
@@ -276,6 +278,10 @@ AGENTS.md
 ai-service/tests/
 backend/tests/
 frontend/tests/
+
+# Test files in source code
+*_test.go
+**/*_test.go
 
 # Documentation directories (keep locally, not in git)
 backend/docs/
