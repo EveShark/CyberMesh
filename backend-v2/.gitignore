@@ -1,0 +1,210 @@
+# ============================================================
+# Backend-v2 .gitignore
+# ============================================================
+
+# ============================================================
+# 1. ENVIRONMENT & SECRETS (CRITICAL - NEVER COMMIT)
+# ============================================================
+
+# Environment files
+.env
+.env.local
+.env.*.local
+.env.production
+.env.staging
+.env.development
+
+# KEEP these for reference
+!.env.example
+!.env.template
+
+# Security - Keys and Certificates
+keys/
+certs/
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+*.jks
+
+# ============================================================
+# 2. BUILD OUTPUTS & BINARIES
+# ============================================================
+
+# Compiled binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Build artifacts
+/backend-linux-amd64
+/backend-darwin-amd64
+/cybermesh
+/cybermesh.exe
+backend
+backend.exe
+
+# Go build cache
+*.test
+*.out
+
+# ============================================================
+# 3. TESTING & COVERAGE
+# ============================================================
+
+# All test files
+tests/
+**/*_test.go
+*_test.go
+
+# Coverage reports
+coverage
+coverage.*
+*.cover
+*.coverprofile
+tests/coverage/
+
+# Test cache
+.pytest_cache/
+__pycache__/
+
+# Benchmark results
+tests/benchmark/
+*.bench
+
+# ============================================================
+# 4. DOCUMENTATION (Optional - adjust as needed)
+# ============================================================
+
+# Documentation directory
+docs/
+
+# Keep only README at root
+# Uncomment if you want to ignore other docs
+# *.md
+# !README.md
+
+# ============================================================
+# 5. ARCHIVE & BACKUPS
+# ============================================================
+
+# Archive directory
+Archive/
+
+# Backup files
+*.backup
+*.bak
+*.old
+*.orig
+*.swp
+
+# ============================================================
+# 6. LOGS & RUNTIME DATA
+# ============================================================
+
+# Log files
+*.log
+*.log.*
+logs/
+**/logs/
+
+# Runtime state
+*.pid
+*.seed
+*.pid.lock
+
+# ============================================================
+# 7. DEPENDENCIES (Optional - usually keep go.sum)
+# ============================================================
+
+# Vendor directory (if using vendoring)
+vendor/
+
+# ============================================================
+# 8. BUILD CONFIGURATION (Optional - adjust as needed)
+# ============================================================
+
+# Makefile (uncomment if you don't want to commit)
+# Makefile
+
+# ============================================================
+# 9. IDE & EDITOR FILES
+# ============================================================
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# JetBrains IDEs (GoLand, etc.)
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# ============================================================
+# 10. OS FILES
+# ============================================================
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# Linux
+*~
+
+# ============================================================
+# 11. TEMPORARY FILES
+# ============================================================
+
+tmp/
+temp/
+*.tmp
+*.temp
+
+# ============================================================
+# 12. PROTO GENERATED FILES (Optional)
+# ============================================================
+
+# Uncomment if you want to ignore generated protobuf files
+# proto/**/*.pb.go
+# proto/**/*_grpc.pb.go
+
+# ============================================================
+# 13. DATABASE FILES
+# ============================================================
+
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+
+# ============================================================
+# 14. CI/CD & DEPLOYMENT (Optional)
+# ============================================================
+
+# Docker build context (if any)
+.dockerignore.local
+
+# Kubernetes secrets (if any)
+*-secret.yaml
+secret.yaml

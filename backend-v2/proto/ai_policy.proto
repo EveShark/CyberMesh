@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package cybermesh.ai.v1;
+
+option go_package = "backend/proto;pb";
+
+// PolicyEvent represents ai.policy.v1 message from AI service to backend
+// Backend consumer: backend/pkg/ingest/kafka/consumer.go
+// Backend validator: backend/pkg/ingest/kafka/verifier.go
+message PolicyEvent {
+  // Message identification
+  string id = 1;                    // Policy unique identifier (UUIDv4)
+  
+  // Policy definition
+  string action = 2;                // Action (e.g., "block", "quarantine", "alert", "rate_limit")
+  string rule = 3;                  // Rule definition (human-readable)
+  bytes params = 4;                 // JSON-encoded parameters (max 512KB)
+  
+  // Timing
+  int64 ts = 5;                     // Unix timestamp (seconds)
+  
+  // Cryptographic envelope
+  bytes content_hash = 6;           // SHA-256 of params (32 bytes)
+  bytes producer_id = 7;            // AI node public key (32 bytes Ed25519)
+  bytes nonce = 8;                  // Unique nonce (16 bytes binary)
+  bytes signature = 9;              // Ed25519 signature (64 bytes)
+  bytes pubkey = 10;                // Ed25519 public key (32 bytes)
+  string alg = 11;                  // Signature algorithm "Ed25519"
+}
