@@ -169,9 +169,9 @@ type StorageBackend interface {
 	ListEvidence(ctx context.Context, minHeight uint64, limit int) ([]EvidenceRecord, error)
 
 	// Genesis certificate operations
-	LoadGenesisCertificate(ctx context.Context, networkID string, configHash [32]byte, peerHash [32]byte) ([]byte, bool, error)
-	SaveGenesisCertificate(ctx context.Context, networkID string, configHash [32]byte, peerHash [32]byte, data []byte) error
-	DeleteGenesisCertificate(ctx context.Context, networkID string, configHash [32]byte, peerHash [32]byte) error
+	LoadGenesisCertificate(ctx context.Context) ([]byte, bool, error)
+	SaveGenesisCertificate(ctx context.Context, data []byte) error
+	DeleteGenesisCertificate(ctx context.Context) error
 
 	// Cleanup operations
 	DeleteBefore(ctx context.Context, height uint64) error

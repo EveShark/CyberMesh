@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"crypto/rand"
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -70,10 +69,6 @@ type ConsensusEngine struct {
 	genesisReadyTrace   genesisReadyTrace
 	genesisDiscarded    atomic.Uint64
 
-	// Drift repair telemetry (best-effort, used for readiness diagnostics)
-	driftLastRepairUnix atomic.Int64
-	driftLastError      atomic.Value // string
-
 	readyMu         sync.RWMutex
 	readyValidators map[ctypes.ValidatorID]time.Time
 	localReady      bool
@@ -103,11 +98,6 @@ type ConsensusEngine struct {
 	activationActiveWindow  time.Duration
 	activationForce         bool
 	activationSeenGates     bool
-}
-
-type DriftStatus struct {
-	LastRepairUnix int64  `json:"last_repair_unix"`
-	LastError      string `json:"last_error"`
 }
 
 type leaderHandshakeState struct {
@@ -173,20 +163,17 @@ type EngineConfig struct {
 
 // EngineMetrics tracks consensus performance
 type EngineMetrics struct {
-	ProposalsReceived              uint64
-	ProposalsSent                  uint64
-	VotesReceived                  uint64
-	VotesSent                      uint64
-	QCsFormed                      uint64
-	BlocksCommitted                uint64
-	InvalidBlocks                  uint64
-	ProposalRejectMissingJustifyQC uint64
-	BootstrapHeightQCMismatch      uint64
-	ViewChanges                    uint64
-	EquivocationsDetected          uint64
-	ParentHashMismatches           uint64
-	LastCommitTime                 time.Time
-	AverageCommitLatency           time.Duration
+	ProposalsReceived     uint64
+	ProposalsSent         uint64
+	VotesReceived         uint64
+	VotesSent             uint64
+	QCsFormed             uint64
+	BlocksCommitted       uint64
+	ViewChanges           uint64
+	EquivocationsDetected uint64
+    ParentHashMismatches  uint64
+	LastCommitTime        time.Time
+	AverageCommitLatency  time.Duration
 
 	mu sync.RWMutex
 }
@@ -629,13 +616,6 @@ func (e *ConsensusEngine) Start(ctx context.Context) error {
 	if err := e.storage.Start(ctx); err != nil {
 		return fmt.Errorf("failed to start storage: %w", err)
 	}
-	if err := e.storage.RepairLastCommittedMetadata(ctx); err != nil {
-		e.driftLastError.Store(err.Error())
-		e.driftLastRepairUnix.Store(time.Now().Unix())
-		return fmt.Errorf("failed to repair consensus metadata: %w", err)
-	}
-	e.driftLastError.Store("")
-	e.driftLastRepairUnix.Store(time.Now().Unix())
 
 	if err := e.hotstuff.Start(ctx); err != nil {
 		return fmt.Errorf("failed to start HotStuff: %w", err)
@@ -659,7 +639,6 @@ func (e *ConsensusEngine) Start(ctx context.Context) error {
 	if e.config.HealthCheckInterval > 0 {
 		go e.healthCheckLoop(ctx)
 	}
-	go e.driftRepairLoop(ctx)
 
 	if e.config.MetricsEnabled {
 		go e.metricsLoop(ctx)
@@ -875,38 +854,13 @@ func (e *ConsensusEngine) OnMessageReceived(ctx context.Context, peerAddr string
 		e.metrics.incrementProposalsReceived()
 		proposal := msg.(*messages.Proposal)
 		e.markValidatorActive(proposal.ProposerID, time.Now())
-		if err := e.hotstuff.OnProposal(ctx, proposal); err != nil {
-			if e.metrics != nil && errors.Is(err, messages.ErrMissingJustifyQC) {
-				e.metrics.incrementProposalRejectMissingJustifyQC()
-			}
-			e.logger.WarnContext(ctx, "proposal message rejected by HotStuff",
-				"peer", peerAddr,
-				"view", proposal.View,
-				"height", proposal.Height,
-				"block_hash", fmt.Sprintf("%x", proposal.BlockHash[:8]),
-				"proposer", fmt.Sprintf("%x", proposal.ProposerID[:8]),
-				"error", err.Error(),
-			)
-			return err
-		}
-		return nil
+		return e.hotstuff.OnProposal(ctx, proposal)
 
 	case messages.TypeVote:
 		e.metrics.incrementVotesReceived()
 		vote := msg.(*messages.Vote)
 		e.markValidatorActive(vote.VoterID, time.Now())
-		if err := e.hotstuff.OnVote(ctx, vote); err != nil {
-			e.logger.WarnContext(ctx, "vote message rejected by HotStuff",
-				"peer", peerAddr,
-				"view", vote.View,
-				"height", vote.Height,
-				"block_hash", fmt.Sprintf("%x", vote.BlockHash[:8]),
-				"voter", fmt.Sprintf("%x", vote.VoterID[:8]),
-				"error", err.Error(),
-			)
-			return err
-		}
-		return nil
+		return e.hotstuff.OnVote(ctx, vote)
 
 	case messages.TypeViewChange:
 		e.metrics.incrementViewChanges()
@@ -1064,11 +1018,17 @@ func (e *ConsensusEngine) OnCommit(block Block, qc QC) error {
 	ctx := context.Background()
 
 	h3 := block.GetHash()
-	e.logger.InfoContext(ctx, "commit received",
+	e.logger.InfoContext(ctx, "block committed",
 		"height", block.GetHeight(),
 		"hash", fmt.Sprintf("%x", h3[:8]),
 		"view", qc.GetView(),
 	)
+
+	e.metrics.incrementBlocksCommitted()
+	e.metrics.updateLastCommitTime()
+
+	// Notify heartbeat of proposal
+	e.heartbeat.OnProposal(ctx)
 
 	// Execute callbacks
 	e.mu.RLock()
@@ -1076,45 +1036,11 @@ func (e *ConsensusEngine) OnCommit(block Block, qc QC) error {
 	copy(callbacks, e.commitCallbacks)
 	e.mu.RUnlock()
 
-	var cbErr error
 	for _, cb := range callbacks {
 		if err := cb(ctx, block, qc); err != nil {
-			if cbErr == nil {
-				cbErr = err
-			}
 			e.logger.ErrorContext(ctx, "commit callback failed", "error", err)
-			if e.audit != nil {
-				e.audit.Security("commit_callback_failed", map[string]interface{}{
-					"height": block.GetHeight(),
-					"hash":   fmt.Sprintf("%x", h3[:8]),
-					"view":   qc.GetView(),
-					"error":  err.Error(),
-				})
-			}
 		}
 	}
-	if cbErr != nil {
-		if IsInvalidBlock(cbErr) {
-			if e.metrics != nil {
-				e.metrics.incrementInvalidBlocks()
-			}
-			e.syncPacemakerWithHotStuff(ctx, "invalid_block_commit")
-			if err := e.TriggerViewChange(ctx); err != nil {
-				e.logger.WarnContext(ctx, "failed to trigger view change after invalid block",
-					"error", err,
-				)
-			}
-			return cbErr
-		}
-		go func() { _ = e.Stop() }()
-		return cbErr
-	}
-
-	e.metrics.incrementBlocksCommitted()
-	e.metrics.updateLastCommitTime()
-
-	// Notify heartbeat of proposal
-	e.heartbeat.OnProposal(ctx)
 
 	return nil
 }
@@ -1211,30 +1137,6 @@ func (e *ConsensusEngine) OnViewChange(newView uint64, highestQC QC) error {
 
 // OnNewView is called when new view message is received
 func (e *ConsensusEngine) OnNewView(newView uint64, newViewMsg interface{}) error {
-	e.metrics.incrementViewChanges()
-	e.heartbeat.ResetLiveness()
-
-	// Extract highestQC from the NewView message if available
-	var highestQC QC
-	if nv, ok := newViewMsg.(*leader.NewViewMsg); ok && nv != nil && nv.HighestQC != nil {
-		highestQC = nv.HighestQC
-	}
-
-	// Advance HotStuff consensus to the new view (same as OnViewChange)
-	// This ensures followers update their engine view when receiving NewView from a leader
-	if err := e.hotstuff.AdvanceView(context.Background(), newView, highestQC); err != nil {
-		e.logger.ErrorContext(context.Background(), "failed to advance view in HotStuff via OnNewView",
-			"new_view", newView,
-			"error", err,
-		)
-		return fmt.Errorf("failed to advance view: %w", err)
-	}
-
-	e.logger.InfoContext(context.Background(), "view advanced via OnNewView",
-		"new_view", newView,
-		"has_qc", highestQC != nil,
-	)
-
 	return nil
 }
 
@@ -1275,37 +1177,6 @@ func (e *ConsensusEngine) GetCurrentView() uint64 {
 // GetCurrentHeight returns the current block height
 func (e *ConsensusEngine) GetCurrentHeight() uint64 {
 	return e.pacemaker.GetCurrentHeight()
-}
-
-func (e *ConsensusEngine) GetHighestQC() QC {
-	if e == nil || e.pacemaker == nil {
-		return nil
-	}
-	return e.pacemaker.GetHighestQC()
-}
-
-func (e *ConsensusEngine) SetBlockValidationFunc(f func(ctx context.Context, block Block) error) {
-	if e == nil || e.hotstuff == nil {
-		return
-	}
-	e.hotstuff.SetBlockValidationFunc(f)
-}
-
-func (e *ConsensusEngine) TriggerViewChange(ctx context.Context) error {
-	e.mu.RLock()
-	running := e.running
-	active := e.consensusActive
-	e.mu.RUnlock()
-	if !running {
-		return fmt.Errorf("consensus engine not running")
-	}
-	if !active {
-		return fmt.Errorf("consensus not active")
-	}
-	if e.pacemaker == nil {
-		return fmt.Errorf("pacemaker not configured")
-	}
-	return e.pacemaker.TriggerViewChange(ctx)
 }
 
 // GetCurrentLeader returns the current leader
@@ -1351,19 +1222,12 @@ func (e *ConsensusEngine) GetMetrics() MetricsSnapshot {
 	return e.metrics.snapshot()
 }
 
-func (e *ConsensusEngine) GetPBFTStorageStats() pbft.StorageStats {
-	if e == nil || e.storage == nil {
-		return pbft.StorageStats{}
-	}
-	return e.storage.GetStats()
-}
-
 // RecordParentHashMismatch increments the metric tracking parent-hash validation mismatches.
 func (e *ConsensusEngine) RecordParentHashMismatch() {
-	if e == nil || e.metrics == nil {
-		return
-	}
-	e.metrics.incrementParentHashMismatches()
+    if e == nil || e.metrics == nil {
+        return
+    }
+    e.metrics.incrementParentHashMismatches()
 }
 
 // GetGenesisReadyMetrics returns aggregated genesis readiness telemetry counters.
@@ -1424,40 +1288,6 @@ func (e *ConsensusEngine) healthCheckLoop(ctx context.Context) {
 	}
 }
 
-func (e *ConsensusEngine) driftRepairLoop(ctx context.Context) {
-	interval := 10 * time.Second
-	if e.config != nil && e.config.HealthCheckInterval > 0 {
-		interval = e.config.HealthCheckInterval
-		if interval < 2*time.Second {
-			interval = 2 * time.Second
-		}
-	}
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-e.stopCh:
-			return
-		case <-ticker.C:
-			if err := e.storage.RepairLastCommittedMetadata(ctx); err != nil {
-				e.driftLastError.Store(err.Error())
-				e.driftLastRepairUnix.Store(time.Now().Unix())
-				e.logger.ErrorContext(ctx, "consensus metadata repair failed", "error", err)
-				if e.audit != nil {
-					_ = e.audit.Security("consensus_metadata_repair_failed", map[string]interface{}{
-						"error": err.Error(),
-					})
-				}
-				continue
-			}
-			e.driftLastError.Store("")
-			e.driftLastRepairUnix.Store(time.Now().Unix())
-		}
-	}
-}
-
 func (e *ConsensusEngine) performHealthCheck(ctx context.Context) {
 	// Check if components are responsive
 	// Log warnings if issues detected
@@ -1492,9 +1322,6 @@ func (e *ConsensusEngine) logMetrics(ctx context.Context) {
 		"votes_sent", snapshot.VotesSent,
 		"qcs_formed", snapshot.QCsFormed,
 		"blocks_committed", snapshot.BlocksCommitted,
-		"invalid_blocks", snapshot.InvalidBlocks,
-		"proposal_reject_missing_justify_qc", snapshot.ProposalRejectMissingJustifyQC,
-		"bootstrap_height_qc_mismatch", snapshot.BootstrapHeightQCMismatch,
 		"view_changes", snapshot.ViewChanges,
 	)
 }
@@ -1543,24 +1370,6 @@ func (e *ConsensusEngine) LeaderRotation() ctypes.LeaderRotation {
 
 func (e *ConsensusEngine) startConsensusComponents(ctx context.Context) error {
 	e.syncPacemakerWithHotStuff(ctx, "pre_pacemaker_run")
-
-	if e.configMgr.GetBool("CONSENSUS_REQUIRE_JUSTIFY_QC", true) {
-		height := e.pacemaker.GetCurrentHeight()
-		highestQC := e.pacemaker.GetHighestQC()
-		if height > 1 && highestQC == nil {
-			if e.metrics != nil {
-				e.metrics.incrementBootstrapHeightQCMismatch()
-			}
-			e.logger.ErrorContext(ctx, "bootstrap aborted: height set but no highest QC; refusing to start",
-				"height", height,
-				"view", e.pacemaker.GetCurrentView(),
-				"last_committed", e.storage.GetLastCommittedHeight(),
-				"hotstuff_height", e.hotstuff.GetCurrentHeight(),
-				"hotstuff_view", e.hotstuff.GetCurrentView(),
-			)
-			return fmt.Errorf("bootstrap aborted: height=%d but no highest QC", height)
-		}
-	}
 
 	if err := e.pacemaker.Start(ctx); err != nil {
 		return fmt.Errorf("failed to start pacemaker: %w", err)
@@ -1689,25 +1498,6 @@ func PrivateGetActivationStatus(engine interface{}) ActivationStatus {
 		return ce.GetActivationStatus()
 	}
 	return ActivationStatus{}
-}
-
-func (e *ConsensusEngine) GetDriftStatus() DriftStatus {
-	status := DriftStatus{LastRepairUnix: e.driftLastRepairUnix.Load()}
-	if v := e.driftLastError.Load(); v != nil {
-		if s, ok := v.(string); ok {
-			status.LastError = s
-		}
-	}
-	return status
-}
-
-// PrivateGetDriftStatus exposes drift-repair telemetry to packages that should not depend on
-// internal consensus engine types.
-func PrivateGetDriftStatus(engine interface{}) DriftStatus {
-	if ce, ok := engine.(*ConsensusEngine); ok && ce != nil {
-		return ce.GetDriftStatus()
-	}
-	return DriftStatus{}
 }
 
 // HasActivationQuorum reports whether activation requirements are currently satisfied.
@@ -1997,13 +1787,6 @@ func (e *ConsensusEngine) IsConsensusActive() bool {
 	return e.consensusActive
 }
 
-// IsRunning reports whether the consensus engine main loop is running.
-func (e *ConsensusEngine) IsRunning() bool {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return e.running
-}
-
 func (e *ConsensusEngine) sendProposalIntent(ctx context.Context, view, height uint64, nonce [32]byte) error {
 	msg := &messages.ProposalIntent{
 		View:      view,
@@ -2249,24 +2032,6 @@ func (m *EngineMetrics) incrementBlocksCommitted() {
 	m.BlocksCommitted++
 }
 
-func (m *EngineMetrics) incrementInvalidBlocks() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.InvalidBlocks++
-}
-
-func (m *EngineMetrics) incrementProposalRejectMissingJustifyQC() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.ProposalRejectMissingJustifyQC++
-}
-
-func (m *EngineMetrics) incrementBootstrapHeightQCMismatch() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.BootstrapHeightQCMismatch++
-}
-
 func (m *EngineMetrics) incrementViewChanges() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2274,9 +2039,9 @@ func (m *EngineMetrics) incrementViewChanges() {
 }
 
 func (m *EngineMetrics) incrementParentHashMismatches() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.ParentHashMismatches++
+    m.mu.Lock()
+    defer m.mu.Unlock()
+    m.ParentHashMismatches++
 }
 
 func (m *EngineMetrics) updateLastCommitTime() {
@@ -2290,19 +2055,16 @@ func (m *EngineMetrics) snapshot() MetricsSnapshot {
 	defer m.mu.RUnlock()
 
 	return MetricsSnapshot{
-		ProposalsReceived:              m.ProposalsReceived,
-		ProposalsSent:                  m.ProposalsSent,
-		VotesReceived:                  m.VotesReceived,
-		VotesSent:                      m.VotesSent,
-		QCsFormed:                      m.QCsFormed,
-		BlocksCommitted:                m.BlocksCommitted,
-		InvalidBlocks:                  m.InvalidBlocks,
-		ProposalRejectMissingJustifyQC: m.ProposalRejectMissingJustifyQC,
-		BootstrapHeightQCMismatch:      m.BootstrapHeightQCMismatch,
-		ViewChanges:                    m.ViewChanges,
-		EquivocationsDetected:          m.EquivocationsDetected,
-		ParentHashMismatches:           m.ParentHashMismatches,
-		LastCommitTime:                 m.LastCommitTime,
+		ProposalsReceived:     m.ProposalsReceived,
+		ProposalsSent:         m.ProposalsSent,
+		VotesReceived:         m.VotesReceived,
+		VotesSent:             m.VotesSent,
+		QCsFormed:             m.QCsFormed,
+		BlocksCommitted:       m.BlocksCommitted,
+		ViewChanges:           m.ViewChanges,
+		EquivocationsDetected: m.EquivocationsDetected,
+        ParentHashMismatches:  m.ParentHashMismatches,
+		LastCommitTime:        m.LastCommitTime,
 	}
 }
 
@@ -2321,19 +2083,16 @@ type EngineStatus struct {
 
 // MetricsSnapshot is a point-in-time metrics view
 type MetricsSnapshot struct {
-	ProposalsReceived              uint64
-	ProposalsSent                  uint64
-	VotesReceived                  uint64
-	VotesSent                      uint64
-	QCsFormed                      uint64
-	BlocksCommitted                uint64
-	InvalidBlocks                  uint64
-	ProposalRejectMissingJustifyQC uint64
-	BootstrapHeightQCMismatch      uint64
-	ViewChanges                    uint64
-	EquivocationsDetected          uint64
-	ParentHashMismatches           uint64
-	LastCommitTime                 time.Time
+	ProposalsReceived     uint64
+	ProposalsSent         uint64
+	VotesReceived         uint64
+	VotesSent             uint64
+	QCsFormed             uint64
+	BlocksCommitted       uint64
+	ViewChanges           uint64
+	EquivocationsDetected uint64
+    ParentHashMismatches  uint64
+	LastCommitTime        time.Time
 }
 
 // Message types (simplified - should import from messages package)

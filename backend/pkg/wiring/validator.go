@@ -1,28 +1,12 @@
 package wiring
 
 import (
-	"errors"
 	"fmt"
 
 	"backend/pkg/block"
 	"backend/pkg/consensus/api"
 	"backend/pkg/utils"
 )
-
-// StaleCommitError indicates a commit callback received a block at a height that
-// is already committed locally (e.g. replay/duplicate delivery). It is safe to
-// ignore and must not halt consensus.
-type StaleCommitError struct {
-	Got      uint64
-	Expected uint64
-}
-
-func (e *StaleCommitError) Error() string {
-	if e == nil {
-		return "stale commit"
-	}
-	return fmt.Sprintf("stale commit height: got %d, expected %d", e.Got, e.Expected)
-}
 
 // validateBlock performs basic block validation before committing
 func (s *Service) validateBlock(b api.Block) error {
@@ -35,7 +19,8 @@ func (s *Service) validateBlock(b api.Block) error {
 
 	if b.GetHeight() < expectedHeight {
 		s.mu.Unlock()
-		return &StaleCommitError{Got: b.GetHeight(), Expected: expectedHeight}
+		return fmt.Errorf("invalid block height: got %d, expected %d",
+			b.GetHeight(), expectedHeight)
 	}
 
 	if b.GetHeight() > expectedHeight {
@@ -83,19 +68,12 @@ func (s *Service) validateBlock(b api.Block) error {
 	// For AppBlocks, validate proposer is a known validator
 	if ab, ok := b.(*block.AppBlock); ok {
 		proposerID := ab.Proposer()
-		if s.eng != nil {
-			status := s.eng.GetStatus()
-			// TODO: Add validator set validation when GetValidatorSet() is available
-			// For now, just log the proposer
-			_ = status
-		}
+		status := s.eng.GetStatus()
+		// TODO: Add validator set validation when GetValidatorSet() is available
+		// For now, just log the proposer
 		_ = proposerID
+		_ = status
 	}
 
 	return nil
-}
-
-func IsStaleCommit(err error) bool {
-	var sce *StaleCommitError
-	return errors.As(err, &sce)
 }

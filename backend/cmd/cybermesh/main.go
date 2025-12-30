@@ -172,12 +172,19 @@ func (s *validatorSet) LastActivity(id ctypes.ValidatorID) (time.Time, bool) {
 	return act.lastSeen, true
 }
 
-func (s *validatorSet) applyInactivityLocked(id ctypes.ValidatorID, _ time.Time) bool {
+func (s *validatorSet) applyInactivityLocked(id ctypes.ValidatorID, now time.Time) bool {
 	entry, ok := s.activity[id]
 	if !ok || entry == nil {
 		return false
 	}
 	if !entry.active {
+		if v := s.index[id]; v != nil {
+			v.IsActive = false
+		}
+		return false
+	}
+	if s.inactivity > 0 && !entry.lastSeen.IsZero() && now.Sub(entry.lastSeen) > s.inactivity {
+		entry.active = false
 		if v := s.index[id]; v != nil {
 			v.IsActive = false
 		}
@@ -408,9 +415,6 @@ func main() {
 		ClockSkewTolerance:        runtimeSkew,
 		GenesisClockSkewTolerance: genesisSkew,
 		ReadyRefreshInterval:      cfgMgr.GetDuration("GENESIS_READY_REFRESH_INTERVAL", 30*time.Second),
-		StateMode:                 cfgMgr.GetString("GENESIS_STATE_MODE", "db_then_disk"),
-		DBRequired:                cfgMgr.GetBool("GENESIS_DB_REQUIRED", cfgMgr.GetString("ENVIRONMENT", "production") == "production"),
-		NetworkID:                 cfgMgr.GetString("GENESIS_NETWORK_ID", "cybermesh"),
 		ConfigHash:                configHash,
 		PeerHash:                  peerHash,
 		StatePath:                 statePath,
@@ -434,12 +438,6 @@ func main() {
 	time.Sleep(100 * time.Millisecond)
 	logger.Info("[DIAGNOSTIC] P2P subscription sync complete, starting consensus",
 		utils.ZapDuration("sync_delay", time.Since(syncStart)))
-
-	// Ensure in-memory state store is aligned with persisted chain before starting consensus.
-	// Consensus proposal/vote filtering relies on store.Latest() for nonce replay protection.
-	if err := service.HydrateStateFromDB(ctx); err != nil {
-		log.Fatalf("state hydration failed: %v", err)
-	}
 
 	if err := consensusEngine.Start(ctx); err != nil {
 		log.Fatalf("consensus engine start failed: %v", err)
@@ -1016,7 +1014,6 @@ func buildWiringConfig(
 			RetryBackoffMS:  cfgMgr.GetInt("PERSIST_RETRY_BACKOFF_MS", 100),
 			MaxBackoffMS:    cfgMgr.GetInt("PERSIST_MAX_BACKOFF_MS", 5000),
 			WorkerCount:     cfgMgr.GetInt("PERSIST_WORKERS", 1),
-			FailClosed:      cfgMgr.GetBool("PERSIST_FAIL_CLOSED", true),
 			ShutdownTimeout: cfgMgr.GetDuration("PERSIST_SHUTDOWN_TIMEOUT", 30*time.Second),
 		}
 

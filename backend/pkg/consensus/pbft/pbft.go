@@ -46,8 +46,6 @@ type HotStuff struct {
 	// Proposal tracking
 	pendingVotes map[types.BlockHash]map[types.ValidatorID]*messages.Vote // blockHash -> votes
 
-	logLast map[string]time.Time
-
 	mu        sync.RWMutex
 	stopCh    chan struct{}
 	callbacks types.ConsensusCallbacks
@@ -112,28 +110,9 @@ func NewHotStuff(
 		logger:       logger,
 		votesSent:    make(map[uint64]types.BlockHash),
 		pendingVotes: make(map[types.BlockHash]map[types.ValidatorID]*messages.Vote),
-		logLast:      make(map[string]time.Time),
 		stopCh:       make(chan struct{}),
 		callbacks:    callbacks,
 	}
-}
-
-func (hs *HotStuff) shouldLogLocked(key string, every time.Duration) bool {
-	now := time.Now()
-	if last, ok := hs.logLast[key]; ok && now.Sub(last) < every {
-		return false
-	}
-	hs.logLast[key] = now
-	return true
-}
-
-func (hs *HotStuff) SetBlockValidationFunc(f func(ctx context.Context, block types.Block) error) {
-	hs.mu.Lock()
-	defer hs.mu.Unlock()
-	if hs.config == nil {
-		hs.config = DefaultHotStuffConfig()
-	}
-	hs.config.BlockValidationFunc = f
 }
 
 // Start initializes the consensus engine
@@ -182,13 +161,6 @@ func (hs *HotStuff) OnProposal(ctx context.Context, proposal *messages.Proposal)
 	hs.mu.Unlock()
 
 	if err != nil {
-		hs.logger.WarnContext(ctx, "proposal handling failed",
-			"view", proposal.View,
-			"height", proposal.Height,
-			"block_hash", fmt.Sprintf("%x", proposal.BlockHash[:8]),
-			"proposer", fmt.Sprintf("%x", proposal.ProposerID[:8]),
-			"error", err.Error(),
-		)
 		return err
 	}
 
@@ -220,13 +192,6 @@ func (hs *HotStuff) onProposalLocked(ctx context.Context, proposal *messages.Pro
 
 	// Validate proposal structure
 	if err := hs.validator.ValidateProposal(ctx, proposal); err != nil {
-		hs.logger.WarnContext(ctx, "proposal rejected: invalid proposal",
-			"view", proposal.View,
-			"height", proposal.Height,
-			"block_hash", fmt.Sprintf("%x", proposal.BlockHash[:8]),
-			"proposer", fmt.Sprintf("%x", proposal.ProposerID[:8]),
-			"error", err.Error(),
-		)
 		if hs.audit != nil {
 			hs.audit.Warn("invalid_proposal", map[string]interface{}{
 				"view":     proposal.View,
@@ -241,21 +206,17 @@ func (hs *HotStuff) onProposalLocked(ctx context.Context, proposal *messages.Pro
 	// Check if we already voted in this view (safety rule)
 	if votedHash, hasVoted := hs.votesSent[proposal.View]; hasVoted {
 		if votedHash == proposal.BlockHash {
-			if hs.logger != nil && hs.shouldLogLocked(fmt.Sprintf("dup_proposal_view_%d", proposal.View), 30*time.Second) {
-				hs.logger.InfoContext(ctx, "duplicate proposal received for view",
-					"view", proposal.View,
-					"block_hash", fmt.Sprintf("%x", proposal.BlockHash[:8]),
-				)
-			}
+			hs.logger.InfoContext(ctx, "duplicate proposal received for view",
+				"view", proposal.View,
+				"block_hash", fmt.Sprintf("%x", proposal.BlockHash[:8]),
+			)
 			return nil, nil // idempotent re-delivery: already processed this proposal
 		}
-		if hs.logger != nil && hs.shouldLogLocked(fmt.Sprintf("already_voted_view_%d", proposal.View), 30*time.Second) {
-			hs.logger.WarnContext(ctx, "already voted in this view",
-				"view", proposal.View,
-				"existing_block", fmt.Sprintf("%x", votedHash[:8]),
-				"incoming_block", fmt.Sprintf("%x", proposal.BlockHash[:8]),
-			)
-		}
+		hs.logger.WarnContext(ctx, "already voted in this view",
+			"view", proposal.View,
+			"existing_block", fmt.Sprintf("%x", votedHash[:8]),
+			"incoming_block", fmt.Sprintf("%x", proposal.BlockHash[:8]),
+		)
 		return nil, fmt.Errorf("already voted in view %d", proposal.View)
 	}
 
@@ -276,8 +237,6 @@ func (hs *HotStuff) onProposalLocked(ctx context.Context, proposal *messages.Pro
 		hs.logger.WarnContext(ctx, "unsafe to vote, proposal doesn't extend locked block",
 			"proposal_view", proposal.View,
 			"locked_view", getQCView(hs.lockedQC),
-			"block_hash", fmt.Sprintf("%x", proposal.BlockHash[:8]),
-			"parent_hash", fmt.Sprintf("%x", proposal.ParentHash[:8]),
 		)
 		return nil, fmt.Errorf("proposal conflicts with locked QC")
 	}
@@ -285,13 +244,6 @@ func (hs *HotStuff) onProposalLocked(ctx context.Context, proposal *messages.Pro
 	// Validate block content (if validator configured)
 	if hs.config.BlockValidationFunc != nil {
 		if err := hs.config.BlockValidationFunc(ctx, proposal.Block); err != nil {
-			hs.logger.WarnContext(ctx, "proposal rejected: block validation failed",
-				"view", proposal.View,
-				"height", proposal.Height,
-				"block_hash", fmt.Sprintf("%x", proposal.BlockHash[:8]),
-				"proposer", fmt.Sprintf("%x", proposal.ProposerID[:8]),
-				"error", err.Error(),
-			)
 			return nil, fmt.Errorf("block validation failed: %w", err)
 		}
 	}
@@ -368,13 +320,13 @@ func (hs *HotStuff) sendVoteLocked(ctx context.Context, proposal *messages.Propo
 		Timestamp: ts,
 	}
 
+	// Mark that we voted in this view
+	hs.votesSent[proposal.View] = proposal.BlockHash
+
 	// Store our vote
 	if err := hs.storage.StoreVote(vote); err != nil {
 		return nil, fmt.Errorf("failed to store vote: %w", err)
 	}
-
-	// Mark that we voted in this view
-	hs.votesSent[proposal.View] = proposal.BlockHash
 
 	hs.logger.InfoContext(ctx, "vote sent",
 		"view", vote.View,
@@ -777,23 +729,6 @@ func (hs *HotStuff) commitBlock(ctx context.Context, block types.Block, qc types
 		"view", qc.GetView(),
 	)
 
-	// Fail-closed: apply/validate the committed block via callback before advancing
-	// any in-memory committed height.
-	if hs.callbacks != nil {
-		if err := hs.callbacks.OnCommit(block, qc); err != nil {
-			if hs.audit != nil {
-				h2 := block.GetHash()
-				hs.audit.Security("block_rejected_by_state_machine", map[string]interface{}{
-					"height": block.GetHeight(),
-					"hash":   fmt.Sprintf("%x", h2[:8]),
-					"view":   qc.GetView(),
-					"error":  err.Error(),
-				})
-			}
-			return fmt.Errorf("commit callback failed: %w", err)
-		}
-	}
-
 	// Mark as committed in storage
 	if err := hs.storage.CommitBlock(block.GetHash(), block.GetHeight()); err != nil {
 		return fmt.Errorf("failed to commit block: %w", err)
@@ -810,6 +745,13 @@ func (hs *HotStuff) commitBlock(ctx context.Context, block types.Block, qc types
 			"view":     qc.GetView(),
 			"tx_count": block.GetTransactionCount(),
 		})
+	}
+
+	// Callback
+	if hs.callbacks != nil {
+		if err := hs.callbacks.OnCommit(block, qc); err != nil {
+			return fmt.Errorf("commit callback failed: %w", err)
+		}
 	}
 
 	// Cleanup old data
@@ -962,36 +904,26 @@ func (hs *HotStuff) loadState(ctx context.Context) error {
 	lastCommitted := hs.storage.GetLastCommittedHeight()
 	lastQC := hs.storage.GetLastCommittedQC()
 
-	// Initialize next height to propose.
+	// CRITICAL: Always initialize currentHeight for the next block to propose
+	// This must be set even on fresh start (lastCommitted=0, lastQC=nil)
+	// Replay window expects [lastCommitted+1, lastCommitted+100]
 	hs.currentHeight = lastCommitted + 1
 
-	var lastQCView uint64
 	if lastQC != nil {
 		// Resuming from committed state
 		hs.lockedQC = lastQC
 		hs.prepareQC = lastQC
 		hs.currentView = lastQC.GetView() + 1
-		lastQCView = lastQC.GetView()
 	} else {
 		// Fresh start: no committed blocks yet
 		// Start from view 0, height 1
 		hs.currentView = 0
-		lastQCView = 0
 	}
-
-	// Prune restored state that can poison restart liveness.
-	// Keep our own vote history to avoid double-voting after restart.
-	hs.storage.ClearStaleConsensusRecords(ctx, lastCommitted, lastQCView, hs.crypto.GetKeyID())
-
-	hs.votesSent = hs.storage.GetVotesByVoterInReplayWindow(hs.crypto.GetKeyID())
-	hs.pendingVotes = make(map[types.BlockHash]map[types.ValidatorID]*messages.Vote)
 
 	hs.logger.InfoContext(ctx, "state loaded",
 		"height", hs.currentHeight,
 		"view", hs.currentView,
 		"last_committed", lastCommitted,
-		"last_committed_qc_view", lastQCView,
-		"restored_local_vote_views", len(hs.votesSent),
 	)
 
 	return nil
@@ -1042,21 +974,8 @@ func (hs *HotStuff) AdvanceView(ctx context.Context, newView uint64, highestQC t
 	hs.mu.Lock()
 	defer hs.mu.Unlock()
 
-	if newView < hs.currentView {
+	if newView <= hs.currentView {
 		return fmt.Errorf("cannot advance to view %d, currently at view %d", newView, hs.currentView)
-	}
-
-	if newView == hs.currentView {
-		// Idempotent: duplicate view-advance notifications can arrive via both OnViewChange and OnNewView.
-		// Still accept QC/height updates.
-		if highestQC != nil && (hs.lockedQC == nil || highestQC.GetView() > hs.lockedQC.GetView()) {
-			hs.lockedQC = highestQC
-			hs.prepareQC = highestQC
-			if highestQC.GetHeight() >= hs.currentHeight {
-				hs.currentHeight = highestQC.GetHeight() + 1
-			}
-		}
-		return nil
 	}
 
 	oldView := hs.currentView

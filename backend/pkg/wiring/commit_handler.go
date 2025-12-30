@@ -2,7 +2,6 @@ package wiring
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -26,12 +25,8 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 	// block.Height against lastCommitted+1 from storage, not currentHeight.
 	if err := s.validateBlock(b); err != nil {
 		s.metrics.IncrementValidationFailures()
-		if IsStaleCommit(err) {
-			s.log.WarnContext(ctx, "stale commit ignored", utils.ZapError(err))
-			return nil
-		}
 		s.log.ErrorContext(ctx, "block validation failed", utils.ZapError(err))
-		return &api.InvalidBlockError{Cause: fmt.Errorf("block validation failed: %w", err)}
+		return fmt.Errorf("block validation failed: %w", err)
 	}
 
 	// Expect our AppBlock (produced by Builder)
@@ -74,38 +69,9 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 			utils.ZapUint64("height", ab.GetHeight()))
 		skew = blockLag
 	}
-	apply := s.applyBlock
-	if apply == nil {
-		apply = state.ApplyBlock
-	}
-	version, root, receipts, err := apply(s.store, blockTime, skew, ab.Transactions())
+	version, root, receipts, err := state.ApplyBlock(s.store, blockTime, skew, ab.Transactions())
 	if err != nil {
 		s.metrics.IncrementCommitErrors()
-
-		// Deterministic state-machine invalidity should abort commit but must not stop the engine.
-		if errors.Is(err, state.ErrNonceReplay) {
-			drop := hashesFromReceipts(receipts)
-			if len(drop) == 0 {
-				drop = hashesFromTxs(ab.Transactions())
-			}
-			if len(drop) > 0 {
-				s.mp.Remove(drop...)
-			}
-			s.log.WarnContext(ctx, "deterministic invalid block rejected",
-				utils.ZapUint64("height", ab.GetHeight()),
-				utils.ZapString("cause", err.Error()),
-				utils.ZapInt("pruned_txs", len(drop)),
-			)
-			return &api.InvalidBlockError{Cause: err}
-		}
-		if errors.Is(err, state.ErrBlockTooLarge) {
-			s.log.WarnContext(ctx, "deterministic invalid block rejected",
-				utils.ZapUint64("height", ab.GetHeight()),
-				utils.ZapString("cause", err.Error()),
-			)
-			return &api.InvalidBlockError{Cause: err}
-		}
-
 		s.log.Error("apply block failed", utils.ZapError(err), utils.ZapUint64("version", version))
 		return err
 	}
@@ -122,7 +88,6 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 	s.lastParent = ab.GetHash()
 	s.lastRoot = root
 	s.lastCommittedHeight = ab.GetHeight()
-	s.lastCommitTime = time.Now()
 	s.mu.Unlock()
 
 	// Remove committed txs from mempool
@@ -151,14 +116,11 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 			Attempt:   0,
 		}
 		if err := s.persistWorker.Enqueue(ctx, task); err != nil {
-			// FAIL-CLOSED: if we cannot persist committed blocks, the database will develop gaps
-			// and nodes will be unable to deterministically hydrate on restart.
-			s.log.ErrorContext(ctx, "failed to enqueue persistence task",
+			// Log error but don't fail consensus (async persistence)
+			s.log.WarnContext(ctx, "failed to enqueue persistence task",
 				utils.ZapError(err),
 				utils.ZapUint64("height", ab.GetHeight()))
-			return fmt.Errorf("persistence enqueue failed (height=%d): %w", ab.GetHeight(), err)
-		}
-		{
+		} else {
 			s.log.InfoContext(ctx, "persistence task enqueued successfully")
 		}
 	} else {
@@ -172,24 +134,4 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 	}
 
 	return nil
-}
-
-func hashesFromReceipts(receipts []state.Receipt) [][32]byte {
-	var out [][32]byte
-	for i := range receipts {
-		if receipts[i].ContentHash != ([32]byte{}) {
-			out = append(out, receipts[i].ContentHash)
-		}
-	}
-	return out
-}
-
-func hashesFromTxs(txs []state.Transaction) [][32]byte {
-	out := make([][32]byte, 0, len(txs))
-	for _, tx := range txs {
-		if env := tx.Envelope(); env != nil {
-			out = append(out, env.ContentHash)
-		}
-	}
-	return out
 }

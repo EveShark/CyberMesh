@@ -1,7 +1,6 @@
 package cockroach
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -208,49 +207,7 @@ func (a *adapter) SaveCommittedBlock(ctx context.Context, height uint64, hash []
 	if len(hash) != 32 {
 		return fmt.Errorf("save committed block: invalid block hash length %d", len(hash))
 	}
-	// Safety: only allow updating last_committed metadata to durable truth.
-	// This prevents foreign writers or buggy call paths from pushing metadata ahead of persisted blocks.
-	var durable sql.NullInt64
-	if err := a.db.QueryRowContext(ctx, `SELECT MAX(height) FROM blocks`).Scan(&durable); err != nil {
-		return fmt.Errorf("save committed block: load durable height: %w", err)
-	}
-	if !durable.Valid || durable.Int64 <= 0 {
-		if height > 0 {
-			if a.auditLogger != nil {
-				_ = a.auditLogger.Security("consensus_metadata_write_rejected_no_blocks", map[string]interface{}{
-					"requested_height": height,
-				})
-			}
-			return fmt.Errorf("save committed block: no durable blocks; refusing metadata write")
-		}
-		return nil
-	}
-	durableHeight := uint64(durable.Int64)
-	if height != durableHeight {
-		if a.auditLogger != nil {
-			_ = a.auditLogger.Security("consensus_metadata_write_rejected_height_mismatch", map[string]interface{}{
-				"requested_height": height,
-				"durable_height":   durableHeight,
-			})
-		}
-		return fmt.Errorf("save committed block: requested height=%d does not match durable height=%d", height, durableHeight)
-	}
-	var durableHash []byte
-	if err := a.db.QueryRowContext(ctx, `SELECT block_hash FROM blocks WHERE height = $1`, durableHeight).Scan(&durableHash); err != nil {
-		return fmt.Errorf("save committed block: load durable hash: %w", err)
-	}
-	if len(durableHash) != 32 {
-		return fmt.Errorf("save committed block: invalid durable hash length %d", len(durableHash))
-	}
-	if !bytes.Equal(durableHash, hash) {
-		if a.auditLogger != nil {
-			_ = a.auditLogger.Security("consensus_metadata_write_rejected_hash_mismatch", map[string]interface{}{
-				"height": durableHeight,
-			})
-		}
-		return fmt.Errorf("save committed block: hash mismatch for durable height=%d", durableHeight)
-	}
-	if _, err := a.stmtUpsertMeta.ExecContext(ctx, durableHeight, durableHash, qc); err != nil {
+	if _, err := a.stmtUpsertMeta.ExecContext(ctx, height, hash, qc); err != nil {
 		return fmt.Errorf("save committed block metadata: %w", err)
 	}
 	return nil
@@ -259,126 +216,23 @@ func (a *adapter) SaveCommittedBlock(ctx context.Context, height uint64, hash []
 func (a *adapter) LoadLastCommitted(ctx context.Context) (uint64, []byte, []byte, error) {
 	stop := a.recordQuery("load_last_committed")
 	defer stop()
-	// Derive committed height from durable blocks table, not consensus_metadata.
-	// This prevents restart corruption when metadata gets ahead of persisted blocks.
-	var maxHeight sql.NullInt64
-	if err := a.db.QueryRowContext(ctx, `SELECT MAX(height) FROM blocks`).Scan(&maxHeight); err != nil {
-		return 0, nil, nil, fmt.Errorf("load last committed from blocks: %w", err)
-	}
-	if !maxHeight.Valid || maxHeight.Int64 <= 0 {
-		// Genesis / empty durable state. If metadata exists, it's stale/corrupt (likely foreign writer).
-		var metaHeight sql.NullInt64
-		err := a.db.QueryRowContext(ctx, `SELECT height FROM consensus_metadata WHERE key = 'last_committed'`).Scan(&metaHeight)
-		switch {
-		case err == nil && metaHeight.Valid && metaHeight.Int64 > 0:
-			if a.auditLogger != nil {
-				_ = a.auditLogger.Security("consensus_height_drift_detected", map[string]interface{}{
-					"metadata_height": uint64(metaHeight.Int64),
-					"blocks_height":   uint64(0),
-					"drift":           uint64(metaHeight.Int64),
-					"action":          "delete_metadata_on_empty_blocks",
-				})
-			}
-			if _, delErr := a.db.ExecContext(ctx, `DELETE FROM consensus_metadata WHERE key = 'last_committed'`); delErr != nil {
-				return 0, nil, nil, fmt.Errorf("delete stale consensus_metadata on empty blocks: %w", delErr)
-			}
-		case errors.Is(err, sql.ErrNoRows):
-			// no metadata
-		case err != nil && !errors.Is(err, sql.ErrNoRows):
-			// Ignore metadata read failures; blocks table is the source of truth.
+	row := a.stmtGetMeta.QueryRowContext(ctx)
+	var height sql.NullInt64
+	var hash []byte
+	var qc []byte
+	if err := row.Scan(&height, &hash, &qc); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil, nil, nil
 		}
+		return 0, nil, nil, fmt.Errorf("load metadata: %w", err)
+	}
+	if !height.Valid {
 		return 0, nil, nil, nil
 	}
-	height := uint64(maxHeight.Int64)
-
-	var hash []byte
-	if err := a.db.QueryRowContext(ctx, `SELECT block_hash FROM blocks WHERE height = $1`, height).Scan(&hash); err != nil {
-		return 0, nil, nil, fmt.Errorf("load last committed hash from blocks: %w", err)
+	if len(hash) > 0 && len(hash) != 32 {
+		return 0, nil, nil, fmt.Errorf("load metadata: invalid hash length %d", len(hash))
 	}
-	if len(hash) != 32 {
-		return 0, nil, nil, fmt.Errorf("load last committed: invalid hash length %d", len(hash))
-	}
-
-	// Repair consensus_metadata.last_committed to durable truth.
-	// SECURITY: metadata ahead of durable blocks indicates corruption or foreign writer.
-	var metaHeight sql.NullInt64
-	metaErr := a.db.QueryRowContext(ctx, `SELECT height FROM consensus_metadata WHERE key = 'last_committed'`).Scan(&metaHeight)
-	metaHeightU := uint64(0)
-	metaFound := false
-	switch {
-	case metaErr == nil && metaHeight.Valid:
-		metaFound = true
-		metaHeightU = uint64(metaHeight.Int64)
-	case errors.Is(metaErr, sql.ErrNoRows):
-		metaFound = false
-	case metaErr != nil:
-		// Ignore metadata read failures; blocks table is the source of truth.
-	}
-	if metaFound && metaHeightU != height {
-		drift := uint64(0)
-		if metaHeightU > height {
-			drift = metaHeightU - height
-			if a.auditLogger != nil {
-				_ = a.auditLogger.Security("consensus_height_drift_detected", map[string]interface{}{
-					"metadata_height": metaHeightU,
-					"blocks_height":   height,
-					"drift":           drift,
-					"action":          "repair_metadata_down_to_durable",
-				})
-			}
-		} else {
-			drift = height - metaHeightU
-			if a.auditLogger != nil {
-				_ = a.auditLogger.Info("consensus_height_drift_detected", map[string]interface{}{
-					"metadata_height": metaHeightU,
-					"blocks_height":   height,
-					"drift":           drift,
-					"action":          "repair_metadata_up_to_durable",
-				})
-			}
-		}
-	}
-
-	// Best-effort: if we have a persisted QC for last_committed, return it.
-	// This is not guessing; it's only using data we already stored.
-	var qcBytes []byte
-	{
-		var metaH sql.NullInt64
-		var metaHash []byte
-		var metaQC []byte
-		err := a.db.QueryRowContext(ctx, `SELECT height, block_hash, qc_cbor FROM consensus_metadata WHERE key = 'last_committed'`).Scan(&metaH, &metaHash, &metaQC)
-		switch {
-		case err == nil:
-			if metaH.Valid && uint64(metaH.Int64) == height && bytes.Equal(metaHash, hash) && len(metaQC) > 0 {
-				qcBytes = metaQC
-			}
-		case errors.Is(err, sql.ErrNoRows):
-			// no metadata yet
-		default:
-			// Ignore metadata read failures; blocks table is the source of truth.
-		}
-	}
-
-	if _, err := a.db.ExecContext(ctx, `
-		INSERT INTO consensus_metadata (key, height, block_hash, qc_cbor, updated_at)
-		VALUES ('last_committed', $1, $2, $3, NOW())
-		ON CONFLICT (key) DO UPDATE
-		SET height = EXCLUDED.height,
-		    block_hash = EXCLUDED.block_hash,
-		    qc_cbor = EXCLUDED.qc_cbor,
-		    updated_at = NOW()
-	`, height, hash, qcBytes); err != nil {
-		// Drift repair failure should fail fast; continuing tends to cause view loops / proposal collisions.
-		if a.auditLogger != nil {
-			_ = a.auditLogger.Security("consensus_metadata_repair_failed", map[string]interface{}{
-				"height": height,
-				"error":  err.Error(),
-			})
-		}
-		return 0, nil, nil, fmt.Errorf("consensus metadata repair failed: %w", err)
-	}
-
-	return height, hash, qcBytes, nil
+	return uint64(height.Int64), hash, qc, nil
 }
 
 func (a *adapter) GetCommittedBlockHash(ctx context.Context, height uint64) ([]byte, bool, error) {
@@ -413,13 +267,10 @@ func (a *adapter) DeleteBefore(ctx context.Context, height uint64) error {
 	return nil
 }
 
-func (a *adapter) LoadGenesisCertificate(ctx context.Context, networkID string, configHash [32]byte, peerHash [32]byte) ([]byte, bool, error) {
+func (a *adapter) LoadGenesisCertificate(ctx context.Context) ([]byte, bool, error) {
 	stop := a.recordQuery("load_genesis_certificate")
 	defer stop()
-	if networkID == "" {
-		return nil, false, fmt.Errorf("load genesis certificate: network_id required")
-	}
-	row := a.stmtLoadGenesisCert.QueryRowContext(ctx, networkID, configHash[:], peerHash[:])
+	row := a.stmtLoadGenesisCert.QueryRowContext(ctx)
 	var cert []byte
 	if err := row.Scan(&cert); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -430,28 +281,22 @@ func (a *adapter) LoadGenesisCertificate(ctx context.Context, networkID string, 
 	return cert, true, nil
 }
 
-func (a *adapter) SaveGenesisCertificate(ctx context.Context, networkID string, configHash [32]byte, peerHash [32]byte, data []byte) error {
+func (a *adapter) SaveGenesisCertificate(ctx context.Context, data []byte) error {
 	stop := a.recordQuery("save_genesis_certificate")
 	defer stop()
-	if networkID == "" {
-		return fmt.Errorf("save genesis certificate: network_id required")
-	}
 	if len(data) == 0 {
 		return fmt.Errorf("save genesis certificate: data required")
 	}
-	if _, err := a.stmtUpsertGenesisCert.ExecContext(ctx, networkID, configHash[:], peerHash[:], data); err != nil {
+	if _, err := a.stmtUpsertGenesisCert.ExecContext(ctx, data); err != nil {
 		return fmt.Errorf("save genesis certificate: %w", err)
 	}
 	return nil
 }
 
-func (a *adapter) DeleteGenesisCertificate(ctx context.Context, networkID string, configHash [32]byte, peerHash [32]byte) error {
+func (a *adapter) DeleteGenesisCertificate(ctx context.Context) error {
 	stop := a.recordQuery("delete_genesis_certificate")
 	defer stop()
-	if networkID == "" {
-		return fmt.Errorf("delete genesis certificate: network_id required")
-	}
-	if _, err := a.stmtDeleteGenesisCert.ExecContext(ctx, networkID, configHash[:], peerHash[:]); err != nil {
+	if _, err := a.stmtDeleteGenesisCert.ExecContext(ctx); err != nil {
 		return fmt.Errorf("delete genesis certificate: %w", err)
 	}
 	return nil
