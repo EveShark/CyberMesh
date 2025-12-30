@@ -7,9 +7,24 @@ import (
 	"sync"
 	"time"
 
+	appblock "backend/pkg/block"
 	"backend/pkg/consensus/messages"
+	"backend/pkg/consensus/types"
 	"github.com/fxamacker/cbor/v2"
 )
+
+type proposalPersistedV1 struct {
+	View       uint64                    `cbor:"1,keyasint"`
+	Height     uint64                    `cbor:"2,keyasint"`
+	Round      uint64                    `cbor:"3,keyasint"`
+	BlockHash  BlockHash                 `cbor:"4,keyasint"`
+	ParentHash BlockHash                 `cbor:"5,keyasint"`
+	ProposerID ValidatorID               `cbor:"6,keyasint"`
+	Timestamp  time.Time                 `cbor:"7,keyasint"`
+	JustifyQC  *messages.QC              `cbor:"8,keyasint,omitempty"`
+	Block      *appblock.AppBlockPayload `cbor:"9,keyasint,omitempty"`
+	Signature  types.Signature           `cbor:"10,keyasint"`
+}
 
 // Storage manages consensus state persistence with replay window
 type Storage struct {
@@ -37,6 +52,17 @@ type Storage struct {
 	limits  *messages.EncoderConfig
 
 	backgroundCtx context.Context
+
+	restoreDropped struct {
+		ProposalsStale int
+		ProposalsAhead int
+		VotesStale     int
+		VotesAhead     int
+		QCsStale       int
+		QCsAhead       int
+		EvidenceStale  int
+		EvidenceAhead  int
+	}
 
 	mu sync.RWMutex
 }
@@ -149,16 +175,14 @@ func (s *Storage) Start(ctx context.Context) error {
 	// Load persisted state from backend
 	if s.config.EnablePersistence && s.backend != nil {
 		if err := s.restoreCommittedState(ctx); err != nil {
-			s.logger.WarnContext(ctx, "failed to restore committed state", "error", err)
+			return err
 		}
 		if err := s.restoreReplayWindow(ctx); err != nil {
-			s.logger.WarnContext(ctx, "failed to restore replay window", "error", err)
+			return err
 		}
-	}
-
-	// Start persistence worker
-	if s.config.EnablePersistence {
-		go s.persistenceWorker(ctx)
+		if err := s.ensureLastCommittedQC(ctx); err != nil {
+			return err
+		}
 	}
 
 	s.logger.InfoContext(ctx, "storage started",
@@ -176,6 +200,9 @@ func (s *Storage) restoreCommittedState(ctx context.Context) error {
 	}
 
 	s.lastCommitted = lastHeight
+	if lastHeight > 0 && len(blockHashBytes) != 32 {
+		return fmt.Errorf("restore committed state: missing committed block hash for height %d", lastHeight)
+	}
 
 	if len(blockHashBytes) == 32 {
 		var bh BlockHash
@@ -188,7 +215,16 @@ func (s *Storage) restoreCommittedState(ctx context.Context) error {
 		if decodeErr != nil {
 			s.logger.WarnContext(ctx, "failed to decode last committed qc", "error", decodeErr)
 		} else {
-			s.lastQC = qc
+			committedHash, ok := s.committedBlocks[lastHeight]
+			if ok && qc.GetHeight() == lastHeight && qc.GetBlockHash() == committedHash {
+				s.lastQC = qc
+			} else {
+				if s.audit != nil {
+					s.audit.Security("last_committed_qc_mismatch", map[string]interface{}{
+						"height": lastHeight,
+					})
+				}
+			}
 		}
 	}
 
@@ -198,7 +234,59 @@ func (s *Storage) restoreCommittedState(ctx context.Context) error {
 	return nil
 }
 
+func (s *Storage) ensureLastCommittedQC(ctx context.Context) error {
+	if s.lastCommitted == 0 {
+		return nil
+	}
+	committedHash, ok := s.committedBlocks[s.lastCommitted]
+	if !ok {
+		return fmt.Errorf("restore committed state: missing committed block hash for height %d", s.lastCommitted)
+	}
+	if s.lastQC != nil && s.lastQC.GetHeight() == s.lastCommitted && s.lastQC.GetBlockHash() == committedHash {
+		return nil
+	}
+
+	var best QC
+	for _, qc := range s.qcs {
+		if qc == nil {
+			continue
+		}
+		if qc.GetHeight() != s.lastCommitted {
+			continue
+		}
+		if qc.GetBlockHash() != committedHash {
+			continue
+		}
+		if best == nil || qc.GetView() > best.GetView() {
+			best = qc
+		}
+	}
+	if best == nil {
+		if s.audit != nil {
+			s.audit.Security("missing_qc_for_last_committed", map[string]interface{}{
+				"height": s.lastCommitted,
+				"hash":   fmt.Sprintf("%x", committedHash[:8]),
+			})
+		}
+		return fmt.Errorf("missing QC for last committed block (height=%d)", s.lastCommitted)
+	}
+
+	s.lastQC = best
+	return nil
+}
+
 func (s *Storage) restoreReplayWindow(ctx context.Context) error {
+	s.restoreDropped = struct {
+		ProposalsStale int
+		ProposalsAhead int
+		VotesStale     int
+		VotesAhead     int
+		QCsStale       int
+		QCsAhead       int
+		EvidenceStale  int
+		EvidenceAhead  int
+	}{}
+
 	minHeight := uint64(0)
 	if s.lastCommitted >= uint64(s.config.ReplayWindowSize) {
 		minHeight = s.lastCommitted - uint64(s.config.ReplayWindowSize) + 1
@@ -223,12 +311,21 @@ func (s *Storage) restoreReplayWindow(ctx context.Context) error {
 		"vote_views", len(s.votes),
 		"qc_count", len(s.qcs),
 		"evidence_count", len(s.evidence),
+		"dropped_proposals_stale", s.restoreDropped.ProposalsStale,
+		"dropped_proposals_ahead", s.restoreDropped.ProposalsAhead,
+		"dropped_votes_stale", s.restoreDropped.VotesStale,
+		"dropped_votes_ahead", s.restoreDropped.VotesAhead,
+		"dropped_qcs_stale", s.restoreDropped.QCsStale,
+		"dropped_qcs_ahead", s.restoreDropped.QCsAhead,
+		"dropped_evidence_stale", s.restoreDropped.EvidenceStale,
+		"dropped_evidence_ahead", s.restoreDropped.EvidenceAhead,
 	)
 	return nil
 }
 
 func (s *Storage) restoreProposals(ctx context.Context, minHeight uint64) error {
 	const pageSize = 256
+	maxAcceptedHeight := s.lastCommitted + 1
 	for offset := minHeight; ; offset += pageSize {
 		records, err := s.backend.ListProposals(ctx, offset, pageSize)
 		if err != nil {
@@ -238,6 +335,14 @@ func (s *Storage) restoreProposals(ctx context.Context, minHeight uint64) error 
 			break
 		}
 		for _, rec := range records {
+			if rec.Height <= s.lastCommitted {
+				s.restoreDropped.ProposalsStale++
+				continue
+			}
+			if rec.Height > maxAcceptedHeight {
+				s.restoreDropped.ProposalsAhead++
+				continue
+			}
 			if len(rec.Hash) != 32 {
 				s.logger.WarnContext(ctx, "skipping proposal with invalid hash length", "length", len(rec.Hash))
 				continue
@@ -260,6 +365,7 @@ func (s *Storage) restoreProposals(ctx context.Context, minHeight uint64) error 
 
 func (s *Storage) restoreQCs(ctx context.Context, minHeight uint64) error {
 	const pageSize = 256
+	maxAcceptedHeight := s.lastCommitted + 1
 	for offset := minHeight; ; offset += pageSize {
 		records, err := s.backend.ListQCs(ctx, offset, pageSize)
 		if err != nil {
@@ -269,6 +375,14 @@ func (s *Storage) restoreQCs(ctx context.Context, minHeight uint64) error {
 			break
 		}
 		for _, rec := range records {
+			if rec.Height < s.lastCommitted {
+				s.restoreDropped.QCsStale++
+				continue
+			}
+			if rec.Height > maxAcceptedHeight {
+				s.restoreDropped.QCsAhead++
+				continue
+			}
 			if len(rec.Hash) != 32 {
 				s.logger.WarnContext(ctx, "skipping qc with invalid hash length", "length", len(rec.Hash))
 				continue
@@ -291,6 +405,7 @@ func (s *Storage) restoreQCs(ctx context.Context, minHeight uint64) error {
 
 func (s *Storage) restoreVotes(ctx context.Context, minHeight uint64) error {
 	const pageSize = 512
+	maxAcceptedHeight := s.lastCommitted + 1
 	for offset := minHeight; ; offset += pageSize {
 		records, err := s.backend.ListVotes(ctx, offset, pageSize)
 		if err != nil {
@@ -300,6 +415,14 @@ func (s *Storage) restoreVotes(ctx context.Context, minHeight uint64) error {
 			break
 		}
 		for _, rec := range records {
+			if rec.Height <= s.lastCommitted {
+				s.restoreDropped.VotesStale++
+				continue
+			}
+			if rec.Height > maxAcceptedHeight {
+				s.restoreDropped.VotesAhead++
+				continue
+			}
 			vote, err := s.decodeVote(rec.Data)
 			if err != nil {
 				s.logger.WarnContext(ctx, "failed to decode persisted vote", "error", err)
@@ -327,6 +450,7 @@ func (s *Storage) sortVotesByTimestamp(view uint64) {
 
 func (s *Storage) restoreEvidence(ctx context.Context, minHeight uint64) error {
 	const pageSize = 256
+	maxAcceptedHeight := s.lastCommitted + 1
 	for offset := minHeight; ; offset += pageSize {
 		records, err := s.backend.ListEvidence(ctx, offset, pageSize)
 		if err != nil {
@@ -336,6 +460,14 @@ func (s *Storage) restoreEvidence(ctx context.Context, minHeight uint64) error {
 			break
 		}
 		for _, rec := range records {
+			if rec.Height <= s.lastCommitted {
+				s.restoreDropped.EvidenceStale++
+				continue
+			}
+			if rec.Height > maxAcceptedHeight {
+				s.restoreDropped.EvidenceAhead++
+				continue
+			}
 			if len(rec.Hash) != 32 {
 				s.logger.WarnContext(ctx, "skipping evidence with invalid hash length", "length", len(rec.Hash))
 				continue
@@ -569,30 +701,6 @@ func (s *Storage) CommitBlock(hash BlockHash, height uint64) error {
 	// Store committed block
 	s.committedBlocks[height] = hash
 
-	// Persist if enabled
-	if s.config.EnablePersistence && s.backend != nil {
-		ctxPersist := context.Background()
-		var qcData []byte
-		if qc, exists := s.qcs[hash]; exists && qc != nil {
-			encoded, err := s.encodeQC(qc)
-			if err != nil {
-				s.logger.WarnContext(ctxPersist, "commit block: failed to encode qc", "error", err)
-			} else {
-				qcData = encoded
-			}
-		} else if s.lastQC != nil {
-			encoded, err := s.encodeQC(s.lastQC)
-			if err != nil {
-				s.logger.WarnContext(ctxPersist, "commit block: failed to encode last qc", "error", err)
-			} else {
-				qcData = encoded
-			}
-		}
-		if err := s.backend.SaveCommittedBlock(s.backgroundCtx, height, hash[:], qcData); err != nil {
-			return fmt.Errorf("failed to persist committed block: %w", err)
-		}
-	}
-
 	s.audit.Info("block_committed_storage", map[string]interface{}{
 		"height": height,
 		"hash":   fmt.Sprintf("%x", hash[:]),
@@ -612,6 +720,23 @@ func (s *Storage) GetLastCommittedHeight() uint64 {
 	defer s.mu.RUnlock()
 
 	return s.lastCommitted
+}
+
+// RepairLastCommittedMetadata forces a best-effort reconciliation of consensus_metadata.last_committed
+// to the durable blocks table via the storage backend.
+//
+// This is used to defend against drift introduced by external writers or partial resets.
+func (s *Storage) RepairLastCommittedMetadata(ctx context.Context) error {
+	s.mu.RLock()
+	backend := s.backend
+	enabled := s.config != nil && s.config.EnablePersistence
+	s.mu.RUnlock()
+
+	if !enabled || backend == nil {
+		return nil
+	}
+	_, _, _, err := backend.LoadLastCommitted(ctx)
+	return err
 }
 
 // GetLastCommittedQC returns the last committed QC
@@ -644,7 +769,34 @@ func (s *Storage) encodeProposal(p *messages.Proposal) ([]byte, error) {
 	if s.encMode == nil {
 		return nil, fmt.Errorf("cbor encoder not initialized")
 	}
-	data, err := s.encMode.Marshal(p)
+
+	var payload *appblock.AppBlockPayload
+	if p != nil && p.Block != nil {
+		ab, ok := p.Block.(*appblock.AppBlock)
+		if !ok {
+			return nil, fmt.Errorf("unsupported block implementation %T", p.Block)
+		}
+		var err error
+		payload, err = ab.ToPayload()
+		if err != nil {
+			return nil, fmt.Errorf("serialize block: %w", err)
+		}
+	}
+
+	wire := proposalPersistedV1{
+		View:       p.View,
+		Height:     p.Height,
+		Round:      p.Round,
+		BlockHash:  p.BlockHash,
+		ParentHash: p.ParentHash,
+		ProposerID: p.ProposerID,
+		Timestamp:  p.Timestamp,
+		JustifyQC:  p.JustifyQC,
+		Block:      payload,
+		Signature:  p.Signature,
+	}
+
+	data, err := s.encMode.Marshal(wire)
 	if err != nil {
 		return nil, err
 	}
@@ -658,11 +810,35 @@ func (s *Storage) decodeProposal(data []byte) (*messages.Proposal, error) {
 	if s.decMode == nil {
 		return nil, fmt.Errorf("cbor decoder not initialized")
 	}
-	var proposal messages.Proposal
-	if err := s.decMode.Unmarshal(data, &proposal); err != nil {
+	var wire proposalPersistedV1
+	if err := s.decMode.Unmarshal(data, &wire); err != nil {
 		return nil, err
 	}
-	return &proposal, nil
+
+	p := &messages.Proposal{
+		View:       wire.View,
+		Height:     wire.Height,
+		Round:      wire.Round,
+		BlockHash:  wire.BlockHash,
+		ParentHash: wire.ParentHash,
+		ProposerID: wire.ProposerID,
+		Timestamp:  wire.Timestamp,
+		JustifyQC:  wire.JustifyQC,
+		Signature:  wire.Signature,
+	}
+
+	if wire.Block != nil {
+		blk, err := wire.Block.ToAppBlock()
+		if err != nil {
+			return nil, fmt.Errorf("decode block payload: %w", err)
+		}
+		if blk.GetHash() != wire.BlockHash {
+			return nil, fmt.Errorf("block hash mismatch: payload %x vs proposal %x", blk.GetHash(), wire.BlockHash)
+		}
+		p.Block = blk
+	}
+
+	return p, nil
 }
 
 func (s *Storage) encodeVote(v *messages.Vote) ([]byte, error) {
@@ -815,47 +991,6 @@ func (s *Storage) Prune(currentHeight uint64) {
 }
 
 // persistenceWorker periodically persists state
-func (s *Storage) persistenceWorker(ctx context.Context) {
-	ticker := time.NewTicker(s.config.PersistInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			s.persistState(ctx)
-		}
-	}
-}
-
-// persistState persists current state to backend
-func (s *Storage) persistState(ctx context.Context) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if s.backend == nil {
-		return
-	}
-
-	// Persist last committed state
-	var qcData []byte
-	var blockHash BlockHash
-	if s.lastQC != nil {
-		encoded, err := s.encodeQC(s.lastQC)
-		if err != nil {
-			s.logger.WarnContext(ctx, "persist state: failed to encode qc", "error", err)
-		} else {
-			qcData = encoded
-		}
-		blockHash = s.lastQC.GetBlockHash()
-	} else if hash, exists := s.committedBlocks[s.lastCommitted]; exists {
-		blockHash = hash
-	}
-	if err := s.backend.SaveCommittedBlock(ctx, s.lastCommitted, blockHash[:], qcData); err != nil {
-		s.logger.ErrorContext(ctx, "failed to persist state", "error", err)
-	}
-}
 
 // GetStats returns storage statistics
 func (s *Storage) GetStats() StorageStats {
@@ -868,13 +1003,21 @@ func (s *Storage) GetStats() StorageStats {
 	}
 
 	return StorageStats{
-		ProposalCount:       len(s.proposals),
-		VoteCount:           totalVotes,
-		QCCount:             len(s.qcs),
-		EvidenceCount:       len(s.evidence),
-		CommittedBlockCount: len(s.committedBlocks),
-		LastCommittedHeight: s.lastCommitted,
-		ReplayWindowSize:    s.config.ReplayWindowSize,
+		ProposalCount:                len(s.proposals),
+		VoteCount:                    totalVotes,
+		QCCount:                      len(s.qcs),
+		EvidenceCount:                len(s.evidence),
+		CommittedBlockCount:          len(s.committedBlocks),
+		LastCommittedHeight:          s.lastCommitted,
+		ReplayWindowSize:             s.config.ReplayWindowSize,
+		RestoreDroppedProposalsStale: s.restoreDropped.ProposalsStale,
+		RestoreDroppedProposalsAhead: s.restoreDropped.ProposalsAhead,
+		RestoreDroppedVotesStale:     s.restoreDropped.VotesStale,
+		RestoreDroppedVotesAhead:     s.restoreDropped.VotesAhead,
+		RestoreDroppedQCsStale:       s.restoreDropped.QCsStale,
+		RestoreDroppedQCsAhead:       s.restoreDropped.QCsAhead,
+		RestoreDroppedEvidenceStale:  s.restoreDropped.EvidenceStale,
+		RestoreDroppedEvidenceAhead:  s.restoreDropped.EvidenceAhead,
 	}
 }
 
@@ -887,4 +1030,182 @@ type StorageStats struct {
 	CommittedBlockCount int
 	LastCommittedHeight uint64
 	ReplayWindowSize    int
+
+	RestoreDroppedProposalsStale int
+	RestoreDroppedProposalsAhead int
+	RestoreDroppedVotesStale     int
+	RestoreDroppedVotesAhead     int
+	RestoreDroppedQCsStale       int
+	RestoreDroppedQCsAhead       int
+	RestoreDroppedEvidenceStale  int
+	RestoreDroppedEvidenceAhead  int
+}
+
+// ClearStaleVotesForUncommittedViews is a legacy helper retained for compatibility.
+// Prefer ClearStaleConsensusRecords, which is height-scoped and preserves local vote history.
+func (s *Storage) ClearStaleVotesForUncommittedViews(ctx context.Context, lastCommittedQCView uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	clearedVoteViews := 0
+	clearedProposals := 0
+
+	// Drop votes for uncommitted views.
+	for view := range s.votes {
+		if view > lastCommittedQCView {
+			delete(s.votes, view)
+			clearedVoteViews++
+		}
+	}
+
+	// Drop proposals for uncommitted views.
+	for hash, p := range s.proposals {
+		if p != nil && p.View > lastCommittedQCView {
+			delete(s.proposals, hash)
+			clearedProposals++
+		}
+	}
+
+	s.logger.InfoContext(ctx, "cleared stale votes for uncommitted views",
+		"last_committed_qc_view", lastCommittedQCView,
+		"cleared_vote_views", clearedVoteViews,
+		"cleared_proposals", clearedProposals,
+	)
+
+	if s.audit != nil {
+		s.audit.Info("stale_votes_cleared", map[string]interface{}{
+			"last_committed_qc_view": lastCommittedQCView,
+			"cleared_vote_views":     clearedVoteViews,
+			"cleared_proposals":      clearedProposals,
+		})
+	}
+}
+
+// ClearStaleConsensusRecords prunes restored votes/proposals outside the replay window and
+// removes cross-run vote/proposal state for views beyond the last committed QC view.
+//
+// This keeps the node from rejecting fresh proposals/votes as duplicates after restart while
+// preserving this validator's own vote history (to avoid double-voting).
+func (s *Storage) ClearStaleConsensusRecords(ctx context.Context, lastCommittedHeight uint64, lastCommittedQCView uint64, self types.ValidatorID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Ensure pruning uses the same window as StoreProposal.
+	minHeight := lastCommittedHeight + 1
+	maxHeight := lastCommittedHeight + uint64(s.config.ReplayWindowSize)
+
+	clearedVotes := 0
+	clearedVoteViews := 0
+	clearedProposals := 0
+
+	// Prune proposals outside height window, and drop proposals for views beyond the last
+	// committed QC view (they may be re-proposed with a different block after restart).
+	for hash, p := range s.proposals {
+		if p == nil {
+			delete(s.proposals, hash)
+			clearedProposals++
+			continue
+		}
+		if p.Height < minHeight || p.Height > maxHeight || p.View > lastCommittedQCView {
+			delete(s.proposals, hash)
+			clearedProposals++
+		}
+	}
+
+	// Prune votes:
+	// 1) always drop votes outside the replay height window
+	// 2) for views beyond lastCommittedQCView, drop votes from other validators (cross-run)
+	for view, votes := range s.votes {
+		out := votes[:0]
+		removed := 0
+		for _, v := range votes {
+			if v == nil {
+				removed++
+				continue
+			}
+			if v.Height < minHeight || v.Height > maxHeight {
+				removed++
+				continue
+			}
+			if view > lastCommittedQCView && v.VoterID != self {
+				removed++
+				continue
+			}
+			out = append(out, v)
+		}
+		if removed > 0 {
+			clearedVotes += removed
+		}
+		if len(out) == 0 {
+			delete(s.votes, view)
+			clearedVoteViews++
+			continue
+		}
+		s.votes[view] = out
+	}
+
+	if s.logger != nil {
+		s.logger.InfoContext(ctx, "pruned restored consensus records",
+			"last_committed_height", lastCommittedHeight,
+			"replay_window", s.config.ReplayWindowSize,
+			"height_range_min", minHeight,
+			"height_range_max", maxHeight,
+			"last_committed_qc_view", lastCommittedQCView,
+			"cleared_votes", clearedVotes,
+			"cleared_vote_views", clearedVoteViews,
+			"cleared_proposals", clearedProposals,
+		)
+	}
+}
+
+// GetVotesByVoterInReplayWindow rebuilds this validator's local vote history from storage.
+// Caller gets a map[view]blockHash.
+func (s *Storage) GetVotesByVoterInReplayWindow(voterID types.ValidatorID) map[uint64]types.BlockHash {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	byView := make(map[uint64]types.BlockHash)
+
+	for view, votes := range s.votes {
+		var seen bool
+		var hash types.BlockHash
+		var conflict bool
+
+		for _, v := range votes {
+			if v == nil || v.VoterID != voterID {
+				continue
+			}
+			if !seen {
+				hash = types.BlockHash(v.BlockHash)
+				seen = true
+				continue
+			}
+			if hash != types.BlockHash(v.BlockHash) {
+				conflict = true
+			}
+		}
+
+		if !seen {
+			continue
+		}
+
+		if conflict {
+			if s.logger != nil {
+				s.logger.ErrorContext(context.Background(), "local vote conflict restored from storage",
+					"view", view,
+					"voter", fmt.Sprintf("%x", voterID[:8]),
+				)
+			}
+			if s.audit != nil {
+				s.audit.Security("restored_local_vote_conflict", map[string]interface{}{
+					"view":  view,
+					"voter": fmt.Sprintf("%x", voterID[:]),
+				})
+			}
+		}
+
+		byView[view] = hash
+	}
+
+	return byView
 }

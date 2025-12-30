@@ -2,6 +2,7 @@ package wiring
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -51,13 +52,14 @@ type Config struct {
 }
 
 type Service struct {
-	cfg     Config
-	eng     *api.ConsensusEngine
-	mp      *mempool.Mempool
-	builder *block.Builder
-	store   state.StateStore
-	log     *utils.Logger
-	metrics *Metrics
+	cfg        Config
+	eng        *api.ConsensusEngine
+	mp         *mempool.Mempool
+	builder    *block.Builder
+	store      state.StateStore
+	applyBlock func(store state.StateStore, now time.Time, skew time.Duration, txs []state.Transaction) (uint64, [32]byte, []state.Receipt, error)
+	log        *utils.Logger
+	metrics    *Metrics
 
 	// Persistence (optional)
 	persistWorker *PersistenceWorker
@@ -77,9 +79,10 @@ type Service struct {
 	lastParent          [32]byte
 	lastRoot            [32]byte // Last committed state root
 	lastCommittedHeight uint64   // Last successfully committed block height
-	commitStateSynced   bool     // Whether commit validator is aligned with consensus height
-	lastProposedView    uint64   // Last view we proposed in (debug visibility)
-	lastProposedHeight  uint64   // Last height we proposed (for cooldown logging)
+	lastCommitTime      time.Time
+	commitStateSynced   bool   // Whether commit validator is aligned with consensus height
+	lastProposedView    uint64 // Last view we proposed in (debug visibility)
+	lastProposedHeight  uint64 // Last height we proposed (for cooldown logging)
 	lastProposalTime    time.Time
 	blockTimeout        time.Duration
 	stopCh              chan struct{}
@@ -96,6 +99,7 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 		mp:           mp,
 		builder:      builder,
 		store:        store,
+		applyBlock:   state.ApplyBlock,
 		log:          log,
 		metrics:      &Metrics{},
 		lastParent:   cfg.GenesisHash, // Initialize with genesis instead of zero
@@ -117,6 +121,52 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 	// Ensure first proposal in view 0 isn't suppressed by cooldown guard
 	s.lastProposedView = ^uint64(0)
 	s.lastProposedHeight = ^uint64(0)
+
+	// Install deterministic, state-aware proposal validation to prevent voting for blocks that
+	// will fail commit-time execution (e.g., nonce replay).
+	if eng != nil && store != nil {
+		eng.SetBlockValidationFunc(func(_ context.Context, blk api.Block) error {
+			ab, ok := blk.(*block.AppBlock)
+			if !ok || ab == nil {
+				return nil
+			}
+			version := store.Latest()
+			seen := make(map[string]struct{}, ab.GetTransactionCount())
+			for _, tx := range ab.Transactions() {
+				env := tx.Envelope()
+				if env == nil {
+					continue
+				}
+				k := string(state.NonceKey(env.ProducerID, env.Nonce))
+				if _, dup := seen[k]; dup {
+					if log != nil {
+						log.WarnContext(context.Background(), "block rejected: duplicate nonce inside proposal",
+							utils.ZapUint64("height", ab.GetHeight()),
+							utils.ZapString("tx", fmt.Sprintf("%x", env.ContentHash[:8])),
+							utils.ZapString("producer", fmt.Sprintf("%x", env.ProducerID[:8])),
+							utils.ZapString("nonce", fmt.Sprintf("%x", env.Nonce)),
+							utils.ZapUint64("state_version", version),
+						)
+					}
+					return state.ErrNonceReplay
+				}
+				seen[k] = struct{}{}
+				if v, ok := store.Get(version, state.NonceKey(env.ProducerID, env.Nonce)); ok && len(v) > 0 {
+					if log != nil {
+						log.WarnContext(context.Background(), "block rejected: tx nonce already committed",
+							utils.ZapUint64("height", ab.GetHeight()),
+							utils.ZapString("tx", fmt.Sprintf("%x", env.ContentHash[:8])),
+							utils.ZapString("producer", fmt.Sprintf("%x", env.ProducerID[:8])),
+							utils.ZapString("nonce", fmt.Sprintf("%x", env.Nonce)),
+							utils.ZapUint64("state_version", version),
+						)
+					}
+					return state.ErrNonceReplay
+				}
+			}
+			return nil
+		})
+	}
 
 	// Initialize Kafka producer if enabled (must be before persistence worker)
 	var kafkaProducer *kafka.Producer
@@ -254,7 +304,7 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 		}
 
 		// Create consumer
-		kafkaConsumer, err := kafka.NewConsumer(context.Background(), cfg.KafkaConsumerCfg, saramaCfg, mp, log, cfg.AuditLogger)
+		kafkaConsumer, err := kafka.NewConsumer(context.Background(), cfg.KafkaConsumerCfg, saramaCfg, store, mp, log, cfg.AuditLogger)
 		if err != nil {
 			// Cleanup on error
 			if kafkaProducer != nil {
@@ -389,6 +439,10 @@ func (s *Service) GetMetrics() Metrics {
 }
 
 func (s *Service) Start(ctx context.Context) error {
+	if err := s.HydrateStateFromDB(ctx); err != nil {
+		return err
+	}
+
 	// Start persistence worker if configured
 	if s.persistWorker != nil {
 		if err := s.persistWorker.Start(ctx); err != nil {
@@ -440,6 +494,166 @@ func (s *Service) Start(ctx context.Context) error {
 	// Proposer loop
 	go s.runProposer(ctx)
 
+	return nil
+}
+
+// HydrateStateFromDB replays persisted blocks into the in-memory state store.
+// This ensures store.Latest() is aligned with the committed chain height before
+// Kafka ingestion and consensus proposal/vote filtering rely on it.
+func (s *Service) HydrateStateFromDB(ctx context.Context) error {
+	if s == nil || s.store == nil || s.cfg.DBAdapter == nil {
+		return nil
+	}
+
+	current := s.store.Latest()
+	latest, err := s.cfg.DBAdapter.GetLatestHeight(ctx)
+	if err != nil {
+		return fmt.Errorf("state hydration: get latest height: %w", err)
+	}
+	if latest <= current {
+		return nil
+	}
+
+	minHeight, err := s.cfg.DBAdapter.GetMinHeight(ctx)
+	if err != nil {
+		return fmt.Errorf("state hydration: get min height: %w", err)
+	}
+	if latest > 0 && minHeight != 1 {
+		return fmt.Errorf("state hydration: blocks table non-contiguous (min_height=%d db_height=%d); run clear-db job", minHeight, latest)
+	}
+
+	start := time.Now()
+	if s.log != nil {
+		s.log.InfoContext(ctx, "hydrating state store from database",
+			utils.ZapUint64("store_version", current),
+			utils.ZapUint64("db_height", latest),
+		)
+	}
+
+	apply := s.applyBlock
+	if apply == nil {
+		apply = state.ApplyBlock
+	}
+	baseSkew := s.cfg.TimestampSkew
+	if baseSkew == 0 {
+		baseSkew = 30 * time.Second
+	}
+
+	for height := uint64(1); height <= latest; height++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		blk, err := s.cfg.DBAdapter.GetBlock(ctx, height)
+		if err != nil {
+			if errors.Is(err, cockroach.ErrBlockNotFound) {
+				return fmt.Errorf("state hydration: missing block height=%d (db_height=%d); database contains gaps; run clear-db job: %w", height, latest, err)
+			}
+			return fmt.Errorf("state hydration: get block height=%d: %w", height, err)
+		}
+		txs, err := s.cfg.DBAdapter.GetTransactionsByBlock(ctx, height)
+		if err != nil {
+			return fmt.Errorf("state hydration: get transactions height=%d: %w", height, err)
+		}
+
+		blockTime := blk.GetTimestamp()
+		skew := baseSkew
+		oldest := blockTime
+		for _, tx := range txs {
+			ts := time.Unix(tx.Timestamp(), 0)
+			if ts.Before(oldest) {
+				oldest = ts
+			}
+		}
+		if delta := blockTime.Sub(oldest); delta > skew {
+			skew = delta
+		}
+
+		_, root, _, err := apply(s.store, blockTime, skew, txs)
+		if err != nil {
+			if errors.Is(err, state.ErrNonceReplay) {
+				return fmt.Errorf("state hydration: nonce replay while replaying committed block height=%d", height)
+			}
+			return fmt.Errorf("state hydration: apply block height=%d: %w", height, err)
+		}
+
+		expected := blk.StateRootHint()
+		var expectedRoot [32]byte
+		copy(expectedRoot[:], expected[:])
+		if root != expectedRoot {
+			return fmt.Errorf("state hydration: state root mismatch height=%d (db_height=%d); expected %x got %x", height, latest, expectedRoot, root)
+		}
+
+		if s.log != nil && height%50 == 0 {
+			s.log.InfoContext(ctx, "state hydration progress",
+				utils.ZapUint64("height", height),
+				utils.ZapUint64("db_height", latest),
+				utils.ZapDuration("elapsed", time.Since(start)),
+			)
+		}
+	}
+
+	if s.log != nil {
+		s.log.InfoContext(ctx, "state hydration complete",
+			utils.ZapUint64("store_version", s.store.Latest()),
+			utils.ZapUint64("db_height", latest),
+			utils.ZapDuration("elapsed", time.Since(start)),
+		)
+	}
+	return nil
+}
+
+func (s *Service) hydrateNoncesOnly(ctx context.Context, dbHeight uint64) error {
+	if s == nil || s.store == nil || s.cfg.DBAdapter == nil {
+		return nil
+	}
+
+	start := time.Now()
+	entries, err := s.cfg.DBAdapter.ListNonceEntriesUpToHeight(ctx, dbHeight)
+	if err != nil {
+		return fmt.Errorf("state hydration (nonce-only): list nonce entries: %w", err)
+	}
+
+	latest := s.store.Latest()
+	txn, err := s.store.Begin(latest)
+	if err != nil {
+		return fmt.Errorf("state hydration (nonce-only): begin: %w", err)
+	}
+
+	for _, e := range entries {
+		if len(e.ProducerID) == 0 || len(e.Nonce) == 0 || len(e.ContentHash) == 0 {
+			continue
+		}
+		// Store content hash under nonce key (same mapping reducers use).
+		if err := txn.Put(state.NonceKey(e.ProducerID, e.Nonce), e.ContentHash); err != nil {
+			return fmt.Errorf("state hydration (nonce-only): put nonce key: %w", err)
+		}
+	}
+
+	_, err = txn.Commit(latest + 1)
+	if err != nil {
+		return fmt.Errorf("state hydration (nonce-only): commit: %w", err)
+	}
+
+	// Advance store version to dbHeight so any height/version comparators don't see a large gap.
+	for s.store.Latest() < dbHeight {
+		v := s.store.Latest()
+		t, err := s.store.Begin(v)
+		if err != nil {
+			return fmt.Errorf("state hydration (nonce-only): begin advance: %w", err)
+		}
+		if _, err := t.Commit(v + 1); err != nil {
+			return fmt.Errorf("state hydration (nonce-only): advance commit: %w", err)
+		}
+	}
+
+	if s.log != nil {
+		s.log.InfoContext(ctx, "state hydration nonce-only complete",
+			utils.ZapInt("nonce_entries", len(entries)),
+			utils.ZapUint64("store_version", s.store.Latest()),
+			utils.ZapUint64("db_height", dbHeight),
+			utils.ZapDuration("elapsed", time.Since(start)),
+		)
+	}
 	return nil
 }
 

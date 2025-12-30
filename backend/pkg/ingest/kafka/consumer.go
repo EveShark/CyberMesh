@@ -15,11 +15,14 @@ import (
 	"github.com/IBM/sarama"
 )
 
+var ErrTxAlreadyCommittedNonce = errors.New("transaction nonce already committed")
+
 // Consumer handles consuming messages from Kafka ai.* topics and submitting to mempool
 type Consumer struct {
 	consumerGroup sarama.ConsumerGroup
 	topics        []string
 	mempool       *mempool.Mempool
+	store         state.StateStore
 	verifierCfg   VerifierConfig
 	logger        *utils.Logger
 	audit         *utils.AuditLogger
@@ -53,6 +56,9 @@ type Consumer struct {
 	retryMax         int
 	retryBackoffBase time.Duration
 	retryBackoffMax  time.Duration
+
+	// Backpressure policy
+	backpressureHighWatermark float64
 }
 
 // ConsumerConfig holds configuration for creating a consumer
@@ -66,10 +72,12 @@ type ConsumerConfig struct {
 	RetryMax         int           // Maximum attempts per message (default: 5)
 	RetryBackoffBase time.Duration // Initial backoff (default: 100ms)
 	RetryBackoffMax  time.Duration // Max backoff cap (default: 5s)
+	// Backpressure: when mempool is above this fraction of its MaxTxs, pause consumption via transient errors.
+	BackpressureHighWatermark float64 // default: 0.9 (set >=1 to disable)
 }
 
 // NewConsumer creates a new Kafka consumer for ai.* topics
-func NewConsumer(ctx context.Context, cfg ConsumerConfig, saramaCfg *sarama.Config, mp *mempool.Mempool, logger *utils.Logger, audit *utils.AuditLogger) (*Consumer, error) {
+func NewConsumer(ctx context.Context, cfg ConsumerConfig, saramaCfg *sarama.Config, store state.StateStore, mp *mempool.Mempool, logger *utils.Logger, audit *utils.AuditLogger) (*Consumer, error) {
 	if len(cfg.Brokers) == 0 {
 		return nil, fmt.Errorf("kafka consumer: no brokers configured")
 	}
@@ -110,6 +118,7 @@ func NewConsumer(ctx context.Context, cfg ConsumerConfig, saramaCfg *sarama.Conf
 		consumerGroup:      consumerGroup,
 		topics:             cfg.Topics,
 		mempool:            mp,
+		store:              store,
 		verifierCfg:        cfg.VerifierCfg,
 		logger:             logger,
 		audit:              audit,
@@ -139,6 +148,11 @@ func NewConsumer(ctx context.Context, cfg ConsumerConfig, saramaCfg *sarama.Conf
 	c.retryBackoffMax = cfg.RetryBackoffMax
 	if c.retryBackoffMax <= 0 {
 		c.retryBackoffMax = 5 * time.Second
+	}
+
+	c.backpressureHighWatermark = cfg.BackpressureHighWatermark
+	if c.backpressureHighWatermark <= 0 {
+		c.backpressureHighWatermark = 0.9
 	}
 
 	if audit != nil {
@@ -427,6 +441,9 @@ func isPermanentErr(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, ErrTxAlreadyCommittedNonce) {
+		return true
+	}
 	// Transient mempool conditions
 	if errors.Is(err, mempool.ErrRateLimited) || errors.Is(err, mempool.ErrMempoolFull) {
 		return false
@@ -439,8 +456,40 @@ func isPermanentErr(err error) bool {
 	return true
 }
 
+func shouldBackpressure(mempoolCount int, mempoolMaxTxs int, watermark float64) bool {
+	if mempoolMaxTxs <= 0 {
+		return false
+	}
+	if watermark <= 0 {
+		watermark = 0.9
+	}
+	// watermark >= 1 disables backpressure.
+	if watermark >= 1 {
+		return false
+	}
+	threshold := int(math.Ceil(watermark * float64(mempoolMaxTxs)))
+	if threshold < 1 {
+		threshold = 1
+	}
+	return mempoolCount >= threshold
+}
+
 // processMessage handles a single Kafka message: decode → verify → mempool.Admit
 func (c *Consumer) processMessage(ctx context.Context, session sarama.ConsumerGroupSession, message *sarama.ConsumerMessage) error {
+	if c.mempool != nil {
+		count, _ := c.mempool.Stats()
+		if shouldBackpressure(count, c.mempool.MaxTxs(), c.backpressureHighWatermark) {
+			if c.logger != nil {
+				c.logger.WarnContext(ctx, "mempool near capacity; applying kafka consumer backpressure",
+					utils.ZapInt("mempool_count", count),
+					utils.ZapInt("mempool_max", c.mempool.MaxTxs()),
+					utils.ZapFloat64("watermark", c.backpressureHighWatermark),
+				)
+			}
+			return mempool.ErrMempoolFull
+		}
+	}
+
 	if c.logger != nil {
 		c.logger.Info("[DEBUG] processMessage() CALLED",
 			utils.ZapString("topic", message.Topic),
@@ -522,6 +571,36 @@ func (c *Consumer) processMessage(ctx context.Context, session sarama.ConsumerGr
 
 	c.incrementVerified()
 	c.setLastMessageTime(time.Now())
+
+	// Drop transactions that are already committed (nonce replay) to avoid consensus stalls on restart/replay.
+	if c.store != nil {
+		if env := tx.Envelope(); env != nil {
+			ver := c.store.Latest()
+			if v, ok := c.store.Get(ver, state.NonceKey(env.ProducerID, env.Nonce)); ok && len(v) > 0 {
+				if c.audit != nil {
+					_ = c.audit.Info("kafka_tx_discarded_already_committed_nonce", map[string]interface{}{
+						"topic":    message.Topic,
+						"offset":   message.Offset,
+						"producer": fmt.Sprintf("%x", env.ProducerID[:8]),
+						"nonce":    fmt.Sprintf("%x", env.Nonce),
+						"tx":       fmt.Sprintf("%x", env.ContentHash[:8]),
+						"version":  ver,
+					})
+				}
+				if c.logger != nil {
+					c.logger.InfoContext(ctx, "discarding kafka tx: nonce already committed",
+						utils.ZapString("topic", message.Topic),
+						utils.ZapInt64("offset", message.Offset),
+						utils.ZapString("tx", fmt.Sprintf("%x", env.ContentHash[:8])),
+						utils.ZapString("producer", fmt.Sprintf("%x", env.ProducerID[:8])),
+						utils.ZapString("nonce", fmt.Sprintf("%x", env.Nonce)),
+						utils.ZapUint64("state_version", ver),
+					)
+				}
+				return ErrTxAlreadyCommittedNonce
+			}
+		}
+	}
 
 	// Submit to mempool
 	if c.logger != nil {

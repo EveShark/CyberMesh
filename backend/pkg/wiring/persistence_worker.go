@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
 	"backend/pkg/block"
+	ctypes "backend/pkg/consensus/types"
 	"backend/pkg/ingest/kafka"
 	"backend/pkg/state"
 	"backend/pkg/storage/cockroach"
@@ -37,6 +39,7 @@ type PersistenceWorkerConfig struct {
 	RetryBackoffMS  int                        // Initial backoff in milliseconds (default: 100)
 	MaxBackoffMS    int                        // Maximum backoff in milliseconds (default: 5000)
 	WorkerCount     int                        // Number of concurrent workers (default: 1)
+	FailClosed      bool                       // Exit process on final persistence failure (recommended: true)
 	ShutdownTimeout time.Duration              // Graceful shutdown timeout (default: 30s)
 	OnSuccess       PersistenceSuccessCallback // Optional callback after successful persistence (for Kafka, etc.)
 }
@@ -44,7 +47,9 @@ type PersistenceWorkerConfig struct {
 // PersistenceWorker handles async block persistence with retry logic
 type PersistenceWorker struct {
 	cfg         PersistenceWorkerConfig
-	adapter     cockroach.Adapter
+	persister   blockPersister
+	dbAdapter   cockroach.Adapter
+	backend     ctypes.StorageBackend
 	logger      *utils.Logger
 	auditLogger interface {
 		Info(event string, fields map[string]interface{}) error
@@ -63,8 +68,12 @@ type PersistenceWorker struct {
 	onSuccess  PersistenceSuccessCallback // Callback after successful persistence
 }
 
+type blockPersister interface {
+	PersistBlock(ctx context.Context, blk *block.AppBlock, receipts []state.Receipt, stateRoot [32]byte) error
+}
+
 // NewPersistenceWorker creates a new async persistence worker
-func NewPersistenceWorker(cfg PersistenceWorkerConfig, adapter cockroach.Adapter, logger *utils.Logger, auditLogger interface {
+func NewPersistenceWorker(cfg PersistenceWorkerConfig, adapter blockPersister, logger *utils.Logger, auditLogger interface {
 	Info(event string, fields map[string]interface{}) error
 	Warn(event string, fields map[string]interface{}) error
 	Error(event string, fields map[string]interface{}) error
@@ -96,13 +105,19 @@ func NewPersistenceWorker(cfg PersistenceWorkerConfig, adapter cockroach.Adapter
 
 	pw := &PersistenceWorker{
 		cfg:         cfg,
-		adapter:     adapter,
+		persister:   adapter,
 		logger:      logger,
 		auditLogger: auditLogger,
 		queue:       make(chan *PersistenceTask, cfg.QueueSize),
 		stopCh:      make(chan struct{}),
 		running:     false,
 		onSuccess:   cfg.OnSuccess, // Store callback
+	}
+	if a, ok := adapter.(cockroach.Adapter); ok {
+		pw.dbAdapter = a
+	}
+	if b, ok := adapter.(ctypes.StorageBackend); ok {
+		pw.backend = b
 	}
 
 	return pw, nil
@@ -251,7 +266,7 @@ func (pw *PersistenceWorker) processTask(ctx context.Context, task *PersistenceT
 		// Create timeout context for this attempt
 		attemptCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 
-		err := pw.adapter.PersistBlock(attemptCtx, task.Block, task.Receipts, task.StateRoot)
+		err := pw.persister.PersistBlock(attemptCtx, task.Block, task.Receipts, task.StateRoot)
 		cancel()
 
 		if err == nil {
@@ -328,6 +343,32 @@ func (pw *PersistenceWorker) processTask(ctx context.Context, task *PersistenceT
 					utils.ZapUint64("height", task.Block.GetHeight()))
 			}
 			// FAIL-CLOSED: Integrity violations are not retried
+			if pw.cfg.FailClosed {
+				os.Exit(1)
+			}
+			return
+		}
+
+		// Non-retryable errors should not spin; record and drop.
+		if !cockroach.IsRetryable(err) {
+			pw.incrementErrorCount()
+			if pw.auditLogger != nil {
+				bh := task.Block.GetHash()
+				_ = pw.auditLogger.Error("block_persist_failed_non_retryable", map[string]interface{}{
+					"height":  task.Block.GetHeight(),
+					"hash":    fmt.Sprintf("%x", bh[:8]),
+					"error":   err.Error(),
+					"attempt": attempt + 1,
+				})
+			}
+			if pw.logger != nil {
+				pw.logger.ErrorContext(ctx, "block persistence failed with non-retryable error",
+					utils.ZapError(err),
+					utils.ZapUint64("height", task.Block.GetHeight()))
+			}
+			if pw.cfg.FailClosed {
+				os.Exit(1)
+			}
 			return
 		}
 
@@ -341,8 +382,14 @@ func (pw *PersistenceWorker) processTask(ctx context.Context, task *PersistenceT
 					utils.ZapDuration("backoff", backoff))
 			}
 
-			// Sleep with backoff
-			time.Sleep(backoff)
+			// Sleep with backoff (context-aware)
+			select {
+			case <-pw.stopCh:
+				return
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
 
 			// Exponential backoff
 			backoff *= 2
@@ -366,6 +413,9 @@ func (pw *PersistenceWorker) processTask(ctx context.Context, task *PersistenceT
 					utils.ZapError(err),
 					utils.ZapUint64("height", task.Block.GetHeight()),
 					utils.ZapInt("attempts", pw.cfg.RetryMax))
+			}
+			if pw.cfg.FailClosed {
+				os.Exit(1)
 			}
 			return
 		}

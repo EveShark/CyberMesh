@@ -54,6 +54,14 @@ type Adapter interface {
 	// ListTransactionsByBlock returns lightweight transaction metadata for a block
 	ListTransactionsByBlock(ctx context.Context, height uint64) ([]TxMeta, error)
 
+	// GetTransactionsByBlock returns decoded transactions for a block, ordered by tx_index.
+	// Used for state-store hydration on startup.
+	GetTransactionsByBlock(ctx context.Context, height uint64) ([]state.Transaction, error)
+
+	// ListNonceEntriesUpToHeight returns (producer_id, nonce, content_hash) for all transactions
+	// committed up to the given height. Used as a fallback hydration path when blocks are missing.
+	ListNonceEntriesUpToHeight(ctx context.Context, height uint64) ([]NonceEntry, error)
+
 	// Consensus persistence operations (adapter satisfies types.StorageBackend)
 	SaveProposal(ctx context.Context, hash []byte, height uint64, view uint64, proposer []byte, data []byte) error
 	LoadProposal(ctx context.Context, hash []byte) ([]byte, error)
@@ -68,9 +76,9 @@ type Adapter interface {
 	ListEvidence(ctx context.Context, minHeight uint64, limit int) ([]types.EvidenceRecord, error)
 	SaveCommittedBlock(ctx context.Context, height uint64, hash []byte, qc []byte) error
 	LoadLastCommitted(ctx context.Context) (uint64, []byte, []byte, error)
-	LoadGenesisCertificate(ctx context.Context) ([]byte, bool, error)
-	SaveGenesisCertificate(ctx context.Context, data []byte) error
-	DeleteGenesisCertificate(ctx context.Context) error
+	LoadGenesisCertificate(ctx context.Context, networkID string, configHash [32]byte, peerHash [32]byte) ([]byte, bool, error)
+	SaveGenesisCertificate(ctx context.Context, networkID string, configHash [32]byte, peerHash [32]byte, data []byte) error
+	DeleteGenesisCertificate(ctx context.Context, networkID string, configHash [32]byte, peerHash [32]byte) error
 	DeleteBefore(ctx context.Context, height uint64) error
 
 	// Ping checks database liveness
@@ -81,6 +89,13 @@ type Adapter interface {
 
 	// Metrics returns aggregated latency metrics for diagnostics
 	Metrics() MetricsSnapshot
+}
+
+// NonceEntry represents a committed (producer, nonce) pair.
+type NonceEntry struct {
+	ProducerID  []byte
+	Nonce       []byte
+	ContentHash []byte
 }
 
 func isUniqueViolation(err error, constraint string) bool {
@@ -342,7 +357,7 @@ func (a *adapter) prepareStatements(ctx context.Context) error {
 	a.stmtLoadGenesisCert, err = a.db.PrepareContext(ctx, `
 		SELECT certificate
 		FROM genesis_certificates
-		ORDER BY created_at DESC
+		WHERE network_id = $1 AND config_hash = $2 AND peer_hash = $3
 		LIMIT 1
 	`)
 	if err != nil {
@@ -350,15 +365,16 @@ func (a *adapter) prepareStatements(ctx context.Context) error {
 	}
 
 	a.stmtUpsertGenesisCert, err = a.db.PrepareContext(ctx, `
-		UPSERT INTO genesis_certificates (id, certificate)
-		VALUES (1, $1)
+		UPSERT INTO genesis_certificates (network_id, config_hash, peer_hash, certificate, created_at)
+		VALUES ($1, $2, $3, $4, NOW())
 	`)
 	if err != nil {
 		return fmt.Errorf("prepare upsert genesis certificate: %w", err)
 	}
 
 	a.stmtDeleteGenesisCert, err = a.db.PrepareContext(ctx, `
-		DELETE FROM genesis_certificates WHERE id = 1
+		DELETE FROM genesis_certificates
+		WHERE network_id = $1 AND config_hash = $2 AND peer_hash = $3
 	`)
 	if err != nil {
 		return fmt.Errorf("prepare delete genesis certificate: %w", err)
@@ -452,6 +468,19 @@ func (a *adapter) PersistBlock(ctx context.Context, blk *block.AppBlock, receipt
 	}
 	defer tx.Rollback() // Safe to call even after commit
 
+	// Fail-closed on block height gaps: never persist height H unless H-1 exists.
+	// This prevents durable chain corruption (e.g. max_height=12 but height=1 missing).
+	if h := blk.GetHeight(); h > 1 {
+		var one int
+		err := tx.QueryRowContext(ctx, `SELECT 1 FROM blocks WHERE height = $1`, h-1).Scan(&one)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("missing previous block height %d before persisting height %d: %w", h-1, h, ErrBlockNotFound)
+			}
+			return fmt.Errorf("check previous block exists: %w", err)
+		}
+	}
+
 	// 1. UPSERT block
 	if err := a.upsertBlock(ctx, tx, blk, stateRoot); err != nil {
 		if a.auditLogger != nil {
@@ -485,6 +514,17 @@ func (a *adapter) PersistBlock(ctx context.Context, blk *block.AppBlock, receipt
 		return fmt.Errorf("upsert snapshot: %w", err)
 	}
 
+	// 4. Update durable last_committed checkpoint atomically with the block insert.
+	if err := a.upsertLastCommittedMeta(ctx, tx, blk.GetHeight(), blk.GetHash()); err != nil {
+		if a.auditLogger != nil {
+			_ = a.auditLogger.Error("consensus_metadata_persist_failed", map[string]interface{}{
+				"height": blk.GetHeight(),
+				"error":  err.Error(),
+			})
+		}
+		return fmt.Errorf("upsert consensus metadata: %w", err)
+	}
+
 	// Commit transaction
 	if err := tx.Commit(); err != nil {
 		if a.auditLogger != nil {
@@ -513,6 +553,29 @@ func (a *adapter) PersistBlock(ctx context.Context, blk *block.AppBlock, receipt
 			utils.ZapInt("tx_count", blk.GetTransactionCount()))
 	}
 
+	return nil
+}
+
+func (a *adapter) upsertLastCommittedMeta(ctx context.Context, tx *sql.Tx, height uint64, hash [32]byte) error {
+	if tx == nil {
+		return fmt.Errorf("%w: tx is nil", ErrInvalidData)
+	}
+	if height == 0 {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO consensus_metadata (key, height, block_hash, qc_cbor, updated_at)
+		VALUES ('last_committed', $1, $2, NULL, NOW())
+		ON CONFLICT (key) DO UPDATE
+		SET height = EXCLUDED.height,
+		    block_hash = EXCLUDED.block_hash,
+		    qc_cbor = NULL,
+		    updated_at = NOW()
+		WHERE consensus_metadata.height < EXCLUDED.height
+	`, height, hash[:])
+	if err != nil {
+		return fmt.Errorf("upsert last_committed metadata: %w", err)
+	}
 	return nil
 }
 
@@ -1019,6 +1082,93 @@ func (a *adapter) ListTransactionsByBlock(ctx context.Context, height uint64) ([
 		return nil, fmt.Errorf("iterate tx meta: %w", err)
 	}
 	return metas, nil
+}
+
+// GetTransactionsByBlock returns decoded transactions for a given block height.
+// Payloads are stored as JSONB (json.Marshal(stateTx)) and decoded based on tx_type.
+func (a *adapter) GetTransactionsByBlock(ctx context.Context, height uint64) ([]state.Transaction, error) {
+	stop := a.recordQuery("get_transactions_by_block")
+	defer stop()
+
+	rows, err := a.db.QueryContext(ctx, `
+		SELECT tx_type, payload
+		FROM transactions
+		WHERE block_height = $1
+		ORDER BY tx_index ASC
+	`, height)
+	if err != nil {
+		return nil, fmt.Errorf("query transactions: %w", err)
+	}
+	defer rows.Close()
+
+	var out []state.Transaction
+	for rows.Next() {
+		var txType string
+		var payload []byte
+		if err := rows.Scan(&txType, &payload); err != nil {
+			return nil, fmt.Errorf("scan transaction: %w", err)
+		}
+		if len(payload) == 0 {
+			return nil, fmt.Errorf("empty payload for height %d", height)
+		}
+
+		switch state.TxType(txType) {
+		case state.TxEvent:
+			var t state.EventTx
+			if err := json.Unmarshal(payload, &t); err != nil {
+				return nil, fmt.Errorf("decode event tx: %w", err)
+			}
+			out = append(out, &t)
+		case state.TxEvidence:
+			var t state.EvidenceTx
+			if err := json.Unmarshal(payload, &t); err != nil {
+				return nil, fmt.Errorf("decode evidence tx: %w", err)
+			}
+			out = append(out, &t)
+		case state.TxPolicy:
+			var t state.PolicyTx
+			if err := json.Unmarshal(payload, &t); err != nil {
+				return nil, fmt.Errorf("decode policy tx: %w", err)
+			}
+			out = append(out, &t)
+		default:
+			return nil, fmt.Errorf("unknown tx type %q at height %d", txType, height)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate transactions: %w", err)
+	}
+	return out, nil
+}
+
+// ListNonceEntriesUpToHeight returns committed nonce keys for all transactions up to height.
+// This can be used to restore nonce replay protection even if the blocks table is missing early heights.
+func (a *adapter) ListNonceEntriesUpToHeight(ctx context.Context, height uint64) ([]NonceEntry, error) {
+	stop := a.recordQuery("list_nonce_entries")
+	defer stop()
+
+	rows, err := a.db.QueryContext(ctx, `
+		SELECT producer_id, nonce, content_hash
+		FROM transactions
+		WHERE block_height <= $1
+	`, height)
+	if err != nil {
+		return nil, fmt.Errorf("query nonce entries: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]NonceEntry, 0)
+	for rows.Next() {
+		var e NonceEntry
+		if err := rows.Scan(&e.ProducerID, &e.Nonce, &e.ContentHash); err != nil {
+			return nil, fmt.Errorf("scan nonce entry: %w", err)
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate nonce entries: %w", err)
+	}
+	return out, nil
 }
 
 // Ping checks database liveness

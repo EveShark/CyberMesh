@@ -3,6 +3,7 @@ package wiring
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"backend/pkg/utils"
@@ -51,6 +52,29 @@ func (s *Service) tryPropose(ctx context.Context) {
 		blockTimeout = 5 * time.Second
 	}
 
+	// Avoid proposing immediately after a commit.
+	// Commits can happen in a tight burst at startup; giving a small cooldown reduces
+	// races where nodes propose/vote before state has applied the previous commit,
+	// which can surface as deterministic nonce replay at low heights.
+	commitCooldown := 200 * time.Millisecond
+	if s.cfg.BuildInterval > 0 && s.cfg.BuildInterval*2 > commitCooldown {
+		commitCooldown = s.cfg.BuildInterval * 2
+	}
+	s.mu.Lock()
+	lastCommit := s.lastCommitTime
+	s.mu.Unlock()
+	if !lastCommit.IsZero() {
+		if since := time.Since(lastCommit); since < commitCooldown {
+			s.log.DebugContext(ctx, "skipping proposal: commit cooldown",
+				utils.ZapDuration("since_last_commit", since),
+				utils.ZapDuration("cooldown", commitCooldown),
+				utils.ZapUint64("view", currentView),
+				utils.ZapUint64("height", currentHeight),
+			)
+			return
+		}
+	}
+
 	if !s.eng.IsConsensusActive() {
 		s.log.DebugContext(ctx, "skipping proposal: consensus not yet active",
 			utils.ZapUint64("view", currentView),
@@ -79,26 +103,12 @@ func (s *Service) tryPropose(ctx context.Context) {
 		utils.ZapDuration("block_timeout", blockTimeout),
 		utils.ZapTime("last_proposal_time", lastTime))
 
-	if lastView == currentView && !lastTime.IsZero() {
-		elapsed := time.Since(lastTime)
-		if elapsed < blockTimeout {
-			cooldown := blockTimeout - elapsed
-			if isLeader, err := s.eng.IsLeader(ctx); err == nil && isLeader {
-				s.log.DebugContext(ctx, "skipping proposal: leader cooldown active",
-					utils.ZapUint64("view", currentView),
-					utils.ZapUint64("height", currentHeight),
-					utils.ZapUint64("last_height", lastHeight),
-					utils.ZapDuration("cooldown_remaining", cooldown))
-			} else {
-				s.log.DebugContext(ctx, "skipping proposal: cooldown active",
-					utils.ZapUint64("view", currentView),
-					utils.ZapUint64("height", currentHeight),
-					utils.ZapUint64("last_height", lastHeight),
-					utils.ZapDuration("cooldown_remaining", cooldown),
-					utils.ZapBool("leader_status_unknown", err != nil))
-			}
-			return
-		}
+	if lastView == currentView {
+		s.log.DebugContext(ctx, "skipping proposal: already proposed in this view",
+			utils.ZapUint64("view", currentView),
+			utils.ZapUint64("height", currentHeight),
+			utils.ZapUint64("last_height", lastHeight))
+		return
 	}
 
 	s.log.InfoContext(ctx, "[PROPOSER] tryPropose called",
@@ -245,9 +255,14 @@ func (s *Service) tryPropose(ctx context.Context) {
 	if height == 0 {
 		height = s.eng.GetCurrentHeight()
 	}
+	// Parent must follow the HotStuff safe extension rule:
+	// build on the block certified by the highest QC (not necessarily the last committed block).
 	s.mu.Lock()
 	parent := s.lastParent
 	s.mu.Unlock()
+	if hqc := s.eng.GetHighestQC(); hqc != nil {
+		parent = hqc.GetBlockHash()
+	}
 
 	s.log.InfoContext(ctx, "[PROPOSER] building block",
 		utils.ZapUint64("height", height),
@@ -278,6 +293,14 @@ func (s *Service) tryPropose(ctx context.Context) {
 	backoff := 50 * time.Millisecond
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if err := s.eng.SubmitBlock(ctx, blk); err != nil {
+			if strings.Contains(err.Error(), "already voted in view") {
+				if vErr := s.eng.TriggerViewChange(ctx); vErr != nil {
+					s.log.WarnContext(ctx, "failed to trigger view change after already-voted error",
+						utils.ZapError(vErr),
+						utils.ZapUint64("view", currentView))
+				}
+				return
+			}
 			if attempt < maxRetries-1 {
 				s.log.WarnContext(ctx, "[PROPOSER] submit block failed, retrying",
 					utils.ZapError(err),
