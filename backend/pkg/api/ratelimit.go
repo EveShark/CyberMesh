@@ -31,9 +31,9 @@ type tokenBucket struct {
 
 // NewRateLimiter creates a new rate limiter
 func NewRateLimiter(config RateLimiterConfig) *RateLimiter {
-    if config.Burst <= 0 {
-        config.Burst = config.RequestsPerMinute
-    }
+	if config.Burst <= 0 {
+		config.Burst = config.RequestsPerMinute
+	}
 
 	return &RateLimiter{
 		config:  config,

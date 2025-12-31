@@ -365,8 +365,14 @@ func (a *adapter) prepareStatements(ctx context.Context) error {
 	}
 
 	a.stmtUpsertMeta, err = a.db.PrepareContext(ctx, `
-		UPSERT INTO consensus_metadata (key, height, block_hash, qc_cbor, updated_at)
+		INSERT INTO consensus_metadata (key, height, block_hash, qc_cbor, updated_at)
 		VALUES ('last_committed', $1, $2, $3, NOW())
+		ON CONFLICT (key) DO UPDATE
+		SET height = excluded.height,
+		    block_hash = excluded.block_hash,
+		    qc_cbor = excluded.qc_cbor,
+		    updated_at = excluded.updated_at
+		WHERE excluded.height >= consensus_metadata.height
 	`)
 	if err != nil {
 		return fmt.Errorf("prepare upsert metadata: %w", err)

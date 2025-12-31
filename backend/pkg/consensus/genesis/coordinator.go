@@ -213,7 +213,10 @@ func (c *Coordinator) initialize(ctx context.Context) error {
 		var err error
 		restored, err = c.restoreFromDatabase(ctx)
 		if err != nil {
-			return fmt.Errorf("restore genesis state from database: %w", err)
+			// Persisted state should never prevent the node from starting; log and fall back to fresh ceremony.
+			if c.logger != nil {
+				c.logger.WarnContext(ctx, "failed to restore genesis state from database; starting fresh ceremony", "error", err)
+			}
 		}
 		if restored {
 			return nil
@@ -222,7 +225,10 @@ func (c *Coordinator) initialize(ctx context.Context) error {
 
 	restored, err = c.restoreFromDisk(ctx)
 	if err != nil {
-		return fmt.Errorf("restore genesis state from disk: %w", err)
+		// Disk state corruption should not block startup; log and continue.
+		if c.logger != nil {
+			c.logger.WarnContext(ctx, "failed to restore genesis state from disk; starting fresh ceremony", "error", err)
+		}
 	}
 	if restored {
 		return nil

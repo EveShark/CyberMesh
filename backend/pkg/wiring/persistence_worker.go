@@ -257,6 +257,26 @@ func (pw *PersistenceWorker) processTask(ctx context.Context, task *PersistenceT
 		if err == nil {
 			// Success - persistence completed
 			bh := task.Block.GetHash()
+
+			// Update consensus restart metadata only after durable block persistence.
+			// This prevents consensus_metadata from advancing ahead of the blocks table.
+			metaCtx, metaCancel := context.WithTimeout(ctx, 5*time.Second)
+			if merr := pw.adapter.SaveCommittedBlock(metaCtx, task.Block.GetHeight(), bh[:], nil); merr != nil {
+				if pw.logger != nil {
+					pw.logger.WarnContext(ctx, "failed to update consensus metadata after persistence",
+						utils.ZapError(merr),
+						utils.ZapUint64("height", task.Block.GetHeight()))
+				}
+				if pw.auditLogger != nil {
+					_ = pw.auditLogger.Warn("consensus_metadata_update_failed", map[string]interface{}{
+						"height": task.Block.GetHeight(),
+						"hash":   fmt.Sprintf("%x", bh[:8]),
+						"error":  merr.Error(),
+					})
+				}
+			}
+			metaCancel()
+
 			if pw.onSuccess != nil || pw.auditLogger != nil || pw.logger != nil {
 				go func() {
 					defer func() {

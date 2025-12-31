@@ -683,37 +683,53 @@ func (hs *HotStuff) checkCommitRule(ctx context.Context, qc types.QC) error {
 		return nil
 	}
 
-	// Check if this QC and previous QC form a 2-chain
-	hs.logger.InfoContext(ctx, "checking 2-chain consecutive views",
-		"current_qc_view", qc.GetView(),
-		"locked_qc_view", hs.lockedQC.GetView(),
-		"consecutive", qc.GetView() == hs.lockedQC.GetView()+1)
-	if qc.GetView() == hs.lockedQC.GetView()+1 {
-		// Consecutive views - commit the block from lockedQC
-		hs.logger.InfoContext(ctx, "2-chain rule satisfied - committing lockedQC block",
-			"commit_height", hs.lockedQC.GetHeight())
-		proposal := hs.storage.GetProposal(hs.lockedQC.GetBlockHash())
-		if proposal == nil {
-			hs.logger.ErrorContext(ctx, "cannot find proposal for committed block")
-			return fmt.Errorf("cannot find proposal for committed block")
-		}
-		if proposal.Block == nil {
-			hash := hs.lockedQC.GetBlockHash()
-			hs.logger.ErrorContext(ctx, "proposal missing block payload",
-				"view", hs.lockedQC.GetView(),
-				"height", hs.lockedQC.GetHeight(),
-				"block_hash", fmt.Sprintf("%x", hash[:8]))
-			return fmt.Errorf("proposal missing block payload for committed block")
-		}
+	// Check if this QC extends the lockedQC block via parent linkage.
+	// Views can advance with timeouts; use the proposal's ParentHash chain rather than strict view adjacency.
+	qcHash := qc.GetBlockHash()
+	currentProposal := hs.storage.GetProposal(qcHash)
+	if currentProposal == nil {
+		hs.logger.WarnContext(ctx, "cannot evaluate commit rule: missing proposal for qc block",
+			"qc_view", qc.GetView(),
+			"qc_height", qc.GetHeight(),
+			"block_hash", fmt.Sprintf("%x", qcHash[:8]))
+	} else {
+		lockedHash := hs.lockedQC.GetBlockHash()
+		consecutiveHeight := qc.GetHeight() == hs.lockedQC.GetHeight()+1
+		parentMatches := currentProposal.ParentHash == lockedHash
+		hs.logger.InfoContext(ctx, "checking 2-chain by parent linkage",
+			"qc_height", qc.GetHeight(),
+			"locked_height", hs.lockedQC.GetHeight(),
+			"consecutive_height", consecutiveHeight,
+			"parent_matches_locked", parentMatches)
 
-		return hs.commitBlock(ctx, proposal.Block, hs.lockedQC)
+		if consecutiveHeight && parentMatches {
+			// Commit the block from lockedQC (parent of current QC's block)
+			hs.logger.InfoContext(ctx, "2-chain rule satisfied - committing lockedQC block",
+				"commit_height", hs.lockedQC.GetHeight())
+			proposal := hs.storage.GetProposal(lockedHash)
+			if proposal == nil {
+				hs.logger.ErrorContext(ctx, "cannot find proposal for committed block")
+				return fmt.Errorf("cannot find proposal for committed block")
+			}
+			if proposal.Block == nil {
+				hs.logger.ErrorContext(ctx, "proposal missing block payload",
+					"view", hs.lockedQC.GetView(),
+					"height", hs.lockedQC.GetHeight(),
+					"block_hash", fmt.Sprintf("%x", lockedHash[:8]))
+				return fmt.Errorf("proposal missing block payload for committed block")
+			}
+
+			return hs.commitBlock(ctx, proposal.Block, hs.lockedQC)
+		}
 	}
 
-	// Update lockedQC if newer
+	// Update lockedQC if newer (prefer height monotonicity; break ties by view).
 	hs.logger.InfoContext(ctx, "2-chain not satisfied - updating lockedQC",
+		"old_locked_height", hs.lockedQC.GetHeight(),
+		"new_qc_height", qc.GetHeight(),
 		"old_locked_view", hs.lockedQC.GetView(),
 		"new_qc_view", qc.GetView())
-	if qc.GetView() > hs.lockedQC.GetView() {
+	if qc.GetHeight() > hs.lockedQC.GetHeight() || (qc.GetHeight() == hs.lockedQC.GetHeight() && qc.GetView() > hs.lockedQC.GetView()) {
 		hs.lockedQC = qc
 	}
 

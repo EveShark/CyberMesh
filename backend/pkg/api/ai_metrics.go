@@ -350,31 +350,62 @@ func mapAiVariantMetrics(payload []aiDetectionVariantEntry) []AiVariantMetric {
 	return variants
 }
 
-func mapAIDetectionLoopCounters(metrics map[string]float64) *AiDetectionLoopCounters {
+func mapAIDetectionLoopCounters(metrics map[string]interface{}) *AiDetectionLoopCounters {
 	if len(metrics) == 0 {
+		return nil
+	}
+
+	// Normalize to float64 counters where possible; ignore non-numeric values.
+	numeric := make(map[string]float64, len(metrics))
+	for k, v := range metrics {
+		if v == nil {
+			continue
+		}
+		switch t := v.(type) {
+		case float64:
+			numeric[k] = t
+		case float32:
+			numeric[k] = float64(t)
+		case int:
+			numeric[k] = float64(t)
+		case int32:
+			numeric[k] = float64(t)
+		case int64:
+			numeric[k] = float64(t)
+		case uint:
+			numeric[k] = float64(t)
+		case uint32:
+			numeric[k] = float64(t)
+		case uint64:
+			numeric[k] = float64(t)
+		default:
+			continue
+		}
+	}
+	if len(numeric) == 0 {
 		return nil
 	}
 
 	var counters AiDetectionLoopCounters
 	found := false
 
-	if value, ok := extractUintCounter(metrics, "detections_total"); ok {
+	if value, ok := extractUintCounter(numeric, "detections_total"); ok {
 		counters.DetectionsTotal = value
 		found = true
 	}
-	if value, ok := extractUintCounter(metrics, "detections_published"); ok {
+	if value, ok := extractUintCounter(numeric, "detections_published"); ok {
 		counters.DetectionsPublished = value
 		found = true
 	}
-	if value, ok := extractUintCounter(metrics, "detections_rate_limited"); ok {
+	if value, ok := extractUintCounter(numeric, "detections_rate_limited"); ok {
 		counters.DetectionsRateLimited = value
 		found = true
 	}
-	if value, ok := extractUintCounter(metrics, "errors"); ok {
+	if value, ok := extractUintCounter(numeric, "errors"); ok {
 		counters.Errors = value
 		found = true
 	}
-	if value, ok := extractUintCounter(metrics, "loop_iterations"); ok {
+	if value, ok := extractUintCounter(numeric, "loop_iterations"); ok {
 		counters.LoopIterations = value
 		found = true
 	}

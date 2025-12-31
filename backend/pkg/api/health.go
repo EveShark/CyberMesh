@@ -76,7 +76,13 @@ func (s *Server) buildReadinessResponse(ctx context.Context) (ReadinessResponse,
 	checks := make(map[string]ReadinessCheckResult)
 	details := make(map[string]interface{})
 	phase := ""
-	allReady := true
+	// Readiness policy:
+	// - In strict mode, any failing check blocks readiness.
+	// - In degraded bootstrap mode, only core control-plane checks block readiness;
+	//   auxiliary dependencies (Kafka/Redis/AI) are reported but do not block.
+	allowDegraded := s.config != nil && s.config.AllowDegradedBootstrap
+	strict := !allowDegraded
+	ready := true
 	warnings := make([]string, 0, 4)
 
 	mergeDetail := func(key string, val interface{}) {
@@ -94,10 +100,10 @@ func (s *Server) buildReadinessResponse(ctx context.Context) (ReadinessResponse,
 		details[key] = val
 	}
 
-	mark := func(name string, res ReadinessCheckResult, detailKey string, detailVal interface{}) {
+	mark := func(name string, res ReadinessCheckResult, detailKey string, detailVal interface{}, required bool) {
 		checks[name] = res
-		if !isReadinessPassing(res.Status) {
-			allReady = false
+		if required && !isReadinessPassing(res.Status) {
+			ready = false
 		}
 		switch res.Status {
 		case "genesis", "single_node", "degraded", "warning":
@@ -120,7 +126,7 @@ func (s *Server) buildReadinessResponse(ctx context.Context) (ReadinessResponse,
 	}
 
 	storageResult, storageDetail := s.runStorageCheck(ctx)
-	mark("storage", storageResult, "storage_error", nil)
+	mark("storage", storageResult, "storage_error", nil, true)
 	checks["cockroach"] = storageResult
 	if storageDetail != nil {
 		details["storage"] = storageDetail
@@ -131,15 +137,15 @@ func (s *Server) buildReadinessResponse(ctx context.Context) (ReadinessResponse,
 	}
 
 	stateResult, stateDetail := s.runStateStoreCheck(ctx)
-	mark("state", stateResult, "state_error", stateDetail)
+	mark("state", stateResult, "state_error", stateDetail, true)
 	if stateResult.Status == "ok" && s.stateStore != nil {
 		details["state_version"] = s.stateStore.Latest()
 	}
 
-	mark("mempool", s.runMempoolCheck(ctx), "", nil)
+	mark("mempool", s.runMempoolCheck(ctx), "", nil, true)
 
 	consensusResult, consensusDetails, consensusPhase := s.runConsensusCheck(ctx)
-	mark("consensus", consensusResult, "", consensusDetails)
+	mark("consensus", consensusResult, "", consensusDetails, true)
 	if consensusResult.Message != "" {
 		details["consensus_error"] = consensusResult.Message
 	}
@@ -148,22 +154,22 @@ func (s *Server) buildReadinessResponse(ctx context.Context) (ReadinessResponse,
 	}
 
 	p2pResult, p2pDetails := s.runP2PCheck(ctx)
-	mark("p2p_quorum", p2pResult, "", p2pDetails)
+	mark("p2p_quorum", p2pResult, "", p2pDetails, true)
 	if p2pResult.Message != "" {
 		details["p2p_quorum_error"] = p2pResult.Message
 	}
 
 	kafkaResult := s.runKafkaCheck(ctx)
-	mark("kafka", kafkaResult, "kafka_error", nil)
+	mark("kafka", kafkaResult, "kafka_error", nil, strict)
 
 	redisResult, redisDetail := s.runRedisCheck(ctx)
-	mark("redis", redisResult, "redis_error", nil)
+	mark("redis", redisResult, "redis_error", nil, strict)
 	if redisDetail != nil {
 		details["redis"] = redisDetail
 	}
 
 	aiResult := s.runAIServiceCheck(ctx)
-	mark("ai_service", aiResult, "ai_error", nil)
+	mark("ai_service", aiResult, "ai_error", nil, strict)
 
 	if phase == "" && s.engine != nil {
 		if s.engine.IsConsensusActive() {
@@ -174,7 +180,7 @@ func (s *Server) buildReadinessResponse(ctx context.Context) (ReadinessResponse,
 	}
 
 	response := ReadinessResponse{
-		Ready:     allReady,
+		Ready:     ready,
 		Checks:    checks,
 		Timestamp: time.Now().Unix(),
 		Details:   details,
@@ -182,7 +188,7 @@ func (s *Server) buildReadinessResponse(ctx context.Context) (ReadinessResponse,
 	}
 
 	statusCode := http.StatusOK
-	if !allReady {
+	if !ready {
 		statusCode = http.StatusServiceUnavailable
 	}
 

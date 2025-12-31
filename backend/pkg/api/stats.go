@@ -45,18 +45,20 @@ type aiDetectionStatsPayload struct {
 	State         string `json:"state"`
 	Message       string `json:"message"`
 	DetectionLoop *struct {
-		Running                   bool               `json:"running"`
-		Status                    string             `json:"status"`
-		Message                   string             `json:"message"`
-		Issues                    []string           `json:"issues"`
-		Blocking                  bool               `json:"blocking"`
-		Healthy                   bool               `json:"healthy"`
-		AvgLatencyMs              float64            `json:"avg_latency_ms"`
-		LastLatencyMs             float64            `json:"last_latency_ms"`
-		SecondsSinceLastDetection *float64           `json:"seconds_since_last_detection"`
-		SecondsSinceLastIteration *float64           `json:"seconds_since_last_iteration"`
-		CacheAgeSeconds           *float64           `json:"cache_age_seconds"`
-		Metrics                   map[string]float64 `json:"metrics"`
+		Running                   bool     `json:"running"`
+		Status                    string   `json:"status"`
+		Message                   string   `json:"message"`
+		Issues                    []string `json:"issues"`
+		Blocking                  bool     `json:"blocking"`
+		Healthy                   bool     `json:"healthy"`
+		AvgLatencyMs              float64  `json:"avg_latency_ms"`
+		LastLatencyMs             float64  `json:"last_latency_ms"`
+		SecondsSinceLastDetection *float64 `json:"seconds_since_last_detection"`
+		SecondsSinceLastIteration *float64 `json:"seconds_since_last_iteration"`
+		CacheAgeSeconds           *float64 `json:"cache_age_seconds"`
+		// Metrics is intentionally schema-tolerant to avoid readiness failures
+		// when the AI service evolves its detection_loop.metrics payload.
+		Metrics map[string]interface{} `json:"metrics"`
 	} `json:"detection_loop"`
 	Derived *struct {
 		DetectionsPerMinute  *float64 `json:"detections_per_minute"`

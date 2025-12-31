@@ -217,6 +217,16 @@ func (s *Storage) restoreReplayWindow(ctx context.Context) error {
 		return err
 	}
 
+	// If consensus_metadata did not include a QC payload, try to derive the lastQC from the
+	// persisted replay window using the committed block hash.
+	if s.lastQC == nil && s.lastCommitted > 0 {
+		if committedHash, ok := s.committedBlocks[s.lastCommitted]; ok {
+			if qc, exists := s.qcs[committedHash]; exists && qc != nil {
+				s.lastQC = qc
+			}
+		}
+	}
+
 	s.logger.InfoContext(ctx, "replay window restored",
 		"min_height", minHeight,
 		"proposal_count", len(s.proposals),
@@ -569,30 +579,6 @@ func (s *Storage) CommitBlock(hash BlockHash, height uint64) error {
 	// Store committed block
 	s.committedBlocks[height] = hash
 
-	// Persist if enabled
-	if s.config.EnablePersistence && s.backend != nil {
-		ctxPersist := context.Background()
-		var qcData []byte
-		if qc, exists := s.qcs[hash]; exists && qc != nil {
-			encoded, err := s.encodeQC(qc)
-			if err != nil {
-				s.logger.WarnContext(ctxPersist, "commit block: failed to encode qc", "error", err)
-			} else {
-				qcData = encoded
-			}
-		} else if s.lastQC != nil {
-			encoded, err := s.encodeQC(s.lastQC)
-			if err != nil {
-				s.logger.WarnContext(ctxPersist, "commit block: failed to encode last qc", "error", err)
-			} else {
-				qcData = encoded
-			}
-		}
-		if err := s.backend.SaveCommittedBlock(s.backgroundCtx, height, hash[:], qcData); err != nil {
-			return fmt.Errorf("failed to persist committed block: %w", err)
-		}
-	}
-
 	s.audit.Info("block_committed_storage", map[string]interface{}{
 		"height": height,
 		"hash":   fmt.Sprintf("%x", hash[:]),
@@ -838,23 +824,9 @@ func (s *Storage) persistState(ctx context.Context) {
 		return
 	}
 
-	// Persist last committed state
-	var qcData []byte
-	var blockHash BlockHash
-	if s.lastQC != nil {
-		encoded, err := s.encodeQC(s.lastQC)
-		if err != nil {
-			s.logger.WarnContext(ctx, "persist state: failed to encode qc", "error", err)
-		} else {
-			qcData = encoded
-		}
-		blockHash = s.lastQC.GetBlockHash()
-	} else if hash, exists := s.committedBlocks[s.lastCommitted]; exists {
-		blockHash = hash
-	}
-	if err := s.backend.SaveCommittedBlock(ctx, s.lastCommitted, blockHash[:], qcData); err != nil {
-		s.logger.ErrorContext(ctx, "failed to persist state", "error", err)
-	}
+	// Intentionally do not persist consensus_metadata here.
+	// consensus_metadata is updated after durable block persistence (e.g., DB transaction) to avoid
+	// advancing metadata ahead of blocks/state and causing restart drift.
 }
 
 // GetStats returns storage statistics

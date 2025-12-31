@@ -171,7 +171,7 @@ type EngineMetrics struct {
 	BlocksCommitted       uint64
 	ViewChanges           uint64
 	EquivocationsDetected uint64
-    ParentHashMismatches  uint64
+	ParentHashMismatches  uint64
 	LastCommitTime        time.Time
 	AverageCommitLatency  time.Duration
 
@@ -1224,10 +1224,10 @@ func (e *ConsensusEngine) GetMetrics() MetricsSnapshot {
 
 // RecordParentHashMismatch increments the metric tracking parent-hash validation mismatches.
 func (e *ConsensusEngine) RecordParentHashMismatch() {
-    if e == nil || e.metrics == nil {
-        return
-    }
-    e.metrics.incrementParentHashMismatches()
+	if e == nil || e.metrics == nil {
+		return
+	}
+	e.metrics.incrementParentHashMismatches()
 }
 
 // GetGenesisReadyMetrics returns aggregated genesis readiness telemetry counters.
@@ -2039,9 +2039,9 @@ func (m *EngineMetrics) incrementViewChanges() {
 }
 
 func (m *EngineMetrics) incrementParentHashMismatches() {
-    m.mu.Lock()
-    defer m.mu.Unlock()
-    m.ParentHashMismatches++
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ParentHashMismatches++
 }
 
 func (m *EngineMetrics) updateLastCommitTime() {
@@ -2063,7 +2063,7 @@ func (m *EngineMetrics) snapshot() MetricsSnapshot {
 		BlocksCommitted:       m.BlocksCommitted,
 		ViewChanges:           m.ViewChanges,
 		EquivocationsDetected: m.EquivocationsDetected,
-        ParentHashMismatches:  m.ParentHashMismatches,
+		ParentHashMismatches:  m.ParentHashMismatches,
 		LastCommitTime:        m.LastCommitTime,
 	}
 }
@@ -2091,7 +2091,7 @@ type MetricsSnapshot struct {
 	BlocksCommitted       uint64
 	ViewChanges           uint64
 	EquivocationsDetected uint64
-    ParentHashMismatches  uint64
+	ParentHashMismatches  uint64
 	LastCommitTime        time.Time
 }
 

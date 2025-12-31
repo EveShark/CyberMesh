@@ -63,6 +63,11 @@ type APIConfig struct {
 	// Environment
 	Environment string // "development", "staging", "production"
 
+	// Readiness policy
+	// If true, /ready will only hard-gate on core control-plane dependencies and
+	// report auxiliary dependencies (Kafka/Redis/AI) as degraded without blocking.
+	AllowDegradedBootstrap bool
+
 	// AI service integration
 	AIServiceBaseURL string
 	AIServiceTimeout time.Duration
@@ -120,16 +125,17 @@ func DefaultAPIConfig() *APIConfig {
 			"state_",
 			"mempool_",
 		},
-		MetricsCompress:     true,
-		MaxRequestSize:      1024 * 1024, // 1MB
-		MaxHeaderSize:       1024 * 1024, // 1MB
-		MaxConcurrentReqs:   100,
-		RequestTimeout:      30 * time.Second,
-		DashboardBlockLimit: 50,
-		DashboardCacheTTL:   3 * time.Second,
-		Environment:         "production",
-		AIServiceTimeout:    2 * time.Second,
-		AllowedRoles:        defaultRoleMapping(),
+		MetricsCompress:        true,
+		MaxRequestSize:         1024 * 1024, // 1MB
+		MaxHeaderSize:          1024 * 1024, // 1MB
+		MaxConcurrentReqs:      100,
+		RequestTimeout:         30 * time.Second,
+		DashboardBlockLimit:    50,
+		DashboardCacheTTL:      3 * time.Second,
+		Environment:            "production",
+		AllowDegradedBootstrap: false,
+		AIServiceTimeout:       2 * time.Second,
+		AllowedRoles:           defaultRoleMapping(),
 	}
 }
 
@@ -238,6 +244,14 @@ func LoadAPIConfig(cm *utils.ConfigManager) (*APIConfig, error) {
 	// Environment
 	if env := cm.GetString("ENVIRONMENT", ""); env != "" {
 		cfg.Environment = env
+	}
+
+	// Readiness policy
+	// Only allow degraded bootstrap outside production.
+	if strings.EqualFold(cfg.Environment, "production") {
+		cfg.AllowDegradedBootstrap = false
+	} else {
+		cfg.AllowDegradedBootstrap = cm.GetBool("ALLOW_DEGRADED_BOOTSTRAP", false)
 	}
 
 	// AI service integration
