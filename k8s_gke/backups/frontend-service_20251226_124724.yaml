@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: cybermesh
+  labels:
+    app: frontend
+    component: web
+  annotations:
+    # GKE Load Balancer with Cloud Armor
+    cloud.google.com/neg: '{"ingress": true}'
+    cloud.google.com/backend-config: '{"default": "frontend-security-policy"}'
+spec:
+  type: LoadBalancer
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 3600
+  selector:
+    app: frontend
+    component: web
+  ports:
+  - name: http
+    port: 80
+    targetPort: 3000
+    protocol: TCP

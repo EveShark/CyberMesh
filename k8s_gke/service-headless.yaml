@@ -15,7 +15,7 @@ spec:
     component: validator
   ports:
   - name: api
-    port: 9441
+    port: 443
     targetPort: api
     protocol: TCP
   - name: p2p

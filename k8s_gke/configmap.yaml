@@ -13,8 +13,8 @@ data:
   REGION: "gke"
   BLOCKCHAIN_NETWORK_ID: "cybermesh-dev"
 
-  # Cluster Topology - All 5 Nodes
-  CLUSTER_TOPOLOGY: "control:1,gateway:1,storage:1,observer:1,ingest:1"
+  # Cluster Topology - All 5 Nodes (flat validator design)
+  CLUSTER_TOPOLOGY: "validator:5"
   CONSENSUS_NODES: "1,2,3,4,5"
   TRUSTED_NODES: "1,2,3,4,5"
   QUORUM_SIZE: "3"
@@ -45,8 +45,15 @@ data:
   DISCOVERY_INTERVAL: "30s"
   DYNAMIC_PEER_DISCOVERY: "true"
 
-  # Database Connection (CockroachDB Cloud)
-  DB_DSN: "postgresql://milena:MA6A3sKboADGU7YZcPv9Gg@cybermesh-threats-10433.jxf.gcp-asia-southeast1.cockroachlabs.cloud:26257/defaultdb?sslmode=verify-full"
+  # Frontend Runtime Configuration
+  # These are served via /api/v1/frontend-config endpoint
+  VITE_SUPABASE_URL: "https://wcgddjipyslnjstabqaq.supabase.co"
+  VITE_SUPABASE_PROJECT_ID: "wcgddjipyslnjstabqaq"
+  VITE_SUPABASE_PUBLISHABLE_KEY: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndjZ2RkamlweXNsbmpzdGFicWFxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjQyODUyMDAsImV4cCI6MjA3OTg2MTIwMH0.F2Bj_QxFfLiStMLeiuPYBFnom331ho8h_alSAtdi25A"
+  VITE_DEMO_MODE: "false"
+
+  # Database Connection (CockroachDB Cloud - GCP US-Central1)
+  # REMOVED FOR SECURITY - Use Secret instead
   DB_MAX_OPEN: "50"
   DB_MAX_IDLE: "10"
   DB_MAX_LIFETIME: "30m"
@@ -59,6 +66,10 @@ data:
 
   # Genesis persistence path (PVC mounted at /app/data)
   GENESIS_STATE_PATH: "/app/data/genesis_state.json"
+
+  # Genesis certificate single source of truth
+  GENESIS_STATE_MODE: "db_only"
+  GENESIS_DB_REQUIRED: "true"
   
   # Genesis Bootstrap - All validators participate in genesis ceremony
   VALIDATOR_1_BOOTSTRAP_ACTIVE: "true"
@@ -75,10 +86,10 @@ data:
   PERSIST_WORKERS: "1"
   PERSIST_SHUTDOWN_TIMEOUT: "30s"
 
-  # Kafka (Confluent Cloud)
+  # Kafka (Confluent Cloud - GCP US-Central1)
   ENABLE_KAFKA: "true"
-  KAFKA_BOOTSTRAP_SERVERS: "pkc-ldvr1.asia-southeast1.gcp.confluent.cloud:9092"
-  KAFKA_BROKERS: "pkc-ldvr1.asia-southeast1.gcp.confluent.cloud:9092"
+  KAFKA_BOOTSTRAP_SERVERS: "pkc-n3603.us-central1.gcp.confluent.cloud:9092"
+  KAFKA_BROKERS: "pkc-n3603.us-central1.gcp.confluent.cloud:9092"
   KAFKA_TLS_ENABLED: "true"
   KAFKA_SASL_MECHANISM: "PLAIN"
 
@@ -110,39 +121,40 @@ data:
   KAFKA_PRODUCER_LINGER_MS: "10"
   KAFKA_PRODUCER_BUFFER_MEMORY: "33554432"
   KAFKA_CONSUMER_GROUP_ID: "cybermesh-consensus"
-  KAFKA_CONSUMER_AUTO_OFFSET_RESET: "earliest"
+  KAFKA_CONSUMER_AUTO_OFFSET_RESET: "latest"
   KAFKA_CONSUMER_MAX_POLL_RECORDS: "500"
+  KAFKA_CONSUMER_OFFSET_INITIAL: "latest"
   KAFKA_CONSUMER_SESSION_TIMEOUT: "30s"
   KAFKA_CONSUMER_HEARTBEAT_INTERVAL: "3s"
 
   # API Server
   API_BASE_PATH: "/api/v1"
-  API_TLS_ENABLED: "false"
-  API_TLS_CERT_FILE: "./certs/api-server.crt"
-  API_TLS_KEY_FILE: "./certs/api-server.key"
-  API_TLS_CLIENT_CA_FILE: "./certs/client-ca.crt"
+  API_TLS_ENABLED: "true"
+  API_TLS_CERT_FILE: "/app/tls/tls.crt"
+  API_TLS_KEY_FILE: "/app/tls/tls.key"
+  API_TLS_CLIENT_CA_FILE: ""
   API_RATE_LIMIT_ENABLED: "true"
   API_RATE_LIMIT_REQUESTS: "100"
   API_RATE_LIMIT_WINDOW: "1m"
   API_CORS_ENABLED: "true"
   API_CORS_ALLOWED_ORIGINS: "*"
   API_REQUEST_TIMEOUT: "30s"
-  DASHBOARD_CACHE_TTL: "3s"
+  DASHBOARD_CACHE_TTL: "15s"
   AI_SERVICE_API_BASE: "http://ai-service.cybermesh.svc.cluster.local:8080"
   AI_SERVICE_API_TIMEOUT: "2s"
 
   # Mempool (consolidated - duplicates removed)
   MEMPOOL_MAX_TXS: "1000"
   MEMPOOL_MAX_BYTES: "20971520"
-  MEMPOOL_NONCE_TTL: "15m"
+  MEMPOOL_NONCE_TTL: "2h"
   MEMPOOL_SKEW_TOLERANCE: "5m"
-  MEMPOOL_RATE_PER_SECOND: "100"
+  MEMPOOL_RATE_PER_SECOND: "10"
 
   # Consensus
   CONSENSUS_TIMEOUT: "2s"
-  CONSENSUS_BLOCK_TIME: "5s"
-  CONSENSUS_MAX_BLOCK_SIZE: "1048576"
-  CONSENSUS_MAX_TXS_PER_BLOCK: "1000"
+  CONSENSUS_BLOCK_TIME: "15s"
+  CONSENSUS_MAX_BLOCK_SIZE: "524288"
+  CONSENSUS_MAX_TXS_PER_BLOCK: "20"
   VIEW_CHANGE_TIMEOUT: "10s"
 
   # Security Mode
@@ -164,8 +176,8 @@ data:
   METRICS_PORT: "9100"
 
   # TLS Paths
-  TLS_CERT_PATH: "certs/server.crt"
-  TLS_KEY_PATH: "certs/server.key"
+  TLS_CERT_PATH: "/app/tls/server.crt"
+  TLS_KEY_PATH: "/app/tls/server.key"
   MTLS_ENABLED: "false"
 
   # Crypto
@@ -181,7 +193,7 @@ data:
   AI_DOMAIN_SEPARATION: "ai.v1"
 
   # Redis (Upstash Cloud)
-  REDIS_HOST: "merry-satyr-14777.upstash.io"
+  REDIS_HOST: ""
   REDIS_PORT: "6379"
   REDIS_DB: "0"
   REDIS_TLS_ENABLED: "true"
@@ -192,11 +204,12 @@ data:
 
   # Consensus Algorithm
   CONSENSUS_ALGORITHM: "pbft"
-  CONSENSUS_BASE_TIMEOUT: "2s"
+  # INCREASED: 2s->10s, 30s->60s to fix view desync (proposals arriving after view change)
+  CONSENSUS_BASE_TIMEOUT: "10s"
   CONSENSUS_MIN_TIMEOUT: "1s"
   CONSENSUS_MAX_TIMEOUT: "60s"
   CONSENSUS_BLOCK_TIMEOUT: "5s"
-  CONSENSUS_VIEWCHANGE_TIMEOUT: "30s"
+  CONSENSUS_VIEWCHANGE_TIMEOUT: "60s"
   CONSENSUS_VOTE_TIMEOUT: "5s"
 
   # Consensus Features
@@ -207,11 +220,15 @@ data:
   ADAPTIVE_TIMEOUT_ENABLED: "true"
 
   # Consensus Safety
-  CONSENSUS_REQUIRE_QUORUM: "true"
-  CONSENSUS_REQUIRE_JUSTIFY_QC: "true"
+  # TEMPORARY: Disabled quorum requirement to break genesis deadlock
+  # TODO: Re-enable after consensus stabilizes
+  CONSENSUS_REQUIRE_QUORUM: "false"
+  CONSENSUS_REQUIRE_JUSTIFY_QC: "false"
   CONSENSUS_STRICT_MONOTONICITY: "true"
   CONSENSUS_ALLOW_SELF_VOTING: "true"
   CONSENSUS_REQUIRE_UNIQUE_VOTERS: "true"
+  CONSENSUS_REQUIRE_QUORUM: "true"
+  CONSENSUS_REQUIRE_JUSTIFY_QC: "true"
   CONSENSUS_STRICT_VALIDATION: "true"
   CONSENSUS_REJECT_FUTURE_MESSAGES: "true"
 
@@ -221,28 +238,28 @@ data:
   NODE_REPUTATION_MIN_SCORE: "0.6"
   NODE_REPUTATION_DECAY_RATE: "0.01"
 
-  # Heartbeat
-  HEARTBEAT_INTERVAL: "500ms"
-  CONSENSUS_HEARTBEAT_INTERVAL: "500ms"
-  CONSENSUS_MAX_IDLE_TIME: "3s"
+  # Heartbeat (reduced for development - less load)
+  HEARTBEAT_INTERVAL: "3s"
+  CONSENSUS_HEARTBEAT_INTERVAL: "3s"
+  CONSENSUS_MAX_IDLE_TIME: "15s"
   CONSENSUS_MISSED_HEARTBEATS: "6"
 
   # State Management
-  STATE_TIMESTAMP_SKEW: "30s"
+  STATE_TIMESTAMP_SKEW: "2h"
 
   # Mempool Limits (already defined above)
 
-  # Blockchain
-  BLOCK_TIME: "5s"
+  # Blockchain (development timing)
+  BLOCK_TIME: "15s"
   MAX_BLOCK_SIZE: "1048576"
   GAS_LIMIT: "10000000"
   CHAIN_DATA_PATH: "./data/chain"
 
-  # Block Building
-  BLOCK_MAX_TXS: "200"
-  BLOCK_MAX_BYTES: "4194304"
+  # Block Building (reduced for development - prevent OOM)
+  BLOCK_MAX_TXS: "20"
+  BLOCK_MAX_BYTES: "524288"
   BLOCK_MIN_MEMPOOL_TXS: "1"
-  BLOCK_BUILD_INTERVAL: "500ms"
+  BLOCK_BUILD_INTERVAL: "10s"
 
   # API Settings
   ENABLE_API: "true"
@@ -392,4 +409,6 @@ data:
   P2P_ALLOW_LOCAL_DISCOVERY: "true"
 
   # Development
-  ALLOW_DEGRADED_BOOTSTRAP: "false"
+  ALLOW_DEGRADED_BOOTSTRAP: "true"
+
+

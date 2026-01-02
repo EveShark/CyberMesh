@@ -1,0 +1,55 @@
+# Cloud Armor Security Policy BackendConfig
+# Applies to GKE LoadBalancer services for WAF protection
+# Must create the Cloud Armor policy first in GCP Console or via gcloud
+
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: cybermesh-security-policy
+  namespace: cybermesh
+spec:
+  # Cloud Armor WAF policy (create this in GCP first)
+  securityPolicy:
+    name: "cybermesh-waf-policy"
+  
+  # Connection draining for graceful shutdown
+  connectionDraining:
+    drainingTimeoutSec: 30
+  
+  # Session affinity (matches Service spec)
+  sessionAffinity:
+    affinityType: "CLIENT_IP"
+    affinityCookieTtlSec: 3600
+  
+  # Health check configuration
+  healthCheck:
+    checkIntervalSec: 15
+    timeoutSec: 5
+    healthyThreshold: 2
+    unhealthyThreshold: 3
+    type: HTTPS
+    requestPath: /api/v1/health
+    port: 443
+
+---
+# Frontend-specific BackendConfig
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: frontend-security-policy
+  namespace: cybermesh
+spec:
+  securityPolicy:
+    name: "cybermesh-waf-policy"
+  
+  connectionDraining:
+    drainingTimeoutSec: 30
+  
+  healthCheck:
+    checkIntervalSec: 15
+    timeoutSec: 5
+    healthyThreshold: 2
+    unhealthyThreshold: 3
+    type: HTTP
+    requestPath: /
+    port: 3000

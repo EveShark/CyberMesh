@@ -6,9 +6,13 @@ metadata:
   labels:
     app: frontend
     component: web
+  annotations:
+    # GKE Load Balancer with Cloud Armor
+    cloud.google.com/neg: '{"ingress": true}'
+    cloud.google.com/backend-config: '{"default": "frontend-security-policy"}'
 spec:
   type: LoadBalancer
-  sessionAffinity: ClientIP
+  sessionAffinity: None
   selector:
     app: frontend
     component: web

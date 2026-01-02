@@ -1,0 +1,27 @@
+# CyberMesh AI Service - Service
+# ClusterIP (internal only) - AI service doesn't need external access
+# Backend validators communicate with AI via internal cluster DNS
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-service
+  namespace: cybermesh
+  labels:
+    app: ai-service
+    component: ml-detection
+spec:
+  type: ClusterIP  # Internal only, no LoadBalancer needed
+  selector:
+    app: ai-service
+    component: ml-detection
+  ports:
+  - name: api
+    port: 8080
+    targetPort: api
+    protocol: TCP
+  - name: metrics
+    port: 10000
+    targetPort: metrics
+    protocol: TCP
+  sessionAffinity: None

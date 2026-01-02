@@ -1,0 +1,252 @@
+apiVersion: v1
+data:
+  001_init_clean.sql: "-- Migration: 001_init.sql\r\n-- Purpose: Initialize CyberMesh
+    distributed cybersecurity control plane schema\r\n-- Database: CockroachDB (distributed,
+    BFT-safe)\r\n-- Security: Military-grade, tamper-evident, auditable\r\n\r\n--
+    =============================================================================\r\n--
+    BLOCKS TABLE\r\n-- Stores committed blocks from BFT consensus\r\n-- =============================================================================\r\nCREATE
+    TABLE IF NOT EXISTS blocks (\r\n    -- Primary key\r\n    height          BIGINT
+    PRIMARY KEY,\r\n    \r\n    -- Block identification\r\n    block_hash      BYTEA
+    NOT NULL UNIQUE,\r\n    parent_hash     BYTEA NOT NULL,\r\n    state_root      BYTEA
+    NOT NULL,\r\n    \r\n    -- Consensus metadata\r\n    proposer_id     BYTEA NOT
+    NULL,\r\n    view_number     BIGINT NOT NULL,\r\n    timestamp       TIMESTAMPTZ
+    NOT NULL,\r\n    \r\n    -- Block content\r\n    tx_count        INT NOT NULL
+    DEFAULT 0,\r\n    tx_root         BYTEA NOT NULL,\r\n    \r\n    -- BFT proof\r\n
+    \   qc_view         BIGINT NOT NULL,\r\n    qc_signatures   BYTEA NOT NULL,\r\n
+    \   \r\n    -- Timestamps\r\n    committed_at    TIMESTAMPTZ NOT NULL DEFAULT
+    NOW(),\r\n    \r\n    -- Indexes\r\n    INDEX idx_blocks_hash (block_hash),\r\n
+    \   INDEX idx_blocks_proposer (proposer_id),\r\n    INDEX idx_blocks_timestamp
+    (timestamp),\r\n    INDEX idx_blocks_committed (committed_at)\r\n);\r\n\r\nCOMMENT
+    ON TABLE blocks IS 'BFT consensus committed blocks';\r\nCOMMENT ON COLUMN blocks.height
+    IS 'Monotonic block height';\r\nCOMMENT ON COLUMN blocks.block_hash IS 'SHA-256
+    hash of block content';\r\nCOMMENT ON COLUMN blocks.parent_hash IS 'Hash of previous
+    block (chain linkage)';\r\nCOMMENT ON COLUMN blocks.state_root IS 'Merkle root
+    of state after applying block';\r\nCOMMENT ON COLUMN blocks.proposer_id IS 'Validator
+    ID that proposed this block';\r\nCOMMENT ON COLUMN blocks.qc_signatures IS 'Aggregated
+    BFT quorum signatures (2f+1)';\r\n\r\n-- =============================================================================\r\n--
+    TRANSACTIONS TABLE\r\n-- Stores all transactions (EventTx, EvidenceTx, PolicyTx)
+    with envelopes\r\n-- =============================================================================\r\nCREATE
+    TABLE IF NOT EXISTS transactions (\r\n    -- Primary key\r\n    tx_hash         BYTEA
+    PRIMARY KEY,\r\n    \r\n    -- Block reference\r\n    block_height    BIGINT NOT
+    NULL,\r\n    tx_index        INT NOT NULL,\r\n    \r\n    -- Transaction type\r\n
+    \   tx_type         VARCHAR(20) NOT NULL CHECK (tx_type IN ('event', 'evidence',
+    'policy')),\r\n    \r\n    -- Envelope (mandatory for all transactions)\r\n    producer_id
+    \    BYTEA NOT NULL,\r\n    nonce           BYTEA NOT NULL,\r\n    content_hash
+    \   BYTEA NOT NULL,\r\n    algorithm       VARCHAR(20) NOT NULL,\r\n    public_key
+    \     BYTEA NOT NULL,\r\n    signature       BYTEA NOT NULL,\r\n    \r\n    --
+    Transaction payload\r\n    payload         JSONB NOT NULL,\r\n    \r\n    -- Chain-of-custody
+    (for EvidenceTx)\r\n    custody_chain   JSONB,\r\n    \r\n    -- Execution result\r\n
+    \   status          VARCHAR(20) NOT NULL CHECK (status IN ('success', 'failed',
+    'skipped')),\r\n    error_msg       TEXT,\r\n    \r\n    -- Timestamps\r\n    submitted_at
+    \   TIMESTAMPTZ NOT NULL,\r\n    executed_at     TIMESTAMPTZ NOT NULL DEFAULT
+    NOW(),\r\n    \r\n    -- Constraints\r\n    UNIQUE (block_height, tx_index),\r\n
+    \   FOREIGN KEY (block_height) REFERENCES blocks(height) ON DELETE CASCADE,\r\n
+    \   \r\n    -- Indexes\r\n    INDEX idx_tx_producer (producer_id),\r\n    INDEX
+    idx_tx_type (tx_type),\r\n    INDEX idx_tx_block (block_height),\r\n    INDEX
+    idx_tx_status (status),\r\n    INDEX idx_tx_submitted (submitted_at),\r\n    INDEX
+    idx_tx_content_hash (content_hash)\r\n);\r\n\r\nCOMMENT ON TABLE transactions
+    IS 'All transactions with mandatory envelopes and signatures';\r\nCOMMENT ON COLUMN
+    transactions.producer_id IS 'AI service or node that produced this transaction';\r\nCOMMENT
+    ON COLUMN transactions.nonce IS 'Monotonic nonce for replay protection';\r\nCOMMENT
+    ON COLUMN transactions.content_hash IS 'SHA-256 of payload for integrity verification';\r\nCOMMENT
+    ON COLUMN transactions.custody_chain IS 'Chain-of-custody entries for evidence
+    (EvidenceTx only)';\r\n\r\n-- =============================================================================\r\n--
+    STATE_REPUTATION TABLE\r\n-- Tracks reputation scores for AI producers/nodes\r\n--
+    =============================================================================\r\nCREATE
+    TABLE IF NOT EXISTS state_reputation (\r\n    -- Primary key\r\n    producer_id
+    \    BYTEA PRIMARY KEY,\r\n    \r\n    -- Reputation data\r\n    score           NUMERIC(10,
+    6) NOT NULL DEFAULT 100.0 CHECK (score >= 0 AND score <= 100),\r\n    total_events
+    \   BIGINT NOT NULL DEFAULT 0,\r\n    violations      BIGINT NOT NULL DEFAULT
+    0,\r\n    last_violation  TIMESTAMPTZ,\r\n    \r\n    -- State version\r\n    updated_height
+    \ BIGINT NOT NULL,\r\n    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),\r\n
+    \   \r\n    -- Indexes\r\n    INDEX idx_reputation_score (score),\r\n    INDEX
+    idx_reputation_violations (violations)\r\n);\r\n\r\nCOMMENT ON TABLE state_reputation
+    IS 'Reputation scores for event producers';\r\nCOMMENT ON COLUMN state_reputation.score
+    IS 'Reputation score (0-100), decreases on violations';\r\nCOMMENT ON COLUMN state_reputation.updated_height
+    IS 'Block height of last update';\r\n\r\n-- =============================================================================\r\n--
+    STATE_QUARANTINE TABLE\r\n-- Tracks quarantined producers/nodes\r\n-- =============================================================================\r\nCREATE
+    TABLE IF NOT EXISTS state_quarantine (\r\n    -- Primary key\r\n    producer_id
+    \    BYTEA PRIMARY KEY,\r\n    \r\n    -- Quarantine data\r\n    reason          TEXT
+    NOT NULL,\r\n    evidence_hash   BYTEA NOT NULL,\r\n    quarantined_at  TIMESTAMPTZ
+    NOT NULL DEFAULT NOW(),\r\n    expires_at      TIMESTAMPTZ,\r\n    permanent       BOOLEAN
+    NOT NULL DEFAULT FALSE,\r\n    \r\n    -- State version\r\n    applied_height
+    \ BIGINT NOT NULL,\r\n    \r\n    -- Indexes\r\n    INDEX idx_quarantine_expires
+    (expires_at),\r\n    INDEX idx_quarantine_permanent (permanent)\r\n);\r\n\r\nCOMMENT
+    ON TABLE state_quarantine IS 'Quarantined producers (blocked from submitting)';\r\nCOMMENT
+    ON COLUMN state_quarantine.permanent IS 'If true, quarantine never expires';\r\nCOMMENT
+    ON COLUMN state_quarantine.evidence_hash IS 'Hash of evidence transaction that
+    triggered quarantine';\r\n\r\n-- =============================================================================\r\n--
+    STATE_POLICIES TABLE\r\n-- Stores active security policies (allow/deny rules)\r\n--
+    =============================================================================\r\nCREATE
+    TABLE IF NOT EXISTS state_policies (\r\n    -- Primary key\r\n    policy_id       BYTEA
+    PRIMARY KEY,\r\n    \r\n    -- Policy metadata\r\n    policy_type     VARCHAR(20)
+    NOT NULL CHECK (policy_type IN ('allow', 'deny', 'rate_limit', 'threshold')),\r\n
+    \   target          VARCHAR(50) NOT NULL,\r\n    \r\n    -- Policy content\r\n
+    \   rules           JSONB NOT NULL,\r\n    \r\n    -- Status\r\n    active          BOOLEAN
+    NOT NULL DEFAULT TRUE,\r\n    priority        INT NOT NULL DEFAULT 100,\r\n    \r\n
+    \   -- Versioning\r\n    created_height  BIGINT NOT NULL,\r\n    created_at      TIMESTAMPTZ
+    NOT NULL DEFAULT NOW(),\r\n    updated_height  BIGINT,\r\n    updated_at      TIMESTAMPTZ,\r\n
+    \   \r\n    -- Indexes\r\n    INDEX idx_policies_type (policy_type),\r\n    INDEX
+    idx_policies_target (target),\r\n    INDEX idx_policies_active (active)\r\n);\r\n\r\nCOMMENT
+    ON TABLE state_policies IS 'Active security policies and rules';\r\nCOMMENT ON
+    COLUMN state_policies.target IS 'What the policy applies to (e.g., producer_id,
+    event_type)';\r\nCOMMENT ON COLUMN state_policies.priority IS 'Higher priority
+    policies evaluated first';\r\n\r\n-- =============================================================================\r\n--
+    AUDIT_LOGS TABLE\r\n-- Tamper-evident audit log for security events\r\n-- =============================================================================\r\nCREATE
+    TABLE IF NOT EXISTS audit_logs (\r\n    -- Primary key\r\n    id              BIGSERIAL
+    PRIMARY KEY,\r\n    \r\n    -- Audit metadata\r\n    event_type      VARCHAR(50)
+    NOT NULL,\r\n    severity        VARCHAR(20) NOT NULL CHECK (severity IN ('DEBUG',
+    'INFO', 'WARN', 'ERROR', 'CRITICAL', 'SECURITY')),\r\n    \r\n    -- Event data\r\n
+    \   actor           TEXT,\r\n    action          TEXT NOT NULL,\r\n    resource
+    \       TEXT,\r\n    result          VARCHAR(20),\r\n    \r\n    -- Context\r\n
+    \   fields          JSONB NOT NULL DEFAULT '{}'::JSONB,\r\n    \r\n    -- Tamper
+    detection\r\n    sequence_num    BIGINT NOT NULL UNIQUE,\r\n    prev_hash       BYTEA,\r\n
+    \   record_hash     BYTEA NOT NULL,\r\n    \r\n    -- Timestamps\r\n    timestamp
+    \      TIMESTAMPTZ NOT NULL DEFAULT NOW(),\r\n    \r\n    -- Indexes\r\n    INDEX
+    idx_audit_event_type (event_type),\r\n    INDEX idx_audit_severity (severity),\r\n
+    \   INDEX idx_audit_timestamp (timestamp),\r\n    INDEX idx_audit_actor (actor),\r\n
+    \   INDEX idx_audit_sequence (sequence_num)\r\n);\r\n\r\nCOMMENT ON TABLE audit_logs
+    IS 'Tamper-evident audit log with hash chaining';\r\nCOMMENT ON COLUMN audit_logs.sequence_num
+    IS 'Monotonic sequence for detecting gaps';\r\nCOMMENT ON COLUMN audit_logs.prev_hash
+    IS 'Hash of previous audit record (chain linkage)';\r\nCOMMENT ON COLUMN audit_logs.record_hash
+    IS 'HMAC of this record for tamper detection';\r\n\r\n-- =============================================================================\r\n--
+    VALIDATORS TABLE\r\n-- Tracks validator nodes in the consensus network\r\n-- =============================================================================\r\nCREATE
+    TABLE IF NOT EXISTS validators (\r\n    -- Primary key\r\n    validator_id    BYTEA
+    PRIMARY KEY,\r\n    \r\n    -- Node identity\r\n    public_key      BYTEA NOT
+    NULL UNIQUE,\r\n    peer_id         TEXT,\r\n    \r\n    -- Status\r\n    is_active
+    \      BOOLEAN NOT NULL DEFAULT TRUE,\r\n    reputation      NUMERIC(10, 6) NOT
+    NULL DEFAULT 100.0 CHECK (reputation >= 0 AND reputation <= 100),\r\n    \r\n
+    \   -- Consensus participation\r\n    joined_height   BIGINT NOT NULL,\r\n    last_seen
+    \      TIMESTAMPTZ,\r\n    blocks_proposed BIGINT NOT NULL DEFAULT 0,\r\n    blocks_voted
+    \   BIGINT NOT NULL DEFAULT 0,\r\n    \r\n    -- Network info\r\n    address         TEXT,\r\n
+    \   \r\n    -- Timestamps\r\n    created_at      TIMESTAMPTZ NOT NULL DEFAULT
+    NOW(),\r\n    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),\r\n    \r\n
+    \   -- Indexes\r\n    INDEX idx_validators_active (is_active),\r\n    INDEX idx_validators_reputation
+    (reputation),\r\n    INDEX idx_validators_last_seen (last_seen)\r\n);\r\n\r\nCOMMENT
+    ON TABLE validators IS 'BFT validator nodes participating in consensus';\r\nCOMMENT
+    ON COLUMN validators.reputation IS 'Node reputation (decreases on Byzantine behavior)';\r\nCOMMENT
+    ON COLUMN validators.joined_height IS 'Block height when validator joined network';\r\n\r\n--
+    =============================================================================\r\n--
+    STATE_VERSIONS TABLE\r\n-- Tracks state root history for merkle proofs and rollback\r\n--
+    =============================================================================\r\nCREATE
+    TABLE IF NOT EXISTS state_versions (\r\n    -- Primary key\r\n    version         BIGINT
+    PRIMARY KEY,\r\n    \r\n    -- State root\r\n    state_root      BYTEA NOT NULL
+    UNIQUE,\r\n    \r\n    -- Block reference\r\n    block_height    BIGINT NOT NULL
+    UNIQUE,\r\n    block_hash      BYTEA NOT NULL,\r\n    \r\n    -- Statistics\r\n
+    \   tx_count        INT NOT NULL DEFAULT 0,\r\n    reputation_changes INT NOT
+    NULL DEFAULT 0,\r\n    policy_changes  INT NOT NULL DEFAULT 0,\r\n    quarantine_changes
+    INT NOT NULL DEFAULT 0,\r\n    \r\n    -- Timestamp\r\n    created_at      TIMESTAMPTZ
+    NOT NULL DEFAULT NOW(),\r\n    \r\n    -- Foreign key\r\n    FOREIGN KEY (block_height)
+    REFERENCES blocks(height) ON DELETE CASCADE,\r\n    \r\n    -- Indexes\r\n    INDEX
+    idx_state_versions_block (block_height),\r\n    INDEX idx_state_versions_root
+    (state_root)\r\n);\r\n\r\nCOMMENT ON TABLE state_versions IS 'State root history
+    for merkle proofs and state verification';\r\nCOMMENT ON COLUMN state_versions.version
+    IS 'Monotonic state version number';\r\n\r\n-- =============================================================================\r\n--
+    CONSENSUS PROPOSALS TABLE\r\n-- Persists HotStuff proposals for replay/recovery\r\n--
+    =============================================================================\r\nCREATE
+    TABLE IF NOT EXISTS consensus_proposals (\r\n    block_hash      BYTEA PRIMARY
+    KEY,\r\n    height          BIGINT NOT NULL,\r\n    view_number     BIGINT NOT
+    NULL,\r\n    proposer_id     BYTEA NOT NULL,\r\n    proposal_cbor   BYTEA NOT
+    NULL,\r\n    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),\r\n    INDEX
+    idx_consensus_proposals_height (height),\r\n    INDEX idx_consensus_proposals_view
+    (view_number)\r\n);\r\n\r\nCOMMENT ON TABLE consensus_proposals IS 'HotStuff proposals
+    stored for crash recovery and replay window restoration';\r\nCOMMENT ON COLUMN
+    consensus_proposals.proposal_cbor IS 'CBOR-encoded messages.Proposal payload';\r\n\r\n--
+    =============================================================================\r\n--
+    CONSENSUS_QCS TABLE\r\n-- Persists quorum certificates per block hash\r\n-- =============================================================================\r\nCREATE
+    TABLE IF NOT EXISTS consensus_qcs (\r\n    block_hash      BYTEA PRIMARY KEY,\r\n
+    \   height          BIGINT NOT NULL,\r\n    view_number     BIGINT NOT NULL,\r\n
+    \   qc_cbor         BYTEA NOT NULL,\r\n    created_at      TIMESTAMPTZ NOT NULL
+    DEFAULT NOW(),\r\n    INDEX idx_consensus_qcs_height (height),\r\n    INDEX idx_consensus_qcs_view
+    (view_number)\r\n);\r\n\r\nCOMMENT ON TABLE consensus_qcs IS 'HotStuff quorum
+    certificates (aggregated votes)';\r\nCOMMENT ON COLUMN consensus_qcs.qc_cbor IS
+    'CBOR-encoded messages.QC payload';\r\n\r\n-- =============================================================================\r\n--
+    CONSENSUS_VOTES TABLE\r\n-- Stores votes keyed by (view, voter, block)\r\n-- =============================================================================\r\nCREATE
+    TABLE IF NOT EXISTS consensus_votes (\r\n    vote_hash       BYTEA PRIMARY KEY,\r\n
+    \   view_number     BIGINT NOT NULL,\r\n    height          BIGINT NOT NULL,\r\n
+    \   voter_id        BYTEA NOT NULL,\r\n    block_hash      BYTEA NOT NULL,\r\n
+    \   vote_cbor       BYTEA NOT NULL,\r\n    created_at      TIMESTAMPTZ NOT NULL
+    DEFAULT NOW(),\r\n    UNIQUE (view_number, voter_id, block_hash),\r\n    INDEX
+    idx_consensus_votes_view (view_number),\r\n    INDEX idx_consensus_votes_height
+    (height)\r\n);\r\n\r\nCOMMENT ON TABLE consensus_votes IS 'Validator votes per
+    view for HotStuff consensus';\r\nCOMMENT ON COLUMN consensus_votes.vote_cbor IS
+    'CBOR-encoded messages.Vote payload';\r\n\r\n-- =============================================================================\r\n--
+    CONSENSUS_EVIDENCE TABLE\r\n-- Stores Byzantine evidence items\r\n-- =============================================================================\r\nCREATE
+    TABLE IF NOT EXISTS consensus_evidence (\r\n    evidence_hash   BYTEA PRIMARY
+    KEY,\r\n    height          BIGINT NOT NULL,\r\n    evidence_cbor   BYTEA NOT
+    NULL,\r\n    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),\r\n    INDEX
+    idx_consensus_evidence_height (height)\r\n);\r\n\r\nCOMMENT ON TABLE consensus_evidence
+    IS 'Byzantine evidence records for slashing/quarantine';\r\nCOMMENT ON COLUMN
+    consensus_evidence.evidence_cbor IS 'CBOR-encoded messages.Evidence payload';\r\n\r\n--
+    =============================================================================\r\n--
+    CONSENSUS_METADATA TABLE\r\n-- Tracks last committed height/block hash for fast
+    restart\r\n-- =============================================================================\r\nCREATE
+    TABLE IF NOT EXISTS consensus_metadata (\r\n    key             VARCHAR(50) PRIMARY
+    KEY,\r\n    height          BIGINT NOT NULL,\r\n    block_hash      BYTEA NOT
+    NULL,\r\n    qc_cbor         BYTEA,\r\n    updated_at      TIMESTAMPTZ NOT NULL
+    DEFAULT NOW()\r\n);\r\n\r\nCOMMENT ON TABLE consensus_metadata IS 'Key-value store
+    for consensus restart metadata';\r\nCOMMENT ON COLUMN consensus_metadata.qc_cbor
+    IS 'CBOR-encoded QC for last committed block';\r\n\r\n-- =============================================================================\r\n--
+    FUNCTIONS\r\n-- =============================================================================\r\n\r\n--
+    Function to verify audit log chain integrity\r\nCREATE OR REPLACE FUNCTION verify_audit_chain(start_seq
+    BIGINT, end_seq BIGINT)\r\nRETURNS TABLE(sequence_num BIGINT, is_valid BOOLEAN,
+    error_msg TEXT) AS $$\r\nBEGIN\r\n    RETURN QUERY\r\n    SELECT \r\n        a.sequence_num,\r\n
+    \       CASE \r\n            WHEN a.sequence_num = start_seq THEN TRUE\r\n            WHEN
+    prev.record_hash = a.prev_hash THEN TRUE\r\n            ELSE FALSE\r\n        END
+    as is_valid,\r\n        CASE\r\n            WHEN a.sequence_num = start_seq THEN
+    'First record in range'\r\n            WHEN prev.record_hash = a.prev_hash THEN
+    'Chain valid'\r\n            ELSE 'Chain broken: prev_hash mismatch'\r\n        END
+    as error_msg\r\n    FROM audit_logs a\r\n    LEFT JOIN audit_logs prev ON prev.sequence_num
+    = a.sequence_num - 1\r\n    WHERE a.sequence_num BETWEEN start_seq AND end_seq\r\n
+    \   ORDER BY a.sequence_num;\r\nEND;\r\n$$ LANGUAGE plpgsql;\r\n\r\n\r\n-- =============================================================================\r\n--
+    GRANTS (Apply appropriate permissions in production)\r\n-- =============================================================================\r\n--
+    TODO: Set up role-based access control with least privilege principle\r\n-- Example:\r\n--
+    GRANT SELECT, INSERT, UPDATE ON blocks TO cybermesh_writer;\r\n-- GRANT SELECT
+    ON blocks TO cybermesh_reader;\r\n\r\n-- =============================================================================\r\n--
+    SECURITY NOTES\r\n-- =============================================================================\r\n--
+    1. All timestamps use TIMESTAMPTZ for proper timezone handling\r\n-- 2. BYTEA
+    columns store cryptographic hashes and signatures (32-64 bytes)\r\n-- 3. JSONB
+    used for flexible policy/payload storage with indexing capability\r\n-- 4. Foreign
+    keys enforce referential integrity\r\n-- 5. CHECK constraints enforce data validation
+    at DB level\r\n-- 6. Audit log uses hash chaining for tamper detection\r\n-- 7.
+    Indexes optimize query performance for common access patterns\r\n-- 8. Comments
+    document schema for future maintainers\r\n"
+  002_tx_nonce_unique.sql: "-- Migration: 002_tx_nonce_unique.sql\r\n-- Purpose: Enforce
+    unique (producer_id, nonce) combinations to prevent replay after restart\r\n\r\nALTER
+    TABLE transactions\r\n    ADD CONSTRAINT transactions_producer_nonce_unique\r\n
+    \   UNIQUE (producer_id, nonce);\r\n"
+  003_genesis_certificate.sql: |
+    -- Migration: 003_genesis_certificate.sql
+    -- Purpose: Persist genesis certificate for durable restoration across validator restarts
+
+    BEGIN TRANSACTION;
+
+    CREATE TABLE IF NOT EXISTS genesis_certificates (
+        id SERIAL PRIMARY KEY,
+        certificate BYTEA NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    -- Enforce single-row table by constraining id to 1. Using CHECK keeps UPSERT simple.
+    ALTER TABLE genesis_certificates
+        ADD CONSTRAINT genesis_certificates_singleton CHECK (id = 1);
+
+    COMMIT;
+  004_genesis_certificate_keyed.sql: "-- Migration: 004_genesis_certificate_keyed.sql\n--
+    Purpose: Key genesis certificates by deployment identity (network_id, config_hash,
+    peer_hash)\n\nBEGIN TRANSACTION;\n\n-- Drop legacy singleton constraint if present.\nALTER
+    TABLE genesis_certificates\n\tDROP CONSTRAINT IF EXISTS genesis_certificates_singleton;\n\n--
+    Add identity columns (idempotent).\nALTER TABLE genesis_certificates\n\tADD COLUMN
+    IF NOT EXISTS network_id STRING NOT NULL DEFAULT 'cybermesh';\n\nALTER TABLE genesis_certificates\n\tADD
+    COLUMN IF NOT EXISTS config_hash BYTES NOT NULL DEFAULT '\\x';\n\nALTER TABLE
+    genesis_certificates\n\tADD COLUMN IF NOT EXISTS peer_hash BYTES NOT NULL DEFAULT
+    '\\x';\n\n-- Backfill default hashes to avoid nulls for existing rows.\nUPDATE
+    genesis_certificates\n\tSET config_hash = '\\x'\n\tWHERE config_hash IS NULL;\n\nUPDATE
+    genesis_certificates\n\tSET peer_hash = '\\x'\n\tWHERE peer_hash IS NULL;\n\n--
+    Ensure (network_id, config_hash, peer_hash) is unique.\nCREATE UNIQUE INDEX IF
+    NOT EXISTS genesis_certificates_identity_idx\n\tON genesis_certificates (network_id,
+    config_hash, peer_hash);\n\nCOMMIT;\n"
+kind: ConfigMap
+metadata:
+  name: migration-sql
+  namespace: cybermesh

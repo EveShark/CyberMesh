@@ -1,0 +1,281 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: validator
+  namespace: cybermesh
+  labels:
+    app: consensus-backend
+    component: validator
+spec:
+  serviceName: validator-headless
+  replicas: 5
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: consensus-backend
+      component: validator
+  template:
+    metadata:
+      labels:
+        app: consensus-backend
+        component: validator
+    spec:
+      serviceAccountName: cybermesh-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      
+      initContainers:
+      # Wait for CockroachDB connectivity
+      - name: wait-for-db
+        image: busybox:1.35
+        command:
+        - sh
+        - -c
+        - |
+          echo "Waiting for CockroachDB connectivity..."
+          until nc -z cybermesh-threats-10433.jxf.gcp-asia-southeast1.cockroachlabs.cloud 26257; do
+            echo "Waiting for database..."
+            sleep 2
+          done
+          echo "Database is reachable!"
+
+      containers:
+      - name: validator
+        image: asia-southeast1-docker.pkg.dev/cybermesh-478105/cybermesh-repo/cybermesh-backend:latest
+        imagePullPolicy: Always
+
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          runAsNonRoot: true
+          capabilities:
+            drop:
+            - ALL
+
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          # Derive NODE_ID from pod ordinal (validator-0 -> NODE_ID=1)
+          POD_ORDINAL=$(echo $HOSTNAME | grep -o '[0-9]*$')
+          export NODE_ID=$((POD_ORDINAL + 1))
+
+          # Set per-node CRYPTO_SIGNING_KEY_HEX and P2P_ID_SEED based on NODE_ID
+          case $NODE_ID in
+            1) export CRYPTO_SIGNING_KEY_HEX=$CRYPTO_SIGNING_KEY_HEX_1 
+               export P2P_ID_SEED=$P2P_ID_SEED_1 ;;
+            2) export CRYPTO_SIGNING_KEY_HEX=$CRYPTO_SIGNING_KEY_HEX_2 
+               export P2P_ID_SEED=$P2P_ID_SEED_2 ;;
+            3) export CRYPTO_SIGNING_KEY_HEX=$CRYPTO_SIGNING_KEY_HEX_3 
+               export P2P_ID_SEED=$P2P_ID_SEED_3 ;;
+            4) export CRYPTO_SIGNING_KEY_HEX=$CRYPTO_SIGNING_KEY_HEX_4 
+               export P2P_ID_SEED=$P2P_ID_SEED_4 ;;
+            5) export CRYPTO_SIGNING_KEY_HEX=$CRYPTO_SIGNING_KEY_HEX_5 
+               export P2P_ID_SEED=$P2P_ID_SEED_5 ;;
+          esac
+
+          # Create signing key file for commit publishing
+          mkdir -p /tmp/keys
+          echo "$CONTROL_SIGNING_KEY_CONTENT" > /tmp/keys/backend_signing_key.pem
+          export CONTROL_SIGNING_KEY_PATH=/tmp/keys/backend_signing_key.pem
+
+          echo "Starting validator with NODE_ID=$NODE_ID"
+          exec /app/cybermesh
+
+        env:
+        # Pod metadata
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        # API Configuration
+        - name: API_PORT
+          value: "9441"
+        - name: API_LISTEN_ADDR
+          value: ":9441"
+        
+        # Per-node signing keys (used by shell script in args)
+        - name: CRYPTO_SIGNING_KEY_HEX_1
+          valueFrom:
+            secretKeyRef:
+              name: cybermesh-secrets
+              key: CRYPTO_SIGNING_KEY_HEX_1
+        - name: CRYPTO_SIGNING_KEY_HEX_2
+          valueFrom:
+            secretKeyRef:
+              name: cybermesh-secrets
+              key: CRYPTO_SIGNING_KEY_HEX_2
+        - name: CRYPTO_SIGNING_KEY_HEX_3
+          valueFrom:
+            secretKeyRef:
+              name: cybermesh-secrets
+              key: CRYPTO_SIGNING_KEY_HEX_3
+        - name: CRYPTO_SIGNING_KEY_HEX_4
+          valueFrom:
+            secretKeyRef:
+              name: cybermesh-secrets
+              key: CRYPTO_SIGNING_KEY_HEX_4
+        - name: CRYPTO_SIGNING_KEY_HEX_5
+          valueFrom:
+            secretKeyRef:
+              name: cybermesh-secrets
+              key: CRYPTO_SIGNING_KEY_HEX_5
+        # Consensus timing overrides (aligned with Civo)
+        - name: BLOCK_BUILD_INTERVAL
+          value: "5s"
+        - name: CONSENSUS_BLOCK_TIMEOUT
+          value: "12s"
+        - name: CONSENSUS_BASE_TIMEOUT
+          value: "15s"
+        - name: CONSENSUS_MIN_TIMEOUT
+          value: "10s"
+        - name: BLOCK_MAX_TXS
+          value: "1000"
+        
+        # Import all ConfigMap values
+        envFrom:
+        - configMapRef:
+            name: cybermesh-config
+        - secretRef:
+            name: cybermesh-secrets
+        - secretRef:
+            name: validator-pubkeys
+        
+        ports:
+        - name: api
+          containerPort: 9441
+          protocol: TCP
+        - name: p2p
+          containerPort: 8001
+          protocol: TCP
+        - name: metrics
+          containerPort: 9100
+          protocol: TCP
+        
+        volumeMounts:
+        # Mount validator signing keys
+        - name: validator-keys
+          mountPath: /app/keys
+          readOnly: true
+        # Mount CockroachDB root certificate
+        - name: db-certs
+          mountPath: /app/certs
+          readOnly: true
+        # Genesis cache and logs
+        - name: genesis-state
+          mountPath: /app/data
+        - name: logs
+          mountPath: /app/logs
+        
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "350m"
+          limits:
+            memory: "1Gi"
+            cpu: "800m"
+        
+        livenessProbe:
+          httpGet:
+            path: /api/v1/health
+            port: api
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        readinessProbe:
+          # Zero-trust gate: only report Ready after consensus + peer quorum succeeds
+          # failureThreshold=60 gives 5 minutes for genesis activation to complete
+          httpGet:
+            path: /api/v1/ready
+            port: api
+          initialDelaySeconds: 15
+          periodSeconds: 5
+          timeoutSeconds: 5
+          failureThreshold: 60
+          successThreshold: 1
+        
+        startupProbe:
+          # Keep pod in Startup until readiness gate passes (covers genesis ceremony delay)
+          httpGet:
+            path: /api/v1/ready
+            port: 9441
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 5
+          # 180 * 5s = 15 minutes
+          failureThreshold: 180
+      
+      volumes:
+      # Validator signing keys (from Secret)
+      - name: validator-keys
+        secret:
+          secretName: validator-keys
+          defaultMode: 0400
+      # CockroachDB root certificate
+      - name: db-certs
+        configMap:
+          name: db-root-cert
+          defaultMode: 0444
+      # Volumes are bound via volumeClaimTemplates (PVC)
+      
+      # Topology spread: PREFER spread validators evenly across zones
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            component: validator
+      
+      # Pod anti-affinity: PREFER spread validators across nodes (best-effort BFT)
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: component
+                  operator: In
+                  values:
+                  - validator
+              topologyKey: kubernetes.io/hostname  # Try to spread validators across different nodes
+  
+  # Persistent storage for logs (survives pod restarts)
+  volumeClaimTemplates:
+  - metadata:
+      name: logs
+      labels:
+        app: consensus-backend
+        component: validator
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: "premium-rwo"  # GKE SSD persistent disk (multi-zone)
+      resources:
+        requests:
+          storage: 2Gi  # 2GB per validator node
+  - metadata:
+      name: genesis-state
+      labels:
+        app: consensus-backend
+        component: validator
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: "premium-rwo"
+      resources:
+        requests:
+          storage: 1Gi

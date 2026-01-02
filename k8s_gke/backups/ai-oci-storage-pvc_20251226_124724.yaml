@@ -1,0 +1,57 @@
+# CyberMesh AI Service - OCI Object Storage PVC
+# PLACEHOLDER - Create this after uploading models to OCI bucket
+# 
+# Prerequisites:
+# 1. Create OCI Object Storage bucket: cybermesh-models
+# 2. Upload models:
+#    - models/ddos_lgbm_v1.0.0.pkl
+#    - models/malware_lgbm_v1.0.0.pkl
+#    - models/anomaly_lgbm_v1.0.0.pkl
+# 3. Install OCI CSI driver in OKE cluster
+# 4. Create storage class for OCI Block Volume
+# 5. Apply this PVC
+# 6. Uncomment volume mount in ai-service-deployment.yaml
+#
+# Fallback: If CSI driver not available, use init container approach
+# (see docker/README.md for init container example)
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: oci-models-pvc
+  namespace: cybermesh
+  labels:
+    app: ai-service
+    component: ml-detection
+spec:
+  accessModes:
+  - ReadOnlyMany  # Multiple AI pods can read (when scaling)
+  storageClassName: oci-bv  # OCI Block Volume CSI driver
+  resources:
+    requests:
+      storage: 5Gi  # Models ~500MB, leave room for growth
+
+---
+# Alternative: If OCI CSI driver not available, add this init container
+# to ai-service-deployment.yaml:
+#
+# initContainers:
+# - name: download-models
+#   image: oracle/oci-cli:latest
+#   command: ["/bin/sh", "-c"]
+#   args:
+#   - |
+#     echo "Downloading models from OCI Object Storage..."
+#     oci os object bulk-download \
+#       --bucket-name cybermesh-models \
+#       --download-dir /app/data/models \
+#       --prefix models/ \
+#       --auth instance_principal
+#     echo "Models downloaded successfully"
+#     ls -lh /app/data/models/
+#   volumeMounts:
+#   - name: models
+#     mountPath: /app/data/models
+#   securityContext:
+#     runAsUser: 1001
+#     runAsGroup: 1001

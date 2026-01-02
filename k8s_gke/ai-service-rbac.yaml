@@ -5,6 +5,8 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: ai-service-sa
+  annotations:
+    iam.gke.io/gcp-service-account: 269316262380-compute@developer.gserviceaccount.com
   namespace: cybermesh
   labels:
     app: ai-service
@@ -15,6 +17,8 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: ai-service-role
+  annotations:
+    iam.gke.io/gcp-service-account: ai-service-sa@sunny-vehicle-482107-p5.iam.gserviceaccount.com
   namespace: cybermesh
   labels:
     app: ai-service
@@ -40,6 +44,8 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: ai-service-rolebinding
+  annotations:
+    iam.gke.io/gcp-service-account: ai-service-sa@sunny-vehicle-482107-p5.iam.gserviceaccount.com
   namespace: cybermesh
   labels:
     app: ai-service
@@ -51,3 +57,4 @@ roleRef:
   kind: Role
   name: ai-service-role
   apiGroup: rbac.authorization.k8s.io
+

@@ -1,0 +1,107 @@
+# CyberMesh Enforcement Agent DaemonSet (GKE)
+# Runs on every node to enforce network policies via iptables
+# Adapted from Civo version for GKE with Artifact Registry
+
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: enforcement-agent
+  namespace: cybermesh
+spec:
+  selector:
+    matchLabels:
+      app: enforcement-agent
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: enforcement-agent
+    spec:
+      serviceAccountName: enforcement-agent
+      # No imagePullSecrets needed - using Workload Identity with Artifact Registry
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: enforcement-agent
+          image: asia-southeast1-docker.pkg.dev/cybermesh-478105/cybermesh-repo/enforcement-agent:latest
+          imagePullPolicy: Always
+          env:
+            - name: CONTROL_POLICY_BROKERS
+              value: "pkc-ldvr1.asia-southeast1.gcp.confluent.cloud:9092"
+            - name: CONTROL_POLICY_TOPIC
+              value: "control.policy.v1"
+            - name: CONTROL_POLICY_TLS
+              value: "true"
+            - name: KAFKA_TLS_ENABLED
+              value: "true"
+            - name: KAFKA_SASL_ENABLED
+              value: "true"
+            - name: KAFKA_SASL_MECHANISM
+              value: "PLAIN"
+            - name: KAFKA_SASL_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: cybermesh-secrets
+                  key: KAFKA_SASL_USERNAME
+            - name: KAFKA_SASL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cybermesh-secrets
+                  key: KAFKA_SASL_PASSWORD
+            - name: CONTROL_POLICY_GROUP
+              value: "policy-enforcement-agent"
+            - name: CONTROL_POLICY_TRUSTED_KEYS
+              value: "/var/run/cybermesh/trust"
+            - name: ENFORCEMENT_BACKEND
+              value: "iptables"
+            - name: ENFORCER_IPTABLES_BIN
+              value: "/usr/sbin/iptables"
+            - name: ENFORCER_KUBE_NAMESPACE
+              value: "default"
+            - name: ENFORCEMENT_STATE_PATH
+              value: "/var/run/enforcement-agent/state.db"
+            - name: ENFORCEMENT_DRY_RUN
+              value: "false"
+            - name: METRICS_ADDR
+              value: ":9094"
+            - name: LOG_LEVEL
+              value: "info"
+          ports:
+            - containerPort: 9094
+              name: metrics
+              protocol: TCP
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["NET_ADMIN"]
+          volumeMounts:
+            - name: trusted-keys
+              mountPath: /var/run/cybermesh/trust
+              readOnly: true
+            - name: sys
+              mountPath: /sys
+            - name: proc
+              mountPath: /proc
+      tolerations:
+        - operator: Exists
+      volumes:
+        - name: trusted-keys
+          secret:
+            secretName: backend-trusted-keys
+        - name: sys
+          hostPath:
+            path: /sys
+            type: Directory
+        - name: proc
+          hostPath:
+            path: /proc
+            type: Directory

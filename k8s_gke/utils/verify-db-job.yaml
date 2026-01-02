@@ -21,82 +21,171 @@ spec:
                 values:
                 - stateless
       
-      volumes:
-      - name: db-cert
-        secret:
-          secretName: db-root-cert
-          optional: true
       containers:
       - name: verify-db
         image: postgres:15-alpine
-        volumeMounts:
-        - name: db-cert
-          mountPath: /certs
-          readOnly: true
         command:
         - sh
         - -c
         - |
           set -e
-          echo "=== Querying CockroachDB to verify data ==="
+          echo "==========================================="
+          echo "CyberMesh Database Health Check"
+          echo "Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "==========================================="
           
-          PGPASSWORD="${DB_PASSWORD}" psql \
-            "host=${DB_HOST} port=${DB_PORT} dbname=${DB_NAME} user=${DB_USER} sslmode=require sslrootcert=/certs/root.crt" \
-            << 'EOF'
+          # Use DATABASE_URL with fallback sslmode
+          CONN=$(echo "${DATABASE_URL}" | sed 's/sslmode=verify-full/sslmode=require/')
           
-          -- Check blocks table
-          SELECT 'Total blocks:' as info, COUNT(*) as count FROM blocks;
+          psql "${CONN}" << 'EOF'
           
-          -- Show recent blocks
-          SELECT height, 
-                 LEFT(ENCODE(block_hash, 'hex'), 16) as hash,
-                 tx_count,
-                 timestamp
+          -- =============================================
+          -- SECTION 1: Critical Height & Chain Status
+          -- =============================================
+          \echo ''
+          \echo '=== CHAIN HEIGHT STATUS ==='
+          SELECT 
+            MAX(height) as current_height,
+            COUNT(*) as total_blocks,
+            MAX(timestamp) as last_block_time,
+            NOW() - MAX(timestamp) as time_since_last_block
+          FROM blocks;
+          
+          -- Last 5 blocks with timestamps
+          \echo ''
+          \echo '=== LAST 5 BLOCKS ==='
+          SELECT 
+            height,
+            LEFT(ENCODE(block_hash, 'hex'), 12) as hash,
+            tx_count,
+            timestamp,
+            committed_at
           FROM blocks 
           ORDER BY height DESC 
-          LIMIT 10;
+          LIMIT 5;
           
-          -- Check transactions table  
-          SELECT 'Total transactions:' as info, COUNT(*) as count FROM transactions;
+          -- =============================================
+          -- SECTION 2: Consensus Status
+          -- =============================================
+          \echo ''
+          \echo '=== CONSENSUS METADATA (Last Committed) ==='
+          SELECT 
+            key,
+            height,
+            LEFT(ENCODE(block_hash, 'hex'), 12) as block_hash,
+            updated_at
+          FROM consensus_metadata
+          WHERE key = 'last_committed';
           
-          -- Show recent transactions
-          SELECT block_height,
-                 tx_index,
-                 tx_type,
-                 LEFT(ENCODE(content_hash, 'hex'), 16) as content_hash,
-                 status
-          FROM transactions
-          ORDER BY block_height DESC, tx_index
-          LIMIT 10;
+          -- =============================================
+          -- SECTION 3: Genesis Certificate Status
+          -- =============================================
+          \echo ''
+          \echo '=== GENESIS CERTIFICATES ==='
+          SELECT 
+            COUNT(*) as total_certs,
+            MAX(created_at) as last_created
+          FROM genesis_certificates;
           
-          -- Show all distinct transaction types
-          SELECT 'All transaction types:' as info;
-          SELECT DISTINCT tx_type, COUNT(*) as count
+          SELECT 
+            network_id,
+            LEFT(ENCODE(config_hash, 'hex'), 12) as config_hash,
+            LEFT(ENCODE(peer_hash, 'hex'), 12) as peer_hash,
+            created_at
+          FROM genesis_certificates
+          ORDER BY created_at DESC
+          LIMIT 3;
+          
+          -- =============================================
+          -- SECTION 4: Validator Status
+          -- =============================================
+          \echo ''
+          \echo '=== ACTIVE VALIDATORS ==='
+          SELECT 
+            COUNT(*) as total_validators,
+            SUM(CASE WHEN is_active THEN 1 ELSE 0 END) as active_count,
+            MAX(last_seen) as most_recent_seen,
+            SUM(blocks_proposed) as total_proposed,
+            SUM(blocks_voted) as total_votes
+          FROM validators;
+          
+          -- =============================================
+          -- SECTION 5: Transaction Summary
+          -- =============================================
+          \echo ''
+          \echo '=== TRANSACTION SUMMARY ==='
+          SELECT 
+            COUNT(*) as total_txs,
+            MAX(block_height) as max_tx_height,
+            MAX(executed_at) as last_tx_time
+          FROM transactions;
+          
+          -- Transaction types breakdown
+          \echo ''
+          \echo '=== TRANSACTION TYPES ==='
+          SELECT 
+            tx_type,
+            COUNT(*) as count,
+            MAX(executed_at) as last_executed
           FROM transactions
           GROUP BY tx_type
           ORDER BY count DESC;
           
-          -- Show most recent transactions with details
-          SELECT 'Recent transactions:' as info;
-          SELECT block_height, tx_index, tx_type, 
-                 LEFT(producer_id, 20) as producer,
-                 status, executed_at
+          -- =============================================
+          -- SECTION 6: Recent Activity (Last 10 Txs)
+          -- =============================================
+          \echo ''
+          \echo '=== LAST 10 TRANSACTIONS ==='
+          SELECT 
+            block_height,
+            tx_index,
+            tx_type,
+            status,
+            executed_at
           FROM transactions
-          ORDER BY block_height DESC, tx_index
-          LIMIT 20;
+          ORDER BY block_height DESC, tx_index DESC
+          LIMIT 10;
+          
+          -- =============================================
+          -- SECTION 7: Consensus Participation
+          -- =============================================
+          \echo ''
+          \echo '=== CONSENSUS ACTIVITY ==='
+          SELECT 
+            'proposals' as type, COUNT(*) as count, MAX(created_at) as last_activity FROM consensus_proposals
+          UNION ALL
+          SELECT 
+            'votes' as type, COUNT(*), MAX(created_at) FROM consensus_votes
+          UNION ALL
+          SELECT 
+            'qcs' as type, COUNT(*), MAX(created_at) FROM consensus_qcs;
+          
+          -- =============================================
+          -- SECTION 8: State Health
+          -- =============================================
+          \echo ''
+          \echo '=== STATE TABLES SUMMARY ==='
+          SELECT 
+            'state_reputation' as table_name, COUNT(*) as rows FROM state_reputation
+          UNION ALL
+          SELECT 'state_quarantine', COUNT(*) FROM state_quarantine
+          UNION ALL
+          SELECT 'state_policies', COUNT(*) FROM state_policies
+          UNION ALL
+          SELECT 'state_versions', COUNT(*) FROM state_versions
+          UNION ALL
+          SELECT 'audit_logs', COUNT(*) FROM audit_logs;
           
           EOF
           
           echo ""
-          echo "=== Verification complete! ==="
+          echo "==========================================="
+          echo "Verification Complete: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "==========================================="
         env:
-        - name: DB_HOST
-          value: "cybermesh-threats-9633.jxf.gcp-asia-southeast1.cockroachlabs.cloud"
-        - name: DB_PORT
-          value: "26257"
-        - name: DB_NAME
-          value: "defaultdb"
-        - name: DB_USER
-          value: "lenny"
-        - name: DB_PASSWORD
-          value: "VnF_SqShUO-rcYx0VmnJ9w"
+        # Database connection string from Secret
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: cybermesh-secrets
+              key: DATABASE_URL

@@ -91,14 +91,14 @@ spec:
           echo "============================================================"
           
           echo "[DEBUG] Testing GCS access..."
-          if ! gsutil ls gs://cybermesh-ai-models-478105/ >/dev/null 2>&1; then
+          if ! gsutil ls gs://cybermesh-ai-models-us/ >/dev/null 2>&1; then
             echo "ERROR: Cannot access GCS bucket. Checking authentication..."
             echo "Using GKE node default credentials (Compute Engine service account)"
-            gcloud config set project cybermesh-478105 || true
+            gcloud config set project sunny-vehicle-482107-p5 || true
           fi
           
           echo "[1/1] Syncing AI models from GCS..."
-          gsutil -m rsync -r gs://cybermesh-ai-models-478105/ /models/
+          gsutil -m rsync -r gs://cybermesh-ai-models-us/ /models/
           MODEL_COUNT=$(find /models -type f -name '*.pkl' 2>/dev/null | wc -l)
           echo "✓ Models synced: $MODEL_COUNT files"
           if [ "$MODEL_COUNT" -lt 1 ]; then
@@ -119,7 +119,7 @@ spec:
       
       containers:
       - name: ai-service
-        image: asia-southeast1-docker.pkg.dev/cybermesh-478105/cybermesh-repo/cybermesh-ai-service:latest
+        image: us-central1-docker.pkg.dev/sunny-vehicle-482107-p5/cybermesh-repo/cybermesh-ai-service:latest
         imagePullPolicy: Always
         command: ["/bin/bash", "/opt/cybermesh/entrypoint.sh"]
         
@@ -218,16 +218,17 @@ spec:
           failureThreshold: 2
           successThreshold: 1
         
-        # Startup probe (allow time for model loading)
+        # Startup probe (allow time for DB connection + model loading + pipeline init)
+        # Total: 20s initial delay + (24 * 5s) = 140s maximum
         startupProbe:
           httpGet:
             path: /ready
             port: 8080
             scheme: HTTP
-          initialDelaySeconds: 10
+          initialDelaySeconds: 20  # Give DB pool time to connect
           periodSeconds: 5
           timeoutSeconds: 3
-          failureThreshold: 12  # 60s max startup time (12 * 5s)
+          failureThreshold: 24  # 120s max startup time after initial delay
       
       volumes:
       # AI signing key from Secret (volume mount, not env var)
@@ -270,3 +271,5 @@ spec:
                   values:
                   - ai-service
               topologyKey: topology.kubernetes.io/zone
+
+

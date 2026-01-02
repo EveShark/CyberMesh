@@ -1,0 +1,258 @@
+# CyberMesh Network Policies
+# Pod-level network isolation for defense in depth
+# Requires a CNI that supports NetworkPolicy (GKE uses Calico or Dataplane V2)
+
+---
+# Default deny all ingress to cybermesh namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: cybermesh
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+
+---
+# Validator pods: Allow P2P between validators, API from LB, metrics from monitoring
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: validator-network-policy
+  namespace: cybermesh
+spec:
+  podSelector:
+    matchLabels:
+      component: validator
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # P2P from other validators
+  - from:
+    - podSelector:
+        matchLabels:
+          component: validator
+    ports:
+    - protocol: TCP
+      port: 8001
+  # API from anywhere (LoadBalancer)
+  - ports:
+    - protocol: TCP
+      port: 443
+  # Metrics from Prometheus/monitoring namespace
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    ports:
+    - protocol: TCP
+      port: 9100
+  egress:
+  # P2P to other validators
+  - to:
+    - podSelector:
+        matchLabels:
+          component: validator
+    ports:
+    - protocol: TCP
+      port: 8001
+  # DNS
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: UDP
+      port: 53
+  # Kafka (Confluent Cloud)
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+    ports:
+    - protocol: TCP
+      port: 9092
+  # CockroachDB Cloud
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+    ports:
+    - protocol: TCP
+      port: 26257
+  # Redis (Upstash)
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+    ports:
+    - protocol: TCP
+      port: 6379
+  # AI Service
+  - to:
+    - podSelector:
+        matchLabels:
+          app: ai-service
+    ports:
+    - protocol: TCP
+      port: 8080
+
+---
+# AI Service: Allow from validators, expose API and metrics
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ai-service-network-policy
+  namespace: cybermesh
+spec:
+  podSelector:
+    matchLabels:
+      app: ai-service
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # API from validators
+  - from:
+    - podSelector:
+        matchLabels:
+          component: validator
+    ports:
+    - protocol: TCP
+      port: 8080
+  # Metrics from monitoring
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    ports:
+    - protocol: TCP
+      port: 10000
+  egress:
+  # DNS
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: UDP
+      port: 53
+  # Kafka
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+    ports:
+    - protocol: TCP
+      port: 9092
+  # Redis
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+    ports:
+    - protocol: TCP
+      port: 6379
+  # Postgres (internal)
+  - to:
+    - podSelector:
+        matchLabels:
+          app: postgres
+    ports:
+    - protocol: TCP
+      port: 5432
+  # GCS (for model sync) - HTTPS
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+    ports:
+    - protocol: TCP
+      port: 443
+
+---
+# Postgres: Only allow from AI service
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-network-policy
+  namespace: cybermesh
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: ai-service
+    ports:
+    - protocol: TCP
+      port: 5432
+
+---
+# Frontend: Allow HTTP from anywhere (LoadBalancer)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frontend-network-policy
+  namespace: cybermesh
+spec:
+  podSelector:
+    matchLabels:
+      app: frontend
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # HTTP from LoadBalancer
+  - ports:
+    - protocol: TCP
+      port: 3000
+  egress:
+  # DNS
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: UDP
+      port: 53
+  # Validator API (for dashboard data)
+  - to:
+    - podSelector:
+        matchLabels:
+          component: validator
+    ports:
+    - protocol: TCP
+      port: 443
+
+---
+# Enforcement Agent: Allow egress to Kafka, metrics collection
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: enforcement-agent-network-policy
+  namespace: cybermesh
+spec:
+  podSelector:
+    matchLabels:
+      app: enforcement-agent
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Metrics from monitoring
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    ports:
+    - protocol: TCP
+      port: 9094
+  egress:
+  # DNS
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: UDP
+      port: 53
+  # Kafka
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+    ports:
+    - protocol: TCP
+      port: 9092

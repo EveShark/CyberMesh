@@ -1,0 +1,135 @@
+# GKE Job to copy AI models from GCS to PVC
+# Uses Workload Identity for authentication (no static credentials)
+# Alternative: Use service account key if Workload Identity not available
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: copy-models-to-pvc
+  namespace: cybermesh
+spec:
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: ai-service
+      containers:
+      - name: copy-models
+        # Using google-cloud-cli image with gsutil pre-installed
+        image: google/cloud-sdk:latest
+        env:
+        - name: GCS_BUCKET
+          value: "gs://cybermesh-ai-models"  # Replace with your GCS bucket name
+        - name: GOOGLE_APPLICATION_CREDENTIALS
+          value: "/var/secrets/google/key.json"
+        command:
+        - sh
+        - -c
+        - |
+          echo "Creating models directory in PVC..."
+          mkdir -p /data/models
+          
+          echo "Downloading models from GCS to PVC..."
+          gsutil -m cp -r ${GCS_BUCKET}/* /data/models/ || {
+            echo "⚠️  Warning: gsutil copy failed, attempting individual file sync..."
+            gsutil -m rsync -r -d ${GCS_BUCKET} /data/models/
+          }
+          
+          echo "Models copied successfully!"
+          echo "Total files: $(find /data/models -type f | wc -l)"
+          du -sh /data/models/
+          ls -lh /data/models/
+          
+          echo "✓ Job completed"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "500m"
+          limits:
+            memory: "512Mi"
+            cpu: "1000m"
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        - name: gcp-key
+          mountPath: /var/secrets/google
+          readOnly: true
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: ai-service-data
+      - name: gcp-key
+        secret:
+          secretName: gcp-service-account-key
+          optional: true  # Optional - uses Workload Identity if not present
+
+---
+# GCP Service Account Key Secret (Optional - use if Workload Identity not configured)
+# Create this with: kubectl create secret generic gcp-service-account-key \
+#   --from-file=key.json=path/to/service-account-key.json \
+#   -n cybermesh
+#
+# Or use Workload Identity binding instead (recommended):
+# 1. Create GCP service account: gcloud iam service-accounts create cybermesh-ai
+# 2. Grant GCS access: gcloud projects add-iam-policy-binding PROJECT_ID \
+#    --member=serviceAccount:cybermesh-ai@PROJECT_ID.iam.gserviceaccount.com \
+#    --role=roles/storage.objectViewer
+# 3. Bind K8s SA to GCP SA: gcloud iam service-accounts add-iam-policy-binding \
+#    cybermesh-ai@PROJECT_ID.iam.gserviceaccount.com \
+#    --role roles/iam.workloadIdentityUser \
+#    --member serviceAccount:PROJECT_ID.svc.id.goog[cybermesh/ai-service]
+# 4. Add annotation to K8s ServiceAccount:
+#    kubectl annotate serviceaccount ai-service \
+#    iam.gke.io/gcp-service-account=cybermesh-ai@PROJECT_ID.iam.gserviceaccount.com \
+#    -n cybermesh
+
+---
+# Alternative Job using gsutil with direct authentication
+# Uncomment if not using Workload Identity
+#
+# apiVersion: batch/v1
+# kind: Job
+# metadata:
+#   name: copy-models-to-pvc-with-key
+#   namespace: cybermesh
+# spec:
+#   ttlSecondsAfterFinished: 600
+#   template:
+#     spec:
+#       restartPolicy: OnFailure
+#       containers:
+#       - name: copy-models
+#         image: google/cloud-sdk:latest
+#         env:
+#         - name: GCS_BUCKET
+#           value: "gs://cybermesh-ai-models"
+#         - name: GOOGLE_APPLICATION_CREDENTIALS
+#           value: "/var/secrets/google/key.json"
+#         command:
+#         - sh
+#         - -c
+#         - |
+#           echo "Authenticating to GCS..."
+#           gcloud auth activate-service-account --key-file=/var/secrets/google/key.json
+#           
+#           echo "Creating models directory..."
+#           mkdir -p /data/models
+#           
+#           echo "Copying models from GCS..."
+#           gsutil -m cp -r ${GCS_BUCKET}/* /data/models/
+#           
+#           echo "Done!"
+#           ls -lh /data/models/
+#         volumeMounts:
+#         - name: data
+#           mountPath: /data
+#         - name: gcp-key
+#           mountPath: /var/secrets/google
+#           readOnly: true
+#       volumes:
+#       - name: data
+#         persistentVolumeClaim:
+#           claimName: ai-service-data
+#       - name: gcp-key
+#         secret:
+#           secretName: gcp-service-account-key

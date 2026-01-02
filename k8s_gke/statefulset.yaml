@@ -38,7 +38,7 @@ spec:
         - -c
         - |
           echo "Waiting for CockroachDB connectivity..."
-          until nc -z cybermesh-threats-10433.jxf.gcp-asia-southeast1.cockroachlabs.cloud 26257; do
+          until nc -z exiled-lion-11490.jxf.gcp-us-central1.cockroachlabs.cloud 26257; do
             echo "Waiting for database..."
             sleep 2
           done
@@ -46,7 +46,7 @@ spec:
 
       containers:
       - name: validator
-        image: asia-southeast1-docker.pkg.dev/cybermesh-478105/cybermesh-repo/cybermesh-backend:latest
+        image: us-central1-docker.pkg.dev/sunny-vehicle-482107-p5/cybermesh-repo/cybermesh-backend:latest
         imagePullPolicy: Always
 
         securityContext:
@@ -102,9 +102,9 @@ spec:
               fieldPath: status.podIP
         # API Configuration
         - name: API_PORT
-          value: "9441"
+          value: "443"
         - name: API_LISTEN_ADDR
-          value: ":9441"
+          value: ":443"
         
         # Per-node signing keys (used by shell script in args)
         - name: CRYPTO_SIGNING_KEY_HEX_1
@@ -132,17 +132,12 @@ spec:
             secretKeyRef:
               name: cybermesh-secrets
               key: CRYPTO_SIGNING_KEY_HEX_5
-        # Consensus timing overrides
-        - name: BLOCK_BUILD_INTERVAL
-          value: "300ms"
-        - name: CONSENSUS_BLOCK_TIMEOUT
-          value: "2s"
-        - name: CONSENSUS_BASE_TIMEOUT
-          value: "3s"
-        - name: CONSENSUS_MIN_TIMEOUT
-          value: "2s"
-        - name: BLOCK_MAX_TXS
-          value: "1000"
+        # NOTE: Removed timing overrides - now using ConfigMap values:
+        # BLOCK_BUILD_INTERVAL: 500ms (was 5s)
+        # CONSENSUS_BASE_TIMEOUT: 2s (was 15s)
+        # CONSENSUS_MIN_TIMEOUT: 1s (was 10s)
+        # CONSENSUS_BLOCK_TIMEOUT: 5s (was 12s)
+        # BLOCK_MAX_TXS: 200 (was 1000)
         
         # Import all ConfigMap values
         envFrom:
@@ -155,7 +150,7 @@ spec:
         
         ports:
         - name: api
-          containerPort: 9441
+          containerPort: 443
           protocol: TCP
         - name: p2p
           containerPort: 8001
@@ -174,10 +169,15 @@ spec:
           mountPath: /app/certs
           readOnly: true
         # Genesis cache and logs
-        - name: genesis-state
-          mountPath: /app/data
+        # COMMENTED OUT: genesis-state now fetched from DB, not PVC
+        # - name: genesis-state
+        #   mountPath: /app/data
         - name: logs
           mountPath: /app/logs
+        # Mount Backend TLS certificates
+        - name: backend-tls
+          mountPath: /app/tls
+          readOnly: true
         
         resources:
           requests:
@@ -189,6 +189,7 @@ spec:
         
         livenessProbe:
           httpGet:
+            scheme: HTTPS
             path: /api/v1/health
             port: api
           initialDelaySeconds: 30
@@ -198,24 +199,28 @@ spec:
         
         readinessProbe:
           # Zero-trust gate: only report Ready after consensus + peer quorum succeeds
+          # failureThreshold=60 gives 5 minutes for genesis activation to complete
           httpGet:
+            scheme: HTTPS
             path: /api/v1/ready
             port: api
           initialDelaySeconds: 15
           periodSeconds: 5
-          timeoutSeconds: 3
-          failureThreshold: 2
+          timeoutSeconds: 5
+          failureThreshold: 60
           successThreshold: 1
         
         startupProbe:
           # Keep pod in Startup until readiness gate passes (covers genesis ceremony delay)
           httpGet:
+            scheme: HTTPS
             path: /api/v1/ready
-            port: 9441
+            port: 443
           initialDelaySeconds: 10
           periodSeconds: 5
-          timeoutSeconds: 1
-          failureThreshold: 24
+          timeoutSeconds: 5
+          # 180 * 5s = 15 minutes
+          failureThreshold: 180
       
       volumes:
       # Validator signing keys (from Secret)
@@ -228,6 +233,11 @@ spec:
         configMap:
           name: db-root-cert
           defaultMode: 0444
+      # Backend TLS certificates
+      - name: backend-tls
+        secret:
+          secretName: backend-tls
+          defaultMode: 0400
       # Volumes are bound via volumeClaimTemplates (PVC)
       
       # Topology spread: PREFER spread validators evenly across zones
@@ -266,14 +276,17 @@ spec:
       resources:
         requests:
           storage: 2Gi  # 2GB per validator node
-  - metadata:
-      name: genesis-state
-      labels:
-        app: consensus-backend
-        component: validator
-    spec:
-      accessModes: ["ReadWriteOnce"]
-      storageClassName: "premium-rwo"
-      resources:
-        requests:
-          storage: 1Gi
+  # COMMENTED OUT: genesis-state now fetched from DB, not PVC
+  # - metadata:
+  #     name: genesis-state
+  #     labels:
+  #       app: consensus-backend
+  #       component: validator
+  #   spec:
+  #     accessModes: ["ReadWriteOnce"]
+  #     storageClassName: "premium-rwo"
+  #     resources:
+  #       requests:
+  #         storage: 1Gi
+
+

@@ -1,0 +1,50 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: enforcement-agent
+  namespace: cybermesh
+  labels:
+    app: enforcement-agent
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: enforcement-agent-role
+  namespace: cybermesh
+  labels:
+    app: enforcement-agent
+rules:
+# NetworkPolicy management for Kubernetes enforcement backend
+- apiGroups: ["networking.k8s.io"]
+  resources: ["networkpolicies"]
+  verbs: ["get", "list", "create", "update", "patch", "delete"]
+# Pod discovery for scope validation
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+# Node information for host-level enforcement
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list"]
+# Namespace info for multi-tenant enforcement
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: enforcement-agent-rolebinding
+  namespace: cybermesh
+  labels:
+    app: enforcement-agent
+subjects:
+- kind: ServiceAccount
+  name: enforcement-agent
+  namespace: cybermesh
+roleRef:
+  kind: Role
+  name: enforcement-agent-role
+  apiGroup: rbac.authorization.k8s.io

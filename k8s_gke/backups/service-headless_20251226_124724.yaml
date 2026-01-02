@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: validator-headless
+  namespace: cybermesh
+  labels:
+    app: consensus-backend
+    component: validator
+spec:
+  type: ClusterIP
+  clusterIP: None  # Headless service for StatefulSet
+  publishNotReadyAddresses: true
+  selector:
+    app: consensus-backend
+    component: validator
+  ports:
+  - name: api
+    port: 9441
+    targetPort: api
+    protocol: TCP
+  - name: p2p
+    port: 8001
+    targetPort: p2p
+    protocol: TCP
+  - name: metrics
+    port: 9100
+    targetPort: metrics
+    protocol: TCP

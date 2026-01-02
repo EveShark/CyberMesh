@@ -29,18 +29,17 @@ spec:
         - -c
         - |
           echo "Connecting to database..."
-          PGPASSWORD="${DB_PASSWORD}" psql \
-            -h "${DB_HOST}" \
-            -p 26257 \
-            -U cybermesh_user \
-            -d cybermesh_threats \
-            -c "DELETE FROM genesis_certificates;" \
-            -c "SELECT COUNT(*) as remaining FROM genesis_certificates;"
+          echo "Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          
+          # Use DATABASE_URL with fallback sslmode
+          CONN=$(echo "${DATABASE_URL}" | sed 's/sslmode=verify-full/sslmode=require/')
+          
+          psql "${CONN}" -c "DELETE FROM genesis_certificates;" -c "SELECT COUNT(*) as remaining FROM genesis_certificates;"
           echo "Done!"
         env:
-        - name: DB_HOST
-          value: "cybermesh-threats-8958.jxf.gcp-asia-southeast1.cockroachlabs.cloud"
-        - name: DB_PASSWORD
-          value: "nO0wBjVYVSPPbUJQOqYstw"
-        - name: PGSSLMODE
-          value: "require"
+        # Database connection string from Secret
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: cybermesh-secrets
+              key: DATABASE_URL

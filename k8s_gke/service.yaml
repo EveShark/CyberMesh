@@ -6,15 +6,21 @@ metadata:
   labels:
     app: consensus-backend
     component: validator
+  annotations:
+    # GKE Load Balancer configuration
+    cloud.google.com/neg: '{"ingress": true}'
+    cloud.google.com/backend-config: '{"default": "cybermesh-security-policy"}'
+    # Optional: Static IP (create first with gcloud compute addresses create)
+    # cloud.google.com/load-balancer-type: "External"
 spec:
   type: LoadBalancer
-  sessionAffinity: ClientIP
+  sessionAffinity: None
   selector:
     app: consensus-backend
     component: validator
   ports:
   - name: api
-    port: 9441
+    port: 443
     targetPort: api
     protocol: TCP
   - name: metrics

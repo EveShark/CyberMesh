@@ -1,0 +1,14 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: validator-pdb
+  namespace: cybermesh
+  labels:
+    app: consensus-backend
+    component: validator
+spec:
+  minAvailable: 3
+  selector:
+    matchLabels:
+      app: consensus-backend
+      component: validator

@@ -49,7 +49,7 @@ spec:
       
       containers:
       - name: frontend
-        image: asia-southeast1-docker.pkg.dev/cybermesh-478105/cybermesh-repo/cybermesh-frontend:latest
+        image: us-central1-docker.pkg.dev/sunny-vehicle-482107-p5/cybermesh-repo/cybermesh-frontend:latest
         imagePullPolicy: Always
         
         securityContext:
@@ -94,3 +94,5 @@ spec:
           periodSeconds: 5
           timeoutSeconds: 3
           failureThreshold: 2
+
+

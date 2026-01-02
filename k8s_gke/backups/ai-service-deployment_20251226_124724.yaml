@@ -1,0 +1,273 @@
+# CyberMesh AI Service - Deployment
+# Stateless ML detection service (Deployment, not StatefulSet)
+# 1 replica initially, scale to 2-3 after validation
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-service
+  namespace: cybermesh
+  labels:
+    app: ai-service
+    component: ml-detection
+    version: v1.0.0
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0  # Zero downtime deployments
+  selector:
+    matchLabels:
+      app: ai-service
+      component: ml-detection
+  template:
+    metadata:
+      labels:
+        app: ai-service
+        component: ml-detection
+        version: v1.0.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "10000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: ai-service-sa
+      
+      # Topology spread: spread AI service across zones
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: ai-service
+      
+      # Prefer stateless node for better distribution
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: workload-type
+                operator: In
+                values:
+                - stateless
+      
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      
+      # Init container to sync models from GCS bucket
+      initContainers:
+      - name: sync-models-datasets
+        image: google/cloud-sdk:alpine
+        securityContext:
+          runAsUser: 0
+          runAsGroup: 0
+          runAsNonRoot: false
+          allowPrivilegeEscalation: false
+        env:
+        - name: CLOUDSDK_CONFIG
+          value: /tmp/gcloud
+        - name: HOME
+          value: /tmp
+        command:
+        - sh
+        - -c
+        - |
+          set -euo pipefail
+          export HOME=/tmp
+          mkdir -p "${CLOUDSDK_CONFIG}"
+          chmod 700 "${CLOUDSDK_CONFIG}"
+          echo "============================================================"
+          echo "CyberMesh AI Service - Data Sync"
+          echo "============================================================"
+          
+          echo "[DEBUG] Testing GCS access..."
+          if ! gsutil ls gs://cybermesh-ai-models/ >/dev/null 2>&1; then
+            echo "ERROR: Cannot access GCS bucket. Checking authentication..."
+            echo "Using GKE node default credentials (Compute Engine service account)"
+            gcloud config set project sunny-vehicle-482107-p5 || true
+          fi
+          
+          echo "[1/1] Syncing AI models from GCS..."
+          gsutil -m rsync -r gs://cybermesh-ai-models/ /models/
+          MODEL_COUNT=$(find /models -type f -name '*.pkl' 2>/dev/null | wc -l)
+          echo "✓ Models synced: $MODEL_COUNT files"
+          if [ "$MODEL_COUNT" -lt 1 ]; then
+            echo "ERROR: No model artifacts synced from GCS"
+            exit 1
+          fi
+
+          chown -R 1001:1001 /models
+          chmod -R g+rx /models
+          
+          echo ""
+          echo "Data sync complete!"
+          echo "Models: /models/ ($MODEL_COUNT files)"
+          echo "============================================================"
+        volumeMounts:
+        - name: models
+          mountPath: /models
+      
+      containers:
+      - name: ai-service
+        image: asia-southeast1-docker.pkg.dev/sunny-vehicle-482107-p5/cybermesh-repo/cybermesh-ai-service:latest
+        imagePullPolicy: Always
+        command: ["/bin/bash", "/opt/cybermesh/entrypoint.sh"]
+        
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          runAsNonRoot: true
+          capabilities:
+            drop:
+            - ALL
+        
+        # Import all AI config from ConfigMap
+        envFrom:
+        - configMapRef:
+            name: ai-service-config
+        - secretRef:
+            name: ai-service-postgres
+        
+        # Kafka/Redis credentials from existing backend secret
+        env:
+        - name: KAFKA_SASL_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: cybermesh-secrets
+              key: KAFKA_SASL_USERNAME
+        - name: KAFKA_SASL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: cybermesh-secrets
+              key: KAFKA_SASL_PASSWORD
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: cybermesh-secrets
+              key: REDIS_PASSWORD
+        ports:
+        - name: api
+          containerPort: 8080
+          protocol: TCP
+        - name: metrics
+          containerPort: 10000
+          protocol: TCP
+        
+        volumeMounts:
+        - name: entrypoint-script
+          mountPath: /opt/cybermesh/entrypoint.sh
+          subPath: entrypoint.sh
+        # AI signing key (Ed25519) mounted as volume (more secure than env var)
+        - name: ai-signing-key
+          mountPath: /app/keys
+          readOnly: true
+        
+        # Models directory - GCS synced models
+        - name: models
+          mountPath: /app/data/models
+          readOnly: true
+        
+        # Logs (ephemeral)
+        - name: logs
+          mountPath: /app/logs
+        
+        # Nonce state (ephemeral - Redis is source of truth)
+        - name: data
+          mountPath: /app/data
+        
+        # Explicit CPU requests (at least 500m per feedback)
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        
+        # Liveness probe on port 8080 (prevents hung inference loops)
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+          successThreshold: 1
+        
+        # Readiness probe on port 8080 (GKE routing control)
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 15
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
+          successThreshold: 1
+        
+        # Startup probe (allow time for model loading)
+        startupProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 12  # 60s max startup time (12 * 5s)
+      
+      volumes:
+      # AI signing key from Secret (volume mount, not env var)
+      - name: ai-signing-key
+        secret:
+          secretName: ai-service-secret
+          defaultMode: 0400  # Read-only for user
+          items:
+          - key: signing_key.pem
+            path: signing_key.pem
+      
+      # Models from GCS (synced by init container to emptyDir)
+      - name: models
+        emptyDir:
+          sizeLimit: 500Mi  # Models are ~200MB
+      
+      # Logs (emptyDir)
+      - name: logs
+        emptyDir: {}
+      
+      # Data directory for nonce state (PVC for persistence across restarts)
+      - name: data
+        persistentVolumeClaim:
+          claimName: ai-service-data
+      - name: entrypoint-script
+        configMap:
+          name: ai-service-entrypoint
+          defaultMode: 0755
+      
+      # Pod anti-affinity: Prefer spreading AI pods across nodes (when scaling to 2+)
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - ai-service
+              topologyKey: topology.kubernetes.io/zone
+

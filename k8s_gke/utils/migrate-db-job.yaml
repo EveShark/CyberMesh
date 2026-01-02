@@ -1,0 +1,93 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate-cockroachdb
+  namespace: cybermesh
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      
+      # Prefer stateless node (soft requirement)
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: workload-type
+                operator: In
+                values:
+                - stateless
+      
+      volumes:
+      - name: migrations
+        configMap:
+          name: migration-sql
+      - name: db-cert
+        secret:
+          secretName: db-root-cert
+          optional: true
+      containers:
+      - name: migrate
+        image: postgres:15-alpine
+        volumeMounts:
+        - name: migrations
+          mountPath: /migrations
+        - name: db-cert
+          mountPath: /certs
+          readOnly: true
+        command:
+        - sh
+        - -c
+        - |
+          set -e
+          echo "Running CockroachDB migrations..."
+          echo "Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          
+          # Setup PostgreSQL to use the cert from /certs if available
+          mkdir -p /root/.postgresql
+          if [ -f /certs/root.crt ]; then
+            cp /certs/root.crt /root/.postgresql/root.crt
+            chmod 600 /root/.postgresql/root.crt
+            echo "SSL certificate copied"
+          fi
+          
+          # Use DATABASE_URL, change sslmode to 'require' instead of 'verify-full' if cert not available
+          if [ ! -f /root/.postgresql/root.crt ]; then
+            CONN=$(echo "${DATABASE_URL}" | sed 's/sslmode=verify-full/sslmode=require/')
+            echo "Using sslmode=require (no root cert available)"
+          else
+            CONN="${DATABASE_URL}"
+            echo "Using sslmode=verify-full with cert"
+          fi
+          
+          echo "Running migration 001_init_clean.sql..."
+          psql "${CONN}" -f /migrations/001_init_clean.sql
+
+          if [ -f /migrations/002_tx_nonce_unique.sql ]; then
+            echo "Running migration 002_tx_nonce_unique.sql..."
+            psql "${CONN}" -f /migrations/002_tx_nonce_unique.sql || echo "Note: Constraint may already exist"
+          fi
+
+          if [ -f /migrations/003_genesis_certificate.sql ]; then
+            echo "Running migration 003_genesis_certificate.sql..."
+            psql "${CONN}" -f /migrations/003_genesis_certificate.sql
+          fi
+
+          if [ -f /migrations/004_genesis_certificate_keyed.sql ]; then
+            echo "Running migration 004_genesis_certificate_keyed.sql..."
+            psql "${CONN}" -f /migrations/004_genesis_certificate_keyed.sql
+          fi
+
+          echo "Migrations complete!"
+          echo "Verifying tables..."
+          psql "${CONN}" -c "SELECT table_name FROM information_schema.tables WHERE table_schema='public' ORDER BY table_name;"
+        env:
+        # Database connection string from Secret
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: cybermesh-secrets
+              key: DATABASE_URL

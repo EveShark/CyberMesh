@@ -1,0 +1,63 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate-cockroachdb
+  namespace: cybermesh
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      
+      volumes:
+      - name: migrations
+        configMap:
+          name: migration-sql
+      - name: db-cert
+        secret:
+          secretName: db-root-cert
+          optional: true
+      containers:
+      - name: migrate
+        image: postgres:15-alpine
+        volumeMounts:
+        - name: migrations
+          mountPath: /migrations
+        - name: db-cert
+          mountPath: /certs
+          readOnly: true
+        command:
+        - sh
+        - -c
+        - |
+          set -e
+          echo "Running CockroachDB migrations..."
+          
+          # Use DATABASE_URL directly
+          echo "Running migration 001_init_clean.sql..."
+          psql "${DATABASE_URL}" -f /migrations/001_init_clean.sql
+
+          if [ -f /migrations/002_tx_nonce_unique.sql ]; then
+            echo "Running migration 002_tx_nonce_unique.sql..."
+            psql "${DATABASE_URL}" -f /migrations/002_tx_nonce_unique.sql || echo "Note: Constraint may already exist"
+          fi
+
+          if [ -f /migrations/003_genesis_certificate.sql ]; then
+            echo "Running migration 003_genesis_certificate.sql..."
+            psql "${DATABASE_URL}" -f /migrations/003_genesis_certificate.sql
+          fi
+
+          if [ -f /migrations/004_genesis_certificate_keyed.sql ]; then
+            echo "Running migration 004_genesis_certificate_keyed.sql..."
+            psql "${DATABASE_URL}" -f /migrations/004_genesis_certificate_keyed.sql
+          fi
+
+          echo "✓ Migrations complete!"
+          echo "Verifying tables..."
+          psql "${DATABASE_URL}" -c "SELECT table_name FROM information_schema.tables WHERE table_schema='public' ORDER BY table_name;"
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: cybermesh-secrets
+              key: DATABASE_URL

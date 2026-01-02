@@ -21,30 +21,22 @@ spec:
                 values:
                 - stateless
       
-      volumes:
-      - name: db-cert
-        secret:
-          secretName: db-root-cert
-          optional: true
       containers:
       - name: clear-db
         image: postgres:15-alpine
-        volumeMounts:
-        - name: db-cert
-          mountPath: /certs
-          readOnly: true
         command:
         - sh
         - -c
         - |
           set -e
-          echo "Connecting to CockroachDB (attempting without SSL verification)..."
+          echo "Connecting to CockroachDB..."
+          echo "Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           
-          # Use SSL with the mounted certificate
-          PGPASSWORD="${DB_PASSWORD}" psql \
-            "host=${DB_HOST} port=${DB_PORT} dbname=${DB_NAME} user=${DB_USER} sslmode=require sslrootcert=/certs/root.crt" \
-            << 'EOF'
-          -- Clear consensus data in dependency order
+          # Use DATABASE_URL with fallback sslmode
+          CONN=$(echo "${DATABASE_URL}" | sed 's/sslmode=verify-full/sslmode=require/')
+          
+          psql "${CONN}" << 'EOF'
+          -- Clear ALL consensus and state data for full reset
           TRUNCATE TABLE transactions CASCADE;
           TRUNCATE TABLE blocks CASCADE;
           TRUNCATE TABLE state_versions CASCADE;
@@ -89,13 +81,9 @@ spec:
           
           echo "Database cleanup complete!"
         env:
-        - name: DB_HOST
-          value: "cybermesh-threats-9633.jxf.gcp-asia-southeast1.cockroachlabs.cloud"
-        - name: DB_PORT
-          value: "26257"
-        - name: DB_NAME
-          value: "defaultdb"
-        - name: DB_USER
-          value: "lenny"
-        - name: DB_PASSWORD
-          value: "VnF_SqShUO-rcYx0VmnJ9w"
+        # Database connection string from Secret
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: cybermesh-secrets
+              key: DATABASE_URL

@@ -1,237 +1,239 @@
 #!/usr/bin/env pwsh
 # Script to prepare K8s manifests for GKE deployment
+# Updated for CyberMesh Migration Analysis
 
 param(
-    [Parameter(Mandatory=$true)]
-    [string]$GCPProjectID,
+    [Parameter(Mandatory=$false)]
+    [string]$GCPProjectID = "sunny-vehicle-482107-p5",
     
     [Parameter(Mandatory=$false)]
-    [string]$ImageTag = "v1.0.0",
+    [string]$GCPRegion = "us-central1",
+    
+    [Parameter(Mandatory=$false)]
+    [string]$ImageTag = "latest",
     
     [Parameter(Mandatory=$false)]
     [switch]$DryRun
 )
 
 Write-Host "=== CyberMesh GKE Preparation Script ===" -ForegroundColor Cyan
+Write-Host "Project: $GCPProjectID"
+Write-Host "Region:  $GCPRegion"
+Write-Host "Tag:     $ImageTag"
 Write-Host ""
 
 $k8sDir = $PSScriptRoot
-$configMapFile = Join-Path $k8sDir "configmap.yaml"
-$statefulSetFile = Join-Path $k8sDir "statefulset.yaml"
 $backupDir = Join-Path $k8sDir "backups"
+$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 
-# Create backup directory
+# Files to process
+$deploymentFiles = @(
+    "statefulset.yaml", 
+    "daemonset.yaml", 
+    "ai-service-deployment.yaml", 
+    "frontend-deployment.yaml"
+)
+
+$rbacFiles = @(
+    "rbac.yaml",
+    "ai-service-rbac.yaml",
+    "enforcement-agent-rbac.yaml"
+)
+
+# -------------------------------------------------------------------------
+# Step 1: Backup
+# -------------------------------------------------------------------------
 if (-not (Test-Path $backupDir)) {
     New-Item -ItemType Directory -Path $backupDir | Out-Null
 }
 
-$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-
-# Step 1: Backup existing files
 Write-Host "1. Creating backups..." -ForegroundColor Yellow
-Copy-Item $configMapFile (Join-Path $backupDir "configmap_${timestamp}.yaml")
-Copy-Item $statefulSetFile (Join-Path $backupDir "statefulset_${timestamp}.yaml")
+Get-ChildItem -Path $k8sDir -Filter "*.yaml" | ForEach-Object {
+    Copy-Item $_.FullName (Join-Path $backupDir "$($_.BaseName)_${timestamp}$($_.Extension)")
+}
 Write-Host "   ✓ Backups created in $backupDir" -ForegroundColor Green
 
+# -------------------------------------------------------------------------
 # Step 2: Update ConfigMap
+# -------------------------------------------------------------------------
 Write-Host ""
-Write-Host "2. Updating ConfigMap..." -ForegroundColor Yellow
-
-$configMapContent = Get-Content $configMapFile -Raw
-
-# Change ENVIRONMENT to production
-$configMapContent = $configMapContent -replace 'ENVIRONMENT: "development"', 'ENVIRONMENT: "production"'
-Write-Host "   ✓ ENVIRONMENT: development → production" -ForegroundColor Green
-
-# Enable API TLS
-$configMapContent = $configMapContent -replace 'API_TLS_ENABLED: "false"', 'API_TLS_ENABLED: "true"'
-Write-Host "   ✓ API_TLS_ENABLED: false → true" -ForegroundColor Green
-
-# Remove DB_DSN from ConfigMap (security risk - already in Secret)
-if ($configMapContent -match '  DB_DSN: "postgresql://[^"]*"') {
-    Write-Host "   ⚠ WARNING: DB_DSN found in ConfigMap (should only be in Secret)" -ForegroundColor Red
-    Write-Host "   ! Commenting out DB_DSN line" -ForegroundColor Yellow
-    $configMapContent = $configMapContent -replace '(  DB_DSN: "postgresql://[^"]*")', '# REMOVED FOR SECURITY - Use Secret instead\n  # $1'
-    Write-Host "   ✓ DB_DSN removed from ConfigMap" -ForegroundColor Green
+Write-Host "2. Updating ConfigMaps..." -ForegroundColor Yellow
+$configMapFile = Join-Path $k8sDir "configmap.yaml"
+if (Test-Path $configMapFile) {
+    $content = Get-Content $configMapFile -Raw
+    
+    # Environment updates
+    $content = $content -replace 'ENVIRONMENT: "development"', 'ENVIRONMENT: "production"'
+    $content = $content -replace 'API_TLS_ENABLED: "false"', 'API_TLS_ENABLED: "true"'
+    $content = $content -replace 'REGION: "disk"', 'REGION: "gke"' # Fix legacy region if present
+    
+    # Security
+    if ($content -match 'DB_DSN: "postgresql://') {
+        $content = $content -replace '(DB_DSN: "postgresql://[^"]*")', '# REMOVED FOR SECURITY - Use Secret instead'
+        Write-Host "   ✓ Cleaned DB_DSN from main ConfigMap" -ForegroundColor Green
+    }
+    
+    if (-not $DryRun) { Set-Content $configMapFile -Value $content }
 }
 
-if (-not $DryRun) {
-    Set-Content $configMapFile -Value $configMapContent
-    Write-Host "   ✓ ConfigMap saved" -ForegroundColor Green
-}
-
-# Step 3: Update StatefulSet
+# -------------------------------------------------------------------------
+# Step 3: Update Images & Registries
+# -------------------------------------------------------------------------
 Write-Host ""
-Write-Host "3. Updating StatefulSet..." -ForegroundColor Yellow
+Write-Host "3. Updating Container Images (Artifact Registry)..." -ForegroundColor Yellow
 
-$statefulSetContent = Get-Content $statefulSetFile -Raw
+$repoHost = "$GCPRegion-docker.pkg.dev"
+$repoPath = "$GCPProjectID/cybermesh-repo"
 
-# Update image reference
-$oldImage = 'image: cybermesh/consensus-backend:latest'
-$newImage = "image: gcr.io/$GCPProjectID/cybermesh-consensus:$ImageTag"
-$statefulSetContent = $statefulSetContent -replace [regex]::Escape($oldImage), $newImage
-Write-Host "   ✓ Image: cybermesh/consensus-backend:latest → gcr.io/$GCPProjectID/cybermesh-consensus:$ImageTag" -ForegroundColor Green
+foreach ($file in $deploymentFiles) {
+    $path = Join-Path $k8sDir $file
+    if (Test-Path $path) {
+        $content = Get-Content $path -Raw
+        
+        # Regex to replace any image reference
+        # Targets: ghcr.io/..., gcr.io/..., or plain image names
+        # Replaces with: REGION-docker.pkg.dev/PROJECT/REPO/IMAGE:TAG
+        
+        # Backend
+        if ($content -match 'image: .*cybermesh-backend.*') {
+            $content = $content -replace 'image: .*cybermesh-backend.*', "image: $repoHost/$repoPath/cybermesh-backend:$ImageTag"
+            Write-Host "   ✓ $file : Updated cybermesh-backend" -ForegroundColor Gray
+        }
+        
+        # AI Service
+        if ($content -match 'image: .*cybermesh-ai-service.*') {
+            $content = $content -replace 'image: .*cybermesh-ai-service.*', "image: $repoHost/$repoPath/cybermesh-ai-service:$ImageTag"
+            Write-Host "   ✓ $file : Updated cybermesh-ai-service" -ForegroundColor Gray
+        }
+        
+        # Enforcement Agent
+        if ($content -match 'image: .*enforcement-agent.*') {
+            $content = $content -replace 'image: .*enforcement-agent.*', "image: $repoHost/$repoPath/enforcement-agent:$ImageTag"
+            Write-Host "   ✓ $file : Updated enforcement-agent" -ForegroundColor Gray
+        }
 
-# Update imagePullPolicy for production
-$statefulSetContent = $statefulSetContent -replace 'imagePullPolicy: IfNotPresent', 'imagePullPolicy: Always'
-Write-Host "   ✓ imagePullPolicy: IfNotPresent → Always" -ForegroundColor Green
+        # Frontend
+        if ($content -match 'image: .*cybermesh-frontend.*') {
+            $content = $content -replace 'image: .*cybermesh-frontend.*', "image: $repoHost/$repoPath/cybermesh-frontend:$ImageTag"
+            Write-Host "   ✓ $file : Updated cybermesh-frontend" -ForegroundColor Gray
+        }
 
-# Update storageClassName to premium-rwo (SSD)
-$statefulSetContent = $statefulSetContent -replace 'storageClassName: "standard-rwo"', 'storageClassName: "premium-rwo"'
-Write-Host "   ✓ storageClassName: standard-rwo → premium-rwo (SSD)" -ForegroundColor Green
+        # Common updates
+        $content = $content -replace 'imagePullPolicy: IfNotPresent', 'imagePullPolicy: Always'
+        
+        # Clean up imagePullSecrets (using Workload Identity)
+        if ($content -match 'imagePullSecrets:') {
+            $content = $content -replace '(?ms)^\s+imagePullSecrets:\s*\r?\n\s+-\s+name: \S+', ''
+            Write-Host "   ✓ $file : Removed imagePullSecrets (using Workload Identity)" -ForegroundColor Gray
+        }
 
-if (-not $DryRun) {
-    Set-Content $statefulSetFile -Value $statefulSetContent
-    Write-Host "   ✓ StatefulSet saved" -ForegroundColor Green
+        if (-not $DryRun) { Set-Content $path -Value $content }
+    }
 }
+Write-Host "   ✓ All images updated to $repoHost/$repoPath/..." -ForegroundColor Green
 
-# Step 4: Generate GKE deployment commands
+# -------------------------------------------------------------------------
+# Step 4: Inject Workload Identity
+# -------------------------------------------------------------------------
 Write-Host ""
-Write-Host "4. Generating deployment commands..." -ForegroundColor Yellow
+Write-Host "4. Injecting Workload Identity Annotations..." -ForegroundColor Yellow
+
+foreach ($file in $rbacFiles) {
+    $path = Join-Path $k8sDir $file
+    if (Test-Path $path) {
+        $content = Get-Content $path -Raw
+        $gsaEmail = "cybermesh-sa@$GCPProjectID.iam.gserviceaccount.com" # Default GSA
+        
+        # Determine specific GSA based on file
+        if ($file -like "*ai-service*") { $gsaEmail = "ai-service-sa@$GCPProjectID.iam.gserviceaccount.com" }
+        if ($file -like "*enforcement*") { $gsaEmail = "enforcement-sa@$GCPProjectID.iam.gserviceaccount.com" }
+        
+        # Add annotation if missing
+        if ($content -notmatch "iam.gke.io/gcp-service-account") {
+            $annotation = "  annotations:`n    iam.gke.io/gcp-service-account: $gsaEmail"
+            $content = $content -replace "metadata:`n  name: (\S+)", "metadata:`n  name: `$1`n$annotation"
+            Write-Host "   ✓ $file : Injected Workload Identity ($gsaEmail)" -ForegroundColor Gray
+            if (-not $DryRun) { Set-Content $path -Value $content }
+        } else {
+            Write-Host "   - $file : Workload Identity already present" -ForegroundColor DarkGray
+        }
+    }
+}
+Write-Host "   ✓ Workload Identity configuration complete" -ForegroundColor Green
+
+# -------------------------------------------------------------------------
+# Step 5: Generate Deploy Script
+# -------------------------------------------------------------------------
+Write-Host ""
+Write-Host "5. Generating deployment script..." -ForegroundColor Yellow
 
 $deployScript = @"
 #!/bin/bash
-# GKE Deployment Commands for CyberMesh
-# Generated: $timestamp
+# GKE Deployment Script for CyberMesh
+# Auto-generated: $timestamp
+# Project: $GCPProjectID | Region: $GCPRegion
 
 set -e
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
-
 echo "=== CyberMesh GKE Deployment ==="
+echo "Project: $GCPProjectID"
+echo "Region:  $GCPRegion"
 echo ""
 
-# Check prerequisites
-echo -e "\${YELLOW}Checking prerequisites...\${NC}"
-
-if ! command -v gcloud &> /dev/null; then
-    echo -e "\${RED}ERROR: gcloud CLI not found\${NC}"
-    exit 1
-fi
-
-if ! command -v kubectl &> /dev/null; then
-    echo -e "\${RED}ERROR: kubectl not found\${NC}"
-    exit 1
-fi
-
-if ! command -v docker &> /dev/null; then
-    echo -e "\${RED}ERROR: docker not found\${NC}"
-    exit 1
-fi
-
-echo -e "\${GREEN}✓ All prerequisites met\${NC}"
-echo ""
-
-# Push Docker image to GCR
-echo -e "\${YELLOW}Pushing Docker image to GCR...\${NC}"
-
-# Configure Docker for GCR
-gcloud auth configure-docker --quiet
-
-# Tag image
-docker tag cybermesh/consensus-backend:latest \\
-  gcr.io/$GCPProjectID/cybermesh-consensus:$ImageTag
-
-# Push to GCR
-docker push gcr.io/$GCPProjectID/cybermesh-consensus:$ImageTag
-
-echo -e "\${GREEN}✓ Image pushed to GCR\${NC}"
-echo ""
-
-# Set kubectl context
-echo -e "\${YELLOW}Setting kubectl context...\${NC}"
-# UNCOMMENT AND MODIFY:
-# gcloud container clusters get-credentials CLUSTER_NAME --region=REGION
-
-echo ""
-echo -e "\${YELLOW}Deploying to Kubernetes...\${NC}"
-
-# Apply manifests in order
+# 1. Apply Namespace & RBAC
+echo "--- 1. Security & Access Control ---"
 kubectl apply -f k8s/namespace.yaml
-kubectl apply -f k8s/secret.yaml
+kubectl apply -f k8s/rbac.yaml
+kubectl apply -f k8s/ai-service-rbac.yaml
+kubectl apply -f k8s/enforcement-agent-rbac.yaml
+
+# 2. Configs & Secrets
+echo "--- 2. Configuration ---"
+# Note: Manually create secrets if they don't exist!
 kubectl apply -f k8s/configmap.yaml
 kubectl apply -f k8s/configmap-db-cert.yaml
-kubectl apply -f k8s/rbac.yaml
-kubectl apply -f k8s/service-headless.yaml
+kubectl apply -f k8s/ai-service-configmap.yaml
+kubectl apply -f k8s/ai-service-entrypoint-configmap.yaml
+if [ -f "k8s/secret.yaml" ]; then kubectl apply -f k8s/secret.yaml; fi
+if [ -f "k8s/backend-trusted-keys-secret.yaml" ]; then kubectl apply -f k8s/backend-trusted-keys-secret.yaml; fi
+
+# 3. Storage
+echo "--- 3. Storage ---"
+kubectl apply -f k8s/ai-service-pvc.yaml
+kubectl apply -f k8s/ai-oci-storage-pvc.yaml
+
+# 4. Services
+echo "--- 4. Services ---"
 kubectl apply -f k8s/service.yaml
+kubectl apply -f k8s/service-headless.yaml
+kubectl apply -f k8s/ai-service-service.yaml
+kubectl apply -f k8s/frontend-service.yaml
+
+# 5. Workloads
+echo "--- 5. Workloads ---"
 kubectl apply -f k8s/pdb.yaml
+kubectl apply -f k8s/postgres-statefulset.yaml
 kubectl apply -f k8s/statefulset.yaml
+kubectl apply -f k8s/ai-service-deployment.yaml
+kubectl apply -f k8s/frontend-deployment.yaml
+kubectl apply -f k8s/daemonset.yaml
+
+# 6. Jobs
+echo "--- 6. Jobs ---"
+kubectl apply -f k8s/utils/migrate-db-job.yaml
 
 echo ""
-echo -e "\${GREEN}✓ All manifests applied\${NC}"
-echo ""
-
-# Wait for rollout
-echo -e "\${YELLOW}Waiting for StatefulSet rollout...\${NC}"
-kubectl rollout status statefulset/validator -n cybermesh --timeout=5m
-
-echo ""
-echo -e "\${GREEN}✓ Deployment complete!\${NC}"
-echo ""
-
-# Show status
-echo -e "\${YELLOW}Deployment status:\${NC}"
-kubectl get all -n cybermesh
-
-echo ""
-echo -e "\${YELLOW}Pod logs (validator-0):\${NC}"
-kubectl logs -n cybermesh validator-0 --tail=20
-
-echo ""
-echo -e "\${GREEN}=== Deployment Complete ===${NC}"
-echo ""
-echo "Next steps:"
-echo "  1. Verify all 5 validators are Running"
-echo "  2. Check API health: kubectl exec -n cybermesh validator-0 -- curl http://localhost:9441/api/v1/health"
-echo "  3. Monitor logs: kubectl logs -n cybermesh -l component=validator -f"
-echo "  4. Get LoadBalancer IP: kubectl get svc validator-api -n cybermesh"
-echo ""
+echo "=== Deployment Applied ==="
+echo "Monitor status:"
+echo "  kubectl get pods -n cybermesh -w"
 "@
 
 $deployScriptPath = Join-Path $k8sDir "deploy_to_gke.sh"
 Set-Content $deployScriptPath -Value $deployScript
-Write-Host "   ✓ Deployment script created: deploy_to_gke.sh" -ForegroundColor Green
+# Make executable (if on linux/mac, but this is PS script running on Windows likely)
+# In git bash: chmod +x would work
+Write-Host "   ✓ Created deploy_to_gke.sh" -ForegroundColor Green
 
-# Step 5: Summary
 Write-Host ""
-Write-Host "=== Summary ===" -ForegroundColor Cyan
-Write-Host ""
-Write-Host "Changes made:" -ForegroundColor Yellow
-Write-Host "  ✓ ConfigMap: ENVIRONMENT → production" -ForegroundColor Green
-Write-Host "  ✓ ConfigMap: API_TLS_ENABLED → true" -ForegroundColor Green
-Write-Host "  ✓ ConfigMap: DB_DSN commented out (security)" -ForegroundColor Green
-Write-Host "  ✓ StatefulSet: Image → gcr.io/$GCPProjectID/cybermesh-consensus:$ImageTag" -ForegroundColor Green
-Write-Host "  ✓ StatefulSet: imagePullPolicy → Always" -ForegroundColor Green
-Write-Host "  ✓ StatefulSet: storageClassName → premium-rwo" -ForegroundColor Green
-Write-Host ""
-
-Write-Host "Files created:" -ForegroundColor Yellow
-Write-Host "  ✓ Backups in: $backupDir" -ForegroundColor Green
-Write-Host "  ✓ Deployment script: deploy_to_gke.sh" -ForegroundColor Green
-Write-Host ""
-
-Write-Host "⚠ IMPORTANT: Before deploying to GKE:" -ForegroundColor Red
-Write-Host "  1. Rotate all secrets in k8s/secret.yaml" -ForegroundColor Yellow
-Write-Host "  2. Create TLS certificates for API server" -ForegroundColor Yellow
-Write-Host "  3. Review resource limits in statefulset.yaml" -ForegroundColor Yellow
-Write-Host "  4. Create GKE cluster (see GKE_READINESS_CHECKLIST.md)" -ForegroundColor Yellow
-Write-Host "  5. Push Docker image: docker push gcr.io/$GCPProjectID/cybermesh-consensus:$ImageTag" -ForegroundColor Yellow
-Write-Host ""
-
-Write-Host "Next steps:" -ForegroundColor Yellow
-Write-Host "  1. Review changes in configmap.yaml and statefulset.yaml" -ForegroundColor Cyan
-Write-Host "  2. Update secrets (CRITICAL!)" -ForegroundColor Cyan
-Write-Host "  3. Run: chmod +x k8s/deploy_to_gke.sh" -ForegroundColor Cyan
-Write-Host "  4. Run: ./k8s/deploy_to_gke.sh" -ForegroundColor Cyan
-Write-Host ""
-
-if ($DryRun) {
-    Write-Host "⚠ DRY RUN MODE - No files were modified" -ForegroundColor Yellow
-    Write-Host "  Run without -DryRun to apply changes" -ForegroundColor Yellow
-}
-
 Write-Host "=== Done ===" -ForegroundColor Green
+Write-Host "Verify files in $k8sDir before running deploy_to_gke.sh"

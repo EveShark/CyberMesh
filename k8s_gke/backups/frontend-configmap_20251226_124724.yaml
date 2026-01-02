@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-config
+  namespace: cybermesh
+  labels:
+    app: frontend
+data:
+  FRONTEND_BACKEND_API_BASE: "http://api.cybermesh.qzz.io:9441/api/v1"
+  # Backend API - Domain URL (used by browser AND server-side API routes)
+  NEXT_PUBLIC_BACKEND_API_BASE: "http://api.cybermesh.qzz.io:9441/api/v1"
+
+  # Internal backend API base for server-side fetches inside the cluster
+  FRONTEND_BACKEND_INTERNAL_API_BASE: "http://validator-api.cybermesh.svc.cluster.local:9441/api/v1"
+  BACKEND_INTERNAL_API_BASE: "http://validator-api.cybermesh.svc.cluster.local:9441/api/v1"
+  
+  FRONTEND_AI_API_BASE: "http://ai-service.cybermesh.svc.cluster.local:8080"
+  # AI Service API - Internal ClusterIP (server-side Next.js API routes only)
+  # NOT prefixed with NEXT_PUBLIC_ because browser can't resolve cluster.local DNS
+  AI_API_BASE: "http://ai-service.cybermesh.svc.cluster.local:8080"
+  
+  # Node environment
+  NODE_ENV: "production"
+  
+  # Next.js configuration
+  HOSTNAME: "0.0.0.0"
+  PORT: "3000"
