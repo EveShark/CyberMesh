@@ -96,7 +96,9 @@ func (r *Rotation) SelectLeader(ctx context.Context, view uint64) (*ValidatorInf
 		return nil, fmt.Errorf("no validators in set")
 	}
 
-	enforceReadiness := r.readiness != nil && view > 0
+	// Disable readiness filtering for deterministic leader selection.
+	// Readiness state may diverge across nodes during restart, breaking consensus.
+	enforceReadiness := false
 	eligible := r.filterEligible(ctx, allValidators, view, enforceReadiness)
 	if len(eligible) == 0 {
 		return r.handleNoEligible(ctx, allValidators, view, enforceReadiness)
@@ -109,6 +111,13 @@ func (r *Rotation) SelectLeader(ctx context.Context, view uint64) (*ValidatorInf
 	leader := &ordered[position]
 
 	eligibleCount := len(ordered)
+	
+	r.logger.InfoContext(ctx, "leader selected",
+		"view", view,
+		"leader", fmt.Sprintf("%x", leader.ID[:8]),
+		"eligible", eligibleCount,
+		"total", len(allValidators))
+	
 	if r.config.AuditSelections {
 		r.auditSelection(ctx, view, leader, eligibleCount, len(allValidators))
 	}

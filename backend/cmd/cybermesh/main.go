@@ -329,10 +329,15 @@ func main() {
 	}
 
 	blockCfg := block.Config{
-		MaxTxsPerBlock: cfgMgr.GetInt("BLOCK_MAX_TXS", 500),
-		MaxBlockBytes:  cfgMgr.GetInt("BLOCK_MAX_BYTES", 4*1024*1024),
-		MinMempoolTxs:  cfgMgr.GetInt("BLOCK_MIN_MEMPOOL_TXS", 1),
-		BuildInterval:  cfgMgr.GetDuration("BLOCK_BUILD_INTERVAL", 500*time.Millisecond),
+		MaxTxsPerBlock:          cfgMgr.GetInt("BLOCK_MAX_TXS", 500),
+		MaxBlockBytes:           cfgMgr.GetInt("BLOCK_MAX_BYTES", 4*1024*1024),
+		MinMempoolTxs:           cfgMgr.GetInt("BLOCK_MIN_MEMPOOL_TXS", 1),
+		BuildInterval:           cfgMgr.GetDuration("BLOCK_BUILD_INTERVAL", 500*time.Millisecond),
+		MempoolCapacity:         cfgMgr.GetInt("MEMPOOL_MAX_TXS", 2000),
+		BackpressureThreshold:   cfgMgr.GetFloat64("MEMPOOL_BACKPRESSURE_THRESHOLD", 0.8),
+		LatencyThresholdSeconds: int64(cfgMgr.GetInt("MEMPOOL_LATENCY_THRESHOLD_SECONDS", 60)),
+		MaxTxsBackpressure:      cfgMgr.GetInt("BLOCK_MAX_TXS_BACKPRESSURE", 200),
+		MaxTxsLatency:           cfgMgr.GetInt("BLOCK_MAX_TXS_LATENCY", 300),
 	}
 	builder := block.NewBuilder(blockCfg, mp, store, logger)
 

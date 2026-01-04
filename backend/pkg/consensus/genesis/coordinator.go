@@ -210,29 +210,31 @@ func (c *Coordinator) initialize(ctx context.Context) error {
 
 	var restored bool
 	if c.backend != nil {
+		c.logger.InfoContext(ctx, "attempting db restore")
 		var err error
 		restored, err = c.restoreFromDatabase(ctx)
 		if err != nil {
-			// Persisted state should never prevent the node from starting; log and fall back to fresh ceremony.
-			if c.logger != nil {
-				c.logger.WarnContext(ctx, "failed to restore genesis state from database; starting fresh ceremony", "error", err)
-			}
+			c.logger.WarnContext(ctx, "db restore error, will start ceremony", "error", err)
 		}
 		if restored {
+			c.logger.InfoContext(ctx, "state restored from database")
 			return nil
 		}
+		c.logger.InfoContext(ctx, "db restore unsuccessful, trying disk")
 	}
 
 	restored, err = c.restoreFromDisk(ctx)
 	if err != nil {
-		// Disk state corruption should not block startup; log and continue.
-		if c.logger != nil {
-			c.logger.WarnContext(ctx, "failed to restore genesis state from disk; starting fresh ceremony", "error", err)
-		}
+		c.logger.WarnContext(ctx, "disk restore error, will start ceremony", "error", err)
 	}
 	if restored {
+		c.logger.InfoContext(ctx, "state restored from disk")
 		return nil
 	}
+
+	c.logger.InfoContext(ctx, "no persisted state found, starting genesis ceremony",
+		"node", fmt.Sprintf("%x", c.localID[:8]),
+		"aggregator", fmt.Sprintf("%x", c.aggregator[:8]))
 
 	// Start periodic rebroadcast until certificate received
 	go c.rebroadcastLoop(ctx)
@@ -1050,23 +1052,43 @@ func (c *Coordinator) restoreFromDisk(ctx context.Context) (bool, error) {
 
 func (c *Coordinator) restoreFromDatabase(ctx context.Context) (bool, error) {
 	if c.backend == nil {
+		c.logger.InfoContext(ctx, "db backend unavailable, skipping restore")
 		return false, nil
 	}
+	
+	c.logger.InfoContext(ctx, "checking db for genesis certificate")
+	
 	data, found, err := c.backend.LoadGenesisCertificate(ctx)
 	if err != nil {
+		c.logger.ErrorContext(ctx, "db query failed", "error", err)
 		return false, fmt.Errorf("load persisted genesis certificate: %w", err)
 	}
 	if !found || len(data) == 0 {
+		c.logger.InfoContext(ctx, "no genesis certificate in db")
 		return false, nil
 	}
+	
+	c.logger.InfoContext(ctx, "found genesis certificate", "bytes", len(data))
+	
 	var cert messages.GenesisCertificate
 	if err := cbor.Unmarshal(data, &cert); err != nil {
+		c.logger.ErrorContext(ctx, "failed to decode certificate", "error", err)
 		return false, fmt.Errorf("decode persisted genesis certificate: %w", err)
 	}
+	
+	c.logger.InfoContext(ctx, "decoded genesis certificate",
+		"attestations", len(cert.Attestations),
+		"aggregator", fmt.Sprintf("%x", cert.Aggregator[:8]),
+		"timestamp", cert.Timestamp)
+	
 	if err := c.validateCertificate(ctx, &cert, true); err != nil {
+		c.logger.WarnContext(ctx, "certificate failed validation", "error", err)
 		c.handleInvalidPersistedCertificate(ctx, err, &cert)
 		return false, nil
 	}
+	
+	c.logger.InfoContext(ctx, "validation passed, restoring state")
+	
 	c.applyRestoredCertificate(ctx, &cert, "cockroachdb", nil)
 	return true, nil
 }
@@ -1075,12 +1097,22 @@ func (c *Coordinator) applyRestoredCertificate(ctx context.Context, cert *messag
 	if cert == nil {
 		return
 	}
+	c.logger.InfoContext(ctx, "applying genesis state", "source", source, "attestations", len(cert.Attestations))
+	
 	c.mu.Lock()
 	c.attestations = make(map[types.ValidatorID]*messages.GenesisReady, len(cert.Attestations))
 	for i := range cert.Attestations {
 		attCopy := cert.Attestations[i]
 		attPtr := &attCopy
 		c.attestations[attCopy.ValidatorID] = attPtr
+		
+		// Mark validators ready for deterministic leader selection
+		if c.host != nil {
+			c.host.MarkValidatorReady(attCopy.ValidatorID)
+			c.logger.InfoContext(ctx, "marked validator ready",
+				"validator", fmt.Sprintf("%x", attCopy.ValidatorID[:8]))
+		}
+		
 		if attCopy.ValidatorID == c.localID {
 			c.readyMu.Lock()
 			c.localReady = attPtr
@@ -1099,7 +1131,7 @@ func (c *Coordinator) applyRestoredCertificate(ctx context.Context, cert *messag
 				fields = append(fields, k, v)
 			}
 		}
-		c.logger.InfoContext(ctx, "restored genesis certificate", fields...)
+		c.logger.InfoContext(ctx, "genesis state applied", fields...)
 	}
 
 	c.setCertificate(ctx, cert)

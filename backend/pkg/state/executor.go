@@ -79,6 +79,15 @@ func ApplyBlock(store StateStore, now time.Time, skew time.Duration, txs []Trans
 		// Enforce nonce uniqueness at execution time (defense-in-depth)
 		if env := tx.Envelope(); env != nil {
 			if v, ok := txn.Get(keyNonce(env.ProducerID, env.Nonce)); ok && len(v) > 0 {
+				// Check if this is a replay of an already-committed transaction
+				var existingHash [32]byte
+				copy(existingHash[:], v)
+				if existingHash == env.ContentHash {
+					// Transaction already applied - skip (idempotent replay)
+					r.Code = ExecCodeOK
+					receipts[i] = r
+					continue
+				}
 				r.Code, r.Error = ExecCodeInvalid, ErrNonceReplay.Error()
 				receipts[i] = r
 				return 0, zeroRoot, receipts, ErrNonceReplay

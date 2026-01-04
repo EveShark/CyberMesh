@@ -38,8 +38,20 @@ func computeTxRoot(txs []state.Transaction) types.BlockHash {
 
 // Build deterministically selects transactions from the mempool under limits and produces an AppBlock.
 func (b *Builder) Build(height uint64, parent types.BlockHash, proposer types.ValidatorID, now time.Time) *AppBlock {
+	count, _, oldest := b.mp.StatsDetailed()
 	maxCount := b.cfg.MaxTxsPerBlock
 	maxBytes := b.cfg.MaxBlockBytes
+	
+	backpressureThreshold := int(float64(b.cfg.MempoolCapacity) * b.cfg.BackpressureThreshold)
+	
+	if count > backpressureThreshold {
+		maxCount = min(count, b.cfg.MaxTxsBackpressure)
+	}
+	
+	if oldest > 0 && now.Unix()-oldest > b.cfg.LatencyThresholdSeconds {
+		maxCount = min(count, b.cfg.MaxTxsLatency)
+	}
+	
 	txs := b.mp.Select(maxCount, maxBytes)
 	// Prepare roots
 	txRoot := computeTxRoot(txs)

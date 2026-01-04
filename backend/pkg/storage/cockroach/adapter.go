@@ -339,11 +339,11 @@ func (a *adapter) prepareStatements(ctx context.Context) error {
 		return fmt.Errorf("prepare list evidence: %w", err)
 	}
 
+	// Match UPSERT constraint (id=1) to ensure consistent genesis loading
 	a.stmtLoadGenesisCert, err = a.db.PrepareContext(ctx, `
 		SELECT certificate
 		FROM genesis_certificates
-		ORDER BY created_at DESC
-		LIMIT 1
+		WHERE id = 1
 	`)
 	if err != nil {
 		return fmt.Errorf("prepare load genesis certificate: %w", err)
