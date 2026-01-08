@@ -1,0 +1,25 @@
+project_id = "wcgddjipyslnjstabqaq"
+
+[functions.blockchain-data]
+verify_jwt = false
+
+[functions.threats-summary]
+verify_jwt = false
+
+[functions.system-health]
+verify_jwt = false
+
+[functions.dashboard-overview]
+verify_jwt = false
+
+[functions.network-status]
+verify_jwt = false
+
+[functions.ai-engine-status]
+verify_jwt = false
+
+[functions.health]
+verify_jwt = false
+
+[functions.send-contact-email]
+verify_jwt = false

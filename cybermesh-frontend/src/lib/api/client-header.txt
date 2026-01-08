@@ -1,0 +1,17 @@
+// Typed API client with fetch wrapper, AbortController support, performance tracking,
+// and request deduplication to prevent duplicate in-flight requests.
+// Routes through Supabase Edge Functions for circuit breaker, caching, and rate limiting  
+
+import type { DashboardOverviewData } from "@/mocks/dashboard";
+import type { AIEngineData } from "@/mocks/ai-engine";
+import type { BlockchainData } from "@/types/blockchain";
+import type { NetworkData } from "@/types/network";
+import type { ThreatsData } from "@/types/threats";
+import type { SystemHealthData } from "@/types/system-health";
+import { recordApiPerformance } from "@/lib/api/performance";
+import { rateLimitedFetch, type RateLimitedFetchOptions } from "@/lib/api/rate-limiter";
+import { transformApiResponse, transformApiRequest } from "@/lib/utils/json";
+
+// Adapter Imports
+import { adaptAIEngine, adaptThreats, adaptNetwork, adaptBlockchain } from "./adapters";
+import type { DashboardOverviewRaw } from "./types/raw";
