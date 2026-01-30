@@ -95,7 +95,7 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
+# lib/ - REMOVED: was blocking cybermesh-frontend/src/lib access
 lib64/
 parts/
 sdist/
@@ -287,7 +287,6 @@ frontend/tests/
 backend/docs/
 ai-service/docs/
 frontend/docs/
-/docs/
 
 # Root data directory (runtime state)
 /data/
