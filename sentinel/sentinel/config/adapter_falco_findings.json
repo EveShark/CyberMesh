@@ -1,0 +1,56 @@
+{
+  "version": "v1",
+  "adapter": "falco_findings",
+  "modality": "scan_findings",
+  "features_version": "ScanFindingsV1",
+  "source": "falco",
+  "tenant_id": "default",
+  "timestamp_field": "time",
+  "required_fields": [
+    "tool",
+    "findings"
+  ],
+  "field_map": {
+    "tool": "$const:falco",
+    "findings": "$"
+  },
+  "transforms": {
+    "tool": { "type": "lower" },
+    "findings": {
+      "type": "map_list",
+      "map": {
+        "rule_id": ["rule"],
+        "rule_name": ["rule"],
+        "severity": ["priority"],
+        "description": ["output"],
+        "location": ["hostname"],
+        "evidence": ["output_fields"],
+        "tags": ["tags"]
+      },
+      "defaults": {
+        "severity": "medium"
+      },
+      "field_transforms": {
+        "severity": {
+          "type": "enum",
+          "map": {
+            "EMERGENCY": "critical",
+            "ALERT": "critical",
+            "CRITICAL": "critical",
+            "ERROR": "high",
+            "WARNING": "medium",
+            "NOTICE": "low",
+            "INFO": "low",
+            "INFORMATIONAL": "low",
+            "DEBUG": "low"
+          }
+        }
+      }
+    }
+  },
+  "limits": {
+    "max_payload_bytes": 1048576,
+    "max_records": 1000,
+    "parse_timeout_ms": 2000
+  }
+}

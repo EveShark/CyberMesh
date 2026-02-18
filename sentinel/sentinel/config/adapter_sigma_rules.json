@@ -1,0 +1,40 @@
+{
+  "version": "v1",
+  "adapter": "sigma_rules",
+  "modality": "scan_findings",
+  "features_version": "ScanFindingsV1",
+  "source": "sigma",
+  "tenant_id": "default",
+  "timestamp_field": "timestamp",
+  "required_fields": [
+    "tool",
+    "findings"
+  ],
+  "field_map": {
+    "tool": ["tool", "source", "scanner"],
+    "findings": ["findings", "hits", "matches"]
+  },
+  "transforms": {
+    "tool": { "type": "lower" },
+    "findings": {
+      "type": "map_list",
+      "map": {
+        "rule_id": ["rule.id", "rule_id", "id"],
+        "rule_name": ["rule.name", "rule_name", "name", "title"],
+        "severity": ["level", "severity", "rule.level"],
+        "description": ["description", "message", "rule.description"],
+        "location": ["location", "file", "path", "target"],
+        "evidence": ["match", "evidence", "context"]
+      },
+      "defaults": {
+        "severity": "medium"
+      },
+      "lower_fields": ["severity"]
+    }
+  },
+  "limits": {
+    "max_payload_bytes": 1048576,
+    "max_records": 1000,
+    "parse_timeout_ms": 2000
+  }
+}

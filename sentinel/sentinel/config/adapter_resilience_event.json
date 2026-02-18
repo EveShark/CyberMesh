@@ -1,0 +1,38 @@
+{
+  "version": "v1",
+  "adapter": "resilience_event",
+  "modality": "resilience_event",
+  "features_version": "ResilienceEventV1",
+  "source": "resilience",
+  "tenant_id": "default",
+  "timestamp_field": "timestamp",
+  "required_fields": [
+    "component",
+    "status"
+  ],
+  "field_map": {
+    "component": ["component", "agent", "adapter", "provider", "service"],
+    "status": ["status", "state", "health"],
+    "error_type": ["error.type", "error_type"],
+    "error_message": ["error.message", "error_message"],
+    "latency_ms": ["latency_ms", "latency", "elapsed_ms"],
+    "backlog_depth": ["backlog_depth", "queue_depth", "backlog"],
+    "missed_heartbeats": ["missed_heartbeats", "missed", "heartbeat_misses"],
+    "last_seen_ts": ["last_seen_ts", "last_seen", "last_seen_timestamp"],
+    "observed_ts": ["observed_ts", "observed", "observed_timestamp"],
+    "attributes": ["attributes", "metadata", "attrs"]
+  },
+  "transforms": {
+    "status": { "type": "lower" },
+    "latency_ms": { "type": "float" },
+    "backlog_depth": { "type": "int" },
+    "missed_heartbeats": { "type": "int" },
+    "last_seen_ts": { "type": "float" },
+    "observed_ts": { "type": "float" }
+  },
+  "limits": {
+    "max_payload_bytes": 1048576,
+    "max_records": 1000,
+    "parse_timeout_ms": 2000
+  }
+}

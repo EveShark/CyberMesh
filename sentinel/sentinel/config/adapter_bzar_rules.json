@@ -1,0 +1,41 @@
+{
+  "version": "v1",
+  "adapter": "bzar_rules",
+  "modality": "scan_findings",
+  "features_version": "ScanFindingsV1",
+  "source": "bzar",
+  "tenant_id": "default",
+  "timestamp_field": "ts",
+  "required_fields": [
+    "tool",
+    "findings"
+  ],
+  "field_map": {
+    "tool": "$const:bzar",
+    "findings": ["findings", "$"]
+  },
+  "transforms": {
+    "tool": { "type": "lower" },
+    "findings": {
+      "type": "map_list",
+      "map": {
+        "rule_id": ["note", "sub", "rule_id", "id"],
+        "rule_name": ["note", "msg", "rule_name", "name", "title"],
+        "severity": ["severity", "level"],
+        "description": ["msg", "description"],
+        "location": ["dst", "id.resp_h", "location", "target"],
+        "evidence": ["sub", "evidence", "context"],
+        "tags": ["actions", "tags"]
+      },
+      "defaults": {
+        "severity": "medium"
+      },
+      "lower_fields": ["severity"]
+    }
+  },
+  "limits": {
+    "max_payload_bytes": 1048576,
+    "max_records": 1000,
+    "parse_timeout_ms": 2000
+  }
+}

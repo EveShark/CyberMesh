@@ -1,0 +1,39 @@
+YARA Rules Processing Statistics
+========================================
+Total files: 1219
+Compiled OK: 1197
+Errors: 22
+Deduplicated: 1458
+Total rules: 16024
+
+By category:
+  document: 111
+  exploit: 661
+  generic: 9781
+  malware: 2896
+  packer: 1719
+  webshell: 856
+
+Compile errors:
+  configured_vulns_ext_vars.yar: External variables required
+  expl_citrix_netscaler_adc_exploitation_cve_2023_3519.yar: Syntax: B:\sentinel\data\signature-base\yara\expl_citrix_netscaler_adc_exploitation_cve_2023_3519.yar(21): u
+  expl_connectwise_screenconnect_vuln_feb24.yar: Syntax: B:\sentinel\data\signature-base\yara\expl_connectwise_screenconnect_vuln_feb24.yar(327): undefined i
+  general_cloaking.yar: Syntax: B:\sentinel\data\signature-base\yara\general_cloaking.yar(63): undefined identifier "filepath"
+  generic_anomalies.yar: Syntax: B:\sentinel\data\signature-base\yara\generic_anomalies.yar(523): undefined identifier "extension"
+  gen_fake_amsi_dll.yar: Syntax: B:\sentinel\data\signature-base\yara\gen_fake_amsi_dll.yar(60): undefined identifier "filename"
+  gen_mal_3cx_compromise_mar23.yar: Syntax: B:\sentinel\data\signature-base\yara\gen_mal_3cx_compromise_mar23.yar(367): undefined identifier "ex
+  gen_susp_obfuscation.yar: Syntax: B:\sentinel\data\signature-base\yara\gen_susp_obfuscation.yar(57): undefined identifier "filepath"
+  gen_vcruntime140_dll_sideloading.yar: Syntax: B:\sentinel\data\signature-base\yara\gen_vcruntime140_dll_sideloading.yar(12): undefined identifier 
+  gen_webshells_ext_vars.yar: External variables required
+  thor_inverse_matches.yar: Syntax: B:\sentinel\data\signature-base\yara\thor_inverse_matches.yar(578): undefined identifier "filepath"
+  yara-rules_vuln_drivers_strict_renamed.yar: Syntax: B:\sentinel\data\signature-base\yara\yara-rules_vuln_drivers_strict_renamed.yar(11991): undefined id
+  yara_mixed_ext_vars.yar: External variables required
+  MALW_AZORULT.yar: Syntax: B:\sentinel\data\yara-rules\malware\MALW_AZORULT.yar(23): invalid field name "sync"
+  MALW_Httpsd_ELF.yar: Syntax: B:\sentinel\data\yara-rules\malware\MALW_Httpsd_ELF.yar(73): undefined identifier "is__elf"
+  MALW_Mirai_Okiru_ELF.yar: Syntax: B:\sentinel\data\yara-rules\malware\MALW_Mirai_Okiru_ELF.yar(21): undefined identifier "is__elf"
+  MALW_Mirai_Satori_ELF.yar: Syntax: B:\sentinel\data\yara-rules\malware\MALW_Mirai_Satori_ELF.yar(34): undefined identifier "is__elf"
+  MALW_Rebirth_Vulcan_ELF.yar: Syntax: B:\sentinel\data\yara-rules\malware\MALW_Rebirth_Vulcan_ELF.yar(72): undefined identifier "is__elf"
+  MALW_TinyShell_Backdoor_gen.yar: Syntax: B:\sentinel\data\yara-rules\malware\MALW_TinyShell_Backdoor_gen.yar(126): undefined identifier "is__
+  MALW_Torte_ELF.yar: Syntax: B:\sentinel\data\yara-rules\malware\MALW_Torte_ELF.yar(31): undefined identifier "is__elf"
+  TOOLKIT_Mandibule.yar: Syntax: B:\sentinel\data\yara-rules\malware\TOOLKIT_Mandibule.yar(65): undefined identifier "is__elf"
+  WShell_THOR_Webshells.yar: Error: [Errno 22] Invalid argument: 'B:\\sentinel\\data\\yara-rules\\webshells\\WShell_THOR_Webshells.yar'

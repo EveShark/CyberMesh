@@ -1,0 +1,43 @@
+{
+  "version": "v1",
+  "adapter": "action_event",
+  "modality": "action_event",
+  "features_version": "ActionEventV1",
+  "source": "action_event",
+  "tenant_id": "default",
+  "timestamp_field": "timestamp",
+  "required_fields": [
+    "event_name"
+  ],
+  "field_map": {
+    "event_name": ["event.name", "event_name", "name"],
+    "event_category": ["event.category", "event_category", "category"],
+    "event_type": ["event.type", "event_type", "type"],
+    "event_action": ["event.action", "event_action", "action"],
+    "event_outcome": ["event.outcome", "event_outcome", "outcome"],
+    "session_id": ["session.id", "session_id"],
+    "chain_id": ["chain_id", "trace.id", "trace_id"],
+    "step_id": ["step.id", "span.id", "step_id", "span_id"],
+    "step_index": ["step.index", "step_index", "sequence_index"],
+    "actor_id": ["user.id", "actor.id", "actor_id", "principal"],
+    "tool_name": ["tool.name", "tool_name"],
+    "tool_namespace": ["tool.namespace", "tool_namespace"],
+    "resource": ["resource.name", "resource", "target", "file.path"],
+    "destination": ["destination", "dst", "url", "destination.url", "dest"],
+    "bytes_out": ["bytes_out", "bytes.out", "network.bytes", "out_bytes"],
+    "bytes_in": ["bytes_in", "bytes.in", "in_bytes"],
+    "attributes": ["attributes", "event.attributes", "metadata", "attrs"]
+  },
+  "transforms": {
+    "event_category": { "type": "listify" },
+    "event_type": { "type": "listify" },
+    "step_index": { "type": "int" },
+    "bytes_out": { "type": "int" },
+    "bytes_in": { "type": "int" }
+  },
+  "limits": {
+    "max_payload_bytes": 1048576,
+    "max_records": 1000,
+    "parse_timeout_ms": 2000
+  }
+}

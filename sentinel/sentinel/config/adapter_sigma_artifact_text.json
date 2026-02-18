@@ -1,0 +1,33 @@
+{
+  "version": "v1",
+  "adapter": "sigma_artifact_text",
+  "modality": "scan_findings",
+  "features_version": "ScanFindingsV1",
+  "source": "sigma",
+  "tenant_id": "default",
+  "required_fields": [
+    "tool",
+    "findings"
+  ],
+  "field_map": {
+    "tool": "$const:sigma",
+    "findings": "lines"
+  },
+  "transforms": {
+    "tool": { "type": "lower" },
+    "findings": {
+      "type": "text_lines_to_findings",
+      "rule_name": "sigma_query_artifact",
+      "severity": "low",
+      "description": "sigma compiled query artifact"
+    }
+  },
+  "limits": {
+    "max_payload_bytes": 1048576,
+    "max_records": 1000,
+    "parse_timeout_ms": 2000,
+    "max_findings": 200,
+    "max_string_bytes": 4096
+  }
+}
+

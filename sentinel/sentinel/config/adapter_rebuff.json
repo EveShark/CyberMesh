@@ -1,0 +1,48 @@
+{
+  "version": "v1",
+  "adapter": "rebuff",
+  "modality": "scan_findings",
+  "features_version": "ScanFindingsV1",
+  "source": "rebuff",
+  "tenant_id": "default",
+  "timestamp_field": "timestamp",
+  "required_fields": [
+    "tool",
+    "findings"
+  ],
+  "field_map": {
+    "tool": "$const:rebuff",
+    "findings": "$"
+  },
+  "transforms": {
+    "tool": { "type": "lower" },
+    "findings": {
+      "type": "map_list",
+      "map": {
+        "rule_id": "$const:rebuff_injection",
+        "rule_name": "$const:prompt_injection",
+        "severity": ["detection_metrics.injectionDetected"],
+        "description": "$const:Rebuff prompt injection signal",
+        "evidence": ["detection_metrics"]
+      },
+      "defaults": {
+        "severity": "medium"
+      },
+      "lower_fields": ["severity"],
+      "field_transforms": {
+        "severity": {
+          "type": "enum",
+          "map": {
+            "True": "high",
+            "False": "low"
+          }
+        }
+      }
+    }
+  },
+  "limits": {
+    "max_payload_bytes": 1048576,
+    "max_records": 1000,
+    "parse_timeout_ms": 2000
+  }
+}

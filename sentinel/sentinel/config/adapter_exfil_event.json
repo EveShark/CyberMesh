@@ -1,0 +1,47 @@
+{
+  "version": "v1",
+  "adapter": "exfil_event",
+  "modality": "exfil_event",
+  "features_version": "ExfilEventV1",
+  "source": "exfil",
+  "tenant_id": "default",
+  "timestamp_field": "timestamp",
+  "required_fields": [
+    "destination",
+    "bytes_out"
+  ],
+  "field_map": {
+    "destination": ["destination", "dest", "dst", "url", "dst_url", "destination.url"],
+    "bytes_out": ["bytes_out", "bytes.out", "out_bytes", "size"],
+    "src_ip": ["src_ip", "source.ip"],
+    "dst_ip": ["dst_ip", "destination.ip"],
+    "src_host": ["src_host", "source.domain", "source.host"],
+    "dst_host": ["dst_host", "destination.domain", "destination.host"],
+    "dst_domain": ["dst_domain", "destination.domain", "domain"],
+    "dst_url": ["dst_url", "destination.url", "url"],
+    "src_user": ["src_user", "source.user", "user.name"],
+    "dst_user": ["dst_user", "destination.user"],
+    "bytes_in": ["bytes_in", "bytes.in", "in_bytes"],
+    "object_count": ["object_count", "objects", "file_count"],
+    "mime_types": ["mime_types", "mime", "content_types"],
+    "data_classification": ["data_classification", "classification", "labels"],
+    "encoding": ["encoding", "content_encoding"],
+    "compressed": ["compressed", "is_compressed"],
+    "policy_decision": ["policy_decision", "policy.action", "policy.decision"],
+    "event_outcome": ["event.outcome", "event_outcome", "outcome"],
+    "attributes": ["attributes", "metadata", "attrs"]
+  },
+  "transforms": {
+    "bytes_out": { "type": "int" },
+    "bytes_in": { "type": "int" },
+    "object_count": { "type": "int" },
+    "mime_types": { "type": "listify" },
+    "data_classification": { "type": "listify" },
+    "compressed": { "type": "bool" }
+  },
+  "limits": {
+    "max_payload_bytes": 1048576,
+    "max_records": 1000,
+    "parse_timeout_ms": 2000
+  }
+}

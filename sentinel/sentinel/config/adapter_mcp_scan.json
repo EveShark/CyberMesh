@@ -1,0 +1,41 @@
+{
+  "version": "v1",
+  "adapter": "mcp_scan",
+  "modality": "scan_findings",
+  "features_version": "ScanFindingsV1",
+  "source": "mcp-scan",
+  "tenant_id": "default",
+  "timestamp_field": "timestamp",
+  "records_path": "*",
+  "required_fields": [
+    "tool",
+    "findings"
+  ],
+  "field_map": {
+    "tool": "$const:mcp-scan",
+    "findings": ["issues", "findings"]
+  },
+  "transforms": {
+    "tool": { "type": "lower" },
+    "findings": {
+      "type": "map_list",
+      "map": {
+        "rule_id": ["code", "id", "rule_id"],
+        "rule_name": ["code", "message", "name", "rule_name", "title"],
+        "severity": ["severity", "level"],
+        "description": ["message", "description"],
+        "location": ["reference", "location"],
+        "evidence": ["extra_data", "evidence", "context"]
+      },
+      "defaults": {
+        "severity": "medium"
+      },
+      "lower_fields": ["severity"]
+    }
+  },
+  "limits": {
+    "max_payload_bytes": 1048576,
+    "max_records": 1000,
+    "parse_timeout_ms": 2000
+  }
+}

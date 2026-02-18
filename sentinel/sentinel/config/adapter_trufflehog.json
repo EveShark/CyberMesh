@@ -1,0 +1,49 @@
+{
+  "version": "v1",
+  "adapter": "trufflehog",
+  "modality": "scan_findings",
+  "features_version": "ScanFindingsV1",
+  "source": "trufflehog",
+  "tenant_id": "default",
+  "timestamp_field": "timestamp",
+  "required_fields": [
+    "tool",
+    "findings"
+  ],
+  "field_map": {
+    "tool": "$const:trufflehog",
+    "findings": "$"
+  },
+  "transforms": {
+    "tool": { "type": "lower" },
+    "findings": {
+      "type": "map_list",
+      "map": {
+        "rule_id": ["DetectorName", "DetectorType"],
+        "rule_name": ["DetectorName"],
+        "severity": ["Verified"],
+        "description": ["DetectorDescription"],
+        "location": ["SourceMetadata.Data.Git.file"],
+        "evidence": ["Redacted"]
+      },
+      "defaults": {
+        "severity": "medium"
+      },
+      "lower_fields": ["severity"],
+      "field_transforms": {
+        "severity": {
+          "type": "enum",
+          "map": {
+            "True": "high",
+            "False": "medium"
+          }
+        }
+      }
+    }
+  },
+  "limits": {
+    "max_payload_bytes": 1048576,
+    "max_records": 1000,
+    "parse_timeout_ms": 2000
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "version": "v1",
+  "adapter": "skill_scanner",
+  "modality": "scan_findings",
+  "features_version": "ScanFindingsV1",
+  "source": "skill-scanner",
+  "tenant_id": "default",
+  "timestamp_field": "timestamp",
+  "required_fields": [
+    "tool",
+    "findings"
+  ],
+  "field_map": {
+    "tool": "$const:skill-scanner",
+    "findings": "findings",
+    "summary": "max_severity"
+  },
+  "transforms": {
+    "tool": { "type": "lower" },
+    "findings": {
+      "type": "map_list",
+      "map": {
+        "rule_id": ["rule_id", "id"],
+        "rule_name": ["title"],
+        "severity": ["severity"],
+        "description": ["description"],
+        "location": ["file_path"],
+        "evidence": ["snippet"]
+      },
+      "defaults": {
+        "severity": "medium"
+      },
+      "lower_fields": ["severity"]
+    }
+  },
+  "limits": {
+    "max_payload_bytes": 1048576,
+    "max_records": 1000,
+    "parse_timeout_ms": 2000
+  }
+}

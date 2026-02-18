@@ -1,0 +1,53 @@
+{
+  "version": "v1",
+  "adapter": "mcp_runtime",
+  "modality": "mcp_runtime",
+  "features_version": "MCPRuntimeEventV1",
+  "source": "mcp-runtime",
+  "tenant_id": "default",
+  "timestamp_field": "timestamp",
+  "required_fields": [
+    "method",
+    "direction"
+  ],
+  "field_map": {
+    "method": ["method", "rpc.method", "mcp.method"],
+    "direction": ["direction", "flow", "rpc.direction"],
+    "jsonrpc": ["jsonrpc"],
+    "request_id": ["id", "request_id", "rpc.id"],
+    "params": ["params"],
+    "result": ["result"],
+    "error_data": ["error.data", "error_data"],
+    "protocol_version": ["protocol_version"],
+    "server_id": ["server.id", "server_id", "server.name"],
+    "client_id": ["client.id", "client_id", "client.name"],
+    "session_id": ["session.id", "session_id"],
+    "tool_name": ["tool.name", "tool_name", "params.name"],
+    "tool_schema_hash": ["tool.schema_hash", "tool_schema_hash", "schema.hash"],
+    "tool_schema_version": ["tool.schema_version", "tool_schema_version", "schema.version"],
+    "arguments": ["arguments", "params.arguments", "params", "args"],
+    "arguments_size_bytes": ["arguments_size_bytes", "args_size", "size", "bytes"],
+    "result_content_types": ["result.content_types", "result.content_type", "content_types"],
+    "is_error": ["error", "is_error", "result.is_error"],
+    "error_code": ["error.code", "error_code"],
+    "error_message": ["error.message", "error_message"],
+    "tools": ["result.tools", "tools"],
+    "cursor": ["params.cursor", "cursor"],
+    "next_cursor": ["result.nextCursor", "next_cursor"],
+    "list_changed": ["list_changed", "params.listChanged"],
+    "attributes": ["attributes", "metadata", "attrs"]
+  },
+  "transforms": {
+    "direction": { "type": "lower" },
+    "arguments_size_bytes": { "type": "int" },
+    "result_content_types": { "type": "listify" },
+    "tools": { "type": "listify" },
+    "list_changed": { "type": "bool" },
+    "is_error": { "type": "bool" }
+  },
+  "limits": {
+    "max_payload_bytes": 1048576,
+    "max_records": 1000,
+    "parse_timeout_ms": 2000
+  }
+}

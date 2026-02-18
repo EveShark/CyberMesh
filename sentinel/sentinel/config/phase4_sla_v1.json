@@ -1,0 +1,26 @@
+{
+  "version": "v1",
+  "generated_at": "2026-02-10",
+  "scope": "Standalone Sentinel Phase 4 (LLM off, threat-intel off). Baseline SLAs for local E2E stability.",
+  "latency_ms_p95": {
+    "action_event": 10.0,
+    "mcp_runtime": 10.0,
+    "exfil_event": 10.0,
+    "resilience_event": 10.0,
+    "scripts": 250.0,
+    "pe_files": 5000.0,
+    "elf_unsupported": 1500.0
+  },
+  "throughput_events_per_s_min": {
+    "telemetry_c2_beacon": 30.0,
+    "telemetry_zeek_sampled": 150.0,
+    "telemetry_aws_vpc": 100.0
+  },
+  "error_rate_max": {
+    "telemetry_zeek_sampled": 0.05,
+    "telemetry_aws_vpc": 0.01
+  },
+  "duplicate_rate_max": {
+    "telemetry_zeek_sampled": 0.12
+  }
+}

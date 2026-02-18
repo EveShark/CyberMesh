@@ -1,0 +1,40 @@
+{
+  "version": "v1",
+  "adapter": "falco_process",
+  "modality": "process_event",
+  "features_version": "ProcessEventV1",
+  "source": "falco",
+  "tenant_id": "default",
+  "id_field": "evt.id",
+  "timestamp_field": "evt.time",
+  "required_fields": [
+    "event_type",
+    "process_name",
+    "pid",
+    "ppid",
+    "user",
+    "command_line"
+  ],
+  "field_map": {
+    "event_type": "evt.type",
+    "process_name": "proc.name",
+    "pid": "proc.pid",
+    "ppid": "proc.ppid",
+    "user": "user.name",
+    "command_line": "proc.cmdline",
+    "rule": "rule",
+    "severity": "priority",
+    "host": "host",
+    "container_id": "container.id"
+  },
+  "transforms": {
+    "pid": { "type": "int" },
+    "ppid": { "type": "int" },
+    "severity": { "type": "lower" }
+  },
+  "limits": {
+    "max_payload_bytes": 1048576,
+    "max_records": 1000,
+    "parse_timeout_ms": 2000
+  }
+}

@@ -1,0 +1,36 @@
+# Local env/secrets
+.env
+.env.*
+!.env.example
+
+# Python cache/artifacts
+.pytest_cache/
+**/__pycache__/
+*.pyc
+
+# Generated runtime outputs
+reports/
+eval_data/
+oss_outputs/
+
+# Large local datasets (kept outside git)
+testdata/
+
+# Generated calibration/benchmark artifacts
+data/benchmark_results/
+data/calibration/
+
+# Large/local data corpora
+data/evaluation_datasets/
+data/eval_samples/
+data/signature-base/
+data/yara-rules/
+
+# Local evaluation outputs
+calibrated_config.json
+fp_report.json
+
+# Skip tests for this commit scope
+tests/
+api/tests/
+scripts/test_*.py

@@ -1,0 +1,31 @@
+Hybrid Sentinel TODO
+
+Completed
+- [x] Draft PRD for hybrid pipeline
+- [x] Add parallel merge/dedupe helper
+- [x] Wire hybrid graph (parse -> parallel core -> optional LLM -> coordinator)
+- [x] Add standalone runner (main.py)
+- [x] Merge metadata across parallel branches
+
+Pending (Must-do)
+- [x] Confirm baseline pipeline run (sequential mode + fast-path)
+- [x] Add degraded-mode detection (YARA/models/hash DB/threat-intel)
+- [x] Standardize per-agent timing + error metadata
+- [x] Add telemetry modality router (FileAnalysisGraph vs TelemetryAnalysisGraph)
+- [x] Add minimal telemetry agent (rules/heuristics + optional intel)
+- [x] Add telemetry ingestion adapters (CSV/IPFIX/JSON -> NetworkFlowFeaturesV1)
+- [x] Add integration tests:
+      - fast-path short-circuit
+      - parallel merge + dedupe
+      - partial failure survives
+      - telemetry ingestion -> detection flow
+- [ ] Update documentation for standalone + AI-service integration
+
+Pending (Should-do)
+- [ ] Fix CLI logging shadowing (stdlib logging conflict)
+- [ ] Improve API startup errors for missing env vars
+- [ ] Add LLM redaction for sensitive metadata
+
+Future
+- [ ] Add telemetry ingestion path (CSV/IPFIX)
+- [ ] Add network-flow agent branch

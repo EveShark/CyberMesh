@@ -1,0 +1,36 @@
+# Core
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+typer[all]>=0.9.0
+rich>=13.0.0
+
+# Agent Framework
+langgraph>=0.2.0
+langchain-core>=0.3.0
+
+# LLM Providers
+httpx>=0.27.0
+openai>=1.0.0
+
+# ML
+lightgbm>=4.0.0
+scikit-learn>=1.3.0
+numpy>=1.24.0
+joblib>=1.3.0
+
+# File Analysis
+pefile>=2023.2.7
+oletools>=0.60.0
+yara-python>=4.3.0
+pypdf>=3.0.0
+
+# Crypto
+cryptography>=41.0.0
+
+# Output
+jinja2>=3.1.0
+pillow>=10.0.0
+
+# Optional: Kafka integration
+# confluent-kafka>=2.3.0
+# protobuf>=4.24.0
