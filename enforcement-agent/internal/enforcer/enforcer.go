@@ -7,6 +7,8 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/CyberMesh/enforcement-agent/internal/enforcer/cilium"
+	"github.com/CyberMesh/enforcement-agent/internal/enforcer/gateway"
 	"github.com/CyberMesh/enforcement-agent/internal/enforcer/iptables"
 	"github.com/CyberMesh/enforcement-agent/internal/enforcer/kubernetes"
 	"github.com/CyberMesh/enforcement-agent/internal/enforcer/nftables"
@@ -36,6 +38,8 @@ type Options struct {
 	DryRun  bool
 	Logger  *zap.Logger
 
+	Cilium     cilium.Config
+	Gateway    gateway.Config
 	IPTables   iptables.Config
 	NFTables   nftables.Config
 	Kubernetes kubernetes.Config
@@ -44,6 +48,14 @@ type Options struct {
 // Factory constructs the selected backend based on name.
 func Factory(opts Options) (Enforcer, error) {
 	switch opts.Backend {
+	case "cilium":
+		opts.Cilium.DryRun = opts.DryRun
+		opts.Cilium.Logger = opts.Logger
+		return cilium.New(opts.Cilium)
+	case "gateway":
+		opts.Gateway.DryRun = opts.DryRun
+		opts.Gateway.Logger = opts.Logger
+		return gateway.New(opts.Gateway)
 	case "iptables":
 		opts.IPTables.DryRun = opts.DryRun
 		opts.IPTables.Logger = opts.Logger

@@ -21,7 +21,7 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// PolicyAckEvent represents control.policy.ack.v1 produced by the enforcement agent
+// PolicyAckEvent represents control.enforcement_ack.v1 produced by the enforcement agent
 type PolicyAckEvent struct {
 	state              protoimpl.MessageState `protogen:"open.v1"`
 	PolicyId           string                 `protobuf:"bytes,1,opt,name=policy_id,json=policyId,proto3" json:"policy_id,omitempty"`

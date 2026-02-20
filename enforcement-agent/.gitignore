@@ -16,6 +16,7 @@
 # Build output directory
 bin/
 /bin/
+/.local/
 
 # Go test binaries
 *.test
@@ -36,6 +37,9 @@ bin/
 # Test directory
 test/
 /test/
+*_test.go
+*_integration_test.go
+internal/state/state_store_test_moved.go
 
 # Coverage reports
 *.out
@@ -135,6 +139,11 @@ build.sh
 build.ps1
 *.sh
 *.ps1
+
+# Deployment manifests are mirrored under k8s_azure/
+/deploy/
+/docs/
+/tools/
 
 # KEEP specific files if needed
 !README.md

@@ -1,97 +1,49 @@
 # CyberMesh Enforcement Agent
 
-Consumes signed policy events from Kafka, validates them (signature + hash), converts `rule_data` into an actionable `PolicySpec`, applies enforcement via a backend (iptables/nftables/Kubernetes), persists local state for reconciliation/expiry, and optionally publishes ACKs back to Kafka.
+Consumes signed policy events from Kafka, validates them (signature + hash), converts `rule_data` into an actionable `PolicySpec`, applies enforcement via a backend (cilium/gateway/iptables/nftables/Kubernetes), persists local state for reconciliation/expiry, and optionally publishes ACKs back to Kafka.
 
-## Low-Level Architecture (LLA)
+## Low-Level Architecture (LLD)
 
-```text
-                           +------------------------------+
-                           |  Trusted Keys (PEM files)    |
-                           |  CONTROL_POLICY_TRUSTED_KEYS |
-                           +---------------+--------------+
-                                           |
-                                           v
- +-------------------+     +------------------------------+      +----------------------+
- | Kafka             |     | kafka.Consumer (sarama)      |      | controller.Controller |
- | control.policy.v1 +---->| internal/kafka/consumer.go   +----->| internal/controller   |
- +-------------------+     | consumer group + lag metrics |      | HandleMessage()       |
-                           +------------------------------+      +----------+-----------+
-                                                                              |
-                                                                              | Verify + parse
-                                                                              v
-                                                                +--------------------------+
-                                                                | policy.TrustedKeys       |
-                                                                | internal/policy/event.go |
-                                                                | - ed25519 verify         |
-                                                                | - sha256 rule_hash check |
-                                                                +------------+-------------+
-                                                                             |
-                                                                             | JSON -> PolicySpec
-                                                                             v
-                                                                +--------------------------+
-                                                                | policy.ParseSpec         |
-                                                                | internal/policy/parser.go|
-                                                                | (currently: rule_type=   |
-                                                                |  "block")                |
-                                                                +------------+-------------+
-                                                                             |
-                                                                             | Guardrails + approval + dedupe
-                                                                             v
-                                                                +--------------------------+
-                                                                | Guardrails               |
-                                                                | internal/controller       |
-                                                                | - allowlist checks        |
-                                                                | - cooldown / max active   |
-                                                                | - rate limits (local/redis|
-                                                                | - manual approval staging |
-                                                                +------------+-------------+
-                                                                             |
-                                                                             | Apply policy
-                                                                             v
-                                                         +-------------------+-------------------+
-                                                         | enforcer.Enforcer (Factory)           |
-                                                         | internal/enforcer/enforcer.go         |
-                                                         |  - iptables (linux)                   |
-                                                         |  - nftables (linux)                   |
-                                                         |  - kubernetes NetworkPolicy           |
-                                                         |  - noop                               |
-                                                         +-------------------+-------------------+
-                                                                             |
-                                                                             | Persist for reconcile/expiry
-                                                                             v
-                                                                +--------------------------+
-                                                                | state.Store              |
-                                                                | internal/state/store.go  |
-                                                                | - snapshot JSON file     |
-                                                                | - TTL/pre-consensus/     |
-                                                                |   rollback deadlines     |
-                                                                +------------+-------------+
-                                                                             |
-                                                                             | Background loops
-                                                                             v
-                 +----------------------------+                 +----------------------------+
-                 | scheduler.Scheduler        |                 | reconciler.Reconciler      |
-                 | internal/scheduler         |                 | internal/reconciler        |
-                 | - expire TTL deadlines     |                 | - periodic re-apply        |
-                 | - remove from backend      |                 | - optional ledger snapshot |
-                 +----------------------------+                 +----------------------------+
+Quick path:
 
-  Optional ACK pipeline (enabled via ACK_ENABLED=true):
+`control.policy.v1 -> verify/parse -> guardrails -> backend apply -> control.enforcement_ack.v1`
 
-    controller.emitAck()
-          |
-          v
-    +-------------------+   +-------------------+   +------------------+   +-------------------+
-    | ack.Batching      |-->| ack.Retrying      |-->| ack.BoltQueue     |-->| ack.KafkaPublisher|
-    | internal/ack      |   | internal/ack      |   | (bbolt on disk)   |   | -> Kafka topic     |
-    | (optional)        |   | queue+worker      |   | ACK_QUEUE_PATH    |   | control.policy.ack |
-    +-------------------+   +-------------------+   +------------------+   +-------------------+
+```mermaid
+flowchart LR
+    K[Kafka: control.policy.v1] --> C[controller.HandleMessage]
+    C --> V[Verify signature + rule_hash]
+    V --> P[Parse PolicySpec]
+    P --> G[Guardrails: dedupe, allowlist, cooldown, rate limit, approval]
+    G --> E{ENFORCEMENT_BACKEND}
 
-  HTTP server (always on, METRICS_ADDR):
-    GET /metrics
-    GET /healthz, GET /readyz
-    GET/POST /control/kill-switch?enabled=true|false
+    E -->|cilium| CIL[Cilium policy apply]
+    E -->|gateway| GW[Gateway rule apply]
+    E -->|iptables| IPT[iptables apply]
+    E -->|nftables| NFT[nftables apply]
+    E -->|kubernetes/k8s| K8S[NetworkPolicy apply]
+    E -->|noop| NOOP[No-op apply]
+
+    CIL --> S[state.Store + scheduler + reconciler]
+    GW --> S
+    IPT --> S
+    NFT --> S
+    K8S --> S
+    NOOP --> S
+
+    S --> ACK[Optional ACK pipeline]
+    ACK --> KA[Kafka: control.enforcement_ack.v1]
 ```
+
+### Backend Selection Matrix
+
+| Backend | Scope | Network Layer | Typical Use |
+|---|---|---|---|
+| `cilium` | East-West | L3/L4 | Kubernetes internal segmentation |
+| `gateway` | North-South | L3/L4 | Ingress/egress boundary policy |
+| `iptables` | Host | L3/L4 | Linux host fallback path |
+| `nftables` | Host | L3/L4 | Linux host modern path |
+| `kubernetes`/`k8s` | Cluster | L3/L4 | Native NetworkPolicy path |
+| `noop` | N/A | N/A | Dev/test safety mode |
 
 ## Repo Layout (What We Use)
 
@@ -140,6 +92,8 @@ Note: This README intentionally excludes `bin/` and `test/` (per project usage),
 - `internal/enforcer/enforcer.go`
   - Backend factory + common `Enforcer` interface.
   - Backends:
+    - `internal/enforcer/cilium/*` (Cilium backend)
+    - `internal/enforcer/gateway/*` (Gateway backend)
     - `internal/enforcer/iptables/*` (linux build)
     - `internal/enforcer/nftables/*` (linux build)
     - `internal/enforcer/kubernetes/kubernetes.go` (NetworkPolicy)
@@ -225,7 +179,7 @@ Note: This README intentionally excludes `bin/` and `test/` (per project usage),
 
 ### Enforcement
 
-- `ENFORCEMENT_BACKEND` (default: `iptables`; other values: `nftables`, `kubernetes`/`k8s`, `noop`)
+- `ENFORCEMENT_BACKEND` (default: `iptables`; other values: `cilium`, `gateway`, `nftables`, `kubernetes`/`k8s`, `noop`)
 - `ENFORCEMENT_DRY_RUN` (`true|false`) - log what would be applied without changing system state
 - `ENFORCEMENT_KILL_SWITCH_ENABLED` (`true|false`) - start with kill switch enabled
 
@@ -234,6 +188,17 @@ Backend-specific:
 - `ENFORCER_NFT_BIN` (default: `nft`)
 - `ENFORCER_KUBE_CONFIG`, `ENFORCER_KUBE_CONTEXT`, `ENFORCER_KUBE_NAMESPACE` (default: `default`)
 - `ENFORCER_KUBE_QPS` (default: `5.0`), `ENFORCER_KUBE_BURST` (default: `10`)
+- Cilium backend:
+  - `CILIUM_POLICY_KIND` (`CiliumNetworkPolicy` or `CiliumClusterwideNetworkPolicy`)
+  - `CILIUM_POLICY_API_VERSION` (default: `cilium.io/v2`)
+  - `CILIUM_POLICY_NAME_PREFIX` (default: `cybermesh-`)
+  - `CILIUM_POLICY_NAMESPACE` (required for namespaced policy kind)
+  - `CILIUM_LABEL_PREFIX` (default: `k8s:`)
+- Gateway backend:
+  - `GATEWAY_NAMESPACE` (required when `ENFORCEMENT_BACKEND=gateway`)
+  - `GATEWAY_POLICY_NAME_PREFIX` (default: `cybermesh-`)
+  - `GATEWAY_REQUIRE_ROUTE_MATCH` (`true|false`)
+  - `GATEWAY_SUPPORTED_ACTIONS` (csv)
 - `ENFORCER_SELECTOR_NAMESPACE_PREFIX`, `ENFORCER_SELECTOR_NODE_PREFIX`
   - Required for selector-only policies in iptables/nftables (used to map selectors to ipset/nft set names).
 
@@ -261,7 +226,7 @@ Redis options:
 ### ACK Publishing (Optional)
 
 - `ACK_ENABLED` (`true|false`, default: `false`)
-- `ACK_TOPIC` (default: `control.policy.ack.v1`)
+- `ACK_TOPIC` (default: `control.enforcement_ack.v1`)
 - `ACK_BROKERS` (defaults to `CONTROL_POLICY_BROKERS`)
 - `ACK_CLIENT_ID` (default: `policy-ack-publisher`)
 - `ACK_RETRY_MAX` (default: `5`)
@@ -303,4 +268,3 @@ The agent exposes a small HTTP server on `METRICS_ADDR`:
 - `backend/proto` import: Go code imports protobuf types from the `backend` module (see `go.mod` line `replace backend => ../backend`). The `proto/` directory here contains schemas and generated code aligned to that `go_package`, but the build expects the sibling `../backend` module to be present.
 - Non-Linux builds: iptables/nftables are `//go:build linux` and have stub implementations for other platforms.
 - Selector-only policies: For iptables/nftables, policies that target selectors (e.g., namespace/node) require selector set prefixes (`ENFORCER_SELECTOR_NAMESPACE_PREFIX`, `ENFORCER_SELECTOR_NODE_PREFIX`) so the backend can map selectors into set names.
-

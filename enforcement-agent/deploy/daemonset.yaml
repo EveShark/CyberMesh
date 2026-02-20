@@ -46,7 +46,7 @@ spec:
                   name: cybermesh-secrets
                   key: KAFKA_SASL_PASSWORD
             - name: CONTROL_POLICY_GROUP
-              value: "policy-enforcement-agent"
+              value: "policy-enforcement-agent-$(NODE_NAME)"
             - name: CONTROL_POLICY_TRUSTED_KEYS
               value: "/var/run/cybermesh/trust"
             - name: ENFORCEMENT_BACKEND

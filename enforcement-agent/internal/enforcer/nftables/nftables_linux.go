@@ -84,25 +84,34 @@ func (e *Enforcer) ensureBaseChains(ctx context.Context) error {
 	if e.dryRun {
 		return nil
 	}
-	commands := [][]string{
-		{"list", "table", "inet", "filter"},
+
+	// Ensure table exists.
+	if err := e.runCmd(ctx, "list", "table", "inet", "filter"); err != nil {
+		if err := e.runCmd(ctx, "add", "table", "inet", "filter"); err != nil {
+			return fmt.Errorf("nftables: create table: %w", err)
+		}
 	}
-	if err := e.runCmd(ctx, commands[0]...); err == nil {
-		return nil
+
+	// Ensure expected base chains exist. A previous run may have created the table
+	// but not the chains, and adding rules would then fail.
+	type chainSpec struct {
+		name string
+		hook string
 	}
-	setup := []string{
-		"add", "table", "inet", "filter",
-	}
-	if err := e.runCmd(ctx, setup...); err != nil {
-		return fmt.Errorf("nftables: create table: %w", err)
-	}
-	for _, chain := range [][]string{
-		{"add", "chain", "inet", "filter", "ingress", "{", "type", "filter", "hook", "input", "priority", "0", ";", "policy", "accept", "}"},
-		{"add", "chain", "inet", "filter", "egress", "{", "type", "filter", "hook", "output", "priority", "0", ";", "policy", "accept", "}"},
-		{"add", "chain", "inet", "filter", "forward", "{", "type", "filter", "hook", "forward", "priority", "0", ";", "policy", "accept", "}"},
+	for _, spec := range []chainSpec{
+		{name: "ingress", hook: "input"},
+		{name: "egress", hook: "output"},
+		{name: "forward", hook: "forward"},
 	} {
+		if err := e.runCmd(ctx, "list", "chain", "inet", "filter", spec.name); err == nil {
+			continue
+		}
+		chain := []string{
+			"add", "chain", "inet", "filter", spec.name,
+			"{", "type", "filter", "hook", spec.hook, "priority", "0", ";", "policy", "accept", ";", "}",
+		}
 		if err := e.runCmd(ctx, chain...); err != nil {
-			return fmt.Errorf("nftables: create chain: %w", err)
+			return fmt.Errorf("nftables: create chain %s: %w", spec.name, err)
 		}
 	}
 	return nil
@@ -443,8 +452,14 @@ type nftRule struct {
 }
 
 func commentFor(policyID, target, chain string) string {
+	// nft's comment parsing is picky: keep it ASCII identifier-safe (no ':' etc).
+	// We only need stable uniqueness for lookup/remove, not human readability.
+	pid := strings.ReplaceAll(policyID, "-", "")
+	if len(pid) > 16 {
+		pid = pid[:16]
+	}
 	h := sha1.Sum([]byte(target + chain))
-	return fmt.Sprintf("cm:%s:%s", policyID, hex.EncodeToString(h[:4]))
+	return fmt.Sprintf("cm_%s_%s", pid, hex.EncodeToString(h[:4]))
 }
 
 func buildSelectorSets(spec policy.PolicySpec, cfg selectorConfig) ([]string, error) {

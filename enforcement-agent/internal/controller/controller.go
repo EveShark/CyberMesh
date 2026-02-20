@@ -2,9 +2,11 @@ package controller
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +41,9 @@ type Controller struct {
 	fastPath   FastPathConfig
 	acks       ack.Publisher
 	instanceID string
+	replay     replayConfig
+	replaySeen map[string]time.Time
+	replayMu   sync.Mutex
 }
 
 type FastPathConfig struct {
@@ -53,6 +58,17 @@ type Options struct {
 	FastPathSignals       int64
 	AckPublisher          ack.Publisher
 	ControllerInstanceID  string
+	ReplayWindow          time.Duration
+	ReplayFutureSkew      time.Duration
+	ReplayCacheMaxEntries int
+}
+
+type replayConfig struct {
+	window         time.Duration
+	futureSkew     time.Duration
+	cacheMax       int
+	enabled        bool
+	requirePayload bool
 }
 
 const (
@@ -64,6 +80,18 @@ const (
 
 // New constructs a controller.
 func New(trust *policy.TrustedKeys, store *state.Store, backend enforcer.Enforcer, recorder *metrics.Recorder, rate ratelimit.Coordinator, kill *control.KillSwitch, logger *zap.Logger, opts Options) *Controller {
+	replayWindow := opts.ReplayWindow
+	if replayWindow <= 0 {
+		replayWindow = 10 * time.Minute
+	}
+	replayFutureSkew := opts.ReplayFutureSkew
+	if replayFutureSkew <= 0 {
+		replayFutureSkew = 30 * time.Second
+	}
+	replayMax := opts.ReplayCacheMaxEntries
+	if replayMax <= 0 {
+		replayMax = 20000
+	}
 	c := &Controller{
 		trust:      trust,
 		store:      store,
@@ -80,6 +108,14 @@ func New(trust *policy.TrustedKeys, store *state.Store, backend enforcer.Enforce
 		},
 		acks:       opts.AckPublisher,
 		instanceID: opts.ControllerInstanceID,
+		replay: replayConfig{
+			window:         replayWindow,
+			futureSkew:     replayFutureSkew,
+			cacheMax:       replayMax,
+			enabled:        replayWindow > 0,
+			requirePayload: true,
+		},
+		replaySeen: make(map[string]time.Time, replayMax),
 	}
 	c.loadPendingApprovals()
 	return c
@@ -117,12 +153,22 @@ func (c *Controller) loadPendingApprovals() {
 // HandleMessage satisfies kafka.MessageHandler.
 func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMessage) error {
 	c.metrics.ObserveIngest()
+	if c.logger != nil {
+		c.logger.Info(
+			"policy message received",
+			zap.String("topic", msg.Topic),
+			zap.Int32("partition", msg.Partition),
+			zap.Int64("offset", msg.Offset),
+			zap.Int("value_bytes", len(msg.Value)),
+			zap.Int("key_bytes", len(msg.Key)),
+		)
+	}
 
 	var event pb.PolicyUpdateEvent
 	if err := proto.Unmarshal(msg.Value, &event); err != nil {
 		c.metrics.ObserveRejected()
 		if c.logger != nil {
-			c.logger.Warn("failed to unmarshal policy", zap.Error(err))
+			c.logger.Warn("failed to unmarshal policy", zap.Error(err), zap.Int("value_bytes", len(msg.Value)))
 		}
 		return nil
 	}
@@ -135,10 +181,19 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 		}
 		return nil
 	}
+	if c.logger != nil {
+		c.logger.Info(
+			"policy verification passed",
+			zap.String("policy_id", evt.Spec.ID),
+			zap.String("action", evt.Spec.Action),
+			zap.String("scope", scopeIdentifier(evt.Spec)),
+		)
+	}
 
 	c.metrics.ObserveValidated()
 	requiresAck := evt.Proto.GetRequiresAck()
 	appliedAt := time.Time{}
+
 	fastPath := EvaluateFastPath(evt.Spec, c.fastPath)
 	if c.metrics != nil {
 		if fastPath.Eligible {
@@ -155,13 +210,26 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 	}
 
 	if c.isDuplicate(evt) {
+		if c.logger != nil {
+			c.logger.Debug("duplicate policy event treated as idempotent noop", zap.String("policy_id", evt.Spec.ID))
+		}
+		appliedAt = time.Now().UTC()
+		c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultApplied, "duplicate_noop", "policy duplicate detected", appliedAt)
+		return nil
+	}
+
+	if reason, replayErr := c.checkReplay(evt, time.Now().UTC()); replayErr != nil {
 		if c.metrics != nil {
-			c.metrics.ObserveGuardrailViolation("duplicate_rule")
+			c.metrics.ObserveGuardrailViolation(reason)
+			c.metrics.ObserveGatewayReplayReject(reason)
 		}
 		if c.logger != nil {
-			c.logger.Debug("duplicate policy event ignored", zap.String("policy_id", evt.Spec.ID))
+			c.logger.Warn("policy replay guard rejected event",
+				zap.String("policy_id", evt.Spec.ID),
+				zap.String("reason", reason),
+				zap.Error(replayErr))
 		}
-		c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultFailed, "duplicate_rule", "policy duplicate detected", appliedAt)
+		c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultFailed, reason, replayErr.Error(), appliedAt)
 		return nil
 	}
 
@@ -242,6 +310,15 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 	}
 
 	start := time.Now()
+	if c.logger != nil {
+		c.logger.Info(
+			"policy apply started",
+			zap.String("policy_id", evt.Spec.ID),
+			zap.String("action", evt.Spec.Action),
+			zap.String("rule_type", evt.Spec.RuleType),
+			zap.Bool("dry_run", evt.Spec.Guardrails.DryRun),
+		)
+	}
 	if err := c.enforcer.Apply(ctx, evt.Spec); err != nil {
 		if reservation != nil {
 			_ = reservation.Release(ctx)
@@ -252,6 +329,9 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 	}
 	appliedAt = time.Now().UTC()
 	c.metrics.ObserveApplied(time.Since(start))
+	if c.logger != nil {
+		c.logger.Info("policy apply succeeded", zap.String("policy_id", evt.Spec.ID), zap.Duration("latency", time.Since(start)))
+	}
 	c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultApplied, "", "", appliedAt)
 
 	if reservation != nil {
@@ -296,6 +376,83 @@ func (c *Controller) isDuplicate(evt policy.Event) bool {
 	}
 	c.seenHashes.Store(key, hash)
 	return false
+}
+
+func (c *Controller) checkReplay(evt policy.Event, now time.Time) (string, error) {
+	if !c.replay.enabled {
+		return "", nil
+	}
+	if evt.Proto == nil {
+		if c.replay.requirePayload {
+			return "replay_missing_envelope", fmt.Errorf("missing policy envelope for replay validation")
+		}
+		return "", nil
+	}
+
+	eventTS := time.Unix(evt.Proto.GetTimestamp(), 0).UTC()
+	if evt.Proto.GetTimestamp() <= 0 {
+		return "replay_invalid_timestamp", fmt.Errorf("invalid timestamp in policy envelope")
+	}
+	if now.Add(c.replay.futureSkew).Before(eventTS) {
+		return "replay_future_timestamp", fmt.Errorf("policy timestamp %s exceeds future skew %s", eventTS.Format(time.RFC3339), c.replay.futureSkew.String())
+	}
+	if eventTS.Before(now.Add(-c.replay.window)) {
+		return "replay_stale_timestamp", fmt.Errorf("policy timestamp %s outside replay window %s", eventTS.Format(time.RFC3339), c.replay.window.String())
+	}
+
+	key := replayKey(evt)
+	c.replayMu.Lock()
+	defer c.replayMu.Unlock()
+	c.pruneReplayLocked(now)
+
+	if seenAt, ok := c.replaySeen[key]; ok {
+		if now.Sub(seenAt) <= c.replay.window {
+			return "replay_duplicate", fmt.Errorf("duplicate replay key within window")
+		}
+	}
+	c.replaySeen[key] = now
+	if len(c.replaySeen) > c.replay.cacheMax {
+		c.evictReplayLocked(len(c.replaySeen) - c.replay.cacheMax)
+	}
+	return "", nil
+}
+
+func replayKey(evt policy.Event) string {
+	policyID := evt.Spec.ID
+	if evt.Proto != nil && strings.TrimSpace(evt.Proto.GetPolicyId()) != "" {
+		policyID = strings.TrimSpace(evt.Proto.GetPolicyId())
+	}
+	return strings.Join([]string{
+		policyID,
+		hex.EncodeToString(evt.Proto.GetRuleHash()),
+		hex.EncodeToString(evt.Proto.GetProducerId()),
+		strconv.FormatInt(evt.Proto.GetTimestamp(), 10),
+	}, "|")
+}
+
+func (c *Controller) pruneReplayLocked(now time.Time) {
+	if !c.replay.enabled {
+		return
+	}
+	cutoff := now.Add(-c.replay.window)
+	for k, seen := range c.replaySeen {
+		if seen.Before(cutoff) {
+			delete(c.replaySeen, k)
+		}
+	}
+}
+
+func (c *Controller) evictReplayLocked(toRemove int) {
+	if toRemove <= 0 {
+		return
+	}
+	for k := range c.replaySeen {
+		delete(c.replaySeen, k)
+		toRemove--
+		if toRemove == 0 {
+			return
+		}
+	}
 }
 
 func (c *Controller) checkGuardrails(ctx context.Context, spec policy.PolicySpec) (ratelimit.Reservation, string, error) {
@@ -498,6 +655,18 @@ func (c *Controller) emitAck(ctx context.Context, evt policy.Event, requiresAck 
 	if !requiresAck || c.acks == nil {
 		return
 	}
+	if c.metrics != nil {
+		c.metrics.ObserveGatewayAckPublish("enqueue_requested")
+	}
+	if c.logger != nil {
+		c.logger.Info(
+			"ack publish requested",
+			zap.String("policy_id", evt.Spec.ID),
+			zap.String("result", string(result)),
+			zap.String("error_code", errorCode),
+			zap.Bool("fast_path", fastPath.Eligible),
+		)
+	}
 	payload := ack.Payload{
 		Event:      evt,
 		Result:     result,
@@ -515,7 +684,17 @@ func (c *Controller) emitAck(ctx context.Context, evt policy.Event, requiresAck 
 		ProducerID: append([]byte(nil), evt.Proto.GetProducerId()...),
 	}
 	if err := c.acks.Publish(ctx, payload); err != nil && c.logger != nil {
+		if c.metrics != nil {
+			c.metrics.ObserveGatewayAckPublish("enqueue_failed")
+		}
 		c.logger.Error("failed to enqueue ack", zap.String("policy_id", evt.Spec.ID), zap.String("result", string(result)), zap.String("error_code", errorCode), zap.Error(err))
+		return
+	}
+	if c.metrics != nil {
+		c.metrics.ObserveGatewayAckPublish("enqueue_ok")
+	}
+	if c.logger != nil {
+		c.logger.Info("ack publish succeeded", zap.String("policy_id", evt.Spec.ID), zap.String("result", string(result)))
 	}
 }
 

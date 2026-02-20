@@ -10,11 +10,16 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/IBM/sarama"
 	"github.com/prometheus/client_golang/prometheus"
+	kgo "github.com/segmentio/kafka-go"
+	kgosasl "github.com/segmentio/kafka-go/sasl"
+	kgoplain "github.com/segmentio/kafka-go/sasl/plain"
+	kgoscram "github.com/segmentio/kafka-go/sasl/scram"
 	"go.uber.org/zap"
 
 	redis "github.com/redis/go-redis/v9"
@@ -24,6 +29,8 @@ import (
 	"github.com/CyberMesh/enforcement-agent/internal/control"
 	"github.com/CyberMesh/enforcement-agent/internal/controller"
 	"github.com/CyberMesh/enforcement-agent/internal/enforcer"
+	"github.com/CyberMesh/enforcement-agent/internal/enforcer/cilium"
+	"github.com/CyberMesh/enforcement-agent/internal/enforcer/gateway"
 	"github.com/CyberMesh/enforcement-agent/internal/enforcer/iptables"
 	"github.com/CyberMesh/enforcement-agent/internal/enforcer/kubernetes"
 	"github.com/CyberMesh/enforcement-agent/internal/enforcer/nftables"
@@ -66,6 +73,47 @@ func main() {
 		Backend: cfg.EnforcementBackend,
 		DryRun:  cfg.DryRun,
 		Logger:  logger,
+		Cilium: cilium.Config{
+			KubeConfigPath:  cfg.KubeConfigPath,
+			Context:         cfg.KubeContext,
+			Namespace:       cfg.KubeNamespace,
+			QPS:             cfg.KubeQPS,
+			Burst:           cfg.KubeBurst,
+			PolicyMode:      cfg.CiliumPolicyMode,
+			PolicyNamespace: cfg.CiliumPolicyNamespace,
+			LabelPrefix:     cfg.CiliumLabelPrefix,
+		},
+		Gateway: gateway.Config{
+			GatewayNamespace: cfg.GatewayNamespace,
+			Metrics:          recorder,
+			Guardrails: gateway.GuardrailsConfig{
+				MaxTargetsPerPolicy: cfg.GatewayGuardrails.MaxTargetsPerPolicy,
+				MaxPortsPerPolicy:   cfg.GatewayGuardrails.MaxPortsPerPolicy,
+				MaxActivePolicies:   cfg.GatewayGuardrails.MaxActivePolicies,
+				MaxActivePerTenant:  cfg.GatewayGuardrails.MaxActivePerTenant,
+				MaxTTLSeconds:       cfg.GatewayGuardrails.MaxTTLSeconds,
+				RequireTenant:       cfg.GatewayGuardrails.RequireTenant,
+				EnforceTenantMatch:  cfg.GatewayGuardrails.EnforceTenantMatch,
+				ApplyCooldown:       cfg.GatewayGuardrails.ApplyCooldown,
+				RequireCanary:       cfg.GatewayGuardrails.RequireCanary,
+				DenyBroadCIDRs:      cfg.GatewayGuardrails.DenyBroadCIDRs,
+				MinIPv4Prefix:       cfg.GatewayGuardrails.MinIPv4Prefix,
+				MinIPv6Prefix:       cfg.GatewayGuardrails.MinIPv6Prefix,
+				ProtectedCIDRs:      cfg.GatewayGuardrails.ProtectedCIDRs,
+				ProtectedIPs:        cfg.GatewayGuardrails.ProtectedIPs,
+				ProtectedNamespaces: cfg.GatewayGuardrails.ProtectedNamespaces,
+			},
+			Cilium: gateway.CiliumConfig{
+				KubeConfigPath:  cfg.KubeConfigPath,
+				Context:         cfg.KubeContext,
+				Namespace:       cfg.KubeNamespace,
+				QPS:             cfg.KubeQPS,
+				Burst:           cfg.KubeBurst,
+				PolicyMode:      cfg.CiliumPolicyMode,
+				PolicyNamespace: cfg.CiliumPolicyNamespace,
+				LabelPrefix:     cfg.CiliumLabelPrefix,
+			},
+		},
 		IPTables: iptables.Config{
 			Binary:             cfg.IPTablesBinary,
 			NamespaceSetPrefix: cfg.SelectorNamespacePrefix,
@@ -118,6 +166,9 @@ func main() {
 		FastPathSignals:       cfg.FastPathSignalsRequired,
 		AckPublisher:          ackPublisher,
 		ControllerInstanceID:  controllerInstanceID(cfg.Ack.ClientID),
+		ReplayWindow:          cfg.Security.ReplayWindow,
+		ReplayFutureSkew:      cfg.Security.ReplayFutureSkew,
+		ReplayCacheMaxEntries: cfg.Security.ReplayCacheMaxEntries,
 	})
 
 	var ledgerProvider reconciler.LedgerProvider
@@ -126,18 +177,19 @@ func main() {
 	}
 
 	consumer, err := kafka.NewConsumer(kafka.Config{
-		Brokers:       cfg.Kafka.Brokers,
-		GroupID:       cfg.Kafka.GroupID,
-		Topic:         cfg.Kafka.Topic,
-		TLS:           cfg.Kafka.TLS,
-		TLSCAPath:     cfg.Kafka.TLSCAPath,
-		TLSCertPath:   cfg.Kafka.TLSCertPath,
-		TLSKeyPath:    cfg.Kafka.TLSKeyPath,
-		SASLEnabled:   cfg.Kafka.SASLEnabled,
-		SASLMechanism: cfg.Kafka.SASLMechanism,
-		SASLUsername:  cfg.Kafka.SASLUsername,
-		SASLPassword:  cfg.Kafka.SASLPassword,
-		Metrics:       recorder,
+		Brokers:         cfg.Kafka.Brokers,
+		GroupID:         cfg.Kafka.GroupID,
+		Topic:           cfg.Kafka.Topic,
+		ProtocolVersion: cfg.Kafka.ProtocolVersion,
+		TLS:             cfg.Kafka.TLS,
+		TLSCAPath:       cfg.Kafka.TLSCAPath,
+		TLSCertPath:     cfg.Kafka.TLSCertPath,
+		TLSKeyPath:      cfg.Kafka.TLSKeyPath,
+		SASLEnabled:     cfg.Kafka.SASLEnabled,
+		SASLMechanism:   cfg.Kafka.SASLMechanism,
+		SASLUsername:    cfg.Kafka.SASLUsername,
+		SASLPassword:    cfg.Kafka.SASLPassword,
+		Metrics:         recorder,
 	}, ctrl)
 	if err != nil {
 		logger.Fatal("failed to create kafka consumer", zap.Error(err))
@@ -306,12 +358,40 @@ func buildAckPublisher(ctx context.Context, cfg config.Config, recorder *metrics
 	if !cfg.Ack.Enabled {
 		return nil, nil
 	}
+	impl := strings.ToLower(strings.TrimSpace(cfg.Ack.PublisherImpl))
+	if impl == "" {
+		impl = "kafkago"
+	}
+	if impl == "sarama" {
+		return buildAckPublisherSarama(ctx, cfg, recorder, logger)
+	}
+	return buildAckPublisherKafkaGo(ctx, cfg, recorder, logger)
+}
+
+func buildAckPublisherSarama(ctx context.Context, cfg config.Config, recorder *metrics.Recorder, logger *zap.Logger) (ack.Publisher, func()) {
 	saramaCfg := sarama.NewConfig()
-	saramaCfg.Version = sarama.V3_6_0_0
+	versionStr := cfg.Kafka.ProtocolVersion
+	if versionStr == "" {
+		versionStr = "3.6.0"
+	}
+	ver, err := sarama.ParseKafkaVersion(versionStr)
+	if err != nil {
+		logger.Fatal("invalid kafka protocol version", zap.String("version", versionStr), zap.Error(err))
+	}
+	saramaCfg.Version = ver
 	saramaCfg.ClientID = cfg.Ack.ClientID
 	saramaCfg.Producer.Return.Successes = true
-	saramaCfg.Producer.RequiredAcks = sarama.WaitForAll
-	saramaCfg.Producer.Idempotent = true
+	saramaCfg.Producer.Return.Errors = true
+	saramaCfg.Producer.Idempotent = cfg.Ack.Idempotent
+	if saramaCfg.Producer.Idempotent {
+		saramaCfg.Producer.RequiredAcks = sarama.WaitForAll
+		// Sarama requires MaxOpenRequests=1 when idempotency is enabled.
+		saramaCfg.Net.MaxOpenRequests = 1
+	} else {
+		// For non-idempotent local/dev runs, WaitForLocal is sufficient and tends to be
+		// more compatible across lightweight brokers (e.g. Redpanda single-node).
+		saramaCfg.Producer.RequiredAcks = sarama.WaitForLocal
+	}
 	saramaCfg.Producer.Retry.Max = cfg.Ack.RetryMax
 	saramaCfg.Producer.Retry.Backoff = cfg.Ack.RetryBackoff
 	saramaCfg.Producer.Partitioner = sarama.NewHashPartitioner
@@ -325,19 +405,26 @@ func buildAckPublisher(ctx context.Context, cfg config.Config, recorder *metrics
 			saramaCfg.Net.TLS.Config = tlsConfig
 		}
 	}
-	producer, err := sarama.NewSyncProducer(cfg.Ack.Brokers, saramaCfg)
+	client, err := sarama.NewClient(cfg.Ack.Brokers, saramaCfg)
 	if err != nil {
+		logger.Fatal("failed to create ACK client", zap.Error(err))
+	}
+	producer, err := sarama.NewSyncProducerFromClient(client)
+	if err != nil {
+		_ = client.Close()
 		logger.Fatal("failed to create ACK producer", zap.Error(err))
 	}
 	var signer ack.Signer
 	if cfg.Ack.Signing.Enabled {
 		if cfg.Ack.Signing.KeyPath == "" {
 			producer.Close()
+			_ = client.Close()
 			logger.Fatal("ACK signing enabled but ACK_SIGNING_KEY_PATH is empty")
 		}
 		signer, err = ack.NewEd25519Signer(cfg.Ack.Signing.KeyPath)
 		if err != nil {
 			producer.Close()
+			_ = client.Close()
 			logger.Fatal("failed to initialize ACK signer", zap.Error(err))
 		}
 		logger.Info("ACK signing enabled", zap.String("algorithm", "ed25519"))
@@ -353,12 +440,14 @@ func buildAckPublisher(ctx context.Context, cfg config.Config, recorder *metrics
 	})
 	if err != nil {
 		producer.Close()
+		_ = client.Close()
 		logger.Fatal("failed to initialize ACK publisher", zap.Error(err))
 	}
 	queue, err := ack.OpenQueue(ack.QueueOptions{Path: cfg.Ack.QueuePath, MaxSize: cfg.Ack.QueueMaxSize})
 	if err != nil {
 		basePublisher.Close(ctx)
 		producer.Close()
+		_ = client.Close()
 		logger.Fatal("failed to open ACK queue", zap.Error(err))
 	}
 	if recorder != nil {
@@ -378,6 +467,8 @@ func buildAckPublisher(ctx context.Context, cfg config.Config, recorder *metrics
 	if err != nil {
 		queue.Close()
 		basePublisher.Close(ctx)
+		producer.Close()
+		_ = client.Close()
 		logger.Fatal("failed to initialize ACK retrier", zap.Error(err))
 	}
 	if cfg.Ack.Batch.Enabled && logger != nil {
@@ -409,11 +500,168 @@ func buildAckPublisher(ctx context.Context, cfg config.Config, recorder *metrics
 		for _, closer := range closers {
 			_ = closer(ctx)
 		}
+		_ = client.Close()
+	}
+}
+
+type kafkaGoWriter struct {
+	w *kgo.Writer
+}
+
+func (kw kafkaGoWriter) WriteMessages(ctx context.Context, msgs ...kgo.Message) error {
+	return kw.w.WriteMessages(ctx, msgs...)
+}
+
+func (kw kafkaGoWriter) Close() error { return kw.w.Close() }
+
+func buildAckPublisherKafkaGo(ctx context.Context, cfg config.Config, recorder *metrics.Recorder, logger *zap.Logger) (ack.Publisher, func()) {
+	_ = ctx
+
+	var tlsConfig *tls.Config
+	if cfg.Kafka.TLS {
+		// Confluent Cloud and most managed Kafka endpoints require TLS but typically do not
+		// require client certificates. Using a nil TLS config results in plaintext dials to
+		// :9092 and hard-to-debug timeouts.
+		tc, err := kafkaTLSConfig(cfg)
+		if err != nil {
+			logger.Fatal("failed to build ACK Kafka TLS config", zap.Error(err))
+		}
+		tlsConfig = tc
+	}
+
+	var saslMech kgosasl.Mechanism
+	if cfg.Kafka.SASLEnabled {
+		mech := strings.ToLower(strings.TrimSpace(cfg.Kafka.SASLMechanism))
+		switch {
+		case mech == "", mech == "plain", mech == "plaintext":
+			saslMech = kgoplain.Mechanism{Username: cfg.Kafka.SASLUsername, Password: cfg.Kafka.SASLPassword}
+		case strings.Contains(mech, "scram"):
+			algo := kgoscram.SHA512
+			if strings.Contains(mech, "256") {
+				algo = kgoscram.SHA256
+			}
+			m, err := kgoscram.Mechanism(algo, cfg.Kafka.SASLUsername, cfg.Kafka.SASLPassword)
+			if err != nil {
+				logger.Fatal("failed to build ACK Kafka SASL SCRAM mechanism", zap.Error(err))
+			}
+			saslMech = m
+		default:
+			logger.Fatal("unsupported ACK Kafka SASL mechanism", zap.String("mechanism", cfg.Kafka.SASLMechanism))
+		}
+	}
+
+	requiredAcks := kgo.RequireOne
+	if cfg.Ack.Idempotent {
+		requiredAcks = kgo.RequireAll
+	}
+	writer := &kgo.Writer{
+		Addr:         kgo.TCP(cfg.Ack.Brokers...),
+		Topic:        cfg.Ack.Topic,
+		Balancer:     &kgo.Hash{},
+		RequiredAcks: requiredAcks,
+		Transport: &kgo.Transport{
+			TLS:      tlsConfig,
+			SASL:     saslMech,
+			ClientID: cfg.Ack.ClientID,
+		},
+		BatchTimeout: 50 * time.Millisecond,
+	}
+
+	var signer ack.Signer
+	if cfg.Ack.Signing.Enabled {
+		if cfg.Ack.Signing.KeyPath == "" {
+			_ = writer.Close()
+			logger.Fatal("ACK signing enabled but ACK_SIGNING_KEY_PATH is empty")
+		}
+		s, err := ack.NewEd25519Signer(cfg.Ack.Signing.KeyPath)
+		if err != nil {
+			_ = writer.Close()
+			logger.Fatal("failed to initialize ACK signer", zap.Error(err))
+		}
+		signer = s
+		logger.Info("ACK signing enabled", zap.String("algorithm", "ed25519"))
+	}
+
+	basePublisher, err := ack.NewKafkaGoPublisher(ack.KafkaGoOptions{
+		Writer:       kafkaGoWriter{w: writer},
+		Topic:        cfg.Ack.Topic,
+		RetryMax:     cfg.Ack.RetryMax,
+		RetryBackoff: cfg.Ack.RetryBackoff,
+		Logger:       logger,
+		Metrics:      recorder,
+		Signer:       signer,
+	})
+	if err != nil {
+		_ = writer.Close()
+		logger.Fatal("failed to initialize ACK publisher", zap.Error(err))
+	}
+
+	queue, err := ack.OpenQueue(ack.QueueOptions{Path: cfg.Ack.QueuePath, MaxSize: cfg.Ack.QueueMaxSize})
+	if err != nil {
+		basePublisher.Close(context.Background())
+		_ = writer.Close()
+		logger.Fatal("failed to open ACK queue", zap.Error(err))
+	}
+	if recorder != nil {
+		if size, err := queue.Len(context.Background()); err == nil {
+			recorder.ObserveAckQueueDepth(size)
+		} else if logger != nil {
+			logger.Warn("failed to read ACK queue depth", zap.Error(err))
+		}
+	}
+
+	retrier, err := ack.NewRetryingPublisher(ack.RetrierOptions{
+		Queue:    queue,
+		Backend:  basePublisher,
+		Metrics:  recorder,
+		Logger:   logger,
+		Interval: cfg.Ack.RetryBackoff,
+	})
+	if err != nil {
+		queue.Close()
+		basePublisher.Close(context.Background())
+		_ = writer.Close()
+		logger.Fatal("failed to initialize ACK retrier", zap.Error(err))
+	}
+	if cfg.Ack.Batch.Enabled && logger != nil {
+		logger.Info("ACK batching enabled", zap.Int("max_size", cfg.Ack.Batch.MaxSize), zap.Duration("interval", cfg.Ack.Batch.Interval))
+	}
+
+	var publisher ack.Publisher = retrier
+	var closers []func(context.Context) error
+	closers = append(closers, retrier.Close, basePublisher.Close)
+	if cfg.Ack.Batch.Enabled {
+		batcher, err := ack.NewBatchingPublisher(ack.BatchingOptions{
+			Backend:   retrier,
+			Metrics:   recorder,
+			Logger:    logger,
+			FlushSize: cfg.Ack.Batch.MaxSize,
+			Interval:  cfg.Ack.Batch.Interval,
+		})
+		if err != nil {
+			queue.Close()
+			retrier.Close(context.Background())
+			basePublisher.Close(context.Background())
+			logger.Fatal("failed to initialize ACK batcher", zap.Error(err))
+		}
+		publisher = batcher
+		closers = append([]func(context.Context) error{batcher.Close}, closers...)
+	}
+
+	return publisher, func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		for _, closer := range closers {
+			_ = closer(ctx)
+		}
+		queue.Close()
+		_ = writer.Close()
 	}
 }
 
 func kafkaTLSConfig(cfg config.Config) (*tls.Config, error) {
 	caCertPool := x509.NewCertPool()
+	hasCA := false
 	if cfg.Kafka.TLSCAPath != "" {
 		caBytes, err := os.ReadFile(cfg.Kafka.TLSCAPath)
 		if err != nil {
@@ -422,6 +670,7 @@ func kafkaTLSConfig(cfg config.Config) (*tls.Config, error) {
 		if ok := caCertPool.AppendCertsFromPEM(caBytes); !ok {
 			return nil, fmt.Errorf("invalid ACK CA cert")
 		}
+		hasCA = true
 	}
 	var certs []tls.Certificate
 	if cfg.Kafka.TLSCertPath != "" && cfg.Kafka.TLSKeyPath != "" {
@@ -431,9 +680,13 @@ func kafkaTLSConfig(cfg config.Config) (*tls.Config, error) {
 		}
 		certs = append(certs, cert)
 	}
-	return &tls.Config{
-		RootCAs:      caCertPool,
+	tlsCfg := &tls.Config{
 		Certificates: certs,
 		MinVersion:   tls.VersionTLS12,
-	}, nil
+	}
+	// If no custom CA is provided, fall back to system roots by leaving RootCAs nil.
+	if hasCA {
+		tlsCfg.RootCAs = caCertPool
+	}
+	return tlsCfg, nil
 }

@@ -12,17 +12,18 @@ import (
 // Config holds runtime configuration for the enforcement agent.
 type Config struct {
 	Kafka struct {
-		Brokers       []string
-		Topic         string
-		GroupID       string
-		TLS           bool
-		TLSCAPath     string
-		TLSCertPath   string
-		TLSKeyPath    string
-		SASLEnabled   bool
-		SASLMechanism string
-		SASLUsername  string
-		SASLPassword  string
+		Brokers         []string
+		Topic           string
+		GroupID         string
+		ProtocolVersion string
+		TLS             bool
+		TLSCAPath       string
+		TLSCertPath     string
+		TLSKeyPath      string
+		SASLEnabled     bool
+		SASLMechanism   string
+		SASLUsername    string
+		SASLPassword    string
 	}
 
 	RateLimiter struct {
@@ -35,15 +36,17 @@ type Config struct {
 	}
 
 	Ack struct {
-		Enabled      bool
-		Topic        string
-		Brokers      []string
-		ClientID     string
-		RetryMax     int
-		RetryBackoff time.Duration
-		QueuePath    string
-		QueueMaxSize int
-		Batch struct {
+		Enabled       bool
+		PublisherImpl string
+		Topic         string
+		Brokers       []string
+		ClientID      string
+		Idempotent    bool
+		RetryMax      int
+		RetryBackoff  time.Duration
+		QueuePath     string
+		QueueMaxSize  int
+		Batch         struct {
 			Enabled  bool
 			MaxSize  int
 			Interval time.Duration
@@ -78,6 +81,31 @@ type Config struct {
 	KubeQPS               float32
 	KubeBurst             int
 
+	// Cilium backend options (ENFORCEMENT_BACKEND=cilium).
+	CiliumPolicyMode      string
+	CiliumPolicyNamespace string
+	CiliumLabelPrefix     string
+
+	// Gateway backend options (ENFORCEMENT_BACKEND=gateway).
+	GatewayNamespace  string
+	GatewayGuardrails struct {
+		MaxTargetsPerPolicy int64
+		MaxPortsPerPolicy   int64
+		MaxActivePolicies   int64
+		MaxActivePerTenant  int64
+		MaxTTLSeconds       int64
+		RequireTenant       bool
+		EnforceTenantMatch  bool
+		ApplyCooldown       time.Duration
+		RequireCanary       bool
+		DenyBroadCIDRs      bool
+		MinIPv4Prefix       int
+		MinIPv6Prefix       int
+		ProtectedCIDRs      []string
+		ProtectedIPs        []string
+		ProtectedNamespaces []string
+	}
+
 	SelectorNamespacePrefix string
 	SelectorNodePrefix      string
 	FastPathEnabled         bool
@@ -85,6 +113,11 @@ type Config struct {
 	FastPathSignalsRequired int64
 
 	LogLevel string
+	Security struct {
+		ReplayWindow          time.Duration
+		ReplayFutureSkew      time.Duration
+		ReplayCacheMaxEntries int
+	}
 }
 
 const (
@@ -108,6 +141,7 @@ func Load() (Config, error) {
 
 	cfg.Kafka.Topic = envWithDefault("CONTROL_POLICY_TOPIC", defaultTopic)
 	cfg.Kafka.GroupID = envWithDefault("CONTROL_POLICY_GROUP", defaultGroupID)
+	cfg.Kafka.ProtocolVersion = envWithDefault("KAFKA_PROTOCOL_VERSION", "3.6.0")
 	cfg.Kafka.TLS = parseBool(os.Getenv("CONTROL_POLICY_TLS"))
 	cfg.Kafka.TLSCAPath = strings.TrimSpace(os.Getenv("CONTROL_POLICY_TLS_CA"))
 	cfg.Kafka.TLSCertPath = strings.TrimSpace(os.Getenv("CONTROL_POLICY_TLS_CERT"))
@@ -117,6 +151,16 @@ func Load() (Config, error) {
 	cfg.Kafka.SASLUsername = strings.TrimSpace(os.Getenv("KAFKA_SASL_USERNAME"))
 	cfg.Kafka.SASLPassword = strings.TrimSpace(os.Getenv("KAFKA_SASL_PASSWORD"))
 
+	// State path is needed early so other subsystems (e.g. ACK queue) can derive defaults.
+	cfg.StatePath = strings.TrimSpace(os.Getenv("ENFORCEMENT_STATE_PATH"))
+	if cfg.StatePath != "" {
+		abs, err := filepath.Abs(cfg.StatePath)
+		if err != nil {
+			return cfg, fmt.Errorf("resolve ENFORCEMENT_STATE_PATH: %w", err)
+		}
+		cfg.StatePath = abs
+	}
+
 	cfg.RateLimiter.Backend = strings.ToLower(envWithDefault("RATE_LIMIT_COORDINATOR", "local"))
 	cfg.RateLimiter.RedisAddr = strings.TrimSpace(os.Getenv("RATE_LIMIT_REDIS_ADDR"))
 	cfg.RateLimiter.RedisUser = strings.TrimSpace(os.Getenv("RATE_LIMIT_REDIS_USERNAME"))
@@ -125,9 +169,10 @@ func Load() (Config, error) {
 	cfg.RateLimiter.KeyPrefix = strings.TrimSpace(os.Getenv("RATE_LIMIT_KEY_PREFIX"))
 
 	cfg.Ack.Enabled = parseBoolEnv("ACK_ENABLED", false)
+	cfg.Ack.PublisherImpl = strings.ToLower(envWithDefault("ACK_PUBLISHER_IMPL", "kafkago"))
 	ackTopic := strings.TrimSpace(os.Getenv("ACK_TOPIC"))
 	if ackTopic == "" {
-		ackTopic = "control.policy.ack.v1"
+		ackTopic = "control.enforcement_ack.v1"
 	}
 	cfg.Ack.Topic = ackTopic
 	ackBrokers := strings.TrimSpace(os.Getenv("ACK_BROKERS"))
@@ -142,6 +187,7 @@ func Load() (Config, error) {
 	if cfg.Ack.ClientID == "" {
 		cfg.Ack.ClientID = "policy-ack-publisher"
 	}
+	cfg.Ack.Idempotent = parseBoolEnv("ACK_IDEMPOTENT", true)
 	cfg.Ack.RetryMax = int(parseIntEnv("ACK_RETRY_MAX", 5))
 	if cfg.Ack.RetryMax <= 0 {
 		cfg.Ack.RetryMax = 5
@@ -179,14 +225,6 @@ func Load() (Config, error) {
 	cfg.EnforcementBackend = strings.ToLower(envWithDefault("ENFORCEMENT_BACKEND", "iptables"))
 	cfg.DryRun = parseBool(os.Getenv("ENFORCEMENT_DRY_RUN"))
 	cfg.KillSwitchEnabled = parseBoolEnv("ENFORCEMENT_KILL_SWITCH_ENABLED", false)
-	cfg.StatePath = strings.TrimSpace(os.Getenv("ENFORCEMENT_STATE_PATH"))
-	if cfg.StatePath != "" {
-		abs, err := filepath.Abs(cfg.StatePath)
-		if err != nil {
-			return cfg, fmt.Errorf("resolve ENFORCEMENT_STATE_PATH: %w", err)
-		}
-		cfg.StatePath = abs
-	}
 	if cfg.StatePath == "" {
 		return cfg, fmt.Errorf("ENFORCEMENT_STATE_PATH is required")
 	}
@@ -199,12 +237,44 @@ func Load() (Config, error) {
 	cfg.KubeNamespace = envWithDefault("ENFORCER_KUBE_NAMESPACE", "default")
 	cfg.KubeQPS = parseFloatEnv("ENFORCER_KUBE_QPS", 5.0)
 	cfg.KubeBurst = int(parseIntEnv("ENFORCER_KUBE_BURST", 10))
+
+	// Cilium backend behavior (only used when ENFORCEMENT_BACKEND=cilium).
+	cfg.CiliumPolicyMode = strings.ToLower(envWithDefault("CILIUM_POLICY_MODE", "namespaced"))
+	cfg.CiliumPolicyNamespace = strings.TrimSpace(os.Getenv("CILIUM_POLICY_NAMESPACE"))
+	cfg.CiliumLabelPrefix = envWithDefault("CILIUM_LABEL_PREFIX", "k8s:")
+
+	// Gateway backend behavior (only used when ENFORCEMENT_BACKEND=gateway).
+	// Keep it flexible: support both names so we can share env across backend/enforcement during testing.
+	cfg.GatewayNamespace = strings.TrimSpace(os.Getenv("GATEWAY_NAMESPACE"))
+	if cfg.GatewayNamespace == "" {
+		cfg.GatewayNamespace = strings.TrimSpace(os.Getenv("POLICY_GATEWAY_NAMESPACE"))
+	}
+	cfg.GatewayNamespace = strings.ToLower(strings.TrimSpace(cfg.GatewayNamespace))
+	cfg.GatewayGuardrails.MaxTargetsPerPolicy = parseIntEnv("GATEWAY_MAX_TARGETS_PER_POLICY", 256)
+	cfg.GatewayGuardrails.MaxPortsPerPolicy = parseIntEnv("GATEWAY_MAX_PORTS_PER_POLICY", 128)
+	cfg.GatewayGuardrails.MaxActivePolicies = parseIntEnv("GATEWAY_MAX_ACTIVE_POLICIES", 4096)
+	cfg.GatewayGuardrails.MaxActivePerTenant = parseIntEnv("GATEWAY_MAX_ACTIVE_POLICIES_PER_TENANT", 0)
+	cfg.GatewayGuardrails.MaxTTLSeconds = parseIntEnv("GATEWAY_MAX_TTL_SECONDS", 3600)
+	cfg.GatewayGuardrails.RequireTenant = parseBoolEnv("GATEWAY_REQUIRE_TENANT", false)
+	cfg.GatewayGuardrails.EnforceTenantMatch = parseBoolEnv("GATEWAY_ENFORCE_TENANT_MATCH", true)
+	cfg.GatewayGuardrails.ApplyCooldown = parseDurationEnv("GATEWAY_APPLY_COOLDOWN", 0)
+	cfg.GatewayGuardrails.RequireCanary = parseBoolEnv("GATEWAY_REQUIRE_CANARY", false)
+	cfg.GatewayGuardrails.DenyBroadCIDRs = parseBoolEnv("GATEWAY_DENY_BROAD_CIDRS", true)
+	cfg.GatewayGuardrails.MinIPv4Prefix = int(parseIntEnv("GATEWAY_MIN_IPV4_PREFIX", 8))
+	cfg.GatewayGuardrails.MinIPv6Prefix = int(parseIntEnv("GATEWAY_MIN_IPV6_PREFIX", 32))
+	cfg.GatewayGuardrails.ProtectedCIDRs = splitAndTrim(strings.TrimSpace(os.Getenv("GATEWAY_PROTECTED_CIDRS")))
+	cfg.GatewayGuardrails.ProtectedIPs = splitAndTrim(strings.TrimSpace(os.Getenv("GATEWAY_PROTECTED_IPS")))
+	cfg.GatewayGuardrails.ProtectedNamespaces = splitAndTrim(strings.TrimSpace(os.Getenv("GATEWAY_PROTECTED_NAMESPACES")))
+
 	cfg.FastPathEnabled = parseBoolEnv("FAST_PATH_ENABLED", false)
 	cfg.FastPathMinConfidence = parseFloat64Env("FAST_PATH_MIN_CONFIDENCE", 0.9)
 	cfg.FastPathSignalsRequired = parseIntEnv("FAST_PATH_SIGNALS_REQUIRED", 2)
 
 	cfg.MetricsAddr = envWithDefault("METRICS_ADDR", defaultMetricsAddr)
 	cfg.LogLevel = strings.ToLower(envWithDefault("LOG_LEVEL", "info"))
+	cfg.Security.ReplayWindow = parseDurationEnv("SECURITY_REPLAY_WINDOW", 10*time.Minute)
+	cfg.Security.ReplayFutureSkew = parseDurationEnv("SECURITY_REPLAY_FUTURE_SKEW", 30*time.Second)
+	cfg.Security.ReplayCacheMaxEntries = int(parseIntEnv("SECURITY_REPLAY_CACHE_MAX_ENTRIES", 20000))
 
 	cfg.StateHistoryRetention = parseDurationEnv("ENFORCEMENT_STATE_HISTORY_RETENTION", 10*time.Minute)
 	cfg.StateLockTimeout = parseDurationEnv("ENFORCEMENT_STATE_LOCK_TIMEOUT", 3*time.Second)
@@ -230,6 +300,11 @@ func Load() (Config, error) {
 		cfg.SchedulerMaxBackoff = cfg.ExpirationCheckFreq * 4
 	}
 	cfg.ShutdownTimeout = parseDurationEnv("SHUTDOWN_TIMEOUT", defaultShutdownTimeout)
+
+	// Backend-specific required fields.
+	if cfg.EnforcementBackend == "gateway" && cfg.GatewayNamespace == "" {
+		return cfg, fmt.Errorf("GATEWAY_NAMESPACE is required when ENFORCEMENT_BACKEND=gateway")
+	}
 
 	return cfg, nil
 }

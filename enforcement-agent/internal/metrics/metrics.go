@@ -3,6 +3,7 @@ package metrics
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -37,6 +38,14 @@ type Recorder struct {
 	ackQueueBlocked     prometheus.Counter
 	ackBatchSize        prometheus.Histogram
 	ackBatchFlush       *prometheus.CounterVec
+	gatewayTranslation  *prometheus.CounterVec
+	gatewayApplyTotal   *prometheus.CounterVec
+	gatewayApplyDur     *prometheus.HistogramVec
+	gatewayGuardrail    *prometheus.CounterVec
+	gatewayReplay       *prometheus.CounterVec
+	gatewayTenantReject prometheus.Counter
+	gatewayActiveRules  prometheus.Gauge
+	gatewayAckPublish   *prometheus.CounterVec
 	backend             string
 }
 
@@ -151,6 +160,39 @@ func NewRecorder(reg prometheus.Registerer) *Recorder {
 			Name: "policy_ack_batch_flush_total",
 			Help: "ACK batch flush outcomes grouped by status",
 		}, []string{"status"}),
+		gatewayTranslation: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_translation_total",
+			Help: "Gateway translation outcomes grouped by status",
+		}, []string{"status"}),
+		gatewayApplyTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_apply_total",
+			Help: "Gateway apply outcomes grouped by reason",
+		}, []string{"reason"}),
+		gatewayApplyDur: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "gateway_apply_duration_seconds",
+			Help:    "Gateway apply latency grouped by result",
+			Buckets: prometheus.DefBuckets,
+		}, []string{"result"}),
+		gatewayGuardrail: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_guardrail_reject_total",
+			Help: "Gateway guardrail rejects grouped by reason",
+		}, []string{"reason"}),
+		gatewayReplay: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_replay_reject_total",
+			Help: "Gateway replay rejects grouped by reason",
+		}, []string{"reason"}),
+		gatewayTenantReject: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "gateway_tenant_reject_total",
+			Help: "Gateway tenant boundary rejects",
+		}),
+		gatewayActiveRules: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "gateway_active_rules",
+			Help: "Active gateway rules tracked by enforcer",
+		}),
+		gatewayAckPublish: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_ack_publish_total",
+			Help: "Gateway ACK enqueue/publish outcomes grouped by status",
+		}, []string{"status"}),
 	}
 
 	reg.MustRegister(
@@ -180,6 +222,14 @@ func NewRecorder(reg prometheus.Registerer) *Recorder {
 		r.ackQueueBlocked,
 		r.ackBatchSize,
 		r.ackBatchFlush,
+		r.gatewayTranslation,
+		r.gatewayApplyTotal,
+		r.gatewayApplyDur,
+		r.gatewayGuardrail,
+		r.gatewayReplay,
+		r.gatewayTenantReject,
+		r.gatewayActiveRules,
+		r.gatewayAckPublish,
 	)
 	return r
 }
@@ -369,6 +419,99 @@ func (r *Recorder) ObserveAckBatchFlush(status string) {
 	}
 }
 
+func (r *Recorder) isGatewayBackend() bool {
+	return strings.EqualFold(strings.TrimSpace(r.backend), "gateway")
+}
+
+// ObserveGatewayTranslation records gateway translation outcomes.
+func (r *Recorder) ObserveGatewayTranslation(status string) {
+	if r == nil || r.gatewayTranslation == nil || !r.isGatewayBackend() {
+		return
+	}
+	if status == "" {
+		status = "unknown"
+	}
+	r.gatewayTranslation.WithLabelValues(status).Inc()
+}
+
+// ObserveGatewayApplySuccess records successful gateway apply operations.
+func (r *Recorder) ObserveGatewayApplySuccess(d time.Duration) {
+	if r == nil || !r.isGatewayBackend() {
+		return
+	}
+	if r.gatewayApplyTotal != nil {
+		r.gatewayApplyTotal.WithLabelValues("ok").Inc()
+	}
+	if r.gatewayApplyDur != nil {
+		r.gatewayApplyDur.WithLabelValues("success").Observe(d.Seconds())
+	}
+}
+
+// ObserveGatewayApplyFailure records failed gateway apply operations.
+func (r *Recorder) ObserveGatewayApplyFailure(reason string, d time.Duration) {
+	if r == nil || !r.isGatewayBackend() {
+		return
+	}
+	if reason == "" {
+		reason = "unknown"
+	}
+	if r.gatewayApplyTotal != nil {
+		r.gatewayApplyTotal.WithLabelValues(reason).Inc()
+	}
+	if r.gatewayApplyDur != nil {
+		r.gatewayApplyDur.WithLabelValues("error").Observe(d.Seconds())
+	}
+}
+
+// ObserveGatewayGuardrailReject records guardrail rejections in gateway backend.
+func (r *Recorder) ObserveGatewayGuardrailReject(reason string) {
+	if r == nil || r.gatewayGuardrail == nil || !r.isGatewayBackend() {
+		return
+	}
+	if reason == "" {
+		reason = "unknown"
+	}
+	r.gatewayGuardrail.WithLabelValues(reason).Inc()
+}
+
+// ObserveGatewayReplayReject records replay-security rejects.
+func (r *Recorder) ObserveGatewayReplayReject(reason string) {
+	if r == nil || r.gatewayReplay == nil || !r.isGatewayBackend() {
+		return
+	}
+	if reason == "" {
+		reason = "unknown"
+	}
+	r.gatewayReplay.WithLabelValues(reason).Inc()
+}
+
+// ObserveGatewayTenantReject increments tenant-boundary reject counter.
+func (r *Recorder) ObserveGatewayTenantReject() {
+	if r == nil || r.gatewayTenantReject == nil || !r.isGatewayBackend() {
+		return
+	}
+	r.gatewayTenantReject.Inc()
+}
+
+// SetGatewayActiveRules sets active gateway rule gauge.
+func (r *Recorder) SetGatewayActiveRules(count int) {
+	if r == nil || r.gatewayActiveRules == nil || !r.isGatewayBackend() {
+		return
+	}
+	r.gatewayActiveRules.Set(float64(count))
+}
+
+// ObserveGatewayAckPublish records gateway ACK path outcomes.
+func (r *Recorder) ObserveGatewayAckPublish(status string) {
+	if r == nil || r.gatewayAckPublish == nil || !r.isGatewayBackend() {
+		return
+	}
+	if status == "" {
+		status = "unknown"
+	}
+	r.gatewayAckPublish.WithLabelValues(status).Inc()
+}
+
 // KafkaLagGauge exposes the consumer lag gauge (used in tests).
 func (r *Recorder) KafkaLagGauge() *prometheus.GaugeVec { return r.kafkaLag }
 
@@ -386,3 +529,18 @@ func (r *Recorder) ValidatedCounter() prometheus.Counter { return r.validated }
 
 // KafkaErrorCounter exposes the consumer error counter (used in tests).
 func (r *Recorder) KafkaErrorCounter() *prometheus.CounterVec { return r.kafkaErrors }
+
+// GatewayGuardrailCounter exposes gateway guardrail counters for tests.
+func (r *Recorder) GatewayGuardrailCounter() *prometheus.CounterVec { return r.gatewayGuardrail }
+
+// GatewayReplayCounter exposes gateway replay counters for tests.
+func (r *Recorder) GatewayReplayCounter() *prometheus.CounterVec { return r.gatewayReplay }
+
+// GatewayApplyCounter exposes gateway apply counters for tests.
+func (r *Recorder) GatewayApplyCounter() *prometheus.CounterVec { return r.gatewayApplyTotal }
+
+// GatewayTranslationCounter exposes gateway translation counters for tests.
+func (r *Recorder) GatewayTranslationCounter() *prometheus.CounterVec { return r.gatewayTranslation }
+
+// GatewayAckCounter exposes gateway ACK counters for tests.
+func (r *Recorder) GatewayAckCounter() *prometheus.CounterVec { return r.gatewayAckPublish }

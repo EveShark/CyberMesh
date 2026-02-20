@@ -19,6 +19,10 @@ rules:
 - apiGroups: ["networking.k8s.io"]
   resources: ["networkpolicies"]
   verbs: ["get", "list", "create", "update", "patch", "delete"]
+# Cilium policy management (namespaced). Required when ENFORCEMENT_BACKEND=cilium and CILIUM_POLICY_MODE=namespaced.
+- apiGroups: ["cilium.io"]
+  resources: ["ciliumnetworkpolicies"]
+  verbs: ["get", "list", "create", "update", "patch", "delete"]
 # Pod discovery for scope validation
 - apiGroups: [""]
   resources: ["pods"]

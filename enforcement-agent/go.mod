@@ -3,11 +3,12 @@ module github.com/CyberMesh/enforcement-agent
 go 1.25.1
 
 require (
-    backend v0.0.0
-    github.com/IBM/sarama v1.46.1
+	backend v0.0.0
+	github.com/IBM/sarama v1.46.1
 	github.com/google/uuid v1.6.0
 	github.com/prometheus/client_golang v1.19.1
 	github.com/redis/go-redis/v9 v9.6.1
+	github.com/segmentio/kafka-go v0.4.47
 	go.etcd.io/bbolt v1.3.10
 	go.uber.org/zap v1.27.0
 	google.golang.org/protobuf v1.36.5
@@ -56,6 +57,9 @@ require (
 	github.com/rcrowley/go-metrics v0.0.0-20250401214520-65e299d6c5c9 // indirect
 	github.com/spf13/pflag v1.0.6 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
+	github.com/xdg-go/pbkdf2 v1.0.0 // indirect
+	github.com/xdg-go/scram v1.1.2 // indirect
+	github.com/xdg-go/stringprep v1.0.4 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect

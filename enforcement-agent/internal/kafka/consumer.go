@@ -31,18 +31,21 @@ type Consumer struct {
 
 // Config represents the options for constructing a consumer.
 type Config struct {
-	Brokers       []string
-	GroupID       string
-	Topic         string
-	TLS           bool
-	TLSCAPath     string
-	TLSCertPath   string
-	TLSKeyPath    string
-	SASLEnabled   bool
-	SASLMechanism string
-	SASLUsername  string
-	SASLPassword  string
-	Metrics       *metrics.Recorder
+	Brokers []string
+	GroupID string
+	Topic   string
+	// ProtocolVersion is a sarama.ParseKafkaVersion string (e.g. "2.1.0", "3.6.0").
+	// Default: "3.6.0".
+	ProtocolVersion string
+	TLS             bool
+	TLSCAPath       string
+	TLSCertPath     string
+	TLSKeyPath      string
+	SASLEnabled     bool
+	SASLMechanism   string
+	SASLUsername    string
+	SASLPassword    string
+	Metrics         *metrics.Recorder
 }
 
 // NewConsumer creates a Consumer instance.
@@ -58,7 +61,15 @@ func NewConsumer(cfg Config, handler MessageHandler) (*Consumer, error) {
 	}
 
 	saramaCfg := sarama.NewConfig()
-	saramaCfg.Version = sarama.V3_6_0_0
+	versionStr := cfg.ProtocolVersion
+	if versionStr == "" {
+		versionStr = "3.6.0"
+	}
+	ver, err := sarama.ParseKafkaVersion(versionStr)
+	if err != nil {
+		return nil, fmt.Errorf("kafka consumer: invalid protocol version %q: %w", versionStr, err)
+	}
+	saramaCfg.Version = ver
 	saramaCfg.Consumer.Return.Errors = true
 	saramaCfg.Consumer.Group.Rebalance.Strategy = sarama.BalanceStrategyRange
 	saramaCfg.Consumer.Offsets.Initial = sarama.OffsetNewest
@@ -177,7 +188,7 @@ func (g *groupHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim s
 func buildTLSConfig(cfg Config) (*tls.Config, error) {
 	var caCertPool *x509.CertPool
 	var err error
-	
+
 	if cfg.TLSCAPath != "" {
 		// Custom CA provided - create empty pool and load it
 		caCertPool = x509.NewCertPool()

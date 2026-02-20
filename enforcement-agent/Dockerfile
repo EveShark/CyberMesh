@@ -37,6 +37,7 @@ FROM debian:12-slim
 # Using iptables-nft (netfilter nftables backend) for modern kernel compatibility
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
+        nftables \
         iptables \
         ca-certificates && \
     rm -rf /var/lib/apt/lists/*
@@ -44,8 +45,9 @@ RUN apt-get update && \
 # Copy binary from builder
 COPY --from=builder /out/enforcement-agent /usr/local/bin/enforcement-agent
 
-# Create mount point for trusted keys
-RUN mkdir -p /var/run/cybermesh/trust
+# Create runtime directories used by the agent.
+# /var/run/enforcement-agent is used for local state lock/db files.
+RUN mkdir -p /var/run/cybermesh/trust /var/run/enforcement-agent
 
 # NOTE: Container must run as root for iptables access with hostNetwork
 # DaemonSet grants privileged: true and NET_ADMIN capability
