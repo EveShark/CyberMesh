@@ -55,6 +55,7 @@ class KafkaWorkerConfig:
     topic_encoding_map: dict[str, str]
     topic_schema_map: dict[str, str]
     output_topic: str
+    output_encoding: str
     dlq_topic: str
     consumer_group_id: str
     auto_offset_reset: str
@@ -78,6 +79,8 @@ class KafkaWorkerConfig:
             raise ValueError("Kafka output topic must be non-empty")
         if not self.dlq_topic:
             raise ValueError("Kafka DLQ topic must be non-empty")
+        if self.output_encoding not in ("json", "protobuf"):
+            raise ValueError("KAFKA_OUTPUT_ENCODING must be one of: json, protobuf")
 
 
 def _first_csv_token(value: str) -> str:
@@ -160,6 +163,7 @@ def load_kafka_worker_config() -> KafkaWorkerConfig:
         topic_encoding_map=topic_encoding_map,
         topic_schema_map=topic_schema_map,
         output_topic=output_topic,
+        output_encoding=_get_env("KAFKA_OUTPUT_ENCODING", "protobuf").strip().lower() or "protobuf",
         dlq_topic=dlq_topic,
         consumer_group_id=_get_env("KAFKA_CONSUMER_GROUP_ID", "sentinel-standalone"),
         auto_offset_reset=_get_env("KAFKA_CONSUMER_AUTO_OFFSET_RESET", "latest"),

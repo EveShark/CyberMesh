@@ -1,6 +1,6 @@
 # Sentinel Standalone Architecture
 
-Last updated: 2026-02-17
+Last updated: 2026-02-20
 
 ## What this service is
 
@@ -19,8 +19,8 @@ IPFIX/flow traffic
   -> Kafka topic telemetry.flow.v1 (protobuf FlowV1)
   -> Sentinel kafka gateway (decode + normalize)
   -> Sentinel orchestrator (route + run agents)
-  -> Kafka topic sentinel.verdicts.* (result envelope)
-  -> (optional) sentinel.verdicts.*.dlq on decode/validation errors
+  -> Kafka output topic (configured; common: sentinel.verdicts.*)
+  -> (optional) configured DLQ topic on decode/validation errors
 ```
 
 ### Runtime wiring in this repo
@@ -69,7 +69,12 @@ Outputs:
 
 Toggle:
 - CLI: `--sequential`
-- Kafka path: `SENTINEL_INGEST_MODE`
+- Kafka path: `--sequential` (worker CLI) or `SENTINEL_SEQUENTIAL=1`
+
+Kafka topic defaults:
+- Input fallback: `telemetry.features.v1`
+- Output fallback: `ai.anomalies.v1`
+- DLQ fallback: `ai.dlq.v1`
 
 ## Guardrails
 

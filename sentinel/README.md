@@ -33,6 +33,21 @@ Runs the file graph, including optional fast-path and optional LLM reasoning.
 ### Telemetry Analysis
 Accepts CSV/JSON/IPFIX JSON payloads and converts them into `NetworkFlowFeaturesV1` features.
 
+### Kafka Worker Analysis
+For streaming telemetry, use:
+```bash
+python sentinel/scripts/kafka_gateway.py --log-level INFO
+```
+Key runtime controls:
+- `ENABLE_KAFKA=true`
+- `KAFKA_INPUT_TOPIC` / `KAFKA_INPUT_TOPICS`
+- `KAFKA_TOPIC_SCHEMA_MAP`, `KAFKA_TOPIC_ENCODING_MAP`
+- `KAFKA_OUTPUT_TOPIC`, `KAFKA_DLQ_TOPIC`
+
+Important defaults (when not overridden):
+- input topic fallback: `telemetry.features.v1`
+- output topic fallback: `ai.anomalies.v1`
+
 ## CLI Usage (Standalone `main.py`)
 File analysis:
 ```bash
@@ -122,6 +137,25 @@ Baseline: sequential execution with the same merge/dedupe rules.
 LLM reasoning runs only when:
 - `needs_llm_reasoning` is true, and
 - an LLM provider is available (Groq → GLM → Ollama fallback chain).
+
+## Agent Coverage Map (Current)
+
+| Capability | Concrete runtime class/path | Status |
+|---|---|---|
+| Static file analysis | `StaticAnalysisAgent` | Implemented |
+| Script analysis | `ScriptAgent` | Implemented |
+| Malware/ML | `MalwareAgent`, `MLAnalysisAgent` | Implemented |
+| File threat intel | `ThreatIntelAgent` | Implemented |
+| Telemetry flow analysis | `FlowAgent`, `TelemetryThreatIntelAgent` | Implemented |
+| Process/event analysis | `ProcessAgent` | Implemented |
+| Scanner findings | `ScannerFindingsAgent` | Implemented |
+| Rules-hit analysis | `RulesHitAgent` | Implemented |
+| Sequence risk | `SequenceRiskAgent` | Implemented |
+| MCP runtime controls | `MCPRuntimeControlsAgent` | Implemented |
+| Exfil/DLP | `ExfilDLPAgent` | Implemented |
+| Resilience | `ResilienceAgent` | Implemented |
+| Identity-specific agent | (no dedicated class yet) | Pending dedicated implementation |
+| Cloud IAM-specific agent | (no dedicated class yet) | Pending dedicated implementation |
 
 ## Output Format
 Both file and telemetry flows return a dict with these core fields:

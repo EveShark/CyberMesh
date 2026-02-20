@@ -1,6 +1,6 @@
 # Sentinel Standalone HLD
 
-Last updated: 2026-02-17
+Last updated: 2026-02-20
 
 ## Service boundary
 
@@ -32,7 +32,7 @@ Sentinel does not own:
 3. Sentinel Kafka worker consumes that topic.
 4. Sentinel decoder maps topic payload -> `CanonicalEvent(modality=network_flow)`.
 5. Orchestrator runs flow path agents (`flow_agent`, `telemetry_threat_intel`, coordinator merge).
-6. Sentinel publishes `sentinel.result.v1` envelope to output topic.
+6. Sentinel publishes result envelope (`schema_version=sentinel.result.v1`) to configured output topic.
 7. Bad records go to DLQ with structured error context.
 
 ## Agent architecture
@@ -70,8 +70,12 @@ Internal contract:
 - `CanonicalEvent` envelope with modality + feature payload.
 
 Egress contract:
-- `sentinel.result.v1` envelope (`payload_type=sentinel_result`).
+- `sentinel.result.v1` envelope (`payload_type=sentinel_result`), on configured output topic.
 - DLQ envelope for parse/validation/decode failures.
+
+Kafka defaults when output topic is not configured:
+- output: `ai.anomalies.v1`
+- dlq: `ai.dlq.v1`
 
 ## Reliability and security posture
 

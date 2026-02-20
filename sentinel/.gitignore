@@ -1,36 +1,42 @@
-# Local env/secrets
+# ============================================================
+# Sentinel Local-Only Content
+# ============================================================
+
+# Environment and secrets
 .env
 .env.*
+**/.env
+**/.env.*
 !.env.example
+!**/.env.example
 
-# Python cache/artifacts
+# Python caches/artifacts
 .pytest_cache/
+**/.pytest_cache/
 **/__pycache__/
 *.pyc
 
-# Generated runtime outputs
+# Local data and generated outputs
+data/
 reports/
+testdata/
 eval_data/
 oss_outputs/
-
-# Large local datasets (kept outside git)
-testdata/
-
-# Generated calibration/benchmark artifacts
-data/benchmark_results/
-data/calibration/
-
-# Large/local data corpora
-data/evaluation_datasets/
-data/eval_samples/
-data/signature-base/
-data/yara-rules/
-
-# Local evaluation outputs
 calibrated_config.json
 fp_report.json
 
-# Skip tests for this commit scope
+# Local docs/design notes
+docs/
+Archive/
+
+# Local test scope (not for this GitHub pass)
+test/
 tests/
 api/tests/
 scripts/test_*.py
+**/test_*.py
+**/*_test.py
+
+# Any hidden/dot directories (top-level and nested)
+.*/
+**/.*/

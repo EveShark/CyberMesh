@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional, Protocol
 
 from sentinel.agents import SentinelOrchestrator
 from sentinel.contracts import CanonicalEvent, Modality
+from sentinel.contracts.generated.sentinel_result_pb2 import SentinelFinding, SentinelResultEvent
 from sentinel.logging import get_logger
 from sentinel.utils.error_codes import (
     ERR_INVALID_FIELDS,
@@ -80,6 +81,13 @@ def _normalize(obj: Any) -> Any:
 
 def _safe_json_dumps(payload: Dict[str, Any]) -> bytes:
     return json.dumps(_normalize(payload), sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _parse_modality(value: Any) -> Modality:
@@ -245,11 +253,16 @@ class KafkaGatewayWorker:
             return True
 
         try:
+            payload, schema_version = self._serialize_result(event, result)
             self.kafka.produce(
                 topic=self.config.output_topic,
                 key=event.id.encode("utf-8"),
-                value=_safe_json_dumps(self._result_envelope(event, result)),
-                headers={"schema_version": "sentinel.result.v1", "tenant_id": event.tenant_id},
+                value=payload,
+                headers={
+                    "schema_version": schema_version,
+                    "tenant_id": event.tenant_id,
+                    "encoding": self.config.output_encoding,
+                },
             )
             self.stats["published"] += 1
         except Exception as exc:  # pylint: disable=broad-except
@@ -319,3 +332,84 @@ class KafkaGatewayWorker:
                 "analysis": _normalize(result),
             },
         }
+
+    def _serialize_result(self, event: CanonicalEvent, result: Dict[str, Any]) -> tuple[bytes, str]:
+        if self.config.output_encoding == "protobuf":
+            return self._result_protobuf(event, result), "sentinel.result.v1"
+        return _safe_json_dumps(self._result_envelope(event, result)), "sentinel.result.v1"
+
+    @staticmethod
+    def _result_protobuf(event: CanonicalEvent, result: Dict[str, Any]) -> bytes:
+        metadata = result.get("metadata") if isinstance(result, dict) else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        msg = SentinelResultEvent(
+            schema_version="sentinel.result.v1",
+            event_id=event.id,
+            tenant_id=event.tenant_id,
+            timestamp=time.time(),
+            source="sentinel.kafka.gateway",
+            payload_type="sentinel_result",
+            threat_level=str(result.get("threat_level") or ""),
+            final_score=_safe_float(result.get("final_score"), 0.0),
+            confidence=_safe_float(result.get("confidence"), 0.0),
+            errors=[str(err) for err in (result.get("errors") or []) if err is not None],
+            degraded=bool(metadata.get("degraded", False)),
+            verdict=str(result.get("verdict") or ""),
+            model_version=str(result.get("model_version") or "sentinel-kafka.v1"),
+        )
+
+        msg.input.id = event.id
+        msg.input.tenant_id = event.tenant_id
+        msg.input.source = event.source
+        msg.input.modality = event.modality.value
+        msg.input.features_version = event.features_version
+        msg.input.timestamp = float(event.timestamp)
+
+        findings = result.get("findings") or []
+        if isinstance(findings, list):
+            for item in findings[:50]:
+                if isinstance(item, dict):
+                    msg.findings.append(
+                        SentinelFinding(
+                            id=str(item.get("id") or item.get("rule_id") or ""),
+                            agent=str(item.get("agent") or item.get("source") or ""),
+                            category=str(item.get("category") or ""),
+                            description=str(item.get("description") or ""),
+                            severity=str(item.get("severity") or ""),
+                            score=_safe_float(item.get("score"), 0.0),
+                        )
+                    )
+                elif item is not None:
+                    msg.findings.append(SentinelFinding(description=str(item)))
+
+        # Preserve source/destination IP context for downstream policy routing.
+        # Sentinel adapter uses finding descriptions as a fallback target extractor.
+        if isinstance(event.features, dict):
+            src_ip = (
+                event.features.get("src_ip")
+                or event.features.get("source_ip")
+                or event.features.get("sip")
+            )
+            dst_ip = (
+                event.features.get("dst_ip")
+                or event.features.get("destination_ip")
+                or event.features.get("dip")
+            )
+            if isinstance(src_ip, str) and src_ip:
+                desc = f"network context src_ip={src_ip}"
+                if isinstance(dst_ip, str) and dst_ip:
+                    desc += f" dst_ip={dst_ip}"
+                msg.findings.append(
+                    SentinelFinding(
+                        id="context-network-ip",
+                        agent="gateway",
+                        category="network_context",
+                        description=desc,
+                        severity="info",
+                        score=0.0,
+                    )
+                )
+
+        return msg.SerializeToString()
