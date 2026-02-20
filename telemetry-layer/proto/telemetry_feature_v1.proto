@@ -1,0 +1,103 @@
+syntax = "proto3";
+
+package cybermesh.telemetry.v1;
+
+option go_package = "cybermesh/telemetry-layer/proto/gen/go;telemetrypb";
+
+// CicFeaturesV1 represents CIC-style features derived from FlowV1.
+message CicFeaturesV1 {
+  string schema = 1;     // "cic.v1"
+  int64 ts = 2;          // Unix timestamp (seconds)
+  string tenant_id = 3;
+  string flow_id = 4;
+
+  string src_ip = 5;
+  string dst_ip = 6;
+  uint32 src_port = 7;
+  uint32 dst_port = 8;
+  uint32 protocol = 9;
+
+  bytes feature_mask = 10;     // Feature availability bitmask (bytes)
+  double feature_coverage = 11; // 0.0 - 1.0
+
+  double flow_duration = 12;
+  double tot_fwd_pkts = 13;
+  double tot_bwd_pkts = 14;
+  double totlen_fwd_pkts = 15;
+  double totlen_bwd_pkts = 16;
+  double fwd_pkt_len_max = 17;
+  double fwd_pkt_len_min = 18;
+  double fwd_pkt_len_mean = 19;
+  double fwd_pkt_len_std = 20;
+  double bwd_pkt_len_max = 21;
+  double bwd_pkt_len_min = 22;
+  double bwd_pkt_len_mean = 23;
+  double bwd_pkt_len_std = 24;
+  double flow_byts_s = 25;
+  double flow_pkts_s = 26;
+  double flow_iat_mean = 27;
+  double flow_iat_std = 28;
+  double flow_iat_max = 29;
+  double flow_iat_min = 30;
+  double fwd_iat_tot = 31;
+  double fwd_iat_mean = 32;
+  double fwd_iat_std = 33;
+  double fwd_iat_max = 34;
+  double fwd_iat_min = 35;
+  double bwd_iat_tot = 36;
+  double bwd_iat_mean = 37;
+  double bwd_iat_std = 38;
+  double bwd_iat_max = 39;
+  double bwd_iat_min = 40;
+  double fwd_psh_flags = 41;
+  double bwd_psh_flags = 42;
+  double fwd_urg_flags = 43;
+  double bwd_urg_flags = 44;
+  double fwd_header_len = 45;
+  double bwd_header_len = 46;
+  double fwd_pkts_s = 47;
+  double bwd_pkts_s = 48;
+  double pkt_len_min = 49;
+  double pkt_len_max = 50;
+  double pkt_len_mean = 51;
+  double pkt_len_std = 52;
+  double pkt_len_var = 53;
+  double fin_flag_cnt = 54;
+  double syn_flag_cnt = 55;
+  double rst_flag_cnt = 56;
+  double psh_flag_cnt = 57;
+  double ack_flag_cnt = 58;
+  double urg_flag_cnt = 59;
+  double cwe_flag_count = 60;
+  double ece_flag_cnt = 61;
+  double down_up_ratio = 62;
+  double pkt_size_avg = 63;
+  double fwd_seg_size_avg = 64;
+  double bwd_seg_size_avg = 65;
+  double fwd_byts_b_avg = 66;
+  double fwd_pkts_b_avg = 67;
+  double fwd_blk_rate_avg = 68;
+  double bwd_byts_b_avg = 69;
+  double bwd_pkts_b_avg = 70;
+  double bwd_blk_rate_avg = 71;
+  double subflow_fwd_pkts = 72;
+  double subflow_fwd_byts = 73;
+  double subflow_bwd_pkts = 74;
+  double subflow_bwd_byts = 75;
+  double init_fwd_win_byts = 76;
+  double init_bwd_win_byts = 77;
+  double fwd_act_data_pkts = 78;
+  double fwd_seg_size_min = 79;
+  double active_mean = 80;
+  double active_std = 81;
+  double active_max = 82;
+  double active_min = 83;
+  double idle_mean = 84;
+  double idle_std = 85;
+  double idle_max = 86;
+  double idle_min = 87;
+
+  // Provenance for dual-lane and multi-sensor operation.
+  string source_type = 88;
+  string source_id = 89;
+}

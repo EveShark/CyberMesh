@@ -1,0 +1,1 @@
+{"tenant_id":"tenant-1","flow":{"start_time":"2026-02-01T00:00:03Z","src_ip":"10.1.0.4","dst_ip":"10.2.0.8","src_port":51512,"dst_port":443,"protocol":"TCP","bytes_sent":1024,"bytes_received":128,"packets_sent":8,"packets_received":1,"action":"Allow","nsg_id":"nsg-001"}}

@@ -1,0 +1,48 @@
+# Secrets / local env
+.env
+.env.*
+!.env.example
+
+# Runtime temp/log artifacts
+.tmp/
+test-logs/
+*.log
+*.tmp
+
+# Python cache/build
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Go / binaries
+*.exe
+*.out
+*.test
+stream-processor/bin/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local-only tests
+**/*_test.go
+**/tests/
+**/test/
+.local-tests/
+
+# Telemetry layer deploy/ops copies (canonical in k8s_azure)
+deployments/
+scripts/
+docs/
+env/
+
+# Tools: keep source, ignore generated/runtime artifacts only
+tools/*.log
+tools/*.err
+tools/**/*.exe

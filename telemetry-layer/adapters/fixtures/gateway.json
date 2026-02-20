@@ -1,0 +1,1 @@
+{"tenant_id":"t1","flow":{"start_time":"2026-02-01T00:00:05Z","src_ip":"192.168.10.5","dst_ip":"34.120.1.2","src_port":51512,"dst_port":443,"protocol":"TCP","bytes_out":4096,"bytes_in":512,"pkts_out":40,"pkts_in":5,"decision":"ALLOW","gateway_id":"gw-1"}}

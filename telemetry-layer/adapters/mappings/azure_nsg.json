@@ -1,0 +1,19 @@
+{
+  "version": "v1",
+  "fields": {
+    "ts": { "path": "flow.start_time", "type": "timestamp", "required": true },
+    "tenant_id": { "path": "tenant_id", "type": "string", "required": true },
+    "src_ip": { "path": "flow.src_ip", "type": "string", "required": true },
+    "dst_ip": { "path": "flow.dst_ip", "type": "string", "required": true },
+    "src_port": { "path": "flow.src_port", "type": "int", "required": true },
+    "dst_port": { "path": "flow.dst_port", "type": "int", "required": true },
+    "proto": { "path": "flow.protocol", "type": "proto", "required": true },
+    "bytes_fwd": { "path": "flow.bytes_sent", "type": "int64" },
+    "bytes_bwd": { "path": "flow.bytes_received", "type": "int64" },
+    "pkts_fwd": { "path": "flow.packets_sent", "type": "int64" },
+    "pkts_bwd": { "path": "flow.packets_received", "type": "int64" },
+    "verdict": { "path": "flow.action", "type": "string" },
+    "source_type": { "const": "azure_nsg", "type": "string" },
+    "source_id": { "path": "flow.nsg_id", "type": "string" }
+  }
+}

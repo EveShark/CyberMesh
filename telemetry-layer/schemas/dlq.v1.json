@@ -1,0 +1,13 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["schema", "timestamp", "source_component", "error_code", "error_message", "payload_hash"],
+  "properties": {
+    "schema": { "const": "dlq.v1" },
+    "timestamp": { "type": "integer", "description": "Unix timestamp (seconds)" },
+    "source_component": { "type": "string", "minLength": 1 },
+    "error_code": { "type": "string", "minLength": 1 },
+    "error_message": { "type": "string", "minLength": 1 },
+    "payload_hash": { "type": "string", "minLength": 8 }
+  }
+}

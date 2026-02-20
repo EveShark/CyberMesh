@@ -1,0 +1,19 @@
+{
+  "version": "v1",
+  "fields": {
+    "ts": { "path": "jsonPayload.start_time", "type": "timestamp", "required": true },
+    "tenant_id": { "path": "resource.labels.project_id", "type": "string", "required": true },
+    "src_ip": { "path": "jsonPayload.src_ip", "type": "string", "required": true },
+    "dst_ip": { "path": "jsonPayload.dest_ip", "type": "string", "required": true },
+    "src_port": { "path": "jsonPayload.src_port", "type": "int", "required": true },
+    "dst_port": { "path": "jsonPayload.dest_port", "type": "int", "required": true },
+    "proto": { "path": "jsonPayload.protocol", "type": "proto", "required": true },
+    "bytes_fwd": { "path": "jsonPayload.bytes_sent", "type": "int64" },
+    "bytes_bwd": { "path": "jsonPayload.bytes_received", "type": "int64" },
+    "pkts_fwd": { "path": "jsonPayload.packets_sent", "type": "int64" },
+    "pkts_bwd": { "path": "jsonPayload.packets_received", "type": "int64" },
+    "verdict": { "path": "jsonPayload.action", "type": "string" },
+    "source_type": { "const": "gcp_vpc", "type": "string" },
+    "source_id": { "path": "resource.labels.subnetwork_name", "type": "string" }
+  }
+}

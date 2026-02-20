@@ -1,0 +1,1 @@
+{"jsonPayload":{"start_time":"2026-02-01T00:00:00Z","src_ip":"10.10.0.5","dest_ip":"10.20.0.9","src_port":443,"dest_port":8080,"protocol":"TCP","bytes_sent":1200,"bytes_received":200,"packets_sent":12,"packets_received":2,"action":"ALLOW"},"resource":{"labels":{"project_id":"proj-1","subnetwork_name":"subnet-a"}}}

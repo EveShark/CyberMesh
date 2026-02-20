@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package cybermesh.telemetry.v1;
+
+option go_package = "cybermesh/telemetry-layer/proto/gen/go;telemetrypb";
+
+import "telemetry_flow_v1.proto";
+
+// DeepFlowV1 represents deep inspection metadata and IDS alerts.
+message DeepFlowV1 {
+  // Schema identifier (e.g., "deepflow.v1").
+  string schema = 1;
+
+  // Unix timestamp in seconds.
+  int64 ts = 2;
+
+  // Tenant identifier.
+  string tenant_id = 3;
+
+  // Sensor identity and source.
+  string sensor_id = 4;
+  SourceType source_type = 5;
+
+  // 5-tuple (when available).
+  string src_ip = 6;
+  string dst_ip = 7;
+  uint32 src_port = 8;
+  uint32 dst_port = 9;
+  uint32 proto = 10;
+
+  // Alert and classification details.
+  string alert_type = 11;
+  string alert_category = 12;
+  string severity = 13;
+  string signature = 14;
+  string signature_id = 15;
+
+  // Protocol metadata (stringified key/value pairs).
+  map<string, string> metadata = 16;
+
+  // Optional flow correlation ID.
+  string flow_id = 17;
+}

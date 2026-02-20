@@ -1,0 +1,1 @@
+{"records":[{"resourceId":"/SUBSCRIPTIONS/00000000-0000-0000-0000-000000000000/RESOURCEGROUPS/rg/providers/Microsoft.Network/networkSecurityGroups/nsg-01","properties":{"flows":[{"flows":[{"flowTuples":["1706745600,10.1.0.5,10.2.0.6,51512,443,T,I,A,B,10,2048,1,128"]}]}]}}]}

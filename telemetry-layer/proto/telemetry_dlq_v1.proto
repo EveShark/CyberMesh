@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package cybermesh.telemetry.v1;
+
+option go_package = "cybermesh/telemetry-layer/proto/gen/go;telemetrypb";
+
+// DlqEventV1 represents a dead-letter queue envelope for invalid events.
+message DlqEventV1 {
+  string schema = 1;            // "dlq.v1"
+  int64 timestamp = 2;          // Unix timestamp (seconds)
+  string source_component = 3;  // bridge/transformer/etc.
+  string error_code = 4;
+  string error_message = 5;
+  string payload_hash = 6;
+}

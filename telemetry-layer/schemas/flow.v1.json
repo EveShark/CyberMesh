@@ -1,0 +1,83 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["schema", "ts", "src_ip", "dst_ip", "proto", "tenant_id", "flow_id"],
+  "properties": {
+    "schema": { "const": "flow.v1" },
+    "ts": { "type": "integer", "description": "Unix timestamp (seconds)" },
+    "tenant_id": {
+      "type": "string",
+      "description": "Tenant ID. Derived from namespace or DEFAULT_TENANT_ID.",
+      "minLength": 1
+    },
+    "src_ip": {
+      "type": "string",
+      "description": "Source IP (IPv4 or IPv6)",
+      "oneOf": [
+        { "format": "ipv4" },
+        { "format": "ipv6" }
+      ]
+    },
+    "dst_ip": {
+      "type": "string",
+      "description": "Destination IP (IPv4 or IPv6)",
+      "oneOf": [
+        { "format": "ipv4" },
+        { "format": "ipv6" }
+      ]
+    },
+    "src_port": { "type": "integer", "minimum": 0, "maximum": 65535 },
+    "dst_port": { "type": "integer", "minimum": 0, "maximum": 65535 },
+    "proto": { "type": "integer" },
+    "flow_id": { "type": "string", "description": "Stable hash of 5-tuple + window" },
+    "bytes_fwd": { "type": "integer", "default": 0 },
+    "bytes_bwd": { "type": "integer", "default": 0 },
+    "pkts_fwd": { "type": "integer", "default": 0 },
+    "pkts_bwd": { "type": "integer", "default": 0 },
+    "duration_ms": { "type": "integer", "default": 0 },
+    "identity": {
+      "type": "object",
+      "properties": {
+        "namespace": { "type": "string" },
+        "pod": { "type": "string" },
+        "node": { "type": "string" }
+      }
+    },
+    "verdict": { "type": "string" },
+    "feature_mask": { "type": "string", "description": "Hex bitmask of available features" },
+    "timing_known": { "type": "boolean", "default": false },
+    "flow_iat_mean": { "type": "number" },
+    "flow_iat_std": { "type": "number" },
+    "flow_iat_max": { "type": "number" },
+    "flow_iat_min": { "type": "number" },
+    "fwd_iat_tot": { "type": "number" },
+    "fwd_iat_mean": { "type": "number" },
+    "fwd_iat_std": { "type": "number" },
+    "fwd_iat_max": { "type": "number" },
+    "fwd_iat_min": { "type": "number" },
+    "bwd_iat_tot": { "type": "number" },
+    "bwd_iat_mean": { "type": "number" },
+    "bwd_iat_std": { "type": "number" },
+    "bwd_iat_max": { "type": "number" },
+    "bwd_iat_min": { "type": "number" },
+    "active_mean": { "type": "number" },
+    "active_std": { "type": "number" },
+    "active_max": { "type": "number" },
+    "active_min": { "type": "number" },
+    "idle_mean": { "type": "number" },
+    "idle_std": { "type": "number" },
+    "idle_max": { "type": "number" },
+    "idle_min": { "type": "number" },
+    "flags_known": { "type": "boolean", "default": false },
+    "fin_flag_cnt": { "type": "number" },
+    "syn_flag_cnt": { "type": "number" },
+    "rst_flag_cnt": { "type": "number" },
+    "psh_flag_cnt": { "type": "number" },
+    "ack_flag_cnt": { "type": "number" },
+    "urg_flag_cnt": { "type": "number" },
+    "cwe_flag_count": { "type": "number" },
+    "ece_flag_cnt": { "type": "number" },
+    "timing_derived": { "type": "boolean", "default": false },
+    "derivation_policy": { "type": "string" }
+  }
+}

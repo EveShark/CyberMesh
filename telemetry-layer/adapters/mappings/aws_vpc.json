@@ -1,0 +1,17 @@
+{
+  "version": "v1",
+  "fields": {
+    "ts": { "path": "start", "type": "int64", "required": true },
+    "tenant_id": { "path": "account_id", "type": "string", "required": true },
+    "src_ip": { "path": "srcaddr", "type": "string", "required": true },
+    "dst_ip": { "path": "dstaddr", "type": "string", "required": true },
+    "src_port": { "path": "srcport", "type": "int", "required": true },
+    "dst_port": { "path": "dstport", "type": "int", "required": true },
+    "proto": { "path": "protocol", "type": "proto", "required": true },
+    "bytes_fwd": { "path": "bytes", "type": "int64" },
+    "pkts_fwd": { "path": "packets", "type": "int64" },
+    "verdict": { "path": "action", "type": "string" },
+    "source_type": { "const": "aws_vpc", "type": "string" },
+    "source_id": { "path": "vpc_id", "type": "string" }
+  }
+}
