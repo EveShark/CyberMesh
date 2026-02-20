@@ -3,7 +3,9 @@
 Distributed threat detection and policy enforcement using cryptographic signing and BFT consensus.
 
 This repository contains multiple services (Go/Python/TypeScript) plus architecture/design documentation.
-The deployment manifests under `k8s_gke/` are the source of truth for the current Kubernetes topology.
+Deployment manifests are split by scope:
+- `k8s_gke/` for core platform workloads
+- `k8s_azure/` for telemetry/sentinel/testing operational workloads
 
 ## Table of Contents
 
@@ -15,6 +17,8 @@ The deployment manifests under `k8s_gke/` are the source of truth for the curren
    - Core Components
    - Data Flow (E2E)
 5. Services
+   - Telemetry Layer (Go + Python)
+   - Sentinel (Python)
    - Backend Validators (Go)
    - AI Service (Python)
    - Enforcement Agent (Go)
@@ -24,7 +28,7 @@ The deployment manifests under `k8s_gke/` are the source of truth for the curren
 8. Consensus (HotStuff 2-chain)
 9. State Machine (Deterministic Execution + State Root)
 10. Feedback Loop (Lifecycle + Calibration)
-11. Deployment (GKE / `k8s_gke/`)
+11. Deployment (`k8s_gke/` + `k8s_azure/`)
 12. Local Development (Dev Workflow)
 13. Observability
 14. Quick Access
@@ -59,14 +63,16 @@ Security detections are noisy and easy to spoof. CyberMesh addresses this by:
 High-level E2E flow (conceptual):
 
 ```text
-Telemetry -> AI Service -> (signed protobuf messages) -> Kafka -> Validators (HotStuff)
-         -> deterministic state machine -> (commits/policies) -> Kafka -> Enforcement Agent
-                                                         -> Frontend queries Validators
+Telemetry Layer -> Sentinel -> AI Service -> Kafka -> Validators (HotStuff)
+               -> deterministic state machine -> Kafka (commits/policies) -> Enforcement Agent
+                                                                          -> Frontend/API
 ```
 
 ### Core Components
 
-- AI Service: produces signed anomalies/evidence; consumes validator feedback to calibrate thresholds.
+- Telemetry Layer: ingests/normalizes flow data and produces telemetry contracts.
+- Sentinel: runs multi-agent analysis on telemetry and publishes verdict envelopes.
+- AI Service: consumes Sentinel verdicts and/or telemetry features, publishes signed anomalies/policy candidates, consumes feedback.
 - Backend Validators: verify signatures, order inputs via HotStuff 2-chain, execute deterministically, persist state.
 - Enforcement Agent: consumes policy commits and applies enforcement on nodes / infrastructure surfaces.
 - Frontend: operator UI for monitoring, review, and querying system state.
@@ -77,11 +83,13 @@ For the detailed, code-aligned E2E flow, see [DATA_FLOW.md](docs/design/DATA_FLO
 
 ## 5. Services
 
-CyberMesh consists of 4 main services:
+CyberMesh runtime consists of 6 main services:
 
+- [Telemetry Layer](telemetry-layer/README.md) - Go/Python ingestion, aggregation, feature transformation, and PCAP workflows
+- [Sentinel](sentinel/README.md) - Python multi-agent telemetry/file analysis and verdict publishing
 - [Backend Validators](backend/README.md) - Go service implementing HotStuff consensus and state machine
 - [AI Service](ai-service/README.md) - Python ML pipeline for threat detection with ensemble voting
-- [Enforcement Agent](enforcement-agent/README.md) - Go DaemonSet applying policies via iptables/nftables/K8s
+- [Enforcement Agent](enforcement-agent/README.md) - Go DaemonSet applying policies via cilium/gateway/iptables/nftables/K8s
 - [Frontend](cybermesh-frontend/README.md) - React/TypeScript dashboard for monitoring
 
 ## 6. Protobuf / Wire Contracts
@@ -115,9 +123,11 @@ Validator outcomes drive feedback to the AI service to adjust thresholds/calibra
 
 - [Feedback Loop](docs/architecture/06_feedback_loop.md) - Anomaly lifecycle and threshold calibration
 
-## 11. Deployment (GKE / `k8s_gke/`)
+## 11. Deployment (`k8s_gke/` + `k8s_azure/`)
 
-Kubernetes manifests (namespaces, services, workloads) live in `k8s_gke/`.
+Kubernetes manifests are split:
+- Core platform workloads: `k8s_gke/`
+- Telemetry/sentinel/testing operational workloads: `k8s_azure/`
 
 - [DEPLOYMENT](docs/design/DEPLOYMENT.md) - Complete deployment guide with manifest application order
 - [GKE Deployment](docs/architecture/12_gke_deployment.md) - Deployment topology and architecture
@@ -128,6 +138,8 @@ Local workflows vary by service. Start with the service README:
 
 - [Backend Validators](backend/README.md) - Go development setup and workflow
 - [AI Service](ai-service/README.md) - Python environment and model training
+- [Telemetry Layer](telemetry-layer/README.md) - Pipeline/gate-driven validation workflows
+- [Sentinel](sentinel/README.md) - Standalone + Kafka worker analysis modes
 - [Enforcement Agent](enforcement-agent/README.md) - Go DaemonSet local testing
 - [Frontend](cybermesh-frontend/README.md) - React/TypeScript development server
 
@@ -148,6 +160,8 @@ Services expose health/metrics endpoints and are wired in Kubernetes manifests.
 **Entry Points:**
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) - Architecture portal
 - [ARCHITECTURE_INDEX.md](docs/ARCHITECTURE_INDEX.md) - Complete index
+- [DOCS_MAP.md](docs/DOCS_MAP.md) - Quick navigation map
+- [DEFINITION_OF_DONE.md](docs/DEFINITION_OF_DONE.md) - Release-readiness checklist
 
 **Deep Dives:**
 - [System Overview](docs/architecture/01_system_overview.md)
@@ -162,17 +176,22 @@ Services expose health/metrics endpoints and are wired in Kubernetes manifests.
 - [P2P Networking](docs/architecture/10_p2p_networking.md)
 - [System Timeline](docs/architecture/11_system_timeline.md)
 - [GKE Deployment](docs/architecture/12_gke_deployment.md)
+- [Sentinel Integration](docs/architecture/13_sentinel_integration.md)
 
 ### 📐 Design Documentation
 - [HLD](docs/design/HLD.md) - High-level design
 - [Data Flow](docs/design/DATA_FLOW.md) - End-to-end system flow
 - [Deployment](docs/design/DEPLOYMENT.md) - GKE deployment guide
+- [Telemetry Layer LLD](docs/design/LLD-telemetry-layer.md) - Ingestion/normalization/features
+- [Sentinel LLD](docs/design/LLD-sentinel.md) - Multi-agent telemetry verdict path
 - [Backend LLD](docs/design/LLD-backend.md) - Backend validators
 - [AI Service LLD](docs/design/LLD-ai-service.md) - Detection pipeline
 - [Enforcement Agent LLD](docs/design/LLD-enforcement-agent.md) - Policy enforcement
 - [Frontend LLD](docs/design/LLD-frontend.md) - Dashboard UI
 
 ### 🔧 Service READMEs
+- [Telemetry Layer](telemetry-layer/README.md) - Go/Python telemetry pipeline
+- [Sentinel](sentinel/README.md) - Multi-agent telemetry/file analysis
 - [Backend Validators](backend/README.md) - Go service
 - [AI Service](ai-service/README.md) - Python ML pipeline
 - [Enforcement Agent](enforcement-agent/README.md) - Go DaemonSet
@@ -194,7 +213,9 @@ To work with CyberMesh, you need:
 
 ## 16. Deployment
 
-Kubernetes manifests are in `k8s_gke/`.
+Kubernetes manifests are split by scope:
+- `k8s_gke/` (core platform)
+- `k8s_azure/` (telemetry/sentinel/testing operational overlays)
 
 **For deployment procedures and topology, see:**
 - [DEPLOYMENT.md](docs/design/DEPLOYMENT.md) - Complete deployment guide with manifest application order
@@ -209,4 +230,3 @@ All production credentials are managed via Kubernetes secrets in the `cybermesh`
 **See:** [DEPLOYMENT.md - Configuration & Secrets](docs/design/DEPLOYMENT.md#6-configuration-and-secrets) for details.
 
 **⚠️ Never commit secrets to this repository.**
-

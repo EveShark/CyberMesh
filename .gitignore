@@ -29,6 +29,7 @@
 
 # Certificates directory
 certs/
+docker/backend/certs/
 
 # Key backups
 backend/keys/backupkeys/
@@ -63,9 +64,12 @@ __pycache__/
 # Backend build artifacts
 /bin/
 backend/bin/
+docker/backend/bin/
 backend/*.exe
+backend/backend-linux-amd64
 backend/logs/*.exe
 backend/tests/**/*.exe
+backend/GIT_CHECKPOINTS.md
 
 # Frontend build outputs
 frontend/.next/
@@ -299,3 +303,14 @@ frontend/docs/
 frontend/src/app/demo/
 frontend/src/p2p-consensus/components/*.v1.tsx
 frontend/src/components/*.v1.tsx
+
+# Root-level workspace folders to keep local
+.*/
+/TestData/
+/test/
+/backend-stable/
+/keys/
+/scripts/
+
+# Telemetry merge planning doc (local-only)
+docs/design/MERGE_TELEMETRY_MANIFESTS_TO_K8S_GKE.md

@@ -163,3 +163,19 @@ scripts/
 *.ps1
 *.sh
 !docker/**/entrypoint.sh
+
+# ============================================================
+# Telemetry Build Optimization
+# ============================================================
+# Keep runtime/build sources, drop heavy test/runtime artifacts.
+telemetry-layer/test-logs/
+telemetry-layer/.tmp/
+telemetry-layer/docs/
+telemetry-layer/deployments/
+telemetry-layer/env/
+telemetry-layer/tools/
+telemetry-layer/scripts/
+telemetry-layer/tests/
+
+# Large fixture datasets are not part of container images.
+TestData/
