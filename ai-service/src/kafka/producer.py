@@ -12,6 +12,7 @@ from confluent_kafka import Producer, KafkaException
 import time
 import hashlib
 import threading
+import os
 from typing import Optional
 from ..contracts import AnomalyMessage, EvidenceMessage, PolicyMessage
 from ..utils.errors import KafkaError
@@ -52,6 +53,10 @@ class AIProducer:
         kafka_config = self._build_config(config)
         
         self.producer = Producer(kafka_config)
+        self.sync_flush = os.getenv("AI_PRODUCER_SYNC_FLUSH", "false").lower() in ("1", "true", "yes", "on")
+        self.policy_sync_flush = os.getenv("AI_PRODUCER_POLICY_SYNC_FLUSH", "true").lower() in ("1", "true", "yes", "on")
+        self.flush_interval_ms = max(1, int(os.getenv("AI_PRODUCER_FLUSH_INTERVAL_MS", "50")))
+        self._last_flush_at = time.monotonic()
         
         # Metrics
         self._messages_sent = 0
@@ -118,6 +123,18 @@ class AIProducer:
             with self._lock:
                 self._messages_sent += 1
                 self._bytes_sent += len(msg.value() or b'')
+
+    def _maybe_flush(self, force: bool = False, timeout: float = 0.2):
+        if self.sync_flush:
+            self.producer.flush(timeout=timeout if force else 10)
+            return
+
+        self.producer.poll(0)
+        now = time.monotonic()
+        elapsed_ms = int((now - self._last_flush_at) * 1000)
+        if force or elapsed_ms >= self.flush_interval_ms:
+            self.producer.flush(timeout=timeout)
+            self._last_flush_at = now
     
     def send_anomaly(self, msg: AnomalyMessage) -> bool:
         """Send anomaly message to ai.anomalies.v1"""
@@ -129,9 +146,9 @@ class AIProducer:
 
     def send_policy(self, msg: PolicyMessage) -> bool:
         """Send policy message to ai.policy.v1"""
-        return self._send_message(msg, "policy")
+        return self._send_message(msg, "policy", force_flush=self.policy_sync_flush)
     
-    def _send_message(self, msg, msg_type: str) -> bool:
+    def _send_message(self, msg, msg_type: str, force_flush: bool = False) -> bool:
         """Send message with circuit breaker and retry"""
         # Get topic from settings
         topic_map = {
@@ -155,11 +172,9 @@ class AIProducer:
                     )
                     # Process delivery callbacks
                     self.producer.poll(0)
-                
+                    self._maybe_flush(force=force_flush)
+
                 self.circuit_breaker.call(_send)
-                
-                # Flush to wait for delivery confirmation
-                self.producer.flush(timeout=10)
                 
                 # Check for delivery errors
                 with self._lock:
@@ -225,7 +240,7 @@ class AIProducer:
     def close(self):
         """Close producer and flush pending messages"""
         try:
-            self.producer.flush(timeout=30)
+            self._maybe_flush(force=True, timeout=30)
         finally:
             # Producer doesn't have explicit close in confluent-kafka
             pass

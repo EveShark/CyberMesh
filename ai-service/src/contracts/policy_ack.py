@@ -1,4 +1,4 @@
-"""Contract helpers for control.policy.ack.v1 messages."""
+"""Contract helpers for control.enforcement_ack.v1 messages."""
 
 from dataclasses import dataclass
 from typing import Optional

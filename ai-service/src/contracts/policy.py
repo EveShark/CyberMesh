@@ -50,8 +50,9 @@ class PolicyUpdateEvent:
     
     DOMAIN = "control.policy.v1"
     
-    # Valid policy actions
-    VALID_ACTIONS = {"add", "remove", "update", "enable", "disable"}
+    # Valid policy actions. "drop"/"reject"/"rate_limit" are emitted by
+    # runtime block policies from AI/backend and must be accepted here.
+    VALID_ACTIONS = {"add", "remove", "update", "enable", "disable", "drop", "reject", "rate_limit"}
     
     # Valid rule types
     VALID_RULE_TYPES = {
@@ -425,6 +426,22 @@ class PolicyUpdateEvent:
             raise ContractError("guardrails.max_targets must be positive integer")
         if max_targets is not None and len(ips) + len(cidrs) > max_targets:
             raise ContractError("block policy exceeds guardrails.max_targets")
+
+        fast_path_ttl = guardrails.get("fast_path_ttl_seconds")
+        if fast_path_ttl is not None and (not isinstance(fast_path_ttl, int) or fast_path_ttl <= 0):
+            raise ContractError("guardrails.fast_path_ttl_seconds must be positive integer")
+
+        fast_path_signals = guardrails.get("fast_path_signals_required")
+        if fast_path_signals is not None and (not isinstance(fast_path_signals, int) or fast_path_signals <= 0):
+            raise ContractError("guardrails.fast_path_signals_required must be positive integer")
+
+        fast_path_conf = guardrails.get("fast_path_confidence_min")
+        if fast_path_conf is not None and (not isinstance(fast_path_conf, (int, float)) or not (0 <= float(fast_path_conf) <= 1)):
+            raise ContractError("guardrails.fast_path_confidence_min must be between 0 and 1")
+
+        max_ppm = guardrails.get("max_policies_per_minute")
+        if max_ppm is not None and (not isinstance(max_ppm, int) or max_ppm <= 0):
+            raise ContractError("guardrails.max_policies_per_minute must be positive integer")
 
         for cidr in cidrs:
             try:

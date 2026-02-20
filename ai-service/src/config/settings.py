@@ -123,6 +123,11 @@ class PolicyPublishingConfig:
     requires_ack: bool = True
     dry_run: bool = False
     canary_scope: bool = False
+    fast_path_enabled: bool = True
+    fast_path_ttl_seconds: int = 30
+    fast_path_signals_required: int = 2
+    fast_path_confidence_min: float = 0.9
+    max_policies_per_minute: int = 120
     cidr_max_prefix_len: int = 24
     max_targets: int = 32
 
@@ -133,6 +138,14 @@ class PolicyPublishingConfig:
             raise ValueError("confidence_threshold must be within [0, 1]")
         if self.ttl_seconds <= 0:
             raise ValueError("ttl_seconds must be positive")
+        if self.fast_path_ttl_seconds <= 0:
+            raise ValueError("fast_path_ttl_seconds must be positive")
+        if self.fast_path_signals_required <= 0:
+            raise ValueError("fast_path_signals_required must be positive")
+        if not (0.0 <= self.fast_path_confidence_min <= 1.0):
+            raise ValueError("fast_path_confidence_min must be within [0, 1]")
+        if self.max_policies_per_minute <= 0:
+            raise ValueError("max_policies_per_minute must be positive")
 
         valid_scopes = {"cluster", "namespace", "node"}
         if self.scope not in valid_scopes:
@@ -308,9 +321,10 @@ class Settings:
     model_malware_path: "Path" = None
     
     # Detection loop (Phase 8)
-    detection_interval: int = 5                  # Seconds between detection runs
+    detection_interval: float = 5.0              # Seconds between detection runs (supports sub-second)
     detection_timeout: int = 30                  # Max seconds for single detection run
     telemetry_batch_size: int = 1000             # Flows per poll
+    min_feature_coverage: float = 0.45           # Minimum feature coverage to accept
     max_detections_per_second: int = 100         # Rate limit for publishing
     max_flows_per_iteration: int = 100           # Max flows per detection loop iteration
     detection_summary_interval: int = 10         # Iterations between summary logs

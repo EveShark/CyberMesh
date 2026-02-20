@@ -100,6 +100,7 @@ def load_settings(env_file: Optional[str] = None) -> Settings:
         aes_key=aes_key,
         model_ddos_path=Path(model_ddos_path) if model_ddos_path else None,
         model_malware_path=Path(model_malware_path) if model_malware_path else None,
+        detection_interval=max(0.05, _get_float_env("DETECTION_INTERVAL", 5.0)),
         min_confidence=_get_float_env("MIN_CONFIDENCE", 0.85),
         policy_publishing=policy_publishing,
     )
@@ -142,7 +143,7 @@ def _load_kafka_topics() -> KafkaTopicsConfig:
         control_commits=_get_env("TOPIC_CONTROL_COMMITS", "control.commits.v1"),
         control_reputation=_get_env("TOPIC_CONTROL_REPUTATION", "control.reputation.v1"),
         control_policy=_get_env("TOPIC_CONTROL_POLICY", "control.policy.v1"),
-        control_policy_ack=_get_env("TOPIC_CONTROL_POLICY_ACK", "control.policy.ack.v1"),
+        control_policy_ack=_get_env("TOPIC_CONTROL_POLICY_ACK", "control.enforcement_ack.v1"),
         control_evidence=_get_env("TOPIC_CONTROL_EVIDENCE", "control.evidence.v1"),
         dlq=_get_env("TOPIC_DLQ", "ai.dlq.v1"),
     )
@@ -248,6 +249,11 @@ def _load_policy_publishing() -> "PolicyPublishingConfig":
         requires_ack=_get_bool_env("POLICY_PUBLISHING_REQUIRES_ACK", True),
         dry_run=_get_bool_env("POLICY_PUBLISHING_DRY_RUN", False),
         canary_scope=_get_bool_env("POLICY_PUBLISHING_CANARY_SCOPE", False),
+        fast_path_enabled=_get_bool_env("POLICY_PUBLISHING_FAST_PATH_ENABLED", True),
+        fast_path_ttl_seconds=_get_int_env("POLICY_PUBLISHING_FAST_PATH_TTL_SECONDS", 30),
+        fast_path_signals_required=_get_int_env("POLICY_PUBLISHING_FAST_PATH_SIGNALS_REQUIRED", 2),
+        fast_path_confidence_min=_get_float_env("POLICY_PUBLISHING_FAST_PATH_CONFIDENCE_MIN", 0.9),
+        max_policies_per_minute=_get_int_env("POLICY_PUBLISHING_MAX_POLICIES_PER_MINUTE", 120),
         cidr_max_prefix_len=_get_int_env("POLICY_PUBLISHING_CIDR_MAX_PREFIX", 24),
         max_targets=_get_int_env("POLICY_PUBLISHING_MAX_TARGETS", 32),
     )

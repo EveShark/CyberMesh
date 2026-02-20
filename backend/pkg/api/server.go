@@ -24,6 +24,7 @@ import (
 
 	redis "github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 )
 
 // Server provides read-only API access to backend state
@@ -461,6 +462,12 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}()
 
+	// Start background cache warmer
+	if s.config.DashboardCacheTTL > 0 {
+		s.wg.Add(1)
+		go s.runCacheWarmer()
+	}
+
 	s.logger.Info("API server started",
 		utils.ZapString("addr", s.config.ListenAddr),
 		utils.ZapString("base_path", s.config.BasePath),
@@ -610,6 +617,132 @@ func (s *Server) setDashboardCache(snapshot *DashboardOverviewResponse, now time
 		generatedAt: now,
 	}
 	s.dashboardCacheMu.Unlock()
+}
+
+func (s *Server) runCacheWarmer() {
+	defer s.wg.Done()
+
+	ttl := s.config.DashboardCacheTTL
+	refreshBefore := ttl * 80 / 100
+	ticker := time.NewTicker(refreshBefore / 2)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+			s.maybeRefreshDashboardCache()
+		}
+	}
+}
+
+func (s *Server) maybeRefreshDashboardCache() {
+	s.dashboardCacheMu.RLock()
+	entry := s.dashboardCache
+	s.dashboardCacheMu.RUnlock()
+
+	if entry.snapshot == nil {
+		return
+	}
+
+	age := time.Since(entry.generatedAt)
+	threshold := s.config.DashboardCacheTTL * 80 / 100
+
+	if age < threshold {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), s.config.RequestTimeout)
+	defer cancel()
+
+	snapshot := s.buildDashboardSnapshot(ctx)
+	if snapshot != nil {
+		s.setDashboardCache(snapshot, time.Now())
+	}
+}
+
+func (s *Server) buildDashboardSnapshot(ctx context.Context) *DashboardOverviewResponse {
+	stats := s.buildStatsResponse(ctx)
+	backendMetrics := s.buildDashboardBackendMetrics(stats)
+	backendDerived := s.buildDashboardBackendDerived(stats)
+	backendHistory := s.snapshotBackendHistory(stats, backendMetrics)
+	readiness, _ := s.buildReadinessResponse(ctx)
+	health := healthResponseFromReadiness(readiness)
+
+	var consensusMetrics consapi.MetricsSnapshot
+	if s.engine != nil {
+		consensusMetrics = s.engine.GetMetrics()
+	}
+
+	var (
+		networkOverview   *NetworkOverviewResponse
+		consensusOverview *ConsensusOverviewResponse
+		blocksSection     DashboardBlocksSection
+		threatsSection    DashboardThreatsSection
+		aiSection         DashboardAISection
+		ledgerSection     *DashboardLedgerSection
+		validatorSection  *DashboardValidatorsSection
+	)
+
+	g, gctx := errgroup.WithContext(ctx)
+
+	if s.engine != nil {
+		g.Go(func() error {
+			networkOverview, _ = s.buildNetworkOverview(gctx, time.Now().UTC())
+			return nil
+		})
+		g.Go(func() error {
+			consensusOverview, _ = s.buildConsensusOverview(gctx, time.Now().UTC())
+			return nil
+		})
+	}
+
+	g.Go(func() error {
+		blocksSection = s.buildDashboardBlocks(gctx, stats, consensusMetrics)
+		return nil
+	})
+
+	g.Go(func() error {
+		threatsSection = s.buildDashboardThreats(gctx)
+		return nil
+	})
+
+	g.Go(func() error {
+		aiSection = s.buildDashboardAI(gctx)
+		return nil
+	})
+
+	g.Go(func() error {
+		ledgerSection = s.buildDashboardLedger(gctx, stats)
+		return nil
+	})
+
+	g.Go(func() error {
+		validatorSection = s.buildDashboardValidators(gctx)
+		return nil
+	})
+
+	_ = g.Wait()
+
+	return &DashboardOverviewResponse{
+		Timestamp: time.Now().UnixMilli(),
+		Backend: DashboardBackendSection{
+			Health:    health,
+			Readiness: readiness,
+			Stats:     stats,
+			Metrics:   backendMetrics,
+			Derived:   backendDerived,
+			History:   backendHistory,
+		},
+		Ledger:     ledgerSection,
+		Validators: validatorSection,
+		Network:    networkOverview,
+		Consensus:  consensusOverview,
+		Blocks:     blocksSection,
+		Threats:    threatsSection,
+		AI:         aiSection,
+	}
 }
 
 func (s *Server) recordLoopStatus(ctx context.Context, status string, blocking bool, issues []string) {

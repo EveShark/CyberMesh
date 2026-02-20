@@ -4,7 +4,7 @@ package cybermesh.control.v1;
 
 option go_package = "backend/proto;pb";
 
-// PolicyAckEvent represents control.policy.ack.v1 produced by the enforcement agent
+// PolicyAckEvent represents control.enforcement_ack.v1 produced by the enforcement agent
 message PolicyAckEvent {
   string policy_id = 1;              // Policy unique identifier
   string scope_identifier = 2;       // scope:<value> identifier used by controller

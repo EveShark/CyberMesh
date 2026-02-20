@@ -46,22 +46,24 @@ func validateKafkaConfig(ctx context.Context, cm *utils.ConfigManager, audit *ut
 		return fmt.Errorf("kafka: KAFKA_INPUT_TOPICS required (comma-separated list)")
 	}
 
-	// Validate SASL credentials present
-	if _, err := cm.GetStringRequired("KAFKA_SASL_USERNAME"); err != nil {
-		if audit != nil {
-			_ = audit.Security("kafka_config_invalid", map[string]interface{}{
-				"error": "KAFKA_SASL_USERNAME required",
-			})
+	// Validate SASL credentials only when SASL is enabled.
+	if cm.GetBool("KAFKA_SASL_ENABLED", true) {
+		if _, err := cm.GetStringRequired("KAFKA_SASL_USERNAME"); err != nil {
+			if audit != nil {
+				_ = audit.Security("kafka_config_invalid", map[string]interface{}{
+					"error": "KAFKA_SASL_USERNAME required",
+				})
+			}
+			return fmt.Errorf("kafka: KAFKA_SASL_USERNAME required: %w", err)
 		}
-		return fmt.Errorf("kafka: KAFKA_SASL_USERNAME required: %w", err)
-	}
-	if _, err := cm.GetSecret("KAFKA_SASL_PASSWORD"); err != nil {
-		if audit != nil {
-			_ = audit.Security("kafka_config_invalid", map[string]interface{}{
-				"error": "KAFKA_SASL_PASSWORD required",
-			})
+		if _, err := cm.GetSecret("KAFKA_SASL_PASSWORD"); err != nil {
+			if audit != nil {
+				_ = audit.Security("kafka_config_invalid", map[string]interface{}{
+					"error": "KAFKA_SASL_PASSWORD required",
+				})
+			}
+			return fmt.Errorf("kafka: KAFKA_SASL_PASSWORD required: %w", err)
 		}
-		return fmt.Errorf("kafka: KAFKA_SASL_PASSWORD required: %w", err)
 	}
 
 	// Validate consumer group ID
@@ -125,41 +127,47 @@ func BuildSaramaConfig(ctx context.Context, cm *utils.ConfigManager, log *utils.
 		}
 	}
 
-	// SASL Authentication (REQUIRED in production)
+	// SASL Authentication (enabled by default; can be disabled for isolated local test brokers).
+	saslEnabled := cm.GetBool("KAFKA_SASL_ENABLED", true)
 	saslMechanism := cm.GetString("KAFKA_SASL_MECHANISM", "SCRAM-SHA-512")
-	saslUsername, err := cm.GetStringRequired("KAFKA_SASL_USERNAME")
-	if err != nil {
-		return nil, fmt.Errorf("KAFKA_SASL_USERNAME required: %w", err)
-	}
-	saslPassword, err := cm.GetSecret("KAFKA_SASL_PASSWORD")
-	if err != nil {
-		return nil, fmt.Errorf("KAFKA_SASL_PASSWORD required: %w", err)
-	}
+	if saslEnabled {
+		saslUsername, err := cm.GetStringRequired("KAFKA_SASL_USERNAME")
+		if err != nil {
+			return nil, fmt.Errorf("KAFKA_SASL_USERNAME required: %w", err)
+		}
+		saslPassword, err := cm.GetSecret("KAFKA_SASL_PASSWORD")
+		if err != nil {
+			return nil, fmt.Errorf("KAFKA_SASL_PASSWORD required: %w", err)
+		}
 
-	cfg.Net.SASL.Enable = true
-	cfg.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
-	cfg.Net.SASL.User = saslUsername
-	cfg.Net.SASL.Password = saslPassword
-
-	switch saslMechanism {
-	case "SCRAM-SHA-512":
+		cfg.Net.SASL.Enable = true
 		cfg.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
-		cfg.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
-			return &XDGSCRAMClient{HashGeneratorFcn: SHA512}
+		cfg.Net.SASL.User = saslUsername
+		cfg.Net.SASL.Password = saslPassword
+
+		switch saslMechanism {
+		case "SCRAM-SHA-512":
+			cfg.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
+			cfg.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
+				return &XDGSCRAMClient{HashGeneratorFcn: SHA512}
+			}
+		case "SCRAM-SHA-256":
+			cfg.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA256
+			cfg.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
+				return &XDGSCRAMClient{HashGeneratorFcn: SHA256}
+			}
+		case "PLAIN":
+			if !tlsEnabled {
+				return nil, fmt.Errorf("SASL PLAIN without TLS is FORBIDDEN (credentials would be cleartext)")
+			}
+			cfg.Net.SASL.Mechanism = sarama.SASLTypePlaintext
+			log.WarnContext(ctx, "SASL PLAIN enabled - use SCRAM for better security")
+		default:
+			return nil, fmt.Errorf("unsupported SASL mechanism: %s (use SCRAM-SHA-256, SCRAM-SHA-512, or PLAIN)", saslMechanism)
 		}
-	case "SCRAM-SHA-256":
-		cfg.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA256
-		cfg.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
-			return &XDGSCRAMClient{HashGeneratorFcn: SHA256}
-		}
-	case "PLAIN":
-		if !tlsEnabled {
-			return nil, fmt.Errorf("SASL PLAIN without TLS is FORBIDDEN (credentials would be cleartext)")
-		}
-		cfg.Net.SASL.Mechanism = sarama.SASLTypePlaintext
-		log.WarnContext(ctx, "SASL PLAIN enabled - use SCRAM for better security")
-	default:
-		return nil, fmt.Errorf("unsupported SASL mechanism: %s (use SCRAM-SHA-256, SCRAM-SHA-512, or PLAIN)", saslMechanism)
+	} else {
+		cfg.Net.SASL.Enable = false
+		log.WarnContext(ctx, "Kafka SASL disabled (test mode only)")
 	}
 
 	// Consumer Configuration
@@ -192,6 +200,11 @@ func BuildSaramaConfig(ctx context.Context, cm *utils.ConfigManager, log *utils.
 	cfg.Producer.Retry.Max = cm.GetInt("KAFKA_PRODUCER_RETRIES", 3)
 	cfg.Producer.Return.Successes = true
 	cfg.Producer.Return.Errors = true
+	if cm.GetBool("KAFKA_CONTROL_LOW_LATENCY", true) {
+		cfg.Producer.Flush.Frequency = cm.GetDuration("KAFKA_PRODUCER_FLUSH_FREQUENCY", 20*time.Millisecond)
+		cfg.Producer.Flush.Messages = cm.GetInt("KAFKA_PRODUCER_FLUSH_MESSAGES", 1)
+		cfg.Producer.Flush.Bytes = cm.GetInt("KAFKA_PRODUCER_FLUSH_BYTES", 0)
+	}
 
 	// Idempotent producer requires MaxOpenRequests = 1
 	if cfg.Producer.Idempotent {

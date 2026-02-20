@@ -103,6 +103,12 @@ type Mempool struct {
 	prod      map[string]*producerState // hex(producerID) -> state
 }
 
+func (m *Mempool) ProducerCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.prod)
+}
+
 func New(cfg Config, log *utils.Logger) *Mempool {
 	h := make(minHeap, 0)
 	heap.Init(&h)

@@ -331,12 +331,25 @@ class ConfidenceCalibrator:
             })
             
             # Save to Redis (hot model) - use SET with binary data
-            if self.config.calibration_save_to_redis:
+            if self.config.calibration_save_to_redis and not getattr(self.storage, "_disabled", False):
                 # Redis decode_responses=True doesn't work for binary data
                 # Use raw client without decode_responses
                 import redis
-                redis_url = f"rediss://default:{self.storage.password}@{self.storage.host}:{self.storage.port}/{self.storage.db}"
-                raw_client = redis.from_url(redis_url, decode_responses=False, ssl_cert_reqs=None)
+                scheme = "rediss" if getattr(self.storage, "tls_enabled", False) else "redis"
+                if getattr(self.storage, "password", None):
+                    redis_url = (
+                        f"{scheme}://default:{self.storage.password}"
+                        f"@{self.storage.host}:{self.storage.port}/{self.storage.db}"
+                    )
+                else:
+                    redis_url = f"{scheme}://{self.storage.host}:{self.storage.port}/{self.storage.db}"
+                raw_client = redis.from_url(
+                    redis_url,
+                    decode_responses=False,
+                    ssl_cert_reqs=None,
+                    socket_connect_timeout=2,
+                    socket_timeout=2,
+                )
                 raw_client.set(self.config.calibration_redis_key, model_bytes)
                 raw_client.close()
                 self.logger.info(f"Saved model to Redis: {self.config.calibration_redis_key}")
@@ -364,11 +377,24 @@ class ConfidenceCalibrator:
         model_data = None
         
         # Try Redis first (fastest) - use raw client for binary data
-        if self.config.calibration_save_to_redis:
+        if self.config.calibration_save_to_redis and not getattr(self.storage, "_disabled", False):
             try:
                 import redis
-                redis_url = f"rediss://default:{self.storage.password}@{self.storage.host}:{self.storage.port}/{self.storage.db}"
-                raw_client = redis.from_url(redis_url, decode_responses=False, ssl_cert_reqs=None)
+                scheme = "rediss" if getattr(self.storage, "tls_enabled", False) else "redis"
+                if getattr(self.storage, "password", None):
+                    redis_url = (
+                        f"{scheme}://default:{self.storage.password}"
+                        f"@{self.storage.host}:{self.storage.port}/{self.storage.db}"
+                    )
+                else:
+                    redis_url = f"{scheme}://{self.storage.host}:{self.storage.port}/{self.storage.db}"
+                raw_client = redis.from_url(
+                    redis_url,
+                    decode_responses=False,
+                    ssl_cert_reqs=None,
+                    socket_connect_timeout=2,
+                    socket_timeout=2,
+                )
                 model_bytes = raw_client.get(self.config.calibration_redis_key)
                 raw_client.close()
                 

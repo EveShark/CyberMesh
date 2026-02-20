@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package cybermesh.sentinel.v1;
+
+// Sentinel verdict contract for topic sentinel.verdicts.v1.
+message SentinelFinding {
+  string id = 1;
+  string agent = 2;
+  string category = 3;
+  string description = 4;
+  string severity = 5;
+  double score = 6;
+}
+
+message SentinelInputRef {
+  string id = 1;
+  string tenant_id = 2;
+  string source = 3;
+  string modality = 4;
+  string features_version = 5;
+  double timestamp = 6;
+}
+
+message SentinelResultEvent {
+  string schema_version = 1;   // sentinel.result.v1
+  string event_id = 2;
+  string tenant_id = 3;
+  double timestamp = 4;        // unix epoch seconds
+  string source = 5;
+  string payload_type = 6;     // sentinel_result
+
+  SentinelInputRef input = 7;
+
+  string threat_level = 8;     // clean|unknown|suspicious|malicious|critical
+  double final_score = 9;      // 0.0 - 1.0
+  double confidence = 10;      // 0.0 - 1.0
+  repeated SentinelFinding findings = 11;
+  repeated string errors = 12;
+  bool degraded = 13;
+  string verdict = 14;
+  string model_version = 15;
+}

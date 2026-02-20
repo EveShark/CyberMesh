@@ -20,7 +20,7 @@ import secrets
 import threading
 import time
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
@@ -365,10 +365,14 @@ class APIHandler(BaseHTTPRequestHandler):
             status: HTTP status code
             data: Dictionary to serialize as JSON
         """
-        self.send_response(status)
-        self.send_header('Content-Type', 'application/json')
-        self.end_headers()
-        self.wfile.write(json.dumps(data).encode('utf-8'))
+        try:
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(data).encode('utf-8'))
+        except (BrokenPipeError, ConnectionResetError):
+            # Client disconnected before response flush (common for kube probes under timeout).
+            return
 
 
 def start_api_server(service_manager, host='0.0.0.0', port=8080):
@@ -404,8 +408,9 @@ def start_api_server(service_manager, host='0.0.0.0', port=8080):
     # Inject service_manager into handler class
     APIHandler.service_manager = service_manager
     
-    # Create HTTP server
-    server = HTTPServer((host, port), APIHandler)
+    # Use threaded server so health/readiness/metrics requests don't block each other.
+    server = ThreadingHTTPServer((host, port), APIHandler)
+    server.daemon_threads = True
     
     # Start in daemon thread (dies with main process)
     thread = threading.Thread(target=server.serve_forever, daemon=True)

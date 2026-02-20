@@ -2,16 +2,16 @@
 
 **Byzantine Fault Tolerant consensus engine for distributed cybersecurity operations**
 
-Version: 1.0.0 | Go 1.24.0 | Production-Ready
+Version: 1.0.0 | Go 1.25.1 | Production-Ready
 
 ---
 
 ## Overview
 
-CyberMesh Backend is a Byzantine Fault Tolerant (BFT) consensus system that validates AI-generated security alerts through distributed consensus. The backend consumes messages from Kafka, verifies Ed25519 signatures, achieves consensus using PBFT, executes transactions through a deterministic state machine, and persists validated data to CockroachDB. The system tolerates up to f Byzantine failures where f = (N-1)/3.
+CyberMesh Backend is a Byzantine Fault Tolerant (BFT) consensus system that validates AI-generated security alerts through distributed consensus. The backend consumes messages from Kafka, verifies Ed25519 signatures, runs a HotStuff-style consensus engine (2-chain rule; implementation currently in `pkg/consensus/pbft` package), executes transactions through a deterministic state machine, and persists validated data to CockroachDB. The system tolerates up to f Byzantine failures where f = (N-1)/3.
 
 **Core Capabilities:**
-- PBFT consensus (3-phase: Pre-Prepare → Prepare → Commit)
+- HotStuff-style consensus (2-chain commit rule)
 - Deterministic state machine (pure functions, reproducible execution)
 - Ed25519 signature verification (Kafka messages)
 - Leader election with heartbeat-based rotation
@@ -21,7 +21,7 @@ CyberMesh Backend is a Byzantine Fault Tolerant (BFT) consensus system that vali
 
 **System Flow:**
 ```
-Kafka Consumer → Ed25519 Verification → Mempool Validation → PBFT Consensus →
+Kafka Consumer → Ed25519 Verification → Mempool Validation → Consensus →
 State Machine Execution → CockroachDB Persistence → Kafka Producer (control.commits.v1)
 ```
 
@@ -46,7 +46,7 @@ The backend operates in a 5-layer architecture:
    - Max capacity: 1000 transactions, 10MB total
 
 3. **Consensus Layer** (`pkg/consensus/`)
-   - PBFT engine: 3-phase commit (pre-prepare, prepare, commit)
+   - HotStuff-style engine (2-chain commit rule; package name `pbft` is historical)
    - Leader election: heartbeat-based with round-robin rotation
    - Quorum: 2f+1 (e.g., 3 of 4 validators)
    - View change: timeout-triggered recovery for failed leaders
@@ -62,14 +62,15 @@ The backend operates in a 5-layer architecture:
    - CockroachDB distributed SQL database
    - TLS encryption with connection pooling (50 max, 10 idle)
    - Idempotent operations (retry-safe)
-   - Tables: blocks, transactions, anomalies, validators
+   - Core tables: blocks, transactions, validators (+ consensus and policy-ack persistence tables)
 
 ### Integration with AI Service
 
-The backend receives anomaly detections from AI service via Kafka and returns commitment notifications:
+The backend receives anomaly/policy/evidence events from AI service via Kafka and publishes control-plane outputs:
 
 - **Incoming**: ai.anomalies.v1, ai.evidence.v1, ai.policy.v1 (AI → Backend)
-- **Outgoing**: control.commits.v1, control.reputation.v1 (Backend → AI)
+- **Feedback Ingestion**: control.enforcement_ack.v1 (Enforcement → Backend policy-ack consumer; persisted for ops/visibility)
+- **Outgoing**: control.commits.v1, control.reputation.v1, control.policy.v1 (Backend → AI/Enforcement)
 - **Message Format**: Protobuf with Ed25519 signatures
 
 See `ai-service/README.md` for AI service architecture.
@@ -79,7 +80,7 @@ See `ai-service/README.md` for AI service architecture.
 ## System Requirements
 
 **Runtime:**
-- Go 1.24.0 or higher
+- Go 1.25.1 or higher
 - CockroachDB 21+ or PostgreSQL 12+ (for persistence)
 - Kafka broker (Confluent Cloud or self-hosted with TLS + SASL)
 - Minimum 4 validators for BFT (tolerates 1 Byzantine failure)
@@ -169,11 +170,11 @@ go run ./cmd/cybermesh/main.go
 ### 6. Verify Health
 
 ```bash
-# Check node started successfully
-curl http://localhost:8443/health
+# Check node started successfully (default base path /api/v1)
+curl http://localhost:8443/api/v1/health
 
-# Check consensus status (if API enabled)
-curl http://localhost:8443/status
+# Check readiness
+curl http://localhost:8443/api/v1/ready
 ```
 
 **Expected Output:**
@@ -423,11 +424,11 @@ backend/
 ├── pkg/                          # Core implementation
 │   ├── consensus/                # Consensus layer
 │   │   ├── consensus.go          # Public API
-│   │   ├── pbft/                 # PBFT implementation
-│   │   │   ├── pbft.go           # PBFT engine (3-phase commit)
+│   │   ├── pbft/                 # HotStuff implementation (historical package name)
+│   │   │   ├── pbft.go           # HotStuff engine (2-chain commit rule)
 │   │   │   ├── quorum.go         # Quorum calculations (2f+1)
 │   │   │   ├── storage.go        # Consensus state storage
-│   │   │   └── types.go          # PBFT types
+│   │   │   └── types.go          # Consensus types
 │   │   ├── leader/               # Leader election
 │   │   │   ├── leader.go         # Leader election logic
 │   │   │   ├── rotation.go       # Round-robin rotation
@@ -497,7 +498,7 @@ backend/
 │   ├── api/                      # HTTP API (optional)
 │   │   ├── server.go             # HTTP server
 │   │   ├── router.go             # Route definitions
-│   │   ├── health.go             # Health checks (/health)
+│   │   ├── health.go             # Health and readiness handlers (base path aware)
 │   │   ├── blocks.go             # Block queries (/blocks)
 │   │   ├── validators.go         # Validator queries (/validators)
 │   │   ├── state.go              # State queries (/state)
@@ -558,31 +559,27 @@ backend/
 
 ## Core Concepts
 
-### PBFT Consensus
+### HotStuff Consensus (2-Chain)
 
-**3-Phase Commit Protocol:**
+**Proposal/Vote/QC/Commit Flow:**
 
-1. **Pre-Prepare Phase**
-   - Leader proposes block to all validators
-   - Validators verify leader signature and block validity
-   - Validators enter Prepare phase if valid
+1. **Proposal**
+   - Leader proposes a block with justify QC
+   - Replicas verify proposal safety and signatures
 
-2. **Prepare Phase**
-   - Validators broadcast Prepare votes to all peers
-   - Each validator waits for 2f Prepare votes (quorum)
-   - Validators enter Commit phase when quorum reached
+2. **Vote + QC Formation**
+   - Replicas vote for safe proposals
+   - Leader forms QC when 2f+1 votes are collected
 
-3. **Commit Phase**
-   - Validators broadcast Commit votes to all peers
-   - Each validator waits for 2f+1 Commit votes (supermajority)
-   - Validators execute block when supermajority reached
+3. **2-Chain Commit Rule**
+   - A block is committed when QC linkage satisfies the 2-chain rule
+   - Committed block is executed and persisted deterministically
 
 **Quorum Calculation:**
 ```
-Total validators: N = 4
-Byzantine failures tolerated: f = (N-1)/3 = 1
-Quorum (Prepare): 2f = 2
-Supermajority (Commit): 2f+1 = 3
+Total validators: N
+Byzantine failures tolerated: f = floor((N-1)/3)
+Quorum: 2f+1
 ```
 
 **File:** `pkg/consensus/pbft/pbft.go`, `pkg/consensus/pbft/quorum.go`
@@ -657,8 +654,8 @@ Supermajority (Commit): 2f+1 = 3
 2. **VERIFIED** - Ed25519 signature + content hash verified
 3. **MEMPOOL** - Added to mempool (nonce checked, rate limited)
 4. **PROPOSED** - Leader included in block proposal
-5. **PREPARED** - 2f validators voted in Prepare phase
-6. **COMMITTED** - 2f+1 validators voted in Commit phase (consensus reached)
+5. **QC_FORMED** - quorum certificate formed (2f+1 votes)
+6. **COMMITTED** - 2-chain commit condition satisfied
 7. **EXECUTED** - State machine executed transaction, persisted to database
 
 **File:** `pkg/ingest/kafka/consumer.go`, `pkg/mempool/mempool.go`, `pkg/consensus/pbft/pbft.go`, `pkg/state/executor.go`
@@ -858,28 +855,21 @@ AUDIT_SIGNING_KEY=<64+ chars>  # HMAC key
    - signature (64 bytes)
    - timestamp (Unix seconds)
 
-3. **anomalies**
-   - anomaly_id (UUID, PRIMARY KEY)
-   - anomaly_type (ddos, malware, anomaly, etc.)
-   - severity (1-10)
-   - confidence (0.0-1.0)
-   - source (IP or hostname)
-   - block_height (FOREIGN KEY → blocks.height)
-   - created_at (timestamp)
-
-4. **validators**
+3. **validators**
    - validator_id (32 bytes, PRIMARY KEY)
    - public_key (32 bytes)
    - reputation (0.0-1.0)
    - is_active (boolean)
    - joined_view (uint64)
 
+Additional persistence tables exist for consensus recovery and enforcement ACK visibility (for example `consensus_*` and `policy_acks` migrations).
+
 **Indexes:**
 - blocks.block_hash (lookup by hash)
 - transactions.content_hash (duplicate detection)
 - transactions.nonce (replay protection)
-- anomalies.anomaly_type (filtering)
-- anomalies.block_height (range queries)
+- transactions.tx_type (type filtering)
+- validators.reputation (validator health/ranking views)
 
 **Connection Pooling:**
 - Max connections: 50
@@ -1237,7 +1227,7 @@ Error: dial tcp: connection refused
 **Production Readiness:** 100%
 
 **Components:**
-- ✅ PBFT Consensus (3-phase commit)
+- ✅ HotStuff-Style Consensus (2-chain commit rule)
 - ✅ Leader Election (heartbeat-based rotation)
 - ✅ Genesis Ceremony (cluster initialization)
 - ✅ Deterministic State Machine (pure functions)
@@ -1264,7 +1254,7 @@ Error: dial tcp: connection refused
 **External Links:**
 - CockroachDB Documentation: https://www.cockroachlabs.com/docs/
 - libp2p Documentation: https://docs.libp2p.io/
-- PBFT Paper: http://pmg.csail.mit.edu/papers/osdi99.pdf
+- HotStuff Paper: https://arxiv.org/abs/1803.05069
 - Ed25519 Cryptography: https://ed25519.cr.yp.to/
 
 **Integration:**

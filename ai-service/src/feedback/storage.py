@@ -90,15 +90,20 @@ class RedisStorage:
             else:
                 redis_url = f"{protocol}://{self.host}:{self.port}/{self.db}"
             
-            # Use from_url which handles TLS connection correctly
-            self._client = redis.from_url(
-                redis_url,
-                max_connections=self.max_connections,
-                decode_responses=True,
-                socket_connect_timeout=5,
-                socket_timeout=5,
-                ssl_cert_reqs=None  # Upstash uses public CAs
-            )
+            # Build connection kwargs explicitly; ssl-only options must not be sent
+            # for plain redis:// connections (redis-py 5 raises on unknown kwargs).
+            conn_kwargs = {
+                "max_connections": self.max_connections,
+                "decode_responses": True,
+                "socket_connect_timeout": 5,
+                "socket_timeout": 5,
+            }
+            if self.tls_enabled:
+                # Keep certificate validation behavior explicit for managed Redis.
+                conn_kwargs["ssl_cert_reqs"] = None
+
+            # Use from_url which handles auth/db parsing and TLS schemes.
+            self._client = redis.from_url(redis_url, **conn_kwargs)
             
             # Test connection
             self._client.ping()

@@ -2,6 +2,7 @@ package wiring
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"backend/pkg/config"
 	"backend/pkg/consensus/api"
 	"backend/pkg/consensus/messages"
+	"backend/pkg/control/policyack"
 	"backend/pkg/ingest/kafka"
 	"backend/pkg/mempool"
 	"backend/pkg/p2p"
@@ -22,12 +24,15 @@ import (
 )
 
 type Config struct {
-	BuildInterval     time.Duration
-	MinMempoolTxs     int
-	TimestampSkew     time.Duration // For state.ApplyBlock validation
-	GenesisHash       [32]byte      // Initial parent hash for first block
-	BlockTimeout      time.Duration // Consensus block timeout (controls leader retry cadence)
-	AllowSoloProposal bool          // Allow proposals even if peer quorum not met (dev/single-node)
+	BuildInterval       time.Duration
+	ProposalCooldown    time.Duration
+	MinMempoolTxs       int
+	TimestampSkew       time.Duration
+	GenesisHash         [32]byte
+	BlockTimeout        time.Duration
+	GenesisGracePeriod  time.Duration
+	AllowSoloProposal   bool
+	StateRetainVersions uint64
 
 	// Persistence configuration
 	EnablePersistence bool                    // Enable async persistence (default: true)
@@ -58,6 +63,7 @@ type Service struct {
 	store   state.StateStore
 	log     *utils.Logger
 	metrics *Metrics
+	memMon  *utils.MemoryMonitor
 
 	// Persistence (optional)
 	persistWorker *PersistenceWorker
@@ -66,6 +72,7 @@ type Service struct {
 	kafkaConsumer   *kafka.Consumer
 	kafkaProducer   *kafka.Producer
 	policyPublisher *policyPublisher
+	policyAckCons   *policyack.Consumer
 
 	// API server (optional)
 	apiServer *apiserver.Server
@@ -81,6 +88,7 @@ type Service struct {
 	lastProposedView    uint64   // Last view we proposed in (debug visibility)
 	lastProposedHeight  uint64   // Last height we proposed (for cooldown logging)
 	lastProposalTime    time.Time
+	proposalCooldown    time.Duration
 	blockTimeout        time.Duration
 	stopCh              chan struct{}
 
@@ -91,21 +99,43 @@ type Service struct {
 
 func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, builder *block.Builder, store state.StateStore, log *utils.Logger) (*Service, error) {
 	s := &Service{
-		cfg:          cfg,
-		eng:          eng,
-		mp:           mp,
-		builder:      builder,
-		store:        store,
-		log:          log,
-		metrics:      &Metrics{},
-		lastParent:   cfg.GenesisHash, // Initialize with genesis instead of zero
-		stopCh:       make(chan struct{}),
-		blockTimeout: cfg.BlockTimeout,
+		cfg:              cfg,
+		eng:              eng,
+		mp:               mp,
+		builder:          builder,
+		memMon:           utils.NewMemoryMonitor(log),
+		store:            store,
+		log:              log,
+		metrics:          &Metrics{},
+		lastParent:       cfg.GenesisHash, // Initialize with genesis instead of zero
+		stopCh:           make(chan struct{}),
+		blockTimeout:     cfg.BlockTimeout,
+		proposalCooldown: cfg.ProposalCooldown,
 		// startTime will be set in Start() after genesis completes
-		genesisGracePeriod: 60 * time.Second, // Covers observed pod startup spread
+		genesisGracePeriod: cfg.GenesisGracePeriod,
 	}
 	if s.blockTimeout <= 0 {
 		s.blockTimeout = 5 * time.Second
+	}
+	if s.proposalCooldown <= 0 {
+		cooldown := cfg.BuildInterval * 2
+		if cooldown <= 0 {
+			cooldown = s.blockTimeout
+		}
+		if cooldown < 100*time.Millisecond {
+			cooldown = 100 * time.Millisecond
+		}
+		if cooldown > s.blockTimeout {
+			cooldown = s.blockTimeout
+		}
+		s.proposalCooldown = cooldown
+	}
+	if s.genesisGracePeriod < 0 {
+		s.genesisGracePeriod = 0
+	}
+	if s.genesisGracePeriod == 0 {
+		// Keep conservative default for multi-node startup unless explicitly tuned by env.
+		s.genesisGracePeriod = 60 * time.Second
 	}
 
 	if cfg.DBAdapter != nil {
@@ -292,6 +322,132 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 		}
 	}
 
+	// Initialize policy ACK consumer (optional).
+	// This consumes control.enforcement_ack.v1 emitted by enforcement-agent and persists it for visibility/ops.
+	if cfg.EnableKafka && cfg.ConfigManager != nil {
+		ackCfg, err := policyack.LoadConfig(cfg.ConfigManager)
+		if err != nil {
+			if kafkaProducer != nil {
+				kafkaProducer.Close()
+			}
+			if s.kafkaConsumer != nil {
+				_ = s.kafkaConsumer.Stop()
+			}
+			return nil, fmt.Errorf("policy ack consumer config invalid: %w", err)
+		}
+		if ackCfg.Enabled {
+			// Require DB access when ACK ingestion enabled (we do not silently drop acks).
+			var db *sql.DB
+			if provider, ok := cfg.DBAdapter.(interface{ GetDB() *sql.DB }); ok {
+				db = provider.GetDB()
+			}
+			if db == nil {
+				if kafkaProducer != nil {
+					kafkaProducer.Close()
+				}
+				if s.kafkaConsumer != nil {
+					_ = s.kafkaConsumer.Stop()
+				}
+				return nil, fmt.Errorf("policy ack consumer enabled but storage adapter does not expose DB handle")
+			}
+
+			store, err := policyack.NewStore(db)
+			if err != nil {
+				if kafkaProducer != nil {
+					kafkaProducer.Close()
+				}
+				if s.kafkaConsumer != nil {
+					_ = s.kafkaConsumer.Stop()
+				}
+				return nil, fmt.Errorf("policy ack store init failed: %w", err)
+			}
+
+			var trust *policyack.TrustedKeys
+			if ackCfg.TrustedKeysDir != "" {
+				t, terr := policyack.LoadTrustedKeys(ackCfg.TrustedKeysDir)
+				if terr != nil {
+					if kafkaProducer != nil {
+						kafkaProducer.Close()
+					}
+					if s.kafkaConsumer != nil {
+						_ = s.kafkaConsumer.Stop()
+					}
+					return nil, fmt.Errorf("policy ack trust store load failed: %w", terr)
+				}
+				trust = t
+			}
+
+			// Reuse the backend's sarama configuration builder (TLS/SASL enforced).
+			saramaCfg, err := kafka.BuildSaramaConfig(context.Background(), cfg.ConfigManager, log, cfg.AuditLogger)
+			if err != nil {
+				if kafkaProducer != nil {
+					kafkaProducer.Close()
+				}
+				if s.kafkaConsumer != nil {
+					_ = s.kafkaConsumer.Stop()
+				}
+				return nil, fmt.Errorf("policy ack consumer: build kafka config failed: %w", err)
+			}
+
+			cg, err := sarama.NewConsumerGroup(ackCfg.Brokers, ackCfg.GroupID, saramaCfg)
+			if err != nil {
+				if kafkaProducer != nil {
+					kafkaProducer.Close()
+				}
+				if s.kafkaConsumer != nil {
+					_ = s.kafkaConsumer.Stop()
+				}
+				return nil, fmt.Errorf("policy ack consumer: create consumer group failed: %w", err)
+			}
+
+			// DLQ producer is optional.
+			var dlq sarama.SyncProducer
+			if ackCfg.DLQ != "" {
+				dlq, err = sarama.NewSyncProducer(ackCfg.Brokers, saramaCfg)
+				if err != nil {
+					_ = cg.Close()
+					if kafkaProducer != nil {
+						kafkaProducer.Close()
+					}
+					if s.kafkaConsumer != nil {
+						_ = s.kafkaConsumer.Stop()
+					}
+					return nil, fmt.Errorf("policy ack consumer: create dlq producer failed: %w", err)
+				}
+			}
+
+			ac, err := policyack.New(context.Background(), cg, policyack.Options{
+				Config: ackCfg,
+				Store:  store,
+				Trust:  trust,
+				Logger: log,
+				Audit:  cfg.AuditLogger,
+				DLQ:    dlq,
+			})
+			if err != nil {
+				if dlq != nil {
+					_ = dlq.Close()
+				}
+				_ = cg.Close()
+				if kafkaProducer != nil {
+					kafkaProducer.Close()
+				}
+				if s.kafkaConsumer != nil {
+					_ = s.kafkaConsumer.Stop()
+				}
+				return nil, fmt.Errorf("policy ack consumer init failed: %w", err)
+			}
+			s.policyAckCons = ac
+			if log != nil {
+				log.Info("Policy ACK consumer configured",
+					utils.ZapString("topic", ackCfg.Topic),
+					utils.ZapString("group_id", ackCfg.GroupID),
+					utils.ZapBool("signature_required", ackCfg.SigningRequired),
+					utils.ZapBool("dlq_enabled", ackCfg.DLQ != ""))
+			}
+		}
+	}
+
 	// Initialize API server if enabled
 	if cfg.EnableAPI && cfg.APIConfig != nil {
 		apiDeps := apiserver.Dependencies{
@@ -410,6 +566,22 @@ func (s *Service) Start(ctx context.Context) error {
 		}
 	}
 
+	// Start policy ACK consumer if configured.
+	if s.policyAckCons != nil {
+		if err := s.policyAckCons.Start(); err != nil {
+			if s.kafkaConsumer != nil {
+				_ = s.kafkaConsumer.Stop()
+			}
+			if s.persistWorker != nil {
+				_ = s.persistWorker.Stop()
+			}
+			return fmt.Errorf("failed to start policy ack consumer: %w", err)
+		}
+		if s.log != nil {
+			s.log.InfoContext(ctx, "Policy ACK consumer started")
+		}
+	}
+
 	// Start API server if configured
 	if s.apiServer != nil {
 		if err := s.apiServer.Start(ctx); err != nil {
@@ -464,6 +636,15 @@ func (s *Service) Stop() {
 			s.log.Warn("Kafka consumer stop error", utils.ZapError(err))
 		} else {
 			s.log.Info("Kafka consumer stopped")
+		}
+	}
+
+	// Stop policy ACK consumer (stop ingesting new ACKs).
+	if s.policyAckCons != nil {
+		if err := s.policyAckCons.Stop(); err != nil {
+			s.log.Warn("policy ack consumer stop error", utils.ZapError(err))
+		} else {
+			s.log.Info("policy ack consumer stopped")
 		}
 	}
 

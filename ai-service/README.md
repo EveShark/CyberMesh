@@ -8,7 +8,7 @@ Version: 0.1.0 | Python 3.11+ | Production-Ready
 
 ## Overview
 
-CyberMesh AI Service is a military-grade anomaly detection system that continuously analyzes network telemetry using machine learning, cryptographically signs detections with Ed25519, and publishes findings to a Byzantine Fault Tolerant backend for consensus validation. The system features adaptive learning through validator feedback, automatically recalibrating confidence scores and adjusting detection thresholds based on acceptance rates.
+CyberMesh AI Service is a real-time anomaly detection and policy publishing service. In integrated runtime it consumes Sentinel verdicts from Kafka, maps them to anomaly/policy contracts, signs outgoing messages with Ed25519, and processes backend feedback to adapt thresholds and confidence over time.
 
 **Core Capabilities:**
 - Real-time detection loop (5-second intervals, rate-limited to 100 detections/sec)
@@ -18,12 +18,12 @@ CyberMesh AI Service is a military-grade anomaly detection system that continuou
 - Ed25519 cryptographic signing with 16-byte nonce replay protection
 - Kafka integration (Confluent Cloud) for bi-directional messaging
 
-**System Flow:**
+**System Flow (Integrated Runtime):**
 ```
-Telemetry → Feature Extraction → [Rules + Math + ML Engines] → Ensemble Voter → 
-Evidence Generator → Ed25519 Signer → Kafka Producer → Backend Validators →
-Consensus → Kafka Consumer → Feedback Service → [Calibrator + Threshold Manager] →
-Detection Pipeline (adaptive loop closed)
+Telemetry/Sentinel → Sentinel Adapter / Detection Pipeline →
+Ed25519 Signer → Kafka Producer (ai.*) → Backend Validators/Consensus →
+Kafka Consumer (control.* + ACK) → Feedback Service →
+[Calibrator + Threshold Manager] → Detection loop
 ```
 
 ---
@@ -36,7 +36,11 @@ Detection Pipeline (adaptive loop closed)
 ServiceManager (src/service/manager.py)
 ├── DetectionLoop (src/service/detection_loop.py) - Background thread, 5s interval
 │   ├── DetectionPipeline (src/ml/pipeline.py) - Orchestrates detection flow
-│   │   ├── TelemetrySource (src/ml/telemetry.py) - File/Postgres data source
+│   │   ├── TelemetrySource implementations:
+│   │   │   ├── FileTelemetrySource (src/ml/telemetry.py / telemetry_file.py)
+│   │   │   ├── PostgresTelemetrySource (src/ml/telemetry_postgres.py)
+│   │   │   ├── LiveTelemetrySource (src/ml/telemetry_live.py)
+│   │   │   └── KafkaTelemetrySource (src/ml/telemetry_kafka.py)
 │   │   ├── FeatureAdapter (src/ml/feature_adapter.py) - 79-feature extraction
 │   │   ├── Engines (src/ml/detectors.py)
 │   │   │   ├── RulesEngine - Threshold-based (pps, ports, entropy)
@@ -46,6 +50,7 @@ ServiceManager (src/service/manager.py)
 │   │   └── EvidenceGenerator (src/ml/evidence.py) - Forensic data packaging
 │   ├── MessagePublisher (src/service/publisher.py) - Signs + publishes to Kafka
 │   └── RateLimiter (src/service/rate_limiter.py) - Token bucket, 100/sec cap
+├── SentinelKafkaAdapter (src/service/sentinel_adapter.py) - Consumes sentinel.verdicts.v1 and maps to AI contracts
 ├── FeedbackService (src/feedback/service.py) - Processes validator responses
 │   ├── AnomalyLifecycleTracker (src/feedback/tracker.py) - 7-state machine, Redis
 │   ├── ConfidenceCalibrator (src/feedback/calibrator.py) - Isotonic/Platt scaling
@@ -54,15 +59,15 @@ ServiceManager (src/service/manager.py)
 ├── KafkaProducer (src/kafka/producer.py) - Confluent Cloud TLS + SASL
 ├── KafkaConsumer (src/kafka/consumer.py) - 4 message handlers
 ├── Signer (src/utils/signer.py) - Ed25519 signing (cryptography library)
-├── NonceManager (src/utils/nonce.py) - 16-byte nonce (8B timestamp + 4B instance + 4B random)
+├── NonceManager (src/utils/nonce.py) - 16-byte nonce (8B timestamp + 4B instance + 4B monotonic counter)
 └── APIServer (src/api/server.py) - /health, /ready, /metrics, /detections/stats
 ```
 
 ### Data Flow Details
 
-**Phase 1: Detection (AI → Kafka)**
+**Step 1: Detection (AI → Kafka)**
 1. DetectionLoop wakes every 5 seconds
-2. Pipeline polls telemetry source (file or Postgres)
+2. Pipeline ingests from configured source (file/postgres/live/kafka) and/or Sentinel adapter path
 3. Extract 79 features from network flows
 4. Run 3 engines in parallel (Rules, Math, ML)
 5. Ensemble voter aggregates predictions (weighted: ML=0.5, Rules=0.3, Math=0.2)
@@ -71,16 +76,16 @@ ServiceManager (src/service/manager.py)
 8. Sign with Ed25519 (domain: ai.anomaly.v1)
 9. Publish to Kafka: ai.anomalies.v1
 
-**Phase 2: Validation (Backend Consensus)**
+**Step 2: Validation (Backend Consensus)**
 10. Backend validators receive anomaly via Kafka
 11. Verify Ed25519 signature
 12. Add to mempool (PUBLISHED → ADMITTED state)
-13. PBFT consensus (3/4 quorum required)
+13. HotStuff-style quorum consensus (2f+1)
 14. Commit to block (ADMITTED → COMMITTED state)
 15. Publish to Kafka: control.commits.v1
 
-**Phase 3: Feedback (Kafka → AI)**
-16. AI Consumer receives control.commits.v1 message
+**Step 3: Feedback (Kafka → AI)**
+16. AI Consumer receives control.commits.v1 and policy-ack topic (default control.enforcement_ack.v1)
 17. FeedbackService updates AnomalyLifecycleTracker (COMMITTED state)
 18. Calculate acceptance rate (committed / published) for time windows
 19. If acceptance < 60%: trigger ConfidenceCalibrator retraining
@@ -228,9 +233,19 @@ TOPIC_CONTROL_COMMITS=control.commits.v1         # Block commits
 TOPIC_CONTROL_REPUTATION=control.reputation.v1   # Validator feedback
 TOPIC_CONTROL_POLICY=control.policy.v1           # Policy updates
 TOPIC_CONTROL_EVIDENCE=control.evidence.v1       # Evidence requests
+TOPIC_CONTROL_POLICY_ACK=control.enforcement_ack.v1   # Enforcement ACK feedback
 
 # Dead letter queue
 TOPIC_DLQ=ai.dlq.v1
+```
+
+**Sentinel Adapter (integrated path):**
+```bash
+SENTINEL_ADAPTER_ENABLED=true
+SENTINEL_INPUT_TOPIC=sentinel.verdicts.v1
+SENTINEL_INPUT_ENCODING=protobuf
+SENTINEL_ADAPTER_MODE=prod
+SENTINEL_POLICY_ENABLED=true
 ```
 
 **Cryptographic Security:**
@@ -264,6 +279,11 @@ DETECTION_TIMEOUT=30                   # Max seconds per detection
 TELEMETRY_BATCH_SIZE=1000             # Flows per poll
 MAX_DETECTIONS_PER_SECOND=100         # Rate limit cap
 MIN_CONFIDENCE=0.70                   # Minimum confidence to publish
+
+# Source selection for DetectionPipeline
+TELEMETRY_SOURCE_TYPE=kafka           # file|postgres|live|kafka
+TELEMETRY_FEATURES_TOPIC=telemetry.features.v1
+TELEMETRY_FEATURES_DLQ_TOPIC=telemetry.features.v1.dlq
 ```
 
 **Ensemble Voting:**
@@ -319,8 +339,10 @@ ai-service/
 │   │   ├── features_flow.py       # Flow-level feature extraction
 │   │   ├── feature_adapter.py     # Unified 79-feature adapter
 │   │   ├── evidence.py            # EvidenceGenerator (forensic packaging)
-│   │   ├── telemetry.py           # FileTelemetrySource (incremental polling)
+│   │   ├── telemetry.py           # TelemetrySource base + FileTelemetrySource
 │   │   ├── telemetry_postgres.py  # PostgresTelemetrySource (optional)
+│   │   ├── telemetry_live.py      # LiveTelemetrySource (windowed live DB path)
+│   │   ├── telemetry_kafka.py     # KafkaTelemetrySource (topic consumer path)
 │   │   ├── adaptive.py            # AdaptiveDetection (threshold integration)
 │   │   ├── malware_variants.py    # MalwareModelCache (5 variants: API, PE, Android, Flow)
 │   │   ├── serving.py             # Model loading and inference
@@ -328,7 +350,7 @@ ai-service/
 │   │   ├── types.py               # Type definitions (DetectionCandidate, EnsembleDecision)
 │   │   └── interfaces.py          # Engine interface
 │   │
-│   ├── feedback/                  # Adaptive learning (Phase 7)
+│   ├── feedback/                  # Adaptive learning and calibration
 │   │   ├── service.py             # FeedbackService orchestrator
 │   │   ├── tracker.py             # AnomalyLifecycleTracker (7-state machine)
 │   │   │                           # States: DETECTED→PUBLISHED→ADMITTED→COMMITTED
@@ -347,6 +369,7 @@ ai-service/
 │   │   ├── detection_loop.py      # DetectionLoop (background thread, 5s interval)
 │   │   ├── rate_limiter.py        # RateLimiter (token bucket, 100/sec)
 │   │   ├── publisher.py           # MessagePublisher (signs + publishes)
+│   │   ├── sentinel_adapter.py    # SentinelKafkaAdapter (sentinel.verdicts.v1 ingestion)
 │   │   ├── handlers.py            # MessageHandlers (4 types: commits, reputation, policy, evidence)
 │   │   └── crypto_setup.py        # Cryptographic initialization
 │   │
@@ -360,7 +383,7 @@ ai-service/
 │   │
 │   ├── utils/                     # Utilities
 │   │   ├── signer.py              # Signer (Ed25519 signing/verification)
-│   │   ├── nonce.py               # NonceManager (16-byte: 8B timestamp + 4B instance + 4B random)
+│   │   ├── nonce.py               # NonceManager (16-byte: 8B timestamp + 4B instance + 4B monotonic counter)
 │   │   ├── errors.py              # Custom exceptions (ServiceError, ConfigError, KafkaError)
 │   │   ├── circuit_breaker.py     # CircuitBreaker (failure threshold, timeout, recovery)
 │   │   ├── backoff.py             # ExponentialBackoff (retry logic)
@@ -740,7 +763,7 @@ Fields:
   - timestamp: Unix seconds
   - payload: Binary evidence data (max 512KB)
   - signature: Ed25519 (64 bytes)
-  - nonce: 16 bytes (8B timestamp + 4B instance + 4B random)
+  - nonce: 16 bytes (8B timestamp + 4B instance + 4B monotonic counter)
 ```
 
 **Incoming (Backend → AI):**
@@ -1529,12 +1552,12 @@ Migrate to unified Settings structure (15-min fix, see `src/config/settings.py:S
 
 **Version:** 0.1.0
 
-**Phase Completion:**
-- ✅ Phase 1-2: Configuration & Logging
-- ✅ Phase 3-4: ML Detection Pipeline  
-- ✅ Phase 5-6: Kafka Integration
-- ✅ Phase 7: Adaptive Learning & Feedback Loop
-- ✅ Phase 8: Real-Time Detection Loop
+**Current Runtime Coverage:**
+- ✅ Configuration, logging, and secure key loading
+- ✅ Detection pipeline (rules/math/ML + ensemble)
+- ✅ Kafka publish/consume integration
+- ✅ Sentinel adapter ingestion path
+- ✅ Adaptive feedback loop and threshold updates
 
 **Production Readiness:** 95%
 - All components individually tested

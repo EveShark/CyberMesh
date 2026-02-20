@@ -60,7 +60,22 @@ class FeedbackService:
             disable_persistence = False
             if env_flag is not None:
                 disable_persistence = env_flag.lower() in ("true", "1", "yes", "on")
-            feedback_cfg = FeedbackConfig(disable_persistence=disable_persistence)
+            # Loader-based settings may not carry feedback config; preserve env-driven tuning.
+            feedback_cfg = FeedbackConfig(
+                disable_persistence=disable_persistence,
+                calibration_save_to_redis=(
+                    os.getenv("FEEDBACK_CALIBRATION_SAVE_TO_REDIS", "true").lower()
+                    in ("true", "1", "yes", "on")
+                ),
+                calibration_model_path=os.getenv(
+                    "FEEDBACK_CALIBRATION_MODEL_PATH",
+                    "data/models/calibration",
+                ),
+                calibration_redis_key=os.getenv(
+                    "FEEDBACK_CALIBRATION_REDIS_KEY",
+                    "calibration:model:current",
+                ),
+            )
         else:
             disable_persistence = getattr(feedback_cfg, "disable_persistence", False)
 

@@ -33,6 +33,7 @@ type policyPublisher struct {
 	audit         *utils.AuditLogger
 	enabled       bool
 	topic         string
+	gatewayNS     string
 	maxTTL        time.Duration
 	maxCIDRPrefix int
 	maxPerBlock   int
@@ -107,6 +108,12 @@ func newPolicyPublisher(producer *kafka.Producer, cfgMgr *utils.ConfigManager, t
 		dlqEnabled:    dlqEnabled,
 		guardrailHits: make(map[string]uint64),
 	}
+
+	// Optional: when set, any policy payload that targets this namespace is treated as a
+	// gateway enforcement policy and must adhere to stricter semantics (egress-only).
+	// We use the namespace selector (target.selectors.namespace) since the policy payload
+	// schema already supports selectors and enforcement-agent canonicalizes namespace there.
+	pp.gatewayNS = strings.ToLower(strings.TrimSpace(cfgMgr.GetString("POLICY_GATEWAY_NAMESPACE", "")))
 
 	if !enabled && logger != nil {
 		logger.Info("Policy publishing disabled via POLICY_ENFORCEMENT_ENABLED=false")
@@ -289,6 +296,22 @@ func (p *policyPublisher) prepareEvent(height uint64, blockTime time.Time, raw [
 		}
 	}
 
+	// Gateway enforcement profile: if this payload targets the configured gateway namespace,
+	// enforce egress-only semantics and keep scope namespaced for safety.
+	if p.gatewayNS != "" {
+		if ns, ok := payload.Target.Selectors["namespace"]; ok {
+			nsStr, ok := ns.(string)
+			if ok && strings.ToLower(strings.TrimSpace(nsStr)) == p.gatewayNS {
+				if direction != "egress" {
+					return nil, policyID, "gateway_policy_direction_invalid", fmt.Errorf("direction: %s", payload.Target.Direction)
+				}
+				if scope != "" && scope != "namespace" {
+					return nil, policyID, "gateway_policy_scope_invalid", fmt.Errorf("scope: %s", payload.Target.Scope)
+				}
+			}
+		}
+	}
+
 	if payload.Guardrails.TTLSeconds == nil || *payload.Guardrails.TTLSeconds <= 0 {
 		return nil, policyID, "ttl_seconds_invalid", nil
 	}
@@ -334,6 +357,22 @@ func (p *policyPublisher) prepareEvent(height uint64, blockTime time.Time, raw [
 		}
 	}
 
+	if payload.Guardrails.FastPathTTLSeconds != nil {
+		if *payload.Guardrails.FastPathTTLSeconds <= 0 {
+			return nil, policyID, "fast_path_ttl_invalid", nil
+		}
+	}
+	if payload.Guardrails.FastPathSignalsRequired != nil {
+		if *payload.Guardrails.FastPathSignalsRequired <= 0 {
+			return nil, policyID, "fast_path_signals_invalid", nil
+		}
+	}
+	if payload.Guardrails.FastPathConfidenceMin != nil {
+		if *payload.Guardrails.FastPathConfidenceMin < 0 || *payload.Guardrails.FastPathConfidenceMin > 1 {
+			return nil, policyID, "fast_path_confidence_invalid", nil
+		}
+	}
+
 	if payload.Guardrails.Allowlist != nil {
 		if len(payload.Guardrails.Allowlist) == 0 {
 			return nil, policyID, "allowlist_empty", nil
@@ -356,12 +395,14 @@ func (p *policyPublisher) prepareEvent(height uint64, blockTime time.Time, raw [
 	hash := sha256.Sum256(raw)
 
 	evt := &pb.PolicyUpdateEvent{
-		PolicyId:         policyID,
-		Action:           action,
-		RuleType:         ruleType,
-		RuleData:         raw,
-		RuleHash:         hash[:],
-		RequiresAck:      payload.Guardrails.ApprovalRequired,
+		PolicyId: policyID,
+		Action:   action,
+		RuleType: ruleType,
+		RuleData: raw,
+		RuleHash: hash[:],
+		// RequiresAck is an execution/telemetry concern (did an agent apply it),
+		// not the same thing as manual-approval staging.
+		RequiresAck:      payload.Guardrails.RequiresAck,
 		Timestamp:        blockTime.Unix(),
 		EffectiveHeight:  int64(height),
 		ExpirationHeight: expirationHeight,
@@ -513,13 +554,19 @@ type policyTarget struct {
 }
 
 type policyGuardrails struct {
-	TTLSeconds       *int     `json:"ttl_seconds"`
-	CIDRMaxPrefixLen *int     `json:"cidr_max_prefix_len"`
-	ApprovalRequired bool     `json:"approval_required"`
-	DryRun           bool     `json:"dry_run"`
-	CanaryScope      bool     `json:"canary_scope"`
-	MaxTargets       *int     `json:"max_targets"`
-	Allowlist        []string `json:"allowlist"`
+	TTLSeconds              *int     `json:"ttl_seconds"`
+	CIDRMaxPrefixLen        *int     `json:"cidr_max_prefix_len"`
+	ApprovalRequired        bool     `json:"approval_required"`
+	RequiresAck             bool     `json:"requires_ack"`
+	FastPathEnabled         bool     `json:"fast_path_enabled"`
+	FastPathCanary          bool     `json:"fast_path_canary_scope"`
+	FastPathTTLSeconds      *int64   `json:"fast_path_ttl_seconds"`
+	FastPathSignalsRequired *int64   `json:"fast_path_signals_required"`
+	FastPathConfidenceMin   *float64 `json:"fast_path_confidence_min"`
+	DryRun                  bool     `json:"dry_run"`
+	CanaryScope             bool     `json:"canary_scope"`
+	MaxTargets              *int     `json:"max_targets"`
+	Allowlist               []string `json:"allowlist"`
 }
 
 type policyRateLimiter struct {

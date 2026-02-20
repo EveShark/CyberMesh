@@ -354,7 +354,17 @@ class DetectionLoop:
                 detection_start = time.time()
                 result = self.pipeline.process()
                 detection_latency = (time.time() - detection_start) * 1000  # ms
-                
+
+                # Never fail silently: when no telemetry is available (or pipeline errored),
+                # emit a low-noise debug line so E2E runs can pinpoint the stall quickly.
+                try:
+                    if getattr(result, "error", None):
+                        self.logger.debug("Detection pipeline returned error", extra={"error": result.error})
+                    elif getattr(result, "decision", None) is None:
+                        self.logger.debug("Detection pipeline returned no decision")
+                except Exception:
+                    pass
+
                 # Record pipeline metrics if available
                 if self._metrics_collector is not None:
                     try:
@@ -374,6 +384,23 @@ class DetectionLoop:
 
                 # 2. Check if we should publish
                 decision = result.decision
+                diagnostics_force_publish = bool(self.config.get("DIAGNOSTICS_FORCE_PUBLISH", False))
+
+                try:
+                    if decision is not None:
+                        self.logger.debug(
+                            "Detection decision",
+                            extra={
+                                "threat_type": getattr(getattr(decision, "threat_type", None), "value", None),
+                                "final_score": float(getattr(decision, "final_score", 0.0) or 0.0),
+                                "confidence": float(getattr(decision, "confidence", 0.0) or 0.0),
+                                "should_publish": bool(getattr(decision, "should_publish", False)),
+                                "abstention_reason": getattr(decision, "abstention_reason", None),
+                                "candidate_count": int(getattr(result, "candidate_count", 0) or 0),
+                            },
+                        )
+                except Exception:
+                    pass
 
                 if decision and self._event_recorder is not None:
                     try:
@@ -542,6 +569,51 @@ class DetectionLoop:
                         "Pipeline returned error",
                         extra={"error": result.error, "latency_ms": round(detection_latency, 2)}
                     )
+                elif diagnostics_force_publish and decision and not decision.should_publish and result.feature_count and result.feature_count > 0:
+                    # Diagnostics-only publish: validate Kafka output wiring even when the
+                    # pipeline abstains. This must be explicitly enabled.
+                    import uuid
+                    import json
+
+                    anomaly_id = str(uuid.uuid4())
+                    anomaly_type = "diagnostics"
+                    severity = 1
+                    confidence = 0.01
+                    detection_ts = time.time()
+                    network_context = decision.metadata.get('network_context', {}) if getattr(decision, "metadata", None) else {}
+                    payload_obj = {
+                        "diagnostics": True,
+                        "reason": "force_publish_enabled",
+                        "detection_timestamp": detection_ts,
+                        "anomaly_id": anomaly_id,
+                        "severity": severity,
+                        "confidence": float(confidence),
+                        "threat_type": anomaly_type,
+                        "final_score": float(getattr(decision, "final_score", 0.0)),
+                        "abstention_reason": getattr(decision, "abstention_reason", None),
+                        "candidate_count": int(result.candidate_count or 0),
+                        "feature_count": int(result.feature_count or 0),
+                        **(network_context or {}),
+                    }
+                    payload_bytes = json.dumps(payload_obj, separators=(",", ":")).encode("utf-8")
+                    try:
+                        self.publisher.publish_anomaly(
+                            anomaly_id=anomaly_id,
+                            anomaly_type=anomaly_type,
+                            source="detection_loop",
+                            severity=severity,
+                            confidence=confidence,
+                            payload=payload_bytes,
+                            model_version="diagnostics",
+                        )
+                        self._increment_metric("detections_published")
+                        self.logger.info(
+                            "Published diagnostics anomaly (forced)",
+                            extra={"anomaly_id": anomaly_id, "abstention_reason": getattr(decision, "abstention_reason", None)},
+                        )
+                    except Exception as err:
+                        self._increment_metric("errors")
+                        self.logger.error("Diagnostics anomaly publish failed", extra={"error": str(err)}, exc_info=True)
                 
                 # 3. Update metrics
                 self._increment_metric("loop_iterations")

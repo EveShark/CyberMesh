@@ -193,7 +193,30 @@ def _validate_block_policy_payload(payload: Dict[str, Any]):
             except ValueError as exc:
                 raise ValidationError(f"invalid allowlist entry: {entry}") from exc
 
-    for bool_field in ("dry_run", "canary_scope", "approval_required"):
+    fast_path_ttl = guardrails.get("fast_path_ttl_seconds")
+    if fast_path_ttl is not None and (not isinstance(fast_path_ttl, int) or fast_path_ttl <= 0):
+        raise ValidationError("guardrails.fast_path_ttl_seconds must be positive integer")
+
+    fast_path_signals = guardrails.get("fast_path_signals_required")
+    if fast_path_signals is not None and (not isinstance(fast_path_signals, int) or fast_path_signals <= 0):
+        raise ValidationError("guardrails.fast_path_signals_required must be positive integer")
+
+    fast_path_conf = guardrails.get("fast_path_confidence_min")
+    if fast_path_conf is not None and (not isinstance(fast_path_conf, (int, float)) or not (0 <= float(fast_path_conf) <= 1)):
+        raise ValidationError("guardrails.fast_path_confidence_min must be between 0 and 1")
+
+    max_ppm = guardrails.get("max_policies_per_minute")
+    if max_ppm is not None and (not isinstance(max_ppm, int) or max_ppm <= 0):
+        raise ValidationError("guardrails.max_policies_per_minute must be positive integer")
+
+    for bool_field in (
+        "dry_run",
+        "canary_scope",
+        "approval_required",
+        "requires_ack",
+        "fast_path_enabled",
+        "fast_path_canary_scope",
+    ):
         if bool_field in guardrails and not isinstance(guardrails[bool_field], bool):
             raise ValidationError(f"guardrails.{bool_field} must be boolean")
 

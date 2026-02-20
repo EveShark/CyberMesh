@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	consapi "backend/pkg/consensus/api"
 	"backend/pkg/utils"
 )
@@ -43,31 +45,75 @@ func (s *Server) handleDashboardOverview(w http.ResponseWriter, r *http.Request)
 	readiness, _ := s.buildReadinessResponse(ctx)
 	health := healthResponseFromReadiness(readiness)
 
-	var networkOverview *NetworkOverviewResponse
-	if s.engine != nil {
-		if overview, err := s.buildNetworkOverview(ctx, time.Now().UTC()); err == nil {
-			networkOverview = overview
-		} else if s.logger != nil {
-			s.logger.WarnContext(ctx, "failed to build network overview", utils.ZapError(err))
-		}
-	}
-
-	var consensusOverview *ConsensusOverviewResponse
 	var consensusMetrics consapi.MetricsSnapshot
 	if s.engine != nil {
 		consensusMetrics = s.engine.GetMetrics()
-		if overview, err := s.buildConsensusOverview(ctx, time.Now().UTC()); err == nil {
-			consensusOverview = overview
-		} else if s.logger != nil {
-			s.logger.WarnContext(ctx, "failed to build consensus overview", utils.ZapError(err))
-		}
 	}
 
-	blocksSection := s.buildDashboardBlocks(ctx, stats, consensusMetrics)
-	threatsSection := s.buildDashboardThreats(ctx)
-	aiSection := s.buildDashboardAI(ctx)
-	ledgerSection := s.buildDashboardLedger(ctx, stats)
-	validatorSection := s.buildDashboardValidators(ctx)
+	var (
+		networkOverview   *NetworkOverviewResponse
+		consensusOverview *ConsensusOverviewResponse
+		blocksSection     DashboardBlocksSection
+		threatsSection    DashboardThreatsSection
+		aiSection         DashboardAISection
+		ledgerSection     *DashboardLedgerSection
+		validatorSection  *DashboardValidatorsSection
+	)
+
+	g, gctx := errgroup.WithContext(ctx)
+
+	if s.engine != nil {
+		g.Go(func() error {
+			if overview, err := s.buildNetworkOverview(gctx, time.Now().UTC()); err == nil {
+				networkOverview = overview
+			} else if s.logger != nil {
+				s.logger.WarnContext(gctx, "failed to build network overview", utils.ZapError(err))
+			}
+			return nil
+		})
+	}
+
+	if s.engine != nil {
+		g.Go(func() error {
+			if overview, err := s.buildConsensusOverview(gctx, time.Now().UTC()); err == nil {
+				consensusOverview = overview
+			} else if s.logger != nil {
+				s.logger.WarnContext(gctx, "failed to build consensus overview", utils.ZapError(err))
+			}
+			return nil
+		})
+	}
+
+	g.Go(func() error {
+		blocksSection = s.buildDashboardBlocks(gctx, stats, consensusMetrics)
+		return nil
+	})
+
+	g.Go(func() error {
+		threatsSection = s.buildDashboardThreats(gctx)
+		return nil
+	})
+
+	g.Go(func() error {
+		aiSection = s.buildDashboardAI(gctx)
+		return nil
+	})
+
+	g.Go(func() error {
+		ledgerSection = s.buildDashboardLedger(gctx, stats)
+		return nil
+	})
+
+	g.Go(func() error {
+		validatorSection = s.buildDashboardValidators(gctx)
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		if s.logger != nil {
+			s.logger.WarnContext(ctx, "dashboard parallel build error", utils.ZapError(err))
+		}
+	}
 
 	response := DashboardOverviewResponse{
 		Timestamp: time.Now().UnixMilli(),
@@ -846,7 +892,7 @@ func (s *Server) buildDashboardThreats(ctx context.Context) DashboardThreatsSect
 		}
 	}
 
-	history, err := s.fetchAIDetectionHistory(ctx, 500, "", "")
+	history, err := s.fetchAIDetectionHistory(ctx, 100, "", "")
 	historyFetchErr := err
 	if err != nil && s.logger != nil {
 		s.logger.WarnContext(ctx, "failed to fetch ai detection history", utils.ZapError(err))
@@ -1040,28 +1086,50 @@ func (s *Server) buildDashboardAI(ctx context.Context) DashboardAISection {
 	ctx, cancel := context.WithTimeout(ctx, s.config.RequestTimeout)
 	defer cancel()
 
-	section := DashboardAISection{}
+	var (
+		metrics    *AIMetricsResponse
+		history    *AiDetectionHistoryResponse
+		suspicious *AiSuspiciousNodesResponse
+		healthDoc  map[string]interface{}
+		readyDoc   map[string]interface{}
+	)
 
-	if metrics, _ := s.loadAIMetricsSnapshot(ctx); metrics != nil {
-		section.Metrics = metrics
-	}
+	g, gctx := errgroup.WithContext(ctx)
 
-	if history, err := s.fetchAIDetectionHistory(ctx, 100, "", ""); err == nil {
-		section.History = history
-	}
+	g.Go(func() error {
+		metrics, _ = s.loadAIMetricsSnapshot(gctx)
+		return nil
+	})
 
-	if suspicious, err := s.fetchAISuspiciousNodesDetailed(ctx, 20); err == nil {
-		section.Suspicious = suspicious
-	}
+	g.Go(func() error {
+		history, _ = s.fetchAIDetectionHistory(gctx, 100, "", "")
+		return nil
+	})
 
-	if health, err := s.fetchAIServiceDocument(ctx, "/health"); err == nil {
-		section.Health = health
-	}
-	if ready, err := s.fetchAIServiceDocument(ctx, "/ready"); err == nil {
-		section.Ready = ready
-	}
+	g.Go(func() error {
+		suspicious, _ = s.fetchAISuspiciousNodesDetailed(gctx, 20)
+		return nil
+	})
 
-	return section
+	g.Go(func() error {
+		healthDoc, _ = s.fetchAIServiceDocument(gctx, "/health")
+		return nil
+	})
+
+	g.Go(func() error {
+		readyDoc, _ = s.fetchAIServiceDocument(gctx, "/ready")
+		return nil
+	})
+
+	_ = g.Wait()
+
+	return DashboardAISection{
+		Metrics:    metrics,
+		History:    history,
+		Suspicious: suspicious,
+		Health:     healthDoc,
+		Ready:      readyDoc,
+	}
 }
 
 func (s *Server) fetchAIServiceDocument(ctx context.Context, path string) (map[string]interface{}, error) {

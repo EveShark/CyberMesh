@@ -50,6 +50,10 @@ func (s *Service) tryPropose(ctx context.Context) {
 	if blockTimeout <= 0 {
 		blockTimeout = 5 * time.Second
 	}
+	cooldownWindow := s.proposalCooldown
+	if cooldownWindow <= 0 {
+		cooldownWindow = blockTimeout
+	}
 
 	if !s.eng.IsConsensusActive() {
 		s.log.DebugContext(ctx, "skipping proposal: consensus not yet active",
@@ -81,8 +85,8 @@ func (s *Service) tryPropose(ctx context.Context) {
 
 	if lastView == currentView && !lastTime.IsZero() {
 		elapsed := time.Since(lastTime)
-		if elapsed < blockTimeout {
-			cooldown := blockTimeout - elapsed
+		if elapsed < cooldownWindow {
+			cooldown := cooldownWindow - elapsed
 			if isLeader, err := s.eng.IsLeader(ctx); err == nil && isLeader {
 				s.log.DebugContext(ctx, "skipping proposal: leader cooldown active",
 					utils.ZapUint64("view", currentView),

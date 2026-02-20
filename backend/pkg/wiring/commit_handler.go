@@ -104,6 +104,16 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 		utils.ZapString("state_root", fmt.Sprintf("%x", root[:8])),
 		utils.ZapUint64("version", version))
 
+	// Prune old state versions to prevent memory growth
+	if memStore, ok := s.store.(*state.MemStore); ok {
+		memStore.PruneRetain(s.cfg.StateRetainVersions)
+	}
+
+	// Check memory thresholds
+	mempoolTxs, _ := s.mp.Stats()
+	producerCount := s.mp.ProducerCount()
+	s.memMon.Check(mempoolTxs, producerCount, 0, 0, 0, 0)
+
 	// Enqueue async persistence if enabled
 	if s.persistWorker != nil {
 		s.log.InfoContext(ctx, "enqueueing persistence task",
@@ -122,6 +132,15 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 				utils.ZapUint64("height", ab.GetHeight()))
 		} else {
 			s.log.InfoContext(ctx, "persistence task enqueued successfully")
+		}
+
+		// Policy publication is control-plane critical and must not be blocked by
+		// async persistence backpressure/integrity retries.
+		if s.policyPublisher != nil {
+			meta := extractCommitMetadata(ab, s.log)
+			if meta.policyCount > 0 {
+				s.policyPublisher.Publish(ctx, ab.GetHeight(), ab.GetTimestamp().Unix(), meta.policyCount, meta.policyPayloads)
+			}
 		}
 	} else {
 		s.log.WarnContext(ctx, "persistWorker is nil, cannot persist to database")

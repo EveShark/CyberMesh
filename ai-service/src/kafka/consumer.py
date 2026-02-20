@@ -309,6 +309,23 @@ class AIConsumer:
                         self.logger.error("Failed to emit DLQ/metrics for timestamp skew", exc_info=True)
                 # Treat as processed (skip) by returning without raising; caller will commit offset.
                 return
+            # ACK topic is best-effort feedback; malformed historical records must not poison
+            # the consumer loop for control-plane ingest.
+            if topic == self.config.kafka_topics.control_policy_ack:
+                reason = "invalid_policy_ack"
+                if self.logger:
+                    self.logger.warning(
+                        f"Dropping malformed policy ACK from {topic}: {e}"
+                    )
+                try:
+                    if getattr(self.config, "environment", "development") == "production":
+                        self._send_to_dlq(topic, data, reason, str(e))
+                    self._metrics.record_dlq_message(topic=topic, reason=reason)
+                except Exception:
+                    if self.logger:
+                        self.logger.error("Failed to emit DLQ/metrics for malformed policy ACK", exc_info=True)
+                # Skip poison ACK and commit offset in caller.
+                return
             # Other validation errors are counted as failures and re-raised
             self._messages_failed += 1
             if self.logger:

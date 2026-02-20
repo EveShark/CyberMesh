@@ -205,19 +205,11 @@ func main() {
 	fmt.Println(strings.Repeat("=", 70))
 	fmt.Println()
 
-	// Try multiple .env paths (Load doesn't overwrite existing env vars)
-	envPaths := []string{".env", "../../../.env", "../../.env", "../.env"}
-	envLoaded := false
-	for _, path := range envPaths {
-		if err := godotenv.Load(path); err == nil {
-			envLoaded = true
-			fmt.Printf("[INFO] Loaded environment from: %s\n", path)
-			break
-		}
-	}
-	if !envLoaded {
-		fmt.Println("[WARN] .env not found or failed to load; continuing with environment variables")
-	}
+	// Local/dev convenience only:
+	// - We never overwrite already-set environment variables (fail-closed for tests).
+	// - Can be disabled entirely with CYBERMESH_DOTENV=0.
+	// - Can be pinned to a single file with CYBERMESH_ENV_FILE.
+	loadDotEnv()
 
 	cfgMgr, err := utils.NewConfigManager(&utils.ConfigManagerConfig{
 		SensitiveKeys: []string{
@@ -424,15 +416,25 @@ func main() {
 		PeerHash:                  peerHash,
 		StatePath:                 statePath,
 	}
-	var genesisBackend ctypes.StorageBackend
-	if persistenceWorker := service.PersistenceWorker(); persistenceWorker != nil {
-		genesisBackend = persistenceWorker.GetStorageBackend()
+	// Local/dev escape hatch: bypass the genesis ceremony and activate consensus immediately.
+	// Intended only for smoke/E2E validation where we run a single-node backend without
+	// a full network plane. Production should keep genesis enabled.
+	genesisBypass := cfgMgr.GetBool("GENESIS_BYPASS", false)
+	var genesisCoord *genesis.Coordinator
+	if genesisBypass {
+		logger.Warn("GENESIS_BYPASS enabled; skipping genesis ceremony (testing only)")
+	} else {
+		var genesisBackend ctypes.StorageBackend
+		if persistenceWorker := service.PersistenceWorker(); persistenceWorker != nil {
+			genesisBackend = persistenceWorker.GetStorageBackend()
+		}
+		coord, err := genesis.NewCoordinator(genesisCfg, localValidatorID, vSet, consensusEngine.LeaderRotation(), cryptoAdapter, consensusEngine, p2pRouter, loggerAdapter, auditAdapter, genesisBackend)
+		if err != nil {
+			log.Fatalf("genesis coordinator init failed: %v", err)
+		}
+		genesisCoord = coord
+		consensusEngine.SetGenesisCoordinator(genesisCoord)
 	}
-	genesisCoord, err := genesis.NewCoordinator(genesisCfg, localValidatorID, vSet, consensusEngine.LeaderRotation(), cryptoAdapter, consensusEngine, p2pRouter, loggerAdapter, auditAdapter, genesisBackend)
-	if err != nil {
-		log.Fatalf("genesis coordinator init failed: %v", err)
-	}
-	consensusEngine.SetGenesisCoordinator(genesisCoord)
 
 	// CRITICAL: Allow P2P subscriptions to fully propagate before starting consensus
 	// This prevents the 1ms race where proposals are published before all validators subscribe
@@ -453,26 +455,28 @@ func main() {
 		log.Fatalf("service start failed: %v", err)
 	}
 
-	if err := genesisCoord.Start(ctx); err != nil {
-		log.Fatalf("genesis ceremony start failed: %v", err)
-	}
-
-	// Wait for genesis asynchronously - don't block proposer
-	go func() {
-		for {
-			cert, err := genesisCoord.WaitForCertificate(ctx)
-			if err == nil {
-				logger.Info("genesis ceremony completed; consensus timers activated",
-					utils.ZapInt("attestations", len(cert.Attestations)))
-				break
-			}
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				logger.Warn("genesis ceremony aborted", utils.ZapError(err))
-				break
-			}
-			logger.Warn("genesis wait interrupted; retrying", utils.ZapError(err))
+	if genesisCoord != nil {
+		if err := genesisCoord.Start(ctx); err != nil {
+			log.Fatalf("genesis ceremony start failed: %v", err)
 		}
-	}()
+
+		// Wait for genesis asynchronously - don't block proposer
+		go func() {
+			for {
+				cert, err := genesisCoord.WaitForCertificate(ctx)
+				if err == nil {
+					logger.Info("genesis ceremony completed; consensus timers activated",
+						utils.ZapInt("attestations", len(cert.Attestations)))
+					break
+				}
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					logger.Warn("genesis ceremony aborted", utils.ZapError(err))
+					break
+				}
+				logger.Warn("genesis wait interrupted; retrying", utils.ZapError(err))
+			}
+		}()
+	}
 
 	fmt.Println("Startup complete. Kafka ingest, mempool, and consensus wiring are active.")
 	fmt.Println("Press Ctrl+C to initiate shutdown.")
@@ -754,6 +758,51 @@ func parseSigningKeyHex(value string) (ed25519.PrivateKey, error) {
 	}
 }
 
+func loadDotEnv() {
+	disable := strings.TrimSpace(os.Getenv("CYBERMESH_DOTENV"))
+	if disable != "" {
+		v := strings.ToLower(disable)
+		if v == "0" || v == "false" || v == "no" || v == "off" {
+			fmt.Println("[INFO] Skipping .env load (CYBERMESH_DOTENV=0)")
+			return
+		}
+	}
+
+	if pinned := strings.TrimSpace(os.Getenv("CYBERMESH_ENV_FILE")); pinned != "" {
+		if loadDotEnvFileNoOverride(pinned) {
+			fmt.Printf("[INFO] Loaded environment from: %s\n", pinned)
+			return
+		}
+		fmt.Printf("[WARN] Failed to load environment from: %s; continuing with environment variables\n", pinned)
+		return
+	}
+
+	paths := []string{".env", "../../../.env", "../../.env", "../.env"}
+	for _, path := range paths {
+		if loadDotEnvFileNoOverride(path) {
+			fmt.Printf("[INFO] Loaded environment from: %s\n", path)
+			return
+		}
+	}
+	fmt.Println("[WARN] .env not found or failed to load; continuing with environment variables")
+}
+
+// loadDotEnvFileNoOverride loads a dotenv file but never overwrites already-set env vars.
+// This prevents repo-root .env from silently clobbering test harness variables.
+func loadDotEnvFileNoOverride(path string) bool {
+	m, err := godotenv.Read(path)
+	if err != nil || len(m) == 0 {
+		return false
+	}
+	for k, v := range m {
+		if strings.TrimSpace(os.Getenv(k)) != "" {
+			continue
+		}
+		_ = os.Setenv(k, v)
+	}
+	return true
+}
+
 func clonePrivateKey(key ed25519.PrivateKey) ed25519.PrivateKey {
 	out := make(ed25519.PrivateKey, len(key))
 	copy(out, key)
@@ -913,16 +962,19 @@ func buildWiringConfig(
 	}
 
 	wiringCfg := wiring.Config{
-		BuildInterval:     cfgMgr.GetDuration("BLOCK_BUILD_INTERVAL", 500*time.Millisecond),
-		MinMempoolTxs:     cfgMgr.GetInt("BLOCK_MIN_MEMPOOL_TXS", 1),
-		TimestampSkew:     cfgMgr.GetDuration("STATE_TIMESTAMP_SKEW", 30*time.Second),
-		GenesisHash:       [32]byte{},
-		BlockTimeout:      cfgMgr.GetDuration("CONSENSUS_BLOCK_TIMEOUT", 5*time.Second),
-		AllowSoloProposal: cfgMgr.GetBool("CONSENSUS_ALLOW_SOLO_PROPOSAL", false),
-		EnablePersistence: false,
-		EnableKafka:       enableKafka,
-		ConfigManager:     cfgMgr,
-		AuditLogger:       auditLogger,
+		BuildInterval:       cfgMgr.GetDuration("BLOCK_BUILD_INTERVAL", 500*time.Millisecond),
+		ProposalCooldown:    cfgMgr.GetDuration("PROPOSER_VIEW_COOLDOWN", 0),
+		MinMempoolTxs:       cfgMgr.GetInt("BLOCK_MIN_MEMPOOL_TXS", 1),
+		TimestampSkew:       cfgMgr.GetDuration("STATE_TIMESTAMP_SKEW", 30*time.Second),
+		GenesisHash:         [32]byte{},
+		BlockTimeout:        cfgMgr.GetDuration("CONSENSUS_BLOCK_TIMEOUT", 5*time.Second),
+		GenesisGracePeriod:  cfgMgr.GetDuration("CONSENSUS_GENESIS_GRACE_PERIOD", 60*time.Second),
+		AllowSoloProposal:   cfgMgr.GetBool("CONSENSUS_ALLOW_SOLO_PROPOSAL", false),
+		StateRetainVersions: uint64(cfgMgr.GetInt("STATE_RETAIN_VERSIONS", 100)),
+		EnablePersistence:   false,
+		EnableKafka:         enableKafka,
+		ConfigManager:       cfgMgr,
+		AuditLogger:         auditLogger,
 	}
 
 	if enableKafka {

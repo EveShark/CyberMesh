@@ -111,6 +111,7 @@ class ServiceManager:
         # Real-time detection (Phase 8)
         self.detection_loop = None
         self.rate_limiter = None
+        self.sentinel_adapter = None
         
         # State tracking
         self._start_time: Optional[datetime] = None
@@ -304,6 +305,11 @@ class ServiceManager:
                 self.logger.info("Initializing feedback service")
                 self._initialize_feedback_service(settings)
                 self.logger.info("Feedback service initialized")
+
+                # Initialize Sentinel adapter (Kafka integration path)
+                self.logger.info("Initializing Sentinel adapter")
+                self._initialize_sentinel_adapter(settings)
+                self.logger.info("Sentinel adapter initialized")
                 
                 # Wire handlers to service_manager (circular dependency resolved)
                 self.handlers.service_manager = self
@@ -359,6 +365,11 @@ class ServiceManager:
                 if self.detection_loop:
                     self.logger.info("Starting detection loop")
                     self.detection_loop.start()
+
+                # Start Sentinel adapter loop
+                if self.sentinel_adapter:
+                    self.logger.info("Starting Sentinel adapter")
+                    self.sentinel_adapter.start()
                 
                 # Mark as running
                 self._running = True
@@ -430,6 +441,18 @@ class ServiceManager:
                     except Exception as e:
                         self.logger.error(
                             "Error stopping detection loop",
+                            exc_info=True,
+                            extra={"error": str(e)}
+                        )
+
+                # Stop Sentinel adapter before producer shutdown
+                if self.sentinel_adapter:
+                    self.logger.info("Stopping Sentinel adapter")
+                    try:
+                        self.sentinel_adapter.stop(timeout=10)
+                    except Exception as e:
+                        self.logger.error(
+                            "Error stopping Sentinel adapter",
                             exc_info=True,
                             extra={"error": str(e)}
                         )
@@ -914,6 +937,8 @@ class ServiceManager:
         """
         from ..ml.telemetry import FileTelemetrySource
         from ..ml.telemetry_postgres import PostgresTelemetrySource
+        from ..ml.telemetry_live import LiveTelemetrySource
+        from ..ml.telemetry_kafka import KafkaTelemetrySource
         from ..ml.features_flow import FlowFeatureExtractor
         from ..ml.detectors import RulesEngine, MathEngine, MLEngine
         from ..ml.ensemble import EnsembleVoter
@@ -956,7 +981,7 @@ class ServiceManager:
         ml_config['MAX_FLOWS_PER_ITERATION'] = int(get_config('MAX_FLOWS_PER_ITERATION', getattr(settings, 'max_flows_per_iteration', 100)))
         ml_config['STAGE_WARN_THRESHOLD_MS'] = float(get_config('STAGE_WARN_THRESHOLD_MS', getattr(settings, 'max_loop_latency_warning_ms', 3000)))
         
-        # 1. Telemetry source - use PostgreSQL if configured
+        # 1. Telemetry source - use PostgreSQL or Kafka if configured
         telemetry_source_type = get_config('TELEMETRY_SOURCE_TYPE', 'file')
         if telemetry_source_type == 'postgres':
             db_config = {
@@ -986,28 +1011,79 @@ class ServiceManager:
             pool_min = int(get_config('DB_POOL_MIN_CONN', 1))
             pool_max = int(get_config('DB_POOL_MAX_CONN', 4))
             prefetch_enabled = str(get_config('DB_PREFETCH_ENABLED', 'false')).lower() in ('1', 'true', 'yes', 'on')
-            telemetry_source = PostgresTelemetrySource(
-                db_config=db_config, 
-                sample_size=100,
-                table_name=table_name,
-                schema=schema,
-                sample_table=sample_table if sample_table else None,
-                sample_strategy=sample_strategy,
-                sample_percent=sample_percent,
-                pool_min=pool_min,
-                pool_max=pool_max,
-                prefetch_enabled=prefetch_enabled,
+            telemetry_mode = get_config('TELEMETRY_MODE', 'train')
+            feature_mask_enabled = str(get_config('FEATURE_MASK_ENABLED', 'true')).lower() in ('1', 'true', 'yes', 'on')
+            min_feature_coverage = float(get_config('FEATURE_MIN_COVERAGE', getattr(settings, 'min_feature_coverage', 0.45)))
+            if telemetry_mode == 'live':
+                telemetry_source = LiveTelemetrySource(
+                    db_config=db_config,
+                    sample_size=100,
+                    table_name=table_name,
+                    schema=schema,
+                    pool_min=pool_min,
+                    pool_max=pool_max,
+                    prefetch_enabled=prefetch_enabled,
+                    feature_mask_enabled=feature_mask_enabled,
+                    min_feature_coverage=min_feature_coverage,
+                )
+                self.logger.info(
+                    'Using LiveTelemetrySource',
+                    extra={
+                        'table': f"{schema}.{table_name}",
+                        'pool_min': pool_min,
+                        'pool_max': pool_max,
+                        'prefetch_enabled': prefetch_enabled,
+                        'feature_mask_enabled': feature_mask_enabled,
+                        'min_feature_coverage': min_feature_coverage,
+                    }
+                )
+            else:
+                telemetry_source = PostgresTelemetrySource(
+                    db_config=db_config, 
+                    sample_size=100,
+                    table_name=table_name,
+                    schema=schema,
+                    sample_table=sample_table if sample_table else None,
+                    sample_strategy=sample_strategy,
+                    sample_percent=sample_percent,
+                    pool_min=pool_min,
+                    pool_max=pool_max,
+                    prefetch_enabled=prefetch_enabled,
+                )
+                self.logger.info(
+                    'Using PostgreSQL telemetry source',
+                    extra={
+                        'table': f"{schema}.{table_name}",
+                        'sample_strategy': sample_strategy,
+                        'sample_table': sample_table,
+                        'sample_percent': sample_percent,
+                        'pool_min': pool_min,
+                        'pool_max': pool_max,
+                        'prefetch_enabled': prefetch_enabled,
+                    }
+                )
+        elif telemetry_source_type == 'kafka':
+            telemetry_topic = get_config('TELEMETRY_FEATURES_TOPIC', 'telemetry.features.v1')
+            telemetry_dlq = get_config('TELEMETRY_FEATURES_DLQ_TOPIC', 'telemetry.features.v1.dlq')
+            consumer_group = get_config('TELEMETRY_CONSUMER_GROUP', f"{settings.node_id}-telemetry")
+            poll_timeout = float(get_config('TELEMETRY_POLL_TIMEOUT_SEC', 1.0))
+            feature_mask_enabled = str(get_config('FEATURE_MASK_ENABLED', 'true')).lower() in ('1', 'true', 'yes', 'on')
+            telemetry_source = KafkaTelemetrySource(
+                settings=settings,
+                topic=telemetry_topic,
+                dlq_topic=telemetry_dlq,
+                consumer_group=consumer_group,
+                poll_timeout=poll_timeout,
+                feature_mask_enabled=feature_mask_enabled,
             )
             self.logger.info(
-                'Using PostgreSQL telemetry source',
+                'Using Kafka telemetry source',
                 extra={
-                    'table': f"{schema}.{table_name}",
-                    'sample_strategy': sample_strategy,
-                    'sample_table': sample_table,
-                    'sample_percent': sample_percent,
-                    'pool_min': pool_min,
-                    'pool_max': pool_max,
-                    'prefetch_enabled': prefetch_enabled,
+                    'topic': telemetry_topic,
+                    'dlq_topic': telemetry_dlq,
+                    'consumer_group': consumer_group,
+                    'poll_timeout': poll_timeout,
+                    'feature_mask_enabled': feature_mask_enabled,
                 }
             )
         else:
@@ -1177,6 +1253,9 @@ class ServiceManager:
             'TRACKER_SAMPLE_CAP': getattr(settings, 'tracker_sample_cap', 100),
             'TRACKER_BATCH_SIZE': getattr(settings, 'tracker_batch_size', 50),
             'TRACKER_FLUSH_INTERVAL_SECONDS': getattr(settings, 'tracker_flush_interval_seconds', 5),
+            # Diagnostics-only mode (explicit opt-in): when enabled the loop may publish a minimal
+            # anomaly even if the pipeline abstains, so we can validate Kafka wiring end-to-end.
+            'DIAGNOSTICS_FORCE_PUBLISH': str(os.getenv('DIAGNOSTICS_FORCE_PUBLISH', 'false')).lower() in ('1', 'true', 'yes', 'on'),
         }
 
         policy_cfg = getattr(settings, "policy_publishing", None)
@@ -1245,6 +1324,30 @@ class ServiceManager:
         self.logger.info(
             f"Detection loop initialized: interval={detection_config['DETECTION_INTERVAL']}s, "
             f"rate_limit={max_detections_per_second}/s"
+        )
+
+    def _initialize_sentinel_adapter(self, settings: Settings) -> None:
+        """
+        Initialize Sentinel Kafka adapter for integrated mode.
+
+        This path is transport-based (Kafka), not in-process wrapper mode.
+        """
+        if os.getenv("SENTINEL_ADAPTER_ENABLED", "false").lower() not in ("1", "true", "yes", "on"):
+            self.sentinel_adapter = None
+            self.logger.info("Sentinel adapter disabled")
+            return
+
+        from .sentinel_adapter import SentinelKafkaAdapter
+
+        tracker = None
+        if self.feedback_service:
+            tracker = getattr(self.feedback_service, "tracker", None)
+
+        self.sentinel_adapter = SentinelKafkaAdapter(
+            settings=settings,
+            publisher=self.publisher,
+            logger=self.logger,
+            tracker=tracker,
         )
 
     def record_engine_metrics(self, engines: List[Dict[str, Any]], variants: List[Dict[str, Any]]) -> None:

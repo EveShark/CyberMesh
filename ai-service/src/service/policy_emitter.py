@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 import ipaddress
+import os
 import uuid
 
 from ..config.settings import PolicyPublishingConfig
@@ -83,14 +84,34 @@ def build_policy_candidate(
         "selectors": {},
     }
 
-    namespace = context.metadata.get("namespace") or context.metadata.get("kubernetes_namespace")
+    namespace = (
+        context.metadata.get("namespace")
+        or context.metadata.get("kubernetes_namespace")
+        or os.getenv("POLICY_PUBLISHING_NAMESPACE")
+        or os.getenv("POLICY_GATEWAY_NAMESPACE")
+    )
     if namespace:
-        target["selectors"] = {"kubernetes_namespace": namespace}
+        # Keep both keys for backward compatibility while backend gateway profile
+        # standardizes on target.selectors.namespace.
+        target["selectors"] = {
+            "namespace": namespace,
+            "kubernetes_namespace": namespace,
+        }
 
     guardrails: Dict[str, Any] = {
         "ttl_seconds": ttl_seconds,
         "cidr_max_prefix_len": cidr_max,
-        "approval_required": bool(config.requires_ack),
+        # approval_required is for manual staging workflows (human approval) and should
+        # not be overloaded to mean "emit ACK".
+        "approval_required": False,
+        # requires_ack means enforcement should emit an ACK after applying the policy.
+        "requires_ack": bool(config.requires_ack),
+        "max_policies_per_minute": int(config.max_policies_per_minute),
+        "fast_path_enabled": bool(config.fast_path_enabled),
+        "fast_path_ttl_seconds": int(config.fast_path_ttl_seconds),
+        "fast_path_signals_required": int(config.fast_path_signals_required),
+        "fast_path_confidence_min": float(config.fast_path_confidence_min),
+        "fast_path_canary_scope": bool(config.canary_scope),
         "dry_run": bool(config.dry_run),
         "canary_scope": bool(config.canary_scope),
     }

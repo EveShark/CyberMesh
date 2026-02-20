@@ -62,12 +62,16 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc(basePath+"/ai/history", s.handleAIDetectionHistory)
 	mux.HandleFunc(basePath+"/ai/suspicious-nodes", s.handleAISuspiciousNodes)
 
+	// Policy execution visibility (ACKs from enforcement-agent).
+	mux.HandleFunc(basePath+"/policies/acks", s.handlePolicyAcks)
+	mux.HandleFunc(basePath+"/policies/acks/", s.handlePolicyAcks)
+
 	// P2P info (for peer discovery) - DISABLED: handler method missing
 	// mux.HandleFunc(basePath+"/p2p/info", s.handleP2PInfo)
 
 	s.logger.Info("routes registered",
 		utils.ZapString("base_path", basePath),
-		utils.ZapInt("endpoint_count", 19))
+		utils.ZapInt("endpoint_count", 21))
 }
 
 // middlewareChain applies middleware in order
@@ -215,6 +219,9 @@ func (s *Server) getRequiredRole(path string) string {
 	}
 	if strings.HasPrefix(path, basePath+"/anomalies/suspicious-nodes") {
 		return "anomaly_reader"
+	}
+	if strings.HasPrefix(path, basePath+"/policies/acks") {
+		return "policy_reader"
 	}
 
 	// Default: no specific role required (public endpoint)

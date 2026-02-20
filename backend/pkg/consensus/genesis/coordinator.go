@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -268,7 +269,11 @@ func (c *Coordinator) issueLocalReady(ctx context.Context, reason string) (*mess
 func (c *Coordinator) buildLocalReady(ctx context.Context) (*messages.GenesisReady, error) {
 	peerHash := c.cfg.PeerHash
 	if c.peerHasher != nil {
-		if ph, err := c.peerHasher.PeerHash(); err == nil {
+		// peerHasher can be a typed-nil pointer behind an interface. Calling methods on it will panic.
+		v := reflect.ValueOf(c.peerHasher)
+		if v.Kind() == reflect.Ptr && v.IsNil() {
+			c.logger.WarnContext(ctx, "peer hash unavailable (typed-nil peer hasher), using configured value")
+		} else if ph, err := c.peerHasher.PeerHash(); err == nil {
 			if !bytesEqual32(ph, peerHash) {
 				c.logger.WarnContext(ctx, "peer hash from router differs from configured fingerprint; using configured value",
 					"configured", fmt.Sprintf("%x", peerHash[:4]),
@@ -869,18 +874,11 @@ func (c *Coordinator) validateCertificate(ctx context.Context, cert *messages.Ge
 		}
 		verifyErr := c.crypto.VerifyWithContext(ctx, att.SignBytes(), att.Signature.Bytes, info.PublicKey, allowOldTimestamps)
 		if verifyErr != nil {
-			skipSignature := allowOldTimestamps && errors.Is(verifyErr, utils.ErrCryptoInvalidSignature)
 			c.mu.Lock()
 			delete(c.verifying, att.ValidatorID)
 			c.mu.Unlock()
-			if !skipSignature {
-				c.recordReadyEvent(ctx, ReadyEventReplayBlocked, att.ValidatorID, attHash, fmt.Sprintf("%s msg_nonce=%s sig_nonce=%s", verifyErr.Error(), nonceLabel, sigNonceLabel))
-				return fmt.Errorf("verify attestation signature for %x: %w", att.ValidatorID[:4], verifyErr)
-			}
-			c.logger.WarnContext(ctx, "skipping signature verification for restored genesis attestation",
-				"validator", validatorLabel,
-				"hash", hashLabel,
-				"reason", verifyErr.Error())
+			c.recordReadyEvent(ctx, ReadyEventReplayBlocked, att.ValidatorID, attHash, fmt.Sprintf("%s msg_nonce=%s sig_nonce=%s", verifyErr.Error(), nonceLabel, sigNonceLabel))
+			return fmt.Errorf("verify attestation signature for %x: %w", att.ValidatorID[:4], verifyErr)
 		} else {
 			c.mu.Lock()
 			delete(c.verifying, att.ValidatorID)
