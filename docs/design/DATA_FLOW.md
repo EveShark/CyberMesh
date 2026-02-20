@@ -1,7 +1,7 @@
 # CyberMesh Data Flow Documentation
 
-**Version:** 2.0.0  
-**Last Updated:** 2026-01-30
+**Version:** 1
+**Last Updated:** 2026-02-20
 
 ---
 
@@ -35,17 +35,24 @@ This document describes how data flows through the CyberMesh system, from networ
 sequenceDiagram
     autonumber
     participant Net as Network
-    participant AI as AI Service
+    participant TL as Telemetry Layer
     participant Kafka as Kafka
+    participant S as Sentinel
+    participant AI as AI Service
     participant Val as Validators
     participant DB as CockroachDB
     participant Agent as Enforcement Agent
     
-    Net->>AI: Telemetry data
-    AI->>AI: Feature extraction (79 features)
-    AI->>AI: 3-Engine detection
-    AI->>AI: Ensemble voting
-    AI->>AI: Ed25519 sign
+    Net->>TL: Telemetry data (flows/alerts/pcap)
+    TL->>Kafka: telemetry.flow.v1 / telemetry.deepflow.v1
+    TL->>Kafka: telemetry.flow.agg.v1 / telemetry.features.v1
+    TL->>Kafka: pcap.result.v1 (on request)
+    Kafka->>S: telemetry.flow.v1 / telemetry.deepflow.v1
+    S->>S: Decode + validate + orchestrate agents
+    S->>Kafka: sentinel.verdicts.v1
+    Kafka->>AI: sentinel.verdicts.v1
+    AI->>AI: Sentinel adapter + policy/anomaly mapping
+    AI->>AI: Evidence enrichment + Ed25519 sign
     AI->>Kafka: ai.anomalies.v1
     
     loop Each Validator
@@ -66,8 +73,8 @@ sequenceDiagram
     
     Kafka->>Agent: Policy message
     Agent->>Agent: Parse policy
-    Agent->>Agent: Apply iptables/nftables
-    Agent->>Kafka: control.policy.ack.v1
+    Agent->>Agent: Apply cilium/gateway/iptables/nftables/k8s
+    Agent->>Kafka: control.enforcement_ack.v1 (default)
 ```
 
 ---
@@ -79,21 +86,21 @@ sequenceDiagram
 ```mermaid
 flowchart TB
     subgraph Input
-        T[Telemetry Source<br/>File or Postgres]
+        T[Sentinel Source<br/>Kafka sentinel.verdicts.v1]
     end
     
-    subgraph Feature["Feature Extraction"]
-        FA[Feature Adapter<br/>79 features]
+    subgraph Feature["Sentinel Adapter"]
+        FA[Schema + Signature Validation<br/>sentinel.result.v1]
     end
     
     subgraph Engines["Detection Engines - Parallel"]
-        R[Rules Engine<br/>Thresholds]
-        M[Math Engine<br/>Statistics]
-        ML[ML Engine<br/>LightGBM]
+        R[Policy Mapper<br/>Threat -> action]
+        M[Anomaly Mapper<br/>Score -> severity]
+        ML[Optional ML Enrichment<br/>existing models]
     end
     
     subgraph Voting
-        E[Ensemble Voter<br/>ML=0.5, R=0.3, M=0.2]
+        E[Decision Merger<br/>deterministic]
         AB{Confidence > 0.70?}
     end
     
@@ -125,13 +132,13 @@ gantt
     axisFormat %L ms
     
     section Phase 1
-    Poll Telemetry     :0, 100
-    Feature Extraction :100, 200
-    
+    Poll Sentinel      :0, 80
+    Adapter Validate   :80, 120
+
     section Phase 2
-    Rules Engine       :200, 50
-    Math Engine        :200, 80
-    ML Engine          :200, 150
+    Policy Mapper      :200, 60
+    Anomaly Mapper     :200, 60
+    ML Enrichment      :200, 120
     
     section Phase 3
     Ensemble Voting    :350, 50
@@ -144,7 +151,7 @@ gantt
 ```
 
 > [!NOTE]
-> The detection loop runs every **5 seconds**. Total processing time is ~500ms, leaving 4.5s for idle/sleep.
+> In integrated runtime, AI consumes `sentinel.verdicts.v1`. `telemetry.features.v1` remains available for direct model paths and offline analysis.
 
 ---
 
@@ -287,7 +294,11 @@ sequenceDiagram
     
     Sched->>Enf: Apply policy
     
-    alt iptables
+    alt cilium
+        Enf->>Net: Apply CiliumNetworkPolicy/CiliumClusterwideNetworkPolicy
+    else gateway
+        Enf->>Net: Apply Gateway egress policy translation
+    else iptables
         Enf->>Net: iptables -A INPUT -s x.x.x.x -j DROP
     else nftables
         Enf->>Net: nft add rule ip filter input drop
@@ -296,7 +307,7 @@ sequenceDiagram
     end
     
     Enf->>Agent: Result
-    Agent->>Kafka: control.policy.ack.v1
+    Agent->>Kafka: control.enforcement_ack.v1
 ```
 
 ### 6.2 Enforcement Backends
@@ -309,6 +320,8 @@ flowchart TB
     end
     
     subgraph Backends
+        CIL[Cilium<br/>CiliumPolicy CRDs]
+        GW[Gateway<br/>Policy translation]
         IPT[iptables<br/>Linux legacy]
         NFT[nftables<br/>Linux modern]
         K8S[Kubernetes<br/>NetworkPolicy]
@@ -320,6 +333,8 @@ flowchart TB
     end
     
     C --> R
+    R --> CIL --> CNI
+    R --> GW --> CNI
     R --> IPT --> NF
     R --> NFT --> NF
     R --> K8S --> CNI
@@ -329,9 +344,36 @@ flowchart TB
     classDef kernel fill:#c8e6c9,stroke:#2e7d32,color:#000;
     
     class C,R agent;
-    class IPT,NFT,K8S backend;
+    class CIL,GW,IPT,NFT,K8S backend;
     class NF,CNI kernel;
 ```
+
+### 6.3 Control Plane vs Data Plane (L3/L4)
+
+```mermaid
+flowchart LR
+    AI[AI Service] -->|ai.policy.v1| BE[Backend Consensus]
+    BE -->|control.policy.v1| AG[Enforcement Agent]
+    AG -->|program rules| DP[Kernel/CNI/Gateway Data Plane]
+    AG -->|control.enforcement_ack.v1| FB[AI Feedback]
+```
+
+Plane responsibilities:
+
+- Control plane:
+  - `AI -> Backend` generates and validates policy intent
+  - backend consensus authorizes policy publication to `control.policy.v1`
+- Data plane:
+  - enforcement backend programs runtime network controls
+  - applies L3/L4 controls and reports execution ACK
+
+L3/L4 mapping in runtime:
+
+| Path | L3 (IP/CIDR/identity) | L4 (port/protocol/state) | Typical scope |
+|---|---|---|---|
+| Cilium/Kubernetes | yes | yes | East-West |
+| Gateway | yes | yes | North-South |
+| iptables/nftables | yes | yes | Host fallback and guardrail |
 
 ---
 
@@ -342,6 +384,8 @@ flowchart TB
 ```mermaid
 flowchart LR
     subgraph Producers
+        TL[Telemetry Layer]
+        S[Sentinel]
         AI[AI Service]
         BE[Backend]
         EA[Enforcement Agent]
@@ -349,13 +393,20 @@ flowchart LR
     
     subgraph Topics["Kafka Topics"]
         direction TB
+        F1[telemetry.flow.v1]
+        F2[sentinel.verdicts.v1]
+        F3[telemetry.flow.agg.v1]
+        F4[telemetry.features.v1]
+        F5[telemetry.deepflow.v1]
+        F6[pcap.request.v1]
+        F7[pcap.result.v1]
         T1[ai.anomalies.v1]
         T2[ai.evidence.v1]  
         T3[ai.policy.v1]
         T4[control.commits.v1]
         T5[control.policy.v1]
         T6[control.reputation.v1]
-        T8[control.policy.ack.v1]
+        T8[control.enforcement_ack.v1]
         T7[ai.dlq.v1]
     end
     
@@ -363,7 +414,16 @@ flowchart LR
         AI2[AI Service]
         BE2[Backend]
         EA2[Enforcement Agent]
+        TL2[Telemetry Layer]
     end
+    
+    TL -->|Flows/Alerts| F1
+    TL -->|Aggregates| F3
+    TL -->|Features| F4
+    TL -->|Deepflow| F5
+    S -->|Verdicts| F2
+    TL -->|PCAP Result| F7
+    TL2 -->|PCAP Request| F6
     
     AI -->|Anomalies| T1
     AI -->|Evidence| T2
@@ -380,6 +440,8 @@ flowchart LR
     AI2 -->|Consume| T4
     AI2 -->|Consume| T6
     AI2 -->|Consume| T8
+    S -->|Consume| F1
+    AI2 -->|Consume| F2
     
     EA2 -->|Consume| T5
     EA -->|Policy ACKs| T8
@@ -390,26 +452,38 @@ flowchart LR
     classDef topic fill:#fff9c4,stroke:#f57f17,color:#000;
     classDef consumer fill:#c8e6c9,stroke:#2e7d32,color:#000;
     
-    class AI,BE,EA producer;
-    class T1,T2,T3,T4,T5,T6,T7,T8 topic;
-    class AI2,BE2,EA2 consumer;
+    class TL,S,AI,BE,EA producer;
+    class F1,F2,F3,F4,F5,F6,F7,T1,T2,T3,T4,T5,T6,T7,T8 topic;
+    class AI2,BE2,EA2,TL2 consumer;
 ```
 
 ### 7.2 Message Schemas
 
 | Topic | Producer | Consumer | Schema | Size |
 |-------|----------|----------|--------|------|
+| `telemetry.flow.v1` | Telemetry | Telemetry | Protobuf/JSON (FlowV1) | varies |
+| `sentinel.verdicts.v1` | Sentinel | AI | Protobuf (`SentinelResultEvent`) | ~1-16KB |
+| `telemetry.flow.agg.v1` | Telemetry | Telemetry | Protobuf/JSON (FlowAgg) | varies |
+| `telemetry.features.v1` | Telemetry | AI/Ops | Protobuf/JSON (CIC v1) | ~3-8KB |
+| `telemetry.deepflow.v1` | Telemetry | Telemetry | Protobuf/JSON (DeepFlowV1) | varies |
+| `pcap.request.v1` | Backend/AI/Ops | Telemetry | Protobuf (PcapRequestV1) | ~1KB |
+| `pcap.result.v1` | Telemetry | Backend/AI/Ops | Protobuf (PcapResultV1) | ~1KB |
 | `ai.anomalies.v1` | AI | Backend | Protobuf (AnomalyEvent) | ~2KB |
 | `ai.evidence.v1` | AI | Backend | Protobuf (EvidenceEvent) | ~512KB max |
 | `ai.policy.v1` | AI | Backend | Protobuf (PolicyEvent) | ~1KB |
 | `control.commits.v1` | Backend | AI | Protobuf (CommitEvent) | ~1KB |
 | `control.policy.v1` | Backend | Agent | Protobuf (PolicyUpdateEvent) | ~2KB |
 | `control.reputation.v1` | Backend | AI | Protobuf (ReputationEvent) | ~500B |
-| `control.policy.ack.v1` | Agent | AI | Protobuf (PolicyAckEvent) | ~1KB |
+| `control.enforcement_ack.v1` | Agent | AI | Protobuf (PolicyAckEvent) | ~1KB |
 | `ai.dlq.v1` | Backend | - | Original + error | Varies |
 
 > [!WARNING]
 > All Kafka messages **MUST** be signed with Ed25519 using domain separation. Invalid signatures are rejected to the DLQ.
+
+> [!NOTE]
+> The policy-ack topic name is configuration-driven:
+> `TOPIC_CONTROL_POLICY_ACK` (AI), `CONTROL_POLICY_ACK_TOPIC` (backend), `ACK_TOPIC` (agent).
+> Current default is `control.enforcement_ack.v1`.
 
 ---
 
@@ -432,7 +506,6 @@ sequenceDiagram
         PW->>DB: BEGIN TRANSACTION
         PW->>DB: INSERT INTO blocks
         PW->>DB: INSERT INTO transactions
-        PW->>DB: INSERT INTO anomalies
         PW->>DB: UPDATE validators
         PW->>DB: COMMIT
     end
@@ -445,7 +518,6 @@ sequenceDiagram
 ```mermaid
 erDiagram
     blocks ||--o{ transactions : contains
-    transactions ||--o{ anomalies : includes
     validators ||--o{ blocks : proposes
     
     blocks {
@@ -462,14 +534,6 @@ erDiagram
         string type
         bytes payload
         bytes signature
-    }
-    
-    anomalies {
-        uuid id PK
-        uuid transaction_id FK
-        string type
-        float confidence
-        string lifecycle_state
     }
     
     validators {

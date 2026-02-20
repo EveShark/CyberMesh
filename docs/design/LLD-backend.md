@@ -1,18 +1,18 @@
 # CyberMesh Backend - Low-Level Design (LLD)
 
-**Version:** 2.0.0  
+**Version:** 1
 **Last Updated:** 2026-01-30
 
 ---
 
-## 📑 Navigation
+##  Navigation
 
 **Quick Links:**
-- [🏗️ Module Architecture](#2-module-architecture)
-- [⚙️ Consensus Engine](#3-consensus-module-pkgconsensus)
-- [🔄 State Machine](#4-state-machine-pkgstate)
-- [📨 Kafka Integration](#5-kafka-integration-pkgingestkafka)
-- [🔌 API Layer](#9-api-layer-pkgapi)
+- [ Module Architecture](#2-module-architecture)
+- [ Consensus Engine](#3-consensus-module-pkgconsensus)
+- [ State Machine](#4-state-machine-pkgstate)
+- [ Kafka Integration](#5-kafka-integration-pkgingestkafka)
+- [ API Layer](#9-api-layer-pkgapi)
 
 ---
 
@@ -483,9 +483,9 @@ All endpoints are served under `/api/v1`:
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Health check (public) ✅ |
-| `/ready` | GET | Readiness probe (public) ✅ |
-| `/metrics` | GET | Prometheus metrics 📊 |
+| `/health` | GET | Health check (public)  |
+| `/ready` | GET | Readiness probe (public)  |
+| `/metrics` | GET | Prometheus metrics  |
 | `/blocks/latest` | GET | Latest block |
 | `/blocks` | GET | List blocks |
 | `/blocks/{height}` | GET | Get block by height |
@@ -531,17 +531,17 @@ flowchart LR
 
 ## 10. Key Files Reference
 
-| File | Purpose | Lines |
-|------|---------|-------|
-| `cmd/cybermesh/main.go` | Entry point, signal handling | ~1100 |
-| `pkg/consensus/api/engine.go` | Consensus orchestration | ~2000 |
-| `pkg/consensus/pbft/pbft.go` | HotStuff (2-chain) engine | ~1000 |
-| `pkg/consensus/genesis/coordinator.go` | Genesis ceremony | ~800 |
-| `pkg/state/executor.go` | Transaction execution | ~400 |
-| `pkg/ingest/kafka/consumer.go` | Kafka consumer | ~900 |
-| `pkg/ingest/kafka/verifier.go` | Signature verification | ~300 |
-| `pkg/mempool/mempool.go` | Transaction pool | ~300 |
-| `pkg/storage/cockroach/adapter.go` | DB adapter | ~600 |
+| File | Purpose |
+|------|---------|
+| `cmd/cybermesh/main.go` | Entry point, signal handling |
+| `pkg/consensus/api/engine.go` | Consensus orchestration |
+| `pkg/consensus/pbft/pbft.go` | HotStuff (2-chain) engine |
+| `pkg/consensus/genesis/coordinator.go` | Genesis ceremony |
+| `pkg/state/executor.go` | Transaction execution |
+| `pkg/ingest/kafka/consumer.go` | Kafka consumer |
+| `pkg/ingest/kafka/verifier.go` | Signature verification |
+| `pkg/mempool/mempool.go` | Transaction pool |
+| `pkg/storage/cockroach/adapter.go` | DB adapter |
 
 ---
 

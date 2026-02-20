@@ -1,7 +1,7 @@
 # Architecture 11: System Timeline
 ## Operational Timing Across AI, Consensus, and Enforcement
 
-**Last Updated:** 2026-01-29
+**Last Updated:** 2026-02-14
 
 This document summarizes the key "clocks" in CyberMesh. Values are taken from code defaults and/or the current GKE manifests.
 
@@ -22,6 +22,14 @@ Per-iteration telemetry size:
 - `TELEMETRY_BATCH_SIZE` default 1000
 - `MAX_FLOWS_PER_ITERATION` default 100
 - Effective `limit = min(MAX_FLOWS_PER_ITERATION, TELEMETRY_BATCH_SIZE)` in `DetectionPipeline.process()`
+
+## 1.1 Telemetry Layer (Aggregation + Features)
+
+Telemetry pipeline timing is driven by:
+- Stream processor window (`AGGREGATION_WINDOW_SEC`, default 10s).
+- Feature transformer poll loop (Kafka consumer per message).
+
+These values affect end-to-end detection latency before the AI loop.
 
 Publishing rate limit:
 - `max_detections_per_second` default is 100 (see AI settings + rate limiter)
@@ -106,7 +114,7 @@ Genesis skew tolerance:
 The enforcement agent consumes policies from Kafka and exposes metrics/health on:
 - `METRICS_ADDR` default `:9094` in `k8s_gke/daemonset.yaml`
 
-Policy apply latency depends on backend (iptables/nftables/k8s) and host performance; it is not fixed in code defaults.
+Policy apply latency depends on backend (cilium/gateway/iptables/nftables/k8s) and host performance; it is not fixed in code defaults.
 
 ---
 
@@ -116,4 +124,3 @@ Policy apply latency depends on backend (iptables/nftables/k8s) and host perform
 - Kafka message bus: `docs/architecture/04_kafka_message_bus.md`
 - HotStuff consensus: `docs/architecture/03_hotstuff_consensus.md`
 - Genesis bootstrap: `docs/architecture/07_genesis_bootstrap.md`
-

@@ -1,30 +1,40 @@
-# CyberMesh Deployment (GKE)
+# CyberMesh Deployment (GKE + Azure Manifests)
 
-**Version:** 2.0.0  
-**Last Updated:** 2026-01-30
+**Version:** 1
+**Last Updated:** 2026-02-20
 
 ---
 
 ## 📑 Navigation
 
 **Quick Links:**
-- [☸️ Workloads](#2-workloads-k8s_gke)
-- [🔌 Services & Ports](#3-services-and-ports)
-- [☁️ External Dependencies](#4-external-dependencies)
-- [🔒 Configuration & Secrets](#5-configuration-and-secrets)
-- [📦 Storage](#6-storage)
-- [🚀 Deployment Steps](#8-applying-the-manifests)
+- [🧭 Topology](#2-high-level-topology)
+- [☸️ Workloads](#3-workloads-k8s_gke)
+- [🛰️ Telemetry Workloads](#31-telemetry-layer-workloads-telemetry-layerdeployments)
+- [🔌 Services & Ports](#4-services-and-ports)
+- [☁️ External Dependencies](#5-external-dependencies)
+- [🔒 Configuration & Secrets](#6-configuration-and-secrets)
+- [📦 Storage](#7-storage)
+- [🚀 Deployment Steps](#9-applying-the-manifests)
 
-This document describes the *current* Kubernetes deployment layout as defined by `k8s_gke/`.
+This document describes the Kubernetes deployment layout for CyberMesh.
+
+Notes:
+- `k8s_gke/` is the source of truth for the core platform (validators, AI service, frontend, enforcement agent).
+- Telemetry and Sentinel operational manifests are maintained under `k8s_azure/telemetry/*` and `k8s_azure/sentinel/*`.
+- `telemetry-layer/deployments/` remains available for local/test bring-up.
 
 > [!CAUTION]
-> This document intentionally **avoids any secret material** (no keys, passwords, usernames, or full connect ion strings).
+> This document intentionally **avoids any secret material** (no keys, passwords, usernames, or full connection strings).
 
 ---
 
 ## 1. Source of Truth
 
 - **Kubernetes manifests:** `k8s_gke/`
+- **Telemetry operational manifests:** `k8s_azure/telemetry/`
+- **Sentinel operational manifests:** `k8s_azure/sentinel/`
+- **Telemetry manifests (local/test):** `telemetry-layer/deployments/`
 - **Runtime architecture overview:** [docs/architecture/12_gke_deployment.md](../architecture/12_gke_deployment.md)
 
 ---
@@ -47,31 +57,39 @@ graph TB
 
     subgraph GKE["GKE Cluster - cybermesh namespace"]
         subgraph Validators["StatefulSet - 5 replicas"]
-            V0[validator-0<br/>NODE_ID=1]
-            V1[validator-1<br/>NODE_ID=2]
-            V2[validator-2<br/>NODE_ID=3]
-            V3[validator-3<br/>NODE_ID=4]
-            V4[validator-4<br/>NODE_ID=5]
+            V0["validator-0<br/>NODE_ID=1"]
+            V1["validator-1<br/>NODE_ID=2"]
+            V2["validator-2<br/>NODE_ID=3"]
+            V3["validator-3<br/>NODE_ID=4"]
+            V4["validator-4<br/>NODE_ID=5"]
         end
         
         subgraph Services["Deployments"]
-            AI[AI Service<br/>Deployment]
-            FE[Frontend<br/>Deployment]
+            S["Sentinel Gateway<br/>Job/Deployment"]
+            AI["AI Service<br/>Deployment"]
+            FE["Frontend<br/>Deployment"]
+        end
+
+        subgraph Telemetry["Telemetry Layer"]
+            SP["Telemetry Pipeline<br/>Deployment"]
+            FT["Edge Feature Transformer<br/>Deployment"]
+            AD["Adapters<br/>Gateway, Baremetal, Cloudlogs, Zeek, Suricata"]
+            PCAP["PCAP Service<br/>Deployment"]
         end
         
         subgraph Agents["DaemonSet"]
-            Agent[Enforcement Agent<br/>Every Node]
+            Agent["Enforcement Agent<br/>Every Node"]
         end
         
         subgraph Data["In-Cluster Data Stores"]
-            PG[(Postgres<br/>StatefulSet)]
+            PG[("Postgres<br/>StatefulSet")]
             InRedis[(Redis)]
         end
         
-        LB1[LoadBalancer<br/>validator-api]
-        LB2[LoadBalancer<br/>frontend]
-        HL[Headless Service<br/>validator-headless]
-        AISVC[ClusterIP<br/>ai-service]
+        LB1["LoadBalancer<br/>validator-api"]
+        LB2["LoadBalancer<br/>frontend"]
+        HL["Headless Service<br/>validator-headless"]
+        AISVC["ClusterIP<br/>ai-service"]
     end
     
     User -->|HTTPS| LB2
@@ -85,8 +103,15 @@ graph TB
     V0 & V1 & V2 & V3 & V4 -->|DB| CRDB
     V0 & V1 & V2 & V3 & V4 -->|Kafka| Kafka
 
+    S -->|Consume telemetry.flow.v1| Kafka
+    S -->|Publish sentinel.verdicts.v1| Kafka
+    AI -->|Consume sentinel.verdicts.v1| Kafka
     AI -->|Kafka| Kafka
     Agent -->|Kafka| Kafka
+    SP -->|Kafka| Kafka
+    FT -->|Kafka| Kafka
+    AD -->|Kafka| Kafka
+    PCAP -->|Kafka| Kafka
     AI -->|Redis| ExtRedis
     AI -->|Redis| InRedis
     AI -->|Postgres| PG
@@ -98,13 +123,13 @@ graph TB
     classDef lb fill:#ffebee,stroke:#c62828,color:#000;
     
     class V0,V1,V2,V3,V4 validator;
-    class AI,FE,Agent service;
+    class S,AI,FE,Agent service;
     class Kafka,CRDB,ExtRedis,PG,InRedis data;
     class LB1,LB2,HL,AISVC lb;
 ```
 
 > [!NOTE]
-> The diagram shows the complete GKE deployment topology with 5 validators, external dependencies, and in-cluster data stores.
+> The diagram shows runtime topology. Today, core services are deployed from `k8s_gke/`, while telemetry/sentinel runtime workloads are deployed from `k8s_azure/` (with `telemetry-layer/deployments/` retained for local/test bring-up).
 
 ---
 
@@ -114,13 +139,47 @@ graph TB
 |----------|------|------|----------|-------|
 | **Backend validators** | StatefulSet | `validator` | 5 | HotStuff validators + API + metrics |
 | **AI service** | Deployment | `ai-service` | 1 | Detection pipeline + Kafka pub/sub + metrics |
+| **Sentinel gateway** | Job (current) / Deployment (target) | `sentinel-kafka-ai-integration*` | on-demand | Telemetry ingest -> `sentinel.verdicts.v1` (from `k8s_azure/sentinel/`) |
 | **Enforcement agent** | DaemonSet | `enforcement-agent` | N (per node) | ⚠️ HostNetwork + privileged (NET_ADMIN) |
 | **Frontend** | Deployment | `frontend` | 1 | Dashboard UI |
 | **Postgres** | StatefulSet | `postgres` | 1 | AI telemetry/local DB (dev/test) |
 | **Redis** | Deployment | `redis` | 1 | Optional in-cluster Redis |
 
 > [!WARNING]
-> The **enforcement agent** runs with `hostNetwork: true` and requires `NET_ADMIN` capability for iptables/nftables access.
+> The **enforcement agent** runs with `hostNetwork: true` and requires `NET_ADMIN` capability for iptables/nftables backends.
+> Cilium/gateway modes are also supported by code and deployed via dedicated manifests where applicable.
+
+Supported enforcement backends:
+- `cilium`
+- `gateway`
+- `iptables`
+- `nftables`
+- `kubernetes` / `k8s`
+- `noop`
+
+---
+
+## 3.1 Telemetry Layer Workloads (`k8s_azure/telemetry/` + `telemetry-layer/deployments/`)
+
+Telemetry runtime manifests are maintained in `k8s_azure/telemetry/layer/`.
+Local/test bring-up manifests remain in `telemetry-layer/deployments/` and are useful for isolated validation.
+Secrets are injected via ConfigMap/Secret env wiring.
+
+| Component | Kind | Name | Notes |
+|----------|------|------|-------|
+| Telemetry pipeline | Deployment | `telemetry-pipeline` | Bridge + stream processor + feature transformer pipeline |
+| Gateway adapter | Deployment | `telemetry-gateway-adapter` | IPFIX/gateway ingest to `telemetry.flow.v1` |
+| Bare-metal adapter | DaemonSet | `telemetry-baremetal-adapter` | Host sensor ingest to `telemetry.flow.v1` |
+| Cloud logs adapter | Deployment | `telemetry-cloudlogs-adapter` | Cloud flow log ingest to `telemetry.flow.v1` |
+| Edge feature transformer | Deployment | `telemetry-edge-feature-transformer` | Optional edge mode |
+| Test Kafka + UI | Deployment/Service | `test-kafka`, `kafka-ui` | Local-only bring-up (do not use in prod) |
+| Test CockroachDB | Deployment/Service | `test-cockroachdb` | Local-only bring-up (do not use in prod) |
+
+Related:
+- `k8s_azure/telemetry/layer/*`
+- `telemetry-layer/deployments/README.md`
+- Telemetry LLD: `docs/design/LLD-telemetry-layer.md`
+- Sentinel integration manifests: `k8s_azure/sentinel/sentinel-kafka-ai-integration-job.yaml`
 
 ---
 
@@ -183,6 +242,7 @@ graph TB
 | `cybermesh-config` | Backend validator runtime config |
 | `ai-service-config` | AI service runtime config |
 | `frontend-config` | Frontend runtime config |
+| `telemetry-config` | Telemetry layer runtime config (stream/transform/adapters/pcap) |
 | `db-root-cert` | CockroachDB root CA cert bundle |
 | `ai-service-entrypoint` | AI service entrypoint script |
 
@@ -199,6 +259,7 @@ graph TB
 | `backend-tls` | 🔒 Backend HTTPS TLS cert/key |
 | `ai-service-secret` | 🔑 AI signing key file |
 | `ai-service-postgres` | 🔒 AI service Postgres credentials |
+| `telemetry-secrets` | 🔒 Telemetry Kafka/Schema Registry credentials |
 
 ---
 

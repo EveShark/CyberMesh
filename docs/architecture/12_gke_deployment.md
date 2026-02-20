@@ -1,13 +1,14 @@
 # Architecture 12: GKE Deployment
 ## Kubernetes Manifests and Runtime Topology (k8s_gke/)
 
-**Last Updated:** 2026-01-30
+**Last Updated:** 2026-02-18
 
-This document summarizes how the current CyberMesh manifests deploy the system on GKE.
+This document summarizes how the current CyberMesh manifests deploy the system across GKE and Azure-oriented manifest sets.
 It intentionally avoids including any sensitive values (no keys, passwords, usernames, or full DSNs).
 
 Primary source of truth:
-- `k8s_gke/*`
+- Core GKE stack: `k8s_gke/*`
+- Telemetry/Sentinel operational manifests: `k8s_azure/telemetry/*`, `k8s_azure/sentinel/*`
 
 ---
 
@@ -55,7 +56,14 @@ Notes:
 - `k8s_gke/daemonset.yaml`
 - Runs on every node (`hostNetwork: true`, privileged with `NET_ADMIN` capability).
 - Consumes policies from Kafka topic `control.policy.v1`.
+- Backend mode is configured by `ENFORCEMENT_BACKEND` and supports:
+  - `cilium`, `gateway`, `iptables`, `nftables`, `kubernetes`/`k8s`, `noop`
 - Exposes metrics/health/control on `:9094`.
+
+Related manifests in repo:
+- `k8s_gke/enforcement-agent-cilium.yaml`
+- `k8s_gke/enforcement-agent-daemonset-cilium-dryrun.yaml`
+- `k8s_gke/telemetry/gateway-gate/*` (gateway gate validation setup)
 
 ### 2.4 Frontend (Deployment)
 
@@ -63,7 +71,23 @@ Notes:
 - Service `k8s_gke/frontend-service.yaml`:
   - LoadBalancer on port 80 -> container port 3000
 
-### 2.5 Deployment Topology
+### 2.5 Telemetry Layer and Sentinel Manifests
+
+In the current repo layout:
+
+- `k8s_gke/telemetry/*` contains gate-focused manifests (gateway/hostfw validation paths).
+- Runtime telemetry pipeline manifests are maintained under `k8s_azure/telemetry/layer/*`, including:
+  - `01-telemetry-pipeline.yaml`
+  - `02-gateway-adapter.yaml`
+  - `03-baremetal-adapter.yaml`
+  - `04-cloudlogs-adapter.yaml`
+  - `07-edge-feature-transformer.yaml`
+- Sentinel Kafka integration job is maintained under:
+  - `k8s_azure/sentinel/sentinel-kafka-ai-integration-job.yaml`
+
+These services are configured via ConfigMap/Secrets and connect to Kafka for ingest/output.
+
+### 2.6 Deployment Topology
 
 ```mermaid
 graph TB
@@ -87,8 +111,16 @@ graph TB
         end
         
         subgraph Services["Deployments"]
+            S[Sentinel Gateway<br/>Job (azure manifest set)]
             AI[AI Service<br/>Deployment]
             FE[Frontend<br/>Deployment]
+        end
+
+        subgraph Telemetry["Telemetry Layer (azure manifest set)"]
+            SP[Telemetry Pipeline<br/>Deployment]
+            FT[Edge Feature Transformer<br/>Deployment]
+            AD[Adapters<br/>Gateway/Baremetal/Cloudlogs]
+            PCAP[PCAP Service<br/>Pipeline path]
         end
         
         subgraph Agents["DaemonSet"]
@@ -117,8 +149,15 @@ graph TB
     V0 & V1 & V2 & V3 & V4 -->|DB| CRDB
     V0 & V1 & V2 & V3 & V4 -->|Kafka| Kafka
 
+    S -->|Consume telemetry.flow.v1| Kafka
+    S -->|Publish sentinel.verdicts.v1| Kafka
+    AI -->|Consume sentinel.verdicts.v1| Kafka
     AI -->|Kafka| Kafka
     Agent -->|Kafka| Kafka
+    SP -->|Kafka| Kafka
+    FT -->|Kafka| Kafka
+    AD -->|Kafka| Kafka
+    PCAP -->|Kafka| Kafka
     AI -->|Redis| ExtRedis
     AI -->|Redis| InRedis
     AI -->|Postgres| PG
@@ -130,7 +169,7 @@ graph TB
     classDef lb fill:#ffebee,stroke:#c62828,color:#000;
     
     class V0,V1,V2,V3,V4 validator;
-    class AI,FE,Agent service;
+    class S,AI,FE,Agent service;
     class Kafka,CRDB,ExtRedis,PG,InRedis data;
     class LB1,LB2,HL,AISVC lb;
 ```
@@ -154,6 +193,7 @@ flowchart LR
         V -->|DB| CRDB[CockroachDB]
         AI[ai-service :8080] -->|Kafka| Kafka
         EA[enforcement-agent :9094] -->|Kafka| Kafka
+        TL[telemetry-layer] -->|Kafka| Kafka
     end
 ```
 
@@ -194,3 +234,4 @@ Redis is deployed via:
 - System overview: `docs/architecture/01_system_overview.md`
 - P2P networking: `docs/architecture/10_p2p_networking.md`
 - Kafka bus: `docs/architecture/04_kafka_message_bus.md`
+- Sentinel integration: `docs/architecture/13_sentinel_integration.md`

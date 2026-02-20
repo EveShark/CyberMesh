@@ -38,9 +38,11 @@ COPY --chown=aiservice:aiservice ai-service/src ./src
 COPY --chown=aiservice:aiservice ai-service/config ./config
 COPY --chown=aiservice:aiservice ai-service/proto ./proto
 COPY --chown=aiservice:aiservice ai-service/cmd ./cmd
+# Telemetry protobuf Python bindings required by src/ml/telemetry_kafka.py
+COPY --chown=aiservice:aiservice telemetry-layer/proto/gen/python ./proto_gen
 
 # Copy entrypoint script
-COPY --chown=aiservice:aiservice docker/ai-service/entrypoint.sh /app/entrypoint.sh
+COPY --chown=aiservice:aiservice docker/scrits/ai-service/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 # Create directories for runtime mounts
@@ -61,6 +63,8 @@ USER aiservice
 # Environment defaults (overridden by ConfigMap in K8s)
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app/proto_gen:/app/src \
+    TELEMETRY_PROTO_PATH=/app/proto_gen \
     DETECTION_INTERVAL=5 \
     METRICS_PORT=10000
 

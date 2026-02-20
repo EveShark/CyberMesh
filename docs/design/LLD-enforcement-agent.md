@@ -1,27 +1,80 @@
-# CyberMesh Enforcement Agent - Low-Level Design (LLD)
+# CyberMesh Enforcement Agent - Low-Level Design
 
-**Version:** 2.0.0  
-**Last Updated:** 2026-01-30
+**Version:** 1
+**Last Updated:** 2026-02-14
 
 ---
 
-## 📑 Navigation
+## Navigation
 
-**Quick Links:**
-- [🏗️ Module Architecture](#2-module-architecture)
-- [🎛️ Controller](#3-controller-internalcontroller)
-- [⚙️ Enforcer](#4-enforcer-internalenforcer)
-- [📋 Policy Spec](#5-policy-specification-internalpolicy)
-- [✅ ACK System](#6-ack-system-internalack)
+- [Module Architecture](#2-module-architecture)
+- [Data Plane and Control Plane](#15-data-plane-and-control-plane)
+- [Controller](#3-controller-internalcontroller)
+- [Enforcer](#4-enforcer-internalenforcer)
+- [Policy Spec](#5-policy-specification-internalpolicy)
+- [ACK System](#6-ack-system-internalack)
 
 ---
 
 ## 1. Overview
 
-The Enforcement Agent is a **Go-based DaemonSet** that consumes policy messages from Kafka and enforces them using iptables, nftables, or Kubernetes NetworkPolicies.
+The Enforcement Agent is a Go-based DaemonSet that consumes `control.policy.v1` and applies policy through the configured backend (`cilium`, `gateway`, `iptables`, `nftables`, `kubernetes`/`k8s`, `noop`).
+Its job is deterministic policy execution plus optional ACK publication for feedback loops.
 
 > [!IMPORTANT]
-> The agent runs as a **DaemonSet** with `hostNetwork: true` and requires `NET_ADMIN` capability for iptables/nftables access.
+> The agent runs as a DaemonSet with `hostNetwork: true` and requires `NET_ADMIN` for iptables/nftables modes.
+
+### 1.5 Data Plane and Control Plane
+
+The enforcement stack is split into a control plane and a data plane:
+
+- Control plane:
+  - `AI -> Backend -> control.policy.v1`
+  - validates signatures, runs consensus, applies guardrails, and emits signed policy updates
+- Data plane:
+  - enforcement backend on each node or gateway
+  - consumes `control.policy.v1`, programs runtime rules, and emits `control.enforcement_ack.v1`
+
+Control-plane message flow:
+
+```mermaid
+flowchart LR
+    AI[AI Service] -->|ai.policy.v1| BE[Backend Validators]
+    BE -->|consensus + policy validation| CP[Policy Update]
+    CP -->|control.policy.v1| EA[Enforcement Agent]
+    EA -->|control.enforcement_ack.v1| FEEDBACK[AI / Feedback]
+```
+
+Data-plane application flow:
+
+```mermaid
+flowchart TB
+    P[PolicySpec] --> B{Backend}
+    B -->|cilium| C[Cilium CRDs]
+    B -->|gateway| G[Gateway rule translation]
+    B -->|iptables| I[iptables netfilter rules]
+    B -->|nftables| N[nftables netfilter rules]
+    B -->|kubernetes| K[NetworkPolicy objects]
+```
+
+L3/L4 behavior by backend:
+
+| Backend | L3 Controls | L4 Controls | Typical Placement |
+|---|---|---|---|
+| `cilium` | IP/CIDR identity, direction | port/protocol policy | East-West in Kubernetes |
+| `gateway` | source/destination CIDR scope | port/protocol policy | North-South ingress/egress |
+| `iptables` | source/destination IP/CIDR | tcp/udp ports, conntrack/rate rules | Host-level fallback |
+| `nftables` | source/destination IP/CIDR | tcp/udp ports, stateful/rate rules | Host-level modern path |
+| `kubernetes` | pod/ipBlock scope via CNI | ingress/egress port policy | Namespace/workload policy |
+
+East-West vs North-South:
+
+- East-West:
+  - pod-to-pod or node-internal traffic
+  - primary backends: `cilium`, `kubernetes`, host firewall (`iptables`/`nftables`) as fallback
+- North-South:
+  - external ingress/egress boundaries
+  - primary backend: `gateway`, with host firewall guardrails where needed
 
 ---
 
@@ -175,9 +228,23 @@ classDiagram
         +Remove(policyID) error
     }
     
+    class CiliumEnforcer {
+        -dynamic dynamic.Interface
+        +Apply(policy) error
+        +Remove(policyID) error
+    }
+    
+    class GatewayEnforcer {
+        -translator Translator
+        +Apply(policy) error
+        +Remove(policyID) error
+    }
+    
     Enforcer <|.. IPTablesEnforcer
     Enforcer <|.. NFTablesEnforcer
     Enforcer <|.. KubernetesEnforcer
+    Enforcer <|.. CiliumEnforcer
+    Enforcer <|.. GatewayEnforcer
 ```
 
 ### 4.2 Backend Selection
@@ -185,11 +252,15 @@ classDiagram
 ```mermaid
 flowchart TB
     START[Start] --> CFG{ENFORCEMENT_BACKEND}
+    CFG -->|cilium| CIL[Cilium Enforcer]
+    CFG -->|gateway| GW[Gateway Enforcer]
     CFG -->|iptables| IPT[iptables Enforcer]
     CFG -->|nftables| NFT[nftables Enforcer]
     CFG -->|kubernetes/k8s| K8S[Kubernetes Enforcer]
     CFG -->|noop| NOOP[No-op Enforcer]
     
+    style CIL fill:#e8f5e9,stroke:#2e7d32,color:#000;
+    style GW fill:#ede7f6,stroke:#5e35b1,color:#000;
     style IPT fill:#e3f2fd,stroke:#1565c0,color:#000;
     style NFT fill:#fff9c4,stroke:#f57f17,color:#000;
     style K8S fill:#c8e6c9,stroke:#2e7d32,color:#000;
@@ -281,7 +352,7 @@ sequenceDiagram
     participant R as RetryingPublisher
     participant Q as Durable Queue (bbolt)
     participant KP as KafkaPublisher
-    participant Kafka as control.policy.ack.v1
+    participant Kafka as control.enforcement_ack.v1
     
     C->>R: Publish(payload)
     R->>Q: Enqueue(payload)
@@ -465,21 +536,23 @@ spec:
 
 ## 11. Key Files Reference
 
-| File | Purpose | Lines |
-|------|---------|-------|
-| `cmd/agent/main.go` | Entrypoint wiring | ~440 |
-| `internal/config/config.go` | Env config parsing | ~320 |
-| `internal/kafka/consumer.go` | Kafka consumer-group wrapper | ~220 |
-| `internal/controller/controller.go` | Policy handler | ~770 |
-| `internal/enforcer/enforcer.go` | Backend factory + interfaces | ~120 |
-| `internal/enforcer/iptables/iptables_linux.go` | iptables backend | ~240 |
-| `internal/enforcer/nftables/nftables_linux.go` | nftables backend | ~520 |
-| `internal/enforcer/kubernetes/kubernetes.go` | Kubernetes NetworkPolicy backend | ~520 |
-| `internal/state/store.go` | Persistent state store | ~690 |
-| `internal/reconciler/reconciler.go` | Re-apply + ledger reconciliation | ~250 |
-| `internal/scheduler/scheduler.go` | TTL/rollback expiration loop | ~200 |
-| `internal/ack/publisher.go` | Kafka ACK publisher | ~170 |
-| `internal/metrics/metrics.go` | Prometheus metrics | ~390 |
+| File | Purpose |
+|------|---------|
+| `cmd/agent/main.go` | Entrypoint wiring |
+| `internal/config/config.go` | Env config parsing |
+| `internal/kafka/consumer.go` | Kafka consumer-group wrapper |
+| `internal/controller/controller.go` | Policy handler |
+| `internal/enforcer/enforcer.go` | Backend factory + interfaces |
+| `internal/enforcer/iptables/iptables_linux.go` | iptables backend |
+| `internal/enforcer/nftables/nftables_linux.go` | nftables backend |
+| `internal/enforcer/kubernetes/kubernetes.go` | Kubernetes NetworkPolicy backend |
+| `internal/enforcer/cilium/cilium.go` | Cilium policy backend |
+| `internal/enforcer/gateway/*` | Gateway policy backend |
+| `internal/state/store.go` | Persistent state store |
+| `internal/reconciler/reconciler.go` | Re-apply + ledger reconciliation |
+| `internal/scheduler/scheduler.go` | TTL/rollback expiration loop |
+| `internal/ack/publisher.go` | Kafka ACK publisher |
+| `internal/metrics/metrics.go` | Prometheus metrics |
 
 ---
 

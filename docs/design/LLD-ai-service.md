@@ -1,7 +1,7 @@
 # CyberMesh AI Service - Low-Level Design (LLD)
 
-**Version:** 2.0.0  
-**Last Updated:** 2026-01-30
+**Version:** 1
+**Last Updated:** 2026-02-18
 
 ---
 
@@ -18,10 +18,10 @@
 
 ## 1. Overview
 
-The AI Service is a **Python-based ML detection pipeline** that analyzes network telemetry, detects threats using 3 detection engines, and publishes cryptographically signed alerts to Kafka.
+The AI Service is a **Python-based detection and policy publisher** that consumes Sentinel verdicts, maps them to anomaly/policy contracts, and publishes signed events to Kafka.
 
 > [!IMPORTANT]
-> The AI Service uses **3 weighted engines** (Rules 30%, Math 20%, ML 50%) with adaptive threshold tuning based on validator feedback.
+> Integrated runtime entrypoint is the Sentinel adapter (`sentinel.verdicts.v1`). Legacy direct telemetry paths remain available for model-centric workflows.
 
 ---
 
@@ -45,7 +45,12 @@ graph TB
         config[config/]
     end
     
+    sentinel[sentinel_adapter.py]
+    policy[policy_emitter.py]
+
     main --> service
+    service --> sentinel
+    sentinel --> policy
     service --> ml
     service --> kafka
     service --> feedback
@@ -92,6 +97,12 @@ classDiagram
         +poll() List~Flow~
     }
     
+    class KafkaTelemetrySource {
+        -topic string
+        -dlq_topic string
+        +poll() List~Flow~
+    }
+    
     class FeatureAdapter {
         +extract(flow) FeatureVector
         +normalize(features) FeatureVector
@@ -99,9 +110,16 @@ classDiagram
     
     TelemetrySource <|.. FileTelemetrySource
     TelemetrySource <|.. PostgresTelemetrySource
+    TelemetrySource <|.. KafkaTelemetrySource
     DetectionPipeline --> TelemetrySource
     DetectionPipeline --> FeatureAdapter
 ```
+
+**Telemetry Input (Live):**
+- `SentinelAdapter` consumes `sentinel.verdicts.v1` (`SentinelResultEvent`).
+- `KafkaTelemetrySource` can still consume `telemetry.features.v1` for direct model paths.
+- Supports JSON and Protobuf payloads; invalid records go to DLQ.
+- Honors `feature_mask` and `feature_coverage` for missing‑feature handling.
 
 ### 3.2 Detection Engines
 
@@ -312,6 +330,12 @@ stateDiagram-v2
 
 ### 7.2 Detection Loop
 
+Integrated mode path:
+- consume `sentinel.verdicts.v1`
+- map verdict -> anomaly/policy
+- publish `ai.anomalies.v1` and `ai.policy.v1`
+- backend consensus produces `control.policy.v1` for enforcement
+
 ```mermaid
 sequenceDiagram
     participant DL as DetectionLoop
@@ -413,6 +437,8 @@ classDiagram
 | `src/feedback/tracker.py` | Lifecycle tracker | ~350 |
 | `src/feedback/calibrator.py` | Confidence calibration | ~200 |
 | `src/kafka/producer.py` | Kafka producer | ~150 |
+| `src/service/sentinel_adapter.py` | Sentinel Kafka consumer + mapper | ~450 |
+| `src/service/policy_emitter.py` | Policy contract publisher | ~250 |
 
 ---
 

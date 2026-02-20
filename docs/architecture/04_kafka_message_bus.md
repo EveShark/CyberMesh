@@ -1,9 +1,9 @@
 # Architecture 4: Kafka Message Bus
 ## Topics, Producers/Consumers, Wire Contracts, Verification
 
-**Last Updated:** 2026-01-29
+**Last Updated:** 2026-02-18
 
-This document describes how CyberMesh uses Kafka to connect the AI service, backend validators, and enforcement agent.
+This document describes how CyberMesh uses Kafka to connect the telemetry layer, AI service, backend validators, and enforcement agent.
 
 Primary code references:
 - Backend Kafka config: `backend/pkg/ingest/kafka/config.go`
@@ -14,6 +14,8 @@ Primary code references:
 - AI producer: `ai-service/src/kafka/producer.py`
 - AI consumer: `ai-service/src/kafka/consumer.py`
 - Agent Kafka client + ack publishing: `enforcement-agent/internal/kafka/*`, `enforcement-agent/internal/ack/*`
+- Sentinel gateway worker: `sentinel/sentinel/kafka/gateway.py`
+- Sentinel decode path: `sentinel/sentinel/kafka/telemetry_decoder.py`
 
 ---
 
@@ -21,30 +23,71 @@ Primary code references:
 
 Topic names are configuration-driven. The defaults referenced in code are:
 
+Note: the policy-ack topic name is configuration-driven:
+- AI: `TOPIC_CONTROL_POLICY_ACK`
+- Backend: `CONTROL_POLICY_ACK_TOPIC`
+- Enforcement agent: `ACK_TOPIC`
+Current default is `control.enforcement_ack.v1`.
+
+Control/data plane topic boundary:
+- Control plane topics:
+  - `ai.policy.v1`
+  - `control.policy.v1`
+- Data plane result topic:
+  - `control.enforcement_ack.v1`
+
+Interpretation:
+- `control.policy.v1` is the control-plane instruction stream.
+- Enforcement backends (`gateway`, `cilium`, `iptables`, `nftables`, `k8s`) are data-plane executors.
+- `control.enforcement_ack.v1` is data-plane execution feedback.
+
 ```mermaid
 graph LR
     subgraph Producers
+        TL[Telemetry Layer]
         AI[AI Service]
         BE[Backend]
         AG[Agent]
     end
 
     subgraph Topics["Kafka Topics"]
+        F1[telemetry.flow.v1]
+        F2[telemetry.flow.agg.v1]
+        F3[telemetry.features.v1]
+        F4[telemetry.deepflow.v1]
+        S1[sentinel.verdicts.v1]
+        S2[sentinel.verdicts.v1.dlq]
+        F5[pcap.request.v1]
+        F6[pcap.result.v1]
         T1[ai.anomalies.v1]
         T2[control.commits.v1]
         T3[control.policy.v1]
-        T4[control.policy.ack.v1]
+        T4[control.enforcement_ack.v1]
         DLQ[ai.dlq.v1]
     end
 
     subgraph Consumers
         BEC[Backend Validators]
-        AIC[AI Feedback]
+        AIC[AI Feedback / Sentinel Adapter]
         AGC[Agent Enforcer]
+        TLC[Telemetry Layer]
     end
 
+    TL --> F1 & F2 & F3 & F4 & F6
+    TLC --> F5
+    F3 --> AIC
+    F1 -->|Sentinel input| S1
+    S1 --> AIC
+
+    TL -->|Flows/Alerts/Features| F1 & F2 & F3 & F4
+    TL -->|PCAP Results| F6
+    TL -->|PCAP Requests| F5
+    TL -.->|via Sentinel worker| S1
+
     AI -->|Signed Anomalies| T1
+    AI -->|Signed Policy Candidates| aiPolicy[ai.policy.v1]
     T1 --> BEC
+    aiPolicy --> BEC
     
     BE -->|Commit Events| T2
     T2 --> AIC
@@ -61,9 +104,9 @@ graph LR
     classDef top fill:#fff3e0,stroke:#e65100,color:#000;
     classDef con fill:#e8f5e9,stroke:#1b5e20,color:#000;
     
-    class AI,BE,AG pro;
-    class T1,T2,T3,T4,DLQ top;
-    class BEC,AIC,AGC con;
+    class TL,AI,BE,AG pro;
+    class F1,F2,F3,F4,S1,S2,F5,F6,T1,T2,T3,T4,aiPolicy,DLQ top;
+    class BEC,AIC,AGC,TLC con;
 ```
 
 ---
@@ -110,6 +153,12 @@ The backend parses protobuf payloads into typed messages in `backend/pkg/ingest/
 - `EvidenceMsg` (ai.evidence.v1)
 - `PolicyMsg` (ai.policy.v1)
 
+### 4.1.1 Sentinel -> AI topic
+
+- `sentinel.verdicts.v1` carries `SentinelResultEvent` protobuf.
+- Produced by Sentinel gateway worker, consumed by AI Sentinel adapter.
+- Contract definition: `ai-service/proto/sentinel_result.proto`.
+
 DoS limits (enforced by schema validation and verifier):
 
 - max total message: 1MB
@@ -122,6 +171,18 @@ The backend publishes protobuf events (from `backend/proto/*`) and signs them:
 
 - `control.commits.v1` (CommitEvent)
 - `control.policy.v1` (PolicyUpdateEvent)
+
+### 4.3 Telemetry Topics
+
+Telemetry topics use canonical Protobuf schemas (JSON allowed in dev/test):
+
+- `telemetry.flow.v1` (FlowV1)
+- `telemetry.flow.agg.v1` (FlowAgg)
+- `telemetry.features.v1` (CIC v1 feature vector)
+- `telemetry.deepflow.v1` (DeepFlowV1)
+- `pcap.request.v1` / `pcap.result.v1`
+
+Schema definitions live under `telemetry-layer/proto/` with generated bindings in `telemetry-layer/proto/gen/*`.
 
 Signing domains are configurable:
 - `CONTROL_SIGNING_DOMAIN` (default: `control.commits.v1`)
@@ -164,6 +225,7 @@ When verification or processing fails, the backend can publish the raw message p
 ## 7. Related Documents
 
 - System overview: `docs/architecture/01_system_overview.md`
+- Sentinel integration: `docs/architecture/13_sentinel_integration.md`
 - AI pipeline: `docs/architecture/02_ai_detection_pipeline.md`
 - Data flow: `docs/design/DATA_FLOW.md`
-
+- Telemetry LLD: `docs/design/LLD-telemetry-layer.md`

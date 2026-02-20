@@ -2,47 +2,41 @@
 # Optimized for size and security
 
 # ============================================================
-# Stage 1: Builder (COMMENTED OUT - Using pre-built binary for speed)
+# Stage 1: Builder
 # ============================================================
-# FROM mirror.gcr.io/library/golang:1.25.1 AS builder
-#
-# WORKDIR /src
-#
-# # Add CA certificates and configure git for better network handling
-# RUN apt-get update && apt-get install -y ca-certificates git curl && \
-#     git config --global http.timeout 60 && \
-#     git config --global http.lowSpeedLimit 0 && \
-#     git config --global http.lowSpeedTime 999999 && \
-#     rm -rf /var/lib/apt/lists/*
-#
-# # Cache go modules first with fallback proxies and network timeout
-# COPY backend/go.mod backend/go.sum ./
-# ENV GOPROXY=https://proxy.golang.org,https://goproxy.io,https://goproxy.cn,direct
-# ENV GOSUMDB=sum.golang.org
-# ENV GONOPROXY=none
-# ENV GONOSUMDB=none
-# ENV GOPRIVATE=none
-# RUN timeout 600 go mod download || \
-#     (echo "Retrying with direct proxy..." && \
-#      GOPROXY=direct GOSUMDB=off timeout 300 go mod download)
-#
-# # Copy only necessary directories
-# COPY backend/cmd/ ./cmd/
-# COPY backend/pkg/ ./pkg/
-# COPY backend/proto/ ./proto/
-#
-# # Update dependencies to ensure compatibility
-# RUN go mod tidy
-#
-# # Build static binary for Linux AMD64
-# ENV CGO_ENABLED=0
-# ENV GOOS=linux
-# ENV GOARCH=amd64
-# RUN go build \
-#     -ldflags="-s -w -X main.version=1.0.0 -X main.buildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-#     -trimpath \
-#     -o /out/cybermesh \
-#     ./cmd/cybermesh
+FROM mirror.gcr.io/library/golang:1.25 AS builder
+
+WORKDIR /src
+
+# Add CA certificates and configure git for network handling
+RUN apt-get update && apt-get install -y ca-certificates git curl && \
+    git config --global http.timeout 60 && \
+    git config --global http.lowSpeedLimit 0 && \
+    git config --global http.lowSpeedTime 999999 && \
+    rm -rf /var/lib/apt/lists/*
+
+# Cache go modules first with fallback proxies
+COPY backend/go.mod backend/go.sum ./
+ENV GOPROXY=https://proxy.golang.org,https://goproxy.io,https://goproxy.cn,direct
+ENV GOSUMDB=sum.golang.org
+RUN timeout 600 go mod download || \
+    (echo "Retrying with direct proxy..." && \
+     GOPROXY=direct GOSUMDB=off timeout 300 go mod download)
+
+# Copy source code
+COPY backend/cmd/ ./cmd/
+COPY backend/pkg/ ./pkg/
+COPY backend/proto/ ./proto/
+
+# Build static binary for Linux AMD64
+ENV CGO_ENABLED=0
+ENV GOOS=linux
+ENV GOARCH=amd64
+RUN go build \
+    -ldflags="-s -w -X main.version=1.0.0 -X main.buildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    -trimpath \
+    -o /out/cybermesh \
+    ./cmd/cybermesh
 
 # ============================================================
 # Stage 2: Runtime
@@ -60,9 +54,8 @@ RUN groupadd -g 1000 cybermesh && \
 
 WORKDIR /app
 
-# Copy pre-built binary directly (Using local binary for faster builds)
-# COPY --from=builder --chown=cybermesh:cybermesh /out/cybermesh ./cybermesh
-COPY --chown=cybermesh:cybermesh backend/bin/cybermesh ./cybermesh
+# Copy binary from builder stage
+COPY --from=builder --chown=cybermesh:cybermesh /out/cybermesh ./cybermesh
 RUN chmod +x ./cybermesh
 
 # Create directories for runtime mounts

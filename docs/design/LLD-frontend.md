@@ -1,7 +1,7 @@
 # CyberMesh Frontend - Low-Level Design (LLD)
 
-**Version:** 2.0.0  
-**Last Updated:** 2026-01-30
+**Version:** 1
+**Last Updated:** 2026-02-05
 
 ---
 
@@ -29,12 +29,12 @@ The Frontend is a **React/TypeScript dashboard** for monitoring CyberMesh threat
 
 | Layer | Technology |
 |-------|------------|
-| Framework | React 18 ✅ |
+| Framework | React 18  |
 | Language | TypeScript |
-| Build | Vite ⚡ |
-| Styling | TailwindCSS 🎨 |
+| Build | Vite  |
+| Styling | TailwindCSS  |
 | State | React Query |
-| Charts | Recharts 📊 |
+| Charts | Recharts  |
 | HTTP | fetch (typed client) |
 
 ---
@@ -72,14 +72,14 @@ graph TB
 | Path | Page | Description |
 |------|------|-------------|
 | `/` | Index | Landing / entry |
-| `/dashboard` | Dashboard | Overview metrics 📊 |
-| `/ai-engine` | AI Engine | AI engine status 🤖 |
-| `/threats` | Threats | Threat list 🚨 |
-| `/blockchain` | Blockchain | Ledger / block views ⛓️ |
-| `/network` | Network | Network topology 🌐 |
-| `/system-health` | System Health | Health + readiness ✅ |
-| `/settings` | Settings | Configuration ⚙️ |
-| `/404` | NotFound | Not found ❌ |
+| `/dashboard` | Dashboard | Overview metrics  |
+| `/ai-engine` | AI Engine | AI engine status  |
+| `/threats` | Threats | Threat list  |
+| `/blockchain` | Blockchain | Ledger / block views  |
+| `/network` | Network | Network topology  |
+| `/system-health` | System Health | Health + readiness  |
+| `/settings` | Settings | Configuration  |
+| `/404` | NotFound | Not found  |
 
 ### 4.2 Page Flow
 

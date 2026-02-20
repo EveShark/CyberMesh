@@ -1,8 +1,12 @@
 # CyberMesh Architecture Portal
 
-**Version:** 2.1.0 | **Last Updated:** 2026-01-29
+**Version:** 1 | **Last Updated:** 2026-02-20
 
 Welcome to **CyberMesh**, a distributed threat detection and response platform that combines real-time AI anomaly detection with BFT consensus.
+
+Control-plane and data-plane split:
+- Control plane: `Telemetry/Sentinel/AI/Backend` decide and authorize policy.
+- Data plane: enforcement backends (`gateway`, `cilium`, `iptables`, `nftables`, `k8s`) apply network controls and publish ACK.
 
 ---
 
@@ -16,16 +20,23 @@ graph TD
     end
 
     subgraph CyberMesh["CyberMesh Platform"]
+        TL[("Telemetry Layer\n(Go + Python)")]
         AI[("AI Service\n(Python)")]
+        S[("Sentinel\n(Multi-agent Layer)")]
         Kafka{{"Kafka\n(Message Bus)"}}
         BE[("Backend Validators\n(Go / HotStuff BFT)")]
         DB[("CockroachDB\n(Persistence)")]
-        Agent[("Enforcement Agent\n(Go / ebpf)")]
+        Agent[("Enforcement Agent\n(Go Policy Enforcer)")]
         UI["Frontend\n(React)"]
     end
-
-    N -->|Flows| AI
-    AI -->|Anomalies| Kafka
+    
+    N -->|Flows/Alerts| TL
+    TL -->|Flows| Kafka
+    Kafka -->|telemetry.flow.v1| S
+    S -->|sentinel.verdicts.v1| Kafka
+    Kafka -->|telemetry.features.v1| AI
+    Kafka -->|sentinel.verdicts.v1| AI
+    AI -->|Anomalies/Policy| Kafka
     Kafka -->|Blocks| BE
     BE <-->|State| DB
     BE -->|Policy| Kafka
@@ -35,10 +46,12 @@ graph TD
 
     classDef python fill:#3776ab,stroke:#fff,stroke-width:2px,color:#fff;
     classDef go fill:#00add8,stroke:#fff,stroke-width:2px,color:#fff;
+    classDef polyglot fill:#4f46e5,stroke:#fff,stroke-width:2px,color:#fff;
     classDef react fill:#61dafb,stroke:#fff,stroke-width:2px,color:#000;
     classDef infra fill:#e4e4e4,stroke:#333,stroke-width:2px,color:#333;
 
-    class AI python;
+    class AI,S python;
+    class TL polyglot;
     class BE,Agent go;
     class UI react;
     class Kafka,DB infra;
@@ -52,10 +65,11 @@ Choose your path based on your role or goal:
 
 ### 🚀 I want the "Big Picture"
 *   **[System Overview](architecture/01_system_overview.md)**: Start here. The end-to-end story of a packet becoming a policy.
+*   **[Sentinel Integration](architecture/13_sentinel_integration.md)**: How telemetry is analyzed by Sentinel before AI/backend/enforcement.
 *   **[System Timeline](architecture/11_system_timeline.md)**: Understand the "heartbeat" of the system (timings, latencies).
 
 ### 🧠 I am an AI / ML Engineer
-*   **[AI Detection Pipeline](architecture/02_ai_detection_pipeline.md)**: How we extract 79 features and run 3 detection engines.
+*   **[AI Detection Pipeline](architecture/02_ai_detection_pipeline.md)**: How we consume CIC features and run 3 detection engines.
 *   **[Feedback Loop](architecture/06_feedback_loop.md)**: How the system learns from validator feedback.
 
 ### ⛓️ I am a Blockchain / Backend Engineer
@@ -75,4 +89,6 @@ Choose your path based on your role or goal:
 
 For a flat list of all architecture and design documents, see the **[Architecture Index](ARCHITECTURE_INDEX.md)**.
 
+For quick developer/operator navigation, see **[Docs Map](DOCS_MAP.md)**.
 
+For release-readiness criteria, see **[Definition Of Done](DEFINITION_OF_DONE.md)**.

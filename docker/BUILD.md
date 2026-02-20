@@ -190,9 +190,11 @@ B:\CyberMesh/
 │   │   └── Dockerfile              # Backend build (uses backend/bin/cybermesh)
 │   ├── frontend/
 │   │   └── Dockerfile              # Frontend build (uses frontend/)
-│   └── ai-service/
-│       ├── Dockerfile              # AI service build (uses ai-service/)
-│       └── entrypoint.sh           # AI service entrypoint
+│   ├── ai-service/
+│   │   └── Dockerfile              # AI service build (uses ai-service/)
+│   └── scrits/
+│       └── ai-service/
+│           └── entrypoint.sh       # AI service entrypoint
 │
 ├── backend/
 │   └── bin/
@@ -258,6 +260,64 @@ Then update K8s manifests:
 
 ```yaml
 image: asia-southeast1-docker.pkg.dev/cybermesh-476310/cybermesh-repo/cybermesh-backend:v1.0.3
+```
+
+---
+
+## Telemetry Images
+
+Telemetry uses 6 custom images:
+
+- `telemetry-bridge`
+- `telemetry-stream-processor`
+- `telemetry-gateway-adapter`
+- `telemetry-baremetal-adapter`
+- `telemetry-cloudlogs-adapter`
+- `telemetry-feature-transformer`
+
+All telemetry builds run from project root and use Dockerfiles in `docker/telemetry/`.
+
+### Build Go-based telemetry images
+
+```powershell
+$REGISTRY = "asia-southeast1-docker.pkg.dev/cybermesh-476310/cybermesh-repo"
+
+docker build -f docker/telemetry/go-component/Dockerfile `
+  --build-arg MODULE_DIR=ingest-bridge_Go `
+  --build-arg CMD_PATH=./cmd/bridge `
+  --build-arg BIN_NAME=telemetry-bridge `
+  -t "$REGISTRY/telemetry-bridge:latest" .
+
+docker build -f docker/telemetry/go-component/Dockerfile `
+  --build-arg MODULE_DIR=stream-processor `
+  --build-arg CMD_PATH=./cmd/processor `
+  --build-arg BIN_NAME=telemetry-stream-processor `
+  -t "$REGISTRY/telemetry-stream-processor:latest" .
+
+docker build -f docker/telemetry/go-component/Dockerfile `
+  --build-arg MODULE_DIR=adapters `
+  --build-arg CMD_PATH=./cmd/gateway `
+  --build-arg BIN_NAME=telemetry-gateway-adapter `
+  -t "$REGISTRY/telemetry-gateway-adapter:latest" .
+
+docker build -f docker/telemetry/go-component/Dockerfile `
+  --build-arg MODULE_DIR=adapters `
+  --build-arg CMD_PATH=./cmd/baremetal `
+  --build-arg BIN_NAME=telemetry-baremetal-adapter `
+  -t "$REGISTRY/telemetry-baremetal-adapter:latest" .
+
+docker build -f docker/telemetry/go-component/Dockerfile `
+  --build-arg MODULE_DIR=adapters `
+  --build-arg CMD_PATH=./cmd/cloudlogs `
+  --build-arg BIN_NAME=telemetry-cloudlogs-adapter `
+  -t "$REGISTRY/telemetry-cloudlogs-adapter:latest" .
+```
+
+### Build Python feature transformer image
+
+```powershell
+docker build -f docker/telemetry/feature-transformer/Dockerfile `
+  -t "$REGISTRY/telemetry-feature-transformer:latest" .
 ```
 
 ### Clean Old Images

@@ -1,18 +1,21 @@
 # Architecture 2: AI Detection Pipeline
 ## 3-Engine Detection Service (Actual Implementation)
 
-**Last Updated:** 2026-01-29
+**Last Updated:** 2026-02-18
 
-This document describes how the AI Service polls telemetry, runs detections, and publishes signed messages to Kafka.
+This document describes how the AI Service consumes telemetry features, runs detections, and publishes signed messages to Kafka.
 
 Primary code references:
 - `ai-service/src/service/detection_loop.py` (background loop + publish gating)
 - `ai-service/src/ml/pipeline.py` (DetectionPipeline.process + instrumentation)
 - `ai-service/src/ml/telemetry.py` (TelemetrySource + FileTelemetrySource)
+- `ai-service/src/ml/telemetry_kafka.py` (KafkaTelemetrySource)
 - `ai-service/src/ml/detectors.py` (RulesEngine, MathEngine, MLEngine)
 - `ai-service/src/ml/ensemble.py` (EnsembleVoter)
 - `ai-service/src/kafka/producer.py` (Kafka producer config + publish methods)
 - `ai-service/src/utils/nonce.py` (nonce format)
+- `ai-service/src/service/sentinel_adapter.py` (Sentinel verdict ingest path)
+- `ai-service/src/service/policy_emitter.py` (policy candidate build)
 
 ---
 
@@ -40,7 +43,7 @@ flows = telemetry.get_network_flows(limit=limit)
 Stages are instrumented with `time.perf_counter()` and returned as an `InstrumentedResult`:
 
 1. Telemetry load
-2. Feature extraction (unified 79-feature path)
+2. Feature normalization (CIC v1 inputs)
 3. Engine inference (Rules/Math/ML)
 4. Ensemble voting
 5. Evidence generation (only when publishing)
@@ -48,7 +51,7 @@ Stages are instrumented with `time.perf_counter()` and returned as an `Instrumen
 ```mermaid
 graph TD
     subgraph Input
-        T[Telemetry Batch] -->|Files/DNS| FE[Feature Extractor]
+        T[Telemetry Features] -->|Kafka| FE[Feature Adapter]
     end
 
     subgraph Engineering["Feature Engineering"]
@@ -89,7 +92,12 @@ Notes:
 
 `TelemetrySource` is an interface with `get_network_flows(limit)` and `get_files(limit)`.
 
-The default implementation used for Phase 6.1 is `FileTelemetrySource`:
+The default live implementation is `KafkaTelemetrySource`:
+
+- Consumes `telemetry.features.v1` (JSON or Protobuf).
+- Enforces required fields + optional feature coverage thresholds.
+
+`FileTelemetrySource` remains available for offline/testing:
 
 - Searches JSON files under:
   - `flows/benign/*.json`, `flows/ddos/*.json`, `flows/*.json`
@@ -121,5 +129,29 @@ Important: idempotent producer settings reduce duplicates at the Kafka producer 
 
 - System overview: `docs/architecture/01_system_overview.md`
 - Kafka bus details: `docs/architecture/04_kafka_message_bus.md`
+- Sentinel integration: `docs/architecture/13_sentinel_integration.md`
 - AI service LLD: `docs/design/LLD-ai-service.md`
+- Telemetry Layer LLD: `docs/design/LLD-telemetry-layer.md`
 
+---
+
+## 6. Sentinel Adapter Path (Integrated Runtime)
+
+In integrated mode, AI service has a second ingest path in addition to `telemetry.features.v1`:
+
+```mermaid
+flowchart LR
+    S[Sentinel verdict topic<br/>sentinel.verdicts.v1] --> A[SentinelKafkaAdapter]
+    A --> P1[publish_anomaly]
+    A --> P2[build_policy_candidate + publish_policy_violation]
+    P1 --> K1[(ai.anomalies.v1)]
+    P2 --> K2[(ai.policy.v1)]
+```
+
+Behavior summary:
+- High-risk Sentinel verdicts are mapped to anomaly messages.
+- Policy publish is gated by adapter + policy settings:
+  - `SENTINEL_ADAPTER_ENABLED=true`
+  - `SENTINEL_ADAPTER_MODE=prod`
+  - `SENTINEL_POLICY_ENABLED=true`
+- Target extraction for policy routing comes from Sentinel verdict context/findings.

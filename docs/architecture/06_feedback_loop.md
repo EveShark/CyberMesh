@@ -1,7 +1,7 @@
 # Architecture 6: Feedback Loop
 ## Lifecycle Tracking, Acceptance Metrics, Calibration, Threshold Adjustment (AI Service)
 
-**Last Updated:** 2026-01-29
+**Last Updated:** 2026-02-14
 
 This document describes the AI service "feedback loop": how it tracks anomaly lifecycles (detected -> published -> committed/rejected/etc) and uses those metrics to drive calibration and threshold adjustments.
 
@@ -133,7 +133,7 @@ Models can be saved to:
 The tracker has fields and methods to record policy dispatch and policy ACK results/latencies.
 
 In the current architecture:
-- the enforcement agent may publish ACKs to `control.policy.ack.v1`
+- the enforcement agent publishes ACKs to a config-driven topic; default is `control.enforcement_ack.v1`
 - the AI service may consume those ACKs and record outcomes via `record_policy_ack`
 
 ---
@@ -143,4 +143,3 @@ In the current architecture:
 - AI pipeline: `docs/architecture/02_ai_detection_pipeline.md`
 - Kafka bus: `docs/architecture/04_kafka_message_bus.md`
 - Data flow: `docs/design/DATA_FLOW.md`
-

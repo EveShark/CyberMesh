@@ -1,7 +1,7 @@
 # Architecture 1: System Overview
 ## End-to-End Pipeline (Code-Backed)
 
-**Last Updated:** 2026-01-29
+**Last Updated:** 2026-02-18
 
 This document describes the CyberMesh system at the "whole product" level: what each major component does and how data moves through the system from telemetry to enforcement.
 
@@ -11,29 +11,65 @@ This document describes the CyberMesh system at the "whole product" level: what 
 
 ### 1.1 AI Service (Python)
 
-- Polls telemetry in batches (default `TELEMETRY_BATCH_SIZE=1000` flows per poll).
-- Extracts a fixed feature vector (79 features) and runs a 3-engine detection pipeline (Rules + Math + ML).
+- Consumes feature vectors from Kafka (`telemetry.features.v1`).
+- Consumes Sentinel verdicts from Kafka (`sentinel.verdicts.v1`) through Sentinel adapter.
+- Normalizes features and runs a 3-engine detection pipeline (Rules + Math + ML).
 - Produces signed protobuf messages to Kafka topics (at minimum `ai.anomalies.v1`).
 
 Primary code references:
 - `ai-service/src/service/detection_loop.py`
 - `ai-service/src/ml/pipeline.py`
 - `ai-service/src/ml/feature_adapter.py`
+- `ai-service/src/ml/telemetry_kafka.py`
 - `ai-service/src/kafka/producer.py`
 - `ai-service/src/utils/nonce.py`
+- `ai-service/src/service/sentinel_adapter.py`
+- `ai-service/src/service/policy_emitter.py`
+
+### 1.1.1 Sentinel (Python)
+
+- Consumes flow telemetry from Kafka (`telemetry.flow.v1`).
+- Decodes flow protobuf (`FlowV1`) into canonical events.
+- Runs orchestrator/agents and publishes verdicts to `sentinel.verdicts.v1`.
+- Routes decode/validation/analyze failures to `sentinel.verdicts.v1.dlq`.
+
+Primary code references:
+- `sentinel/sentinel/kafka/gateway.py`
+- `sentinel/sentinel/kafka/telemetry_decoder.py`
+- `sentinel/sentinel/agents/orchestrator.py`
+- `k8s_azure/sentinel/sentinel-kafka-ai-integration-job.yaml`
+
+### 1.1.2 Telemetry Layer (Go + Python)
+
+- Ingests network telemetry (flows/alerts/PCAP requests).
+- Aggregates and normalizes flows into canonical schema.
+- Generates CIC feature vectors and publishes to Kafka.
+
+Primary code references:
+- `telemetry-layer/stream-processor/`
+- `telemetry-layer/feature-transformer_python/`
+- `telemetry-layer/adapters/`
+- `telemetry-layer/pcap-service/`
 
 ### 1.2 Kafka (Message Bus)
 
 Kafka decouples producers (AI Service, Backend, Enforcement Agent) from consumers (Backend, AI Service, Enforcement Agent).
 
-Topic names are environment/config driven, but the default/expected topics in code are:
+Topic names are environment/config driven. Defaults include:
 
+- `telemetry.flow.v1` (Telemetry -> Telemetry)
+- `telemetry.flow.agg.v1` (Telemetry -> Telemetry)
+- `telemetry.features.v1` (Telemetry -> AI)
+- `sentinel.verdicts.v1` (Sentinel -> AI)
+- `telemetry.deepflow.v1` (Telemetry -> Telemetry)
+- `pcap.request.v1` (Backend/AI/Ops -> Telemetry)
+- `pcap.result.v1` (Telemetry -> Backend/AI/Ops)
 - `ai.anomalies.v1` (AI -> Backend)
 - `ai.evidence.v1` (AI -> Backend, optional depending on configuration)
 - `ai.policy.v1` (AI -> Backend, optional depending on configuration)
 - `control.commits.v1` (Backend -> AI)
 - `control.policy.v1` (Backend -> Enforcement Agent)
-- `control.policy.ack.v1` (Enforcement Agent -> AI, optional)
+- `control.enforcement_ack.v1` (Enforcement Agent -> AI, optional; configurable via `TOPIC_CONTROL_POLICY_ACK`)
 - `ai.dlq.v1` (Backend consumer DLQ)
 
 ### 1.3 Backend Validators (Go)
@@ -64,14 +100,30 @@ Primary code references:
 
 - Consumes `control.policy.v1` from Kafka.
 - Verifies signature and parses the policy spec.
-- Applies enforcement using a configured backend (iptables, nftables, Kubernetes NetworkPolicy, or noop).
-- Optionally publishes policy acknowledgements to `control.policy.ack.v1` for the AI Service to consume.
+- Applies enforcement using a configured backend (cilium, gateway, iptables, nftables, kubernetes/k8s, or noop).
+- Optionally publishes policy acknowledgements for AI feedback.
+  - Topic name is config-driven via `TOPIC_CONTROL_POLICY_ACK` (AI), `CONTROL_POLICY_ACK_TOPIC` (backend), and `ACK_TOPIC` (agent). Current default is `control.enforcement_ack.v1`.
 
 Primary code references:
 - `enforcement-agent/internal/controller/*`
 - `enforcement-agent/internal/enforcer/*`
 - `enforcement-agent/internal/kafka/*`
 - `enforcement-agent/internal/ack/*`
+
+### 1.5.1 Enforcement Plane Model (L3/L4)
+
+Control plane path:
+- `AI -> Backend -> control.policy.v1`
+- backend consensus is the authorization gate before enforcement
+
+Data plane path:
+- Enforcement agent consumes `control.policy.v1`
+- selects backend (`cilium`, `gateway`, `iptables`, `nftables`, `k8s`, `noop`)
+- applies L3/L4 controls and emits ACK on `control.enforcement_ack.v1`
+
+Traffic scope guidance:
+- East-West: `cilium`/`k8s` primary, host firewall fallback (`iptables`/`nftables`)
+- North-South: `gateway` primary, host firewall guardrails where needed
 
 ### 1.6 Frontend (React/TypeScript)
 
@@ -92,20 +144,30 @@ The following sequence diagram illustrates the lifecycle of a threat detection, 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Telemetry as Data Sources
-    participant AI as AI Service
-    participant Kafka as Kafka Cluster
-    participant Backend as Backend Validator
-    participant DB as CockroachDB
-    participant Agent as Enforcement Agent
+    participant Telemetry as "Data Sources"
+    participant TL as "Telemetry Layer"
+    participant Kafka as "Kafka Cluster"
+    participant Sentinel as "Sentinel"
+    participant AI as "AI Service"
+    participant Backend as "Backend Validator"
+    participant DB as "CockroachDB"
+    participant Agent as "Enforcement Agent"
 
     %% Phase 1: Detection
-    Telemetry->>AI: Batch Data (Files/DNS/Logs)
+    Telemetry->>TL: Flows/Alerts/PCAP Requests
+    TL->>Kafka: telemetry.flow.v1 + telemetry.deepflow.v1
+    TL->>Kafka: telemetry.flow.agg.v1 + telemetry.features.v1
+    Kafka->>Sentinel: telemetry.flow.v1
+    Sentinel->>Sentinel: decode + analyze
+    Sentinel-->>Kafka: sentinel.verdicts.v1
     activate AI
-    AI->>AI: Extract 79 Features
+    Kafka->>AI: telemetry.features.v1
+    Kafka->>AI: sentinel.verdicts.v1
+    AI->>AI: Normalize Features
     AI->>AI: Run 3 Engines (Rules, Math, ML)
     AI->>AI: Ensemble Vote & Sign (Ed25519)
-    AI-->>Kafka: Publish to 'ai.anomalies.v1'
+    AI-->>Kafka: Publish ai.anomalies.v1
+    AI-->>Kafka: Publish ai.policy.v1 when policy candidate exists
     deactivate AI
 
     %% Phase 2: Consensus
@@ -116,8 +178,8 @@ sequenceDiagram
     Backend->>Backend: Core Consensus (Proposal -> Vote -> QC)
     Backend->>Backend: Execute State Machine
     Backend->>DB: Persist Block & State
-    Backend-->>Kafka: Publish 'control.commits.v1'
-    Backend-->>Kafka: Publish 'control.policy.v1'
+    Backend-->>Kafka: Publish control.commits.v1
+    Backend-->>Kafka: Publish control.policy.v1
     deactivate Backend
 
     %% Phase 3: Enforcement & Feedback
@@ -125,8 +187,8 @@ sequenceDiagram
         Kafka-->>Agent: Consume Policy
         activate Agent
         Agent->>Agent: Verify & Parse
-        Agent->>Agent: Apply Rules (iptables/k8s)
-        Agent-->>Kafka: Publish 'control.policy.ack.v1'
+        Agent->>Agent: Apply Rules via cilium, gateway, iptables, nftables, or k8s
+        Agent-->>Kafka: Publish control.enforcement_ack.v1
         deactivate Agent
     and Feedback
         Kafka-->>AI: Consume Commit/Ack
@@ -150,8 +212,9 @@ sequenceDiagram
 
 - High-level design: `docs/design/HLD.md`
 - Full end-to-end sequences: `docs/design/DATA_FLOW.md`
+- Sentinel integration architecture: `docs/architecture/13_sentinel_integration.md`
 - Backend LLD: `docs/design/LLD-backend.md`
 - AI service LLD: `docs/design/LLD-ai-service.md`
+- Telemetry Layer LLD: `docs/design/LLD-telemetry-layer.md`
 - Enforcement agent LLD: `docs/design/LLD-enforcement-agent.md`
 - Frontend LLD: `docs/design/LLD-frontend.md`
-
