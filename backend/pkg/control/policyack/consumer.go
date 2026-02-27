@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"backend/pkg/utils"
@@ -15,17 +16,58 @@ import (
 )
 
 type Consumer struct {
-	cfg    Config
-	store  *Store
-	trust  *TrustedKeys
-	log    *utils.Logger
-	audit  *utils.AuditLogger
+	cfg         Config
+	store       *Store
+	trust       *TrustedKeys
+	log         *utils.Logger
+	audit       *utils.AuditLogger
 	dlqProducer sarama.SyncProducer
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
 
 	cg sarama.ConsumerGroup
+
+	processedTotal          atomic.Uint64
+	rejectedTotal           atomic.Uint64
+	storeRetryAttempts      atomic.Uint64
+	storeRetryExhausted     atomic.Uint64
+	dlqPublishedTotal       atomic.Uint64
+	dlqPublishFailures      atomic.Uint64
+	loopErrors              atomic.Uint64
+	workQueueWaits          atomic.Uint64
+	softThrottleActivations atomic.Uint64
+	transientFailureStreak  atomic.Uint64
+	logsThrottled           atomic.Uint64
+	lastLoopErrLogNs        int64
+	lastStoreWarnLogNs      int64
+	lastRejectLogNs         int64
+	lastDLQErrLogNs         int64
+}
+
+type ConsumerStats struct {
+	ProcessedTotal          uint64
+	RejectedTotal           uint64
+	StoreRetryAttempts      uint64
+	StoreRetryExhausted     uint64
+	DLQPublishedTotal       uint64
+	DLQPublishFailures      uint64
+	LoopErrors              uint64
+	WorkQueueWaits          uint64
+	SoftThrottleActivations uint64
+	LogsThrottled           uint64
+}
+
+type CausalStats struct {
+	SkewCorrectionsTotal uint64
+	AIToAckBuckets       []utils.HistogramBucket
+	AIToAckCount         uint64
+	AIToAckSumMs         float64
+	AIToAckP95Ms         float64
+	PublishToAckBuckets  []utils.HistogramBucket
+	PublishToAckCount    uint64
+	PublishToAckSumMs    float64
+	PublishToAckP95Ms    float64
 }
 
 type Options struct {
@@ -53,15 +95,15 @@ func New(ctx context.Context, group sarama.ConsumerGroup, opts Options) (*Consum
 
 	cctx, cancel := context.WithCancel(ctx)
 	return &Consumer{
-		cfg:    opts.Config,
-		store:  opts.Store,
-		trust:  opts.Trust,
-		log:    opts.Logger,
-		audit:  opts.Audit,
+		cfg:         opts.Config,
+		store:       opts.Store,
+		trust:       opts.Trust,
+		log:         opts.Logger,
+		audit:       opts.Audit,
 		dlqProducer: opts.DLQ,
-		ctx:    cctx,
-		cancel: cancel,
-		cg:     group,
+		ctx:         cctx,
+		cancel:      cancel,
+		cg:          group,
 	}, nil
 }
 
@@ -98,7 +140,8 @@ func (c *Consumer) loop() {
 			if errors.Is(err, sarama.ErrClosedConsumerGroup) {
 				return
 			}
-			if c.log != nil {
+			c.loopErrors.Add(1)
+			if c.log != nil && c.shouldLog(&c.lastLoopErrLogNs) {
 				c.log.ErrorContext(c.ctx, "policy ack consumer error, retrying",
 					utils.ZapError(err),
 					utils.ZapString("topic", c.cfg.Topic))
@@ -124,23 +167,102 @@ func (h *handler) Setup(sarama.ConsumerGroupSession) error   { return nil }
 func (h *handler) Cleanup(sarama.ConsumerGroupSession) error { return nil }
 
 func (h *handler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+	workers := h.c.cfg.Workers
+	if workers <= 0 {
+		workers = 1
+	}
+	queueSize := h.c.cfg.WorkQueueSize
+	if queueSize <= 0 {
+		queueSize = workers * 64
+	}
+
+	type workItem struct {
+		msg *sarama.ConsumerMessage
+	}
+	workCh := make(chan workItem, queueSize)
+	errCh := make(chan error, 1)
+	ctx, cancel := context.WithCancel(sess.Context())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	workerFn := func() {
+		defer wg.Done()
+		for item := range workCh {
+			if item.msg == nil {
+				continue
+			}
+			err := h.c.process(ctx, item.msg)
+			if err == nil {
+				sess.MarkMessage(item.msg, "")
+				continue
+			}
+			if errors.Is(err, errPermanent) {
+				sess.MarkMessage(item.msg, "")
+				continue
+			}
+			select {
+			case errCh <- err:
+			default:
+			}
+			if h.c.cfg.SoftThrottleEnabled {
+				streak := h.c.transientFailureStreak.Add(1)
+				if int(streak) >= h.c.cfg.SoftThrottleWindow && h.c.cfg.SoftThrottleSleep > 0 {
+					h.c.softThrottleActivations.Add(1)
+					select {
+					case <-time.After(h.c.cfg.SoftThrottleSleep):
+					case <-ctx.Done():
+					}
+				}
+			}
+			cancel()
+			return
+		}
+	}
+
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go workerFn()
+	}
+	defer func() {
+		close(workCh)
+		wg.Wait()
+	}()
+
 	for {
 		select {
-		case <-sess.Context().Done():
-			return nil
+		case <-ctx.Done():
+			select {
+			case err := <-errCh:
+				return err
+			default:
+				return nil
+			}
 		case msg := <-claim.Messages():
 			if msg == nil {
 				return nil
 			}
-			if err := h.c.process(sess.Context(), msg); err != nil {
-				// Permanent errors are DLQ'ed and marked. Transient errors return error to trigger retry.
-				if errors.Is(err, errPermanent) {
-					sess.MarkMessage(msg, "")
-					continue
-				}
-				return err
+			queued := false
+			select {
+			case workCh <- workItem{msg: msg}:
+				queued = true
+			default:
+				h.c.workQueueWaits.Add(1)
 			}
-			sess.MarkMessage(msg, "")
+			if queued {
+				continue
+			}
+			select {
+			case workCh <- workItem{msg: msg}:
+			case err := <-errCh:
+				return err
+			case <-ctx.Done():
+				select {
+				case err := <-errCh:
+					return err
+				default:
+					return nil
+				}
+			}
 		}
 	}
 }
@@ -150,17 +272,45 @@ var errPermanent = errors.New("permanent")
 func (c *Consumer) process(ctx context.Context, msg *sarama.ConsumerMessage) error {
 	var ack pb.PolicyAckEvent
 	if err := proto.Unmarshal(msg.Value, &ack); err != nil {
+		c.rejectedTotal.Add(1)
 		c.sendDLQ(ctx, msg, "unmarshal_failed", err)
 		return fmt.Errorf("%w: policy ack unmarshal: %v", errPermanent, err)
 	}
 
 	if strings.TrimSpace(ack.PolicyId) == "" || strings.TrimSpace(ack.ControllerInstance) == "" {
+		c.rejectedTotal.Add(1)
 		c.sendDLQ(ctx, msg, "invalid_required_fields", fmt.Errorf("policy_id/controller_instance required"))
 		return fmt.Errorf("%w: invalid required fields", errPermanent)
+	}
+	if c.cfg.RequireQCRef && strings.TrimSpace(ack.QcReference) == "" {
+		c.rejectedTotal.Add(1)
+		c.sendDLQ(ctx, msg, "missing_qc_reference", fmt.Errorf("qc_reference required"))
+		return fmt.Errorf("%w: missing qc_reference", errPermanent)
+	}
+	if c.cfg.RequireRuleHash && len(ack.RuleHash) == 0 {
+		c.rejectedTotal.Add(1)
+		c.sendDLQ(ctx, msg, "missing_rule_hash", fmt.Errorf("rule_hash required"))
+		return fmt.Errorf("%w: missing rule_hash", errPermanent)
+	}
+	if len(ack.RuleHash) > 0 && len(ack.RuleHash) != 32 {
+		c.rejectedTotal.Add(1)
+		c.sendDLQ(ctx, msg, "invalid_rule_hash_size", fmt.Errorf("rule_hash must be 32 bytes"))
+		return fmt.Errorf("%w: invalid rule_hash size", errPermanent)
+	}
+	if c.cfg.RequireProducer && len(ack.ProducerId) == 0 {
+		c.rejectedTotal.Add(1)
+		c.sendDLQ(ctx, msg, "missing_producer_id", fmt.Errorf("producer_id required"))
+		return fmt.Errorf("%w: missing producer_id", errPermanent)
+	}
+	if len(ack.ProducerId) > 0 && len(ack.ProducerId) != 32 {
+		c.rejectedTotal.Add(1)
+		c.sendDLQ(ctx, msg, "invalid_producer_id_size", fmt.Errorf("producer_id must be 32 bytes"))
+		return fmt.Errorf("%w: invalid producer_id size", errPermanent)
 	}
 
 	res := strings.ToLower(strings.TrimSpace(ack.Result))
 	if res != "applied" && res != "failed" {
+		c.rejectedTotal.Add(1)
 		c.sendDLQ(ctx, msg, "invalid_result", fmt.Errorf("result=%q", ack.Result))
 		return fmt.Errorf("%w: invalid result", errPermanent)
 	}
@@ -170,15 +320,18 @@ func (c *Consumer) process(ctx context.Context, msg *sarama.ConsumerMessage) err
 	algo := strings.ToLower(string(header(msg.Headers, "ack-signature-alg")))
 	if len(sig) == 0 {
 		if c.cfg.SigningRequired {
+			c.rejectedTotal.Add(1)
 			c.sendDLQ(ctx, msg, "missing_signature", fmt.Errorf("ack-signature header missing"))
 			return fmt.Errorf("%w: signature required", errPermanent)
 		}
 	} else {
 		if algo != "" && algo != "ed25519" {
+			c.rejectedTotal.Add(1)
 			c.sendDLQ(ctx, msg, "unsupported_signature_alg", fmt.Errorf("alg=%q", algo))
 			return fmt.Errorf("%w: unsupported signature alg", errPermanent)
 		}
 		if c.trust == nil || !c.trust.Verify(msg.Value, sig) {
+			c.rejectedTotal.Add(1)
 			c.sendDLQ(ctx, msg, "signature_verify_failed", fmt.Errorf("verify failed"))
 			return fmt.Errorf("%w: signature verify failed", errPermanent)
 		}
@@ -190,7 +343,8 @@ func (c *Consumer) process(ctx context.Context, msg *sarama.ConsumerMessage) err
 	for attempt := 1; attempt <= c.cfg.StoreRetryMax; attempt++ {
 		if err := c.store.Upsert(ctx, &ack, time.Now().UTC()); err != nil {
 			last = err
-			if c.log != nil {
+			c.storeRetryAttempts.Add(1)
+			if c.log != nil && c.shouldLog(&c.lastStoreWarnLogNs) {
 				c.log.WarnContext(ctx, "policy ack store failed; retrying",
 					utils.ZapInt("attempt", attempt),
 					utils.ZapDuration("backoff", backoff),
@@ -205,25 +359,28 @@ func (c *Consumer) process(ctx context.Context, msg *sarama.ConsumerMessage) err
 			backoff *= 2
 			continue
 		}
+		c.processedTotal.Add(1)
+		c.transientFailureStreak.Store(0)
 		if c.audit != nil {
 			_ = c.audit.Info("policy_ack_persisted", map[string]interface{}{
-				"policy_id":            ack.PolicyId,
-				"controller_instance":  ack.ControllerInstance,
-				"result":               ack.Result,
-				"error_code":           ack.ErrorCode,
-				"fast_path":            ack.FastPath,
-				"ack_topic":            c.cfg.Topic,
-				"consumer_group":       c.cfg.GroupID,
-				"partition":            msg.Partition,
-				"offset":               msg.Offset,
-				"signature_present":    len(sig) > 0,
-				"signature_alg":        algo,
+				"policy_id":           ack.PolicyId,
+				"controller_instance": ack.ControllerInstance,
+				"result":              ack.Result,
+				"error_code":          ack.ErrorCode,
+				"fast_path":           ack.FastPath,
+				"ack_topic":           c.cfg.Topic,
+				"consumer_group":      c.cfg.GroupID,
+				"partition":           msg.Partition,
+				"offset":              msg.Offset,
+				"signature_present":   len(sig) > 0,
+				"signature_alg":       algo,
 			})
 		}
 		return nil
 	}
 
 	// Exhausted retries: treat as transient so we don't drop data.
+	c.storeRetryExhausted.Add(1)
 	if last != nil {
 		return fmt.Errorf("policy ack store retries exhausted: %w", last)
 	}
@@ -254,7 +411,7 @@ func (c *Consumer) sendDLQ(ctx context.Context, msg *sarama.ConsumerMessage, rea
 	}
 
 	if c.dlqProducer == nil || c.cfg.DLQ == "" {
-		if c.log != nil {
+		if c.log != nil && c.shouldLog(&c.lastRejectLogNs) {
 			c.log.WarnContext(ctx, "policy ack rejected (no dlq configured)",
 				utils.ZapString("reason", reason),
 				utils.ZapError(err))
@@ -280,11 +437,16 @@ func (c *Consumer) sendDLQ(ctx context.Context, msg *sarama.ConsumerMessage, rea
 		Value:   sarama.ByteEncoder(msg.Value),
 		Headers: headers,
 	}
-	if _, _, perr := c.dlqProducer.SendMessage(dlqMsg); perr != nil && c.log != nil {
-		c.log.WarnContext(ctx, "failed to publish policy ack dlq",
-			utils.ZapString("dlq_topic", c.cfg.DLQ),
-			utils.ZapError(perr))
+	if _, _, perr := c.dlqProducer.SendMessage(dlqMsg); perr != nil {
+		c.dlqPublishFailures.Add(1)
+		if c.log != nil && c.shouldLog(&c.lastDLQErrLogNs) {
+			c.log.WarnContext(ctx, "failed to publish policy ack dlq",
+				utils.ZapString("dlq_topic", c.cfg.DLQ),
+				utils.ZapError(perr))
+		}
+		return
 	}
+	c.dlqPublishedTotal.Add(1)
 }
 
 func errString(err error) string {
@@ -292,4 +454,57 @@ func errString(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+func (c *Consumer) shouldLog(lastNs *int64) bool {
+	throttle := c.cfg.LogThrottle
+	if throttle <= 0 {
+		throttle = 5 * time.Second
+	}
+	now := time.Now().UnixNano()
+	prev := atomic.LoadInt64(lastNs)
+	if prev == 0 || time.Duration(now-prev) >= throttle {
+		if atomic.CompareAndSwapInt64(lastNs, prev, now) {
+			return true
+		}
+	}
+	c.logsThrottled.Add(1)
+	return false
+}
+
+// Stats returns runtime counters for the ACK consumer.
+func (c *Consumer) Stats() ConsumerStats {
+	if c == nil {
+		return ConsumerStats{}
+	}
+	return ConsumerStats{
+		ProcessedTotal:          c.processedTotal.Load(),
+		RejectedTotal:           c.rejectedTotal.Load(),
+		StoreRetryAttempts:      c.storeRetryAttempts.Load(),
+		StoreRetryExhausted:     c.storeRetryExhausted.Load(),
+		DLQPublishedTotal:       c.dlqPublishedTotal.Load(),
+		DLQPublishFailures:      c.dlqPublishFailures.Load(),
+		LoopErrors:              c.loopErrors.Load(),
+		WorkQueueWaits:          c.workQueueWaits.Load(),
+		SoftThrottleActivations: c.softThrottleActivations.Load(),
+		LogsThrottled:           c.logsThrottled.Load(),
+	}
+}
+
+func (c *Consumer) CausalStats() CausalStats {
+	if c == nil || c.store == nil {
+		return CausalStats{}
+	}
+	s := c.store.Stats()
+	return CausalStats{
+		SkewCorrectionsTotal: s.SkewCorrectionsTotal,
+		AIToAckBuckets:       s.AIToAckBuckets,
+		AIToAckCount:         s.AIToAckCount,
+		AIToAckSumMs:         s.AIToAckSumMs,
+		AIToAckP95Ms:         s.AIToAckP95Ms,
+		PublishToAckBuckets:  s.PublishToAckBuckets,
+		PublishToAckCount:    s.PublishToAckCount,
+		PublishToAckSumMs:    s.PublishToAckSumMs,
+		PublishToAckP95Ms:    s.PublishToAckP95Ms,
+	}
 }

@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	apiserver "backend/pkg/api"
@@ -14,6 +16,7 @@ import (
 	"backend/pkg/consensus/api"
 	"backend/pkg/consensus/messages"
 	"backend/pkg/control/policyack"
+	"backend/pkg/control/policyoutbox"
 	"backend/pkg/ingest/kafka"
 	"backend/pkg/mempool"
 	"backend/pkg/p2p"
@@ -69,10 +72,15 @@ type Service struct {
 	persistWorker *PersistenceWorker
 
 	// Kafka (optional)
-	kafkaConsumer   *kafka.Consumer
-	kafkaProducer   *kafka.Producer
-	policyPublisher *policyPublisher
-	policyAckCons   *policyack.Consumer
+	kafkaConsumer              *kafka.Consumer
+	kafkaProducer              *kafka.Producer
+	policyPublisher            *policyPublisher
+	policyPublishOnCommit      bool
+	policyPublishOnPersistence bool
+	policyCommitProposerOnly   bool
+	policyOutboxDispatcher     *policyoutbox.Dispatcher
+	policyOutboxStore          *policyoutbox.Store
+	policyAckCons              *policyack.Consumer
 
 	// API server (optional)
 	apiServer *apiserver.Server
@@ -80,17 +88,22 @@ type Service struct {
 	// P2P router (optional)
 	router *p2p.Router
 
-	mu                  sync.Mutex
-	lastParent          [32]byte
-	lastRoot            [32]byte // Last committed state root
-	lastCommittedHeight uint64   // Last successfully committed block height
-	commitStateSynced   bool     // Whether commit validator is aligned with consensus height
-	lastProposedView    uint64   // Last view we proposed in (debug visibility)
-	lastProposedHeight  uint64   // Last height we proposed (for cooldown logging)
-	lastProposalTime    time.Time
-	proposalCooldown    time.Duration
-	blockTimeout        time.Duration
-	stopCh              chan struct{}
+	mu                   sync.Mutex
+	lastParent           [32]byte
+	lastRoot             [32]byte // Last committed state root
+	lastCommittedHeight  uint64   // Last successfully committed block height
+	commitStateSynced    bool     // Whether commit validator is aligned with consensus height
+	lastProposedView     uint64   // Last view we proposed in (debug visibility)
+	lastProposedHeight   uint64   // Last height we proposed (for cooldown logging)
+	lastProposalTime     time.Time
+	proposalCooldown     time.Duration
+	blockTimeout         time.Duration
+	stopCh               chan struct{}
+	commitLogEveryN      uint64
+	commitWarnThrottle   time.Duration
+	commitCounter        uint64
+	commitLogsSuppressed uint64
+	lastPersistNilWarnNs int64
 
 	// Genesis coordination
 	startTime          time.Time     // Service start time for genesis delay calculation
@@ -136,6 +149,77 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 	if s.genesisGracePeriod == 0 {
 		// Keep conservative default for multi-node startup unless explicitly tuned by env.
 		s.genesisGracePeriod = 60 * time.Second
+	}
+	s.commitLogEveryN = 20
+	s.commitWarnThrottle = 10 * time.Second
+	if cfg.ConfigManager != nil {
+		if every := cfg.ConfigManager.GetInt("CONTROL_COMMIT_LOG_EVERY_N", 20); every > 0 {
+			s.commitLogEveryN = uint64(every)
+		}
+		if throttle := cfg.ConfigManager.GetDuration("CONTROL_COMMIT_WARN_LOG_THROTTLE", 10*time.Second); throttle > 0 {
+			s.commitWarnThrottle = throttle
+		}
+	}
+
+	// Control-plane policy publish source selection.
+	// Supported values: "commit" | "persistence" | "both" | "none"
+	// Default remains "both" for backward compatibility.
+	s.policyPublishOnCommit = true
+	s.policyPublishOnPersistence = true
+	s.policyCommitProposerOnly = false
+	if cfg.ConfigManager != nil {
+		source := strings.ToLower(strings.TrimSpace(cfg.ConfigManager.GetString("CONTROL_POLICY_PUBLISH_SOURCE", "both")))
+		switch source {
+		case "commit":
+			s.policyPublishOnCommit = true
+			s.policyPublishOnPersistence = false
+		case "persistence":
+			s.policyPublishOnCommit = false
+			s.policyPublishOnPersistence = true
+		case "none":
+			s.policyPublishOnCommit = false
+			s.policyPublishOnPersistence = false
+		case "both", "":
+			s.policyPublishOnCommit = true
+			s.policyPublishOnPersistence = true
+		default:
+			s.policyPublishOnCommit = true
+			s.policyPublishOnPersistence = true
+			if log != nil {
+				log.Warn("Invalid CONTROL_POLICY_PUBLISH_SOURCE; defaulting to both",
+					utils.ZapString("value", source))
+			}
+		}
+
+		// Commit writer mode controls how many validators may publish control.policy
+		// for a committed block.
+		// Supported values:
+		// - "all": any validator that commits may publish (legacy behavior)
+		// - "proposer": only the committed block proposer may publish (single writer)
+		writerMode := strings.ToLower(strings.TrimSpace(cfg.ConfigManager.GetString("CONTROL_POLICY_COMMIT_WRITER_MODE", "proposer")))
+		switch writerMode {
+		case "all", "":
+			s.policyCommitProposerOnly = false
+		case "proposer":
+			s.policyCommitProposerOnly = true
+		default:
+			s.policyCommitProposerOnly = true
+			if log != nil {
+				log.Warn("Invalid CONTROL_POLICY_COMMIT_WRITER_MODE; defaulting to proposer",
+					utils.ZapString("value", writerMode))
+			}
+		}
+		if log != nil {
+			log.Info("Configured policy publish source",
+				utils.ZapBool("publish_on_commit", s.policyPublishOnCommit),
+				utils.ZapBool("publish_on_persistence", s.policyPublishOnPersistence),
+				utils.ZapBool("commit_writer_proposer_only", s.policyCommitProposerOnly))
+		}
+	}
+
+	var dbHandle *sql.DB
+	if provider, ok := cfg.DBAdapter.(interface{ GetDB() *sql.DB }); ok {
+		dbHandle = provider.GetDB()
 	}
 
 	if cfg.DBAdapter != nil {
@@ -210,6 +294,7 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 				if err != nil {
 					return nil, fmt.Errorf("failed to build Kafka config: %w", err)
 				}
+				cfg.KafkaProducerCfg.LogThrottle = cfg.ConfigManager.GetDuration("KAFKA_PRODUCER_LOG_THROTTLE", 10*time.Second)
 
 				// Create producer
 				kafkaProducer, err = kafka.NewProducer(context.Background(), cfg.KafkaProducerCfg, saramaCfg, log, cfg.AuditLogger)
@@ -225,6 +310,68 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 						return nil, fmt.Errorf("failed to initialize policy publisher: %w", err)
 					}
 					s.policyPublisher = pp
+
+					outboxEnabled := cfg.ConfigManager.GetBool("CONTROL_POLICY_OUTBOX_ENABLED", true)
+					if outboxEnabled {
+						if dbHandle == nil {
+							kafkaProducer.Close()
+							return nil, fmt.Errorf("policy outbox enabled but storage adapter does not expose DB handle")
+						}
+						outboxStore, err := policyoutbox.NewStore(dbHandle)
+						if err != nil {
+							kafkaProducer.Close()
+							return nil, fmt.Errorf("failed to initialize policy outbox store: %w", err)
+						}
+						schemaCheckTimeout := cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_SCHEMA_CHECK_TIMEOUT", 10*time.Second)
+						if schemaCheckTimeout <= 0 {
+							schemaCheckTimeout = 10 * time.Second
+						}
+						schemaCtx, cancel := context.WithTimeout(context.Background(), schemaCheckTimeout)
+						defer cancel()
+						if err := outboxStore.EnsureSchema(schemaCtx); err != nil {
+							kafkaProducer.Close()
+							return nil, fmt.Errorf("policy outbox schema invariant failed: %w", err)
+						}
+
+						outboxCfg := policyoutbox.Config{
+							Enabled:          true,
+							LeaseKey:         strings.TrimSpace(cfg.ConfigManager.GetString("CONTROL_POLICY_OUTBOX_LEASE_KEY", "control.policy.dispatcher")),
+							PolicyTopic:      cfg.KafkaProducerCfg.Topics.Policy,
+							LeaseTTL:         cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_LEASE_TTL", 10*time.Second),
+							ReclaimAfter:     cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_RECLAIM_AFTER", 30*time.Second),
+							PollInterval:     cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_POLL_INTERVAL", 500*time.Millisecond),
+							DrainMaxDuration: cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_DRAIN_MAX_DURATION", 2*time.Second),
+							BatchSize:        cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_BATCH_SIZE", 100),
+							BatchSizeMin:     cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_BATCH_SIZE_MIN", 25),
+							BatchSizeMax:     cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_BATCH_SIZE_MAX", 400),
+							AdaptiveBatch:    cfg.ConfigManager.GetBool("CONTROL_POLICY_OUTBOX_ADAPTIVE_BATCH", true),
+							MaxInFlight:      cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_MAX_IN_FLIGHT", 8),
+							MarkWorkers:      cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_MARK_WORKERS", 4),
+							InternalQueue:    cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_INTERNAL_QUEUE_SIZE", 256),
+							DrainMaxBatches:  cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_DRAIN_BATCHES", 4),
+							MaxRetries:       cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_MAX_RETRIES", 8),
+							RetryInitialBack: cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_RETRY_INITIAL", 250*time.Millisecond),
+							RetryMaxBack:     cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_RETRY_MAX", 30*time.Second),
+							RetryJitterRatio: cfg.ConfigManager.GetFloat64("CONTROL_POLICY_OUTBOX_RETRY_JITTER_RATIO", 0.2),
+							LogThrottle:      cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_LOG_THROTTLE", 5*time.Second),
+						}
+
+						holderID := strings.TrimSpace(cfg.ConfigManager.GetString("NODE_ID", "backend-node"))
+						dispatcher, err := policyoutbox.NewDispatcher(outboxCfg, outboxStore, pp, log, cfg.AuditLogger, holderID)
+						if err != nil {
+							kafkaProducer.Close()
+							return nil, fmt.Errorf("failed to initialize policy outbox dispatcher: %w", err)
+						}
+						s.policyOutboxDispatcher = dispatcher
+						s.policyOutboxStore = outboxStore
+
+						// Outbox is the authority; disable direct policy publish paths.
+						s.policyPublishOnCommit = false
+						s.policyPublishOnPersistence = false
+						if log != nil {
+							log.Info("Control policy outbox enabled; direct policy publish disabled")
+						}
+					}
 				}
 			}
 		}
@@ -243,10 +390,6 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 							utils.ZapError(err),
 							utils.ZapUint64("height", height))
 					}
-				}
-
-				if s.policyPublisher != nil {
-					s.policyPublisher.Publish(ctx, height, ts, policyCount, policyPayloads)
 				}
 			}
 		}
@@ -337,11 +480,7 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 		}
 		if ackCfg.Enabled {
 			// Require DB access when ACK ingestion enabled (we do not silently drop acks).
-			var db *sql.DB
-			if provider, ok := cfg.DBAdapter.(interface{ GetDB() *sql.DB }); ok {
-				db = provider.GetDB()
-			}
-			if db == nil {
+			if dbHandle == nil {
 				if kafkaProducer != nil {
 					kafkaProducer.Close()
 				}
@@ -351,7 +490,7 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 				return nil, fmt.Errorf("policy ack consumer enabled but storage adapter does not expose DB handle")
 			}
 
-			store, err := policyack.NewStore(db)
+			store, err := policyack.NewStore(dbHandle)
 			if err != nil {
 				if kafkaProducer != nil {
 					kafkaProducer.Close()
@@ -461,6 +600,7 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 			P2PRouter:     cfg.P2PRouter,
 			KafkaProd:     s.kafkaProducer,
 			KafkaCons:     s.kafkaConsumer,
+			OutboxStats:   s,
 			NodeAliases:   cfg.APIConfig.NodeAliasMap,
 			NodeAliasList: cfg.APIConfig.NodeAliasList,
 		}
@@ -582,6 +722,25 @@ func (s *Service) Start(ctx context.Context) error {
 		}
 	}
 
+	// Start policy outbox dispatcher if configured.
+	if s.policyOutboxDispatcher != nil {
+		if err := s.policyOutboxDispatcher.Start(ctx); err != nil {
+			if s.policyAckCons != nil {
+				_ = s.policyAckCons.Stop()
+			}
+			if s.kafkaConsumer != nil {
+				_ = s.kafkaConsumer.Stop()
+			}
+			if s.persistWorker != nil {
+				_ = s.persistWorker.Stop()
+			}
+			return fmt.Errorf("failed to start policy outbox dispatcher: %w", err)
+		}
+		if s.log != nil {
+			s.log.InfoContext(ctx, "Policy outbox dispatcher started")
+		}
+	}
+
 	// Start API server if configured
 	if s.apiServer != nil {
 		if err := s.apiServer.Start(ctx); err != nil {
@@ -648,6 +807,14 @@ func (s *Service) Stop() {
 		}
 	}
 
+	// Stop policy outbox dispatcher.
+	if s.policyOutboxDispatcher != nil {
+		s.policyOutboxDispatcher.Stop()
+		if s.log != nil {
+			s.log.Info("policy outbox dispatcher stopped")
+		}
+	}
+
 	// Stop persistence worker (drain pending blocks)
 	if s.persistWorker != nil {
 		if err := s.persistWorker.Stop(); err != nil {
@@ -684,6 +851,116 @@ func (s *Service) PersistenceWorker() *PersistenceWorker {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.persistWorker
+}
+
+// GetPolicyOutboxDispatcherStats returns dispatcher runtime stats for API metrics.
+func (s *Service) GetPolicyOutboxDispatcherStats() (policyoutbox.DispatcherStats, bool) {
+	s.mu.Lock()
+	dispatcher := s.policyOutboxDispatcher
+	s.mu.Unlock()
+	if dispatcher == nil {
+		return policyoutbox.DispatcherStats{}, false
+	}
+	return dispatcher.Stats(), true
+}
+
+// GetPolicyOutboxBacklogStats returns current outbox backlog stats for API metrics.
+func (s *Service) GetPolicyOutboxBacklogStats(ctx context.Context) (policyoutbox.BacklogStats, bool) {
+	s.mu.Lock()
+	store := s.policyOutboxStore
+	s.mu.Unlock()
+	if store == nil {
+		return policyoutbox.BacklogStats{}, false
+	}
+	stats, err := store.BacklogStats(ctx)
+	if err != nil {
+		return policyoutbox.BacklogStats{}, false
+	}
+	return stats, true
+}
+
+// GetCommitPathStats returns commit-path logging/runtime stats for API metrics.
+func (s *Service) GetCommitPathStats() (apiserver.CommitPathStats, bool) {
+	if s == nil {
+		return apiserver.CommitPathStats{}, false
+	}
+	return apiserver.CommitPathStats{
+		LogSampleEvery: s.commitLogEveryN,
+		LogsSuppressed: atomic.LoadUint64(&s.commitLogsSuppressed),
+	}, true
+}
+
+// GetPolicyAckConsumerStats returns policy ACK consumer runtime stats for API metrics.
+func (s *Service) GetPolicyAckConsumerStats() (apiserver.PolicyAckConsumerStats, bool) {
+	s.mu.Lock()
+	cons := s.policyAckCons
+	s.mu.Unlock()
+	if cons == nil {
+		return apiserver.PolicyAckConsumerStats{}, false
+	}
+	stats := cons.Stats()
+	return apiserver.PolicyAckConsumerStats{
+		ProcessedTotal:          stats.ProcessedTotal,
+		RejectedTotal:           stats.RejectedTotal,
+		StoreRetryAttempts:      stats.StoreRetryAttempts,
+		StoreRetryExhausted:     stats.StoreRetryExhausted,
+		DLQPublishedTotal:       stats.DLQPublishedTotal,
+		DLQPublishFailures:      stats.DLQPublishFailures,
+		LoopErrors:              stats.LoopErrors,
+		WorkQueueWaits:          stats.WorkQueueWaits,
+		SoftThrottleActivations: stats.SoftThrottleActivations,
+		LogsThrottled:           stats.LogsThrottled,
+	}, true
+}
+
+// GetPolicyAckCausalStats returns causal latency/skew stats from ACK correlation store.
+func (s *Service) GetPolicyAckCausalStats() (apiserver.PolicyAckCausalStats, bool) {
+	s.mu.Lock()
+	cons := s.policyAckCons
+	s.mu.Unlock()
+	if cons == nil {
+		return apiserver.PolicyAckCausalStats{}, false
+	}
+	stats := cons.CausalStats()
+	return apiserver.PolicyAckCausalStats{
+		SkewCorrectionsTotal: stats.SkewCorrectionsTotal,
+		AIToAckBuckets:       stats.AIToAckBuckets,
+		AIToAckCount:         stats.AIToAckCount,
+		AIToAckSumMs:         stats.AIToAckSumMs,
+		AIToAckP95Ms:         stats.AIToAckP95Ms,
+		PublishToAckBuckets:  stats.PublishToAckBuckets,
+		PublishToAckCount:    stats.PublishToAckCount,
+		PublishToAckSumMs:    stats.PublishToAckSumMs,
+		PublishToAckP95Ms:    stats.PublishToAckP95Ms,
+	}, true
+}
+
+func (s *Service) shouldLogCommitInfo() bool {
+	every := s.commitLogEveryN
+	if every <= 1 {
+		return true
+	}
+	n := atomic.AddUint64(&s.commitCounter, 1)
+	if n%every == 0 {
+		return true
+	}
+	atomic.AddUint64(&s.commitLogsSuppressed, 1)
+	return false
+}
+
+func (s *Service) shouldLogCommitWarn(lastNs *int64, throttle time.Duration) bool {
+	if throttle <= 0 {
+		return true
+	}
+	now := time.Now().UnixNano()
+	prev := atomic.LoadInt64(lastNs)
+	if prev == 0 || time.Duration(now-prev) >= throttle {
+		if atomic.CompareAndSwapInt64(lastNs, prev, now) {
+			return true
+		}
+	}
+	atomic.AddUint64(&s.commitLogsSuppressed, 1)
+	return false
 }
 
 // StopWithTimeout stops the service with a timeout for graceful shutdown

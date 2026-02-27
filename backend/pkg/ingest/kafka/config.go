@@ -191,6 +191,16 @@ func BuildSaramaConfig(ctx context.Context, cm *utils.ConfigManager, log *utils.
 	cfg.Consumer.Group.Session.Timeout = cm.GetDuration("KAFKA_CONSUMER_SESSION_TIMEOUT", 10*time.Second)
 	cfg.Consumer.Group.Heartbeat.Interval = cm.GetDuration("KAFKA_CONSUMER_HEARTBEAT", 3*time.Second)
 	cfg.Consumer.Return.Errors = true
+	isolationLevel := strings.ToLower(strings.TrimSpace(cm.GetString("KAFKA_CONSUMER_ISOLATION_LEVEL", "read_committed")))
+	switch isolationLevel {
+	case "read_uncommitted":
+		cfg.Consumer.IsolationLevel = sarama.ReadUncommitted
+	default:
+		cfg.Consumer.IsolationLevel = sarama.ReadCommitted
+	}
+	if instanceID := strings.TrimSpace(cm.GetString("KAFKA_CONSUMER_GROUP_INSTANCE_ID", "")); instanceID != "" {
+		cfg.Consumer.Group.InstanceId = instanceID
+	}
 
 	// Producer Configuration (Idempotent + Exactly-Once)
 	cfg.Producer.Idempotent = cm.GetBool("KAFKA_PRODUCER_IDEMPOTENT", true)

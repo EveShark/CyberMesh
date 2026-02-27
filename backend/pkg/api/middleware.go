@@ -430,7 +430,7 @@ func (s *Server) middlewareGlobalAuth(next http.Handler) http.Handler {
 		}
 
 		// Production mode: Enforce RBAC
-		requiredRole := s.getRequiredRole(r.URL.Path)
+		requiredRole := s.getRequiredRole(r.Method, r.URL.Path)
 		if requiredRole != "" && !s.hasRole(clientRole, requiredRole) {
 			s.logger.WarnContext(r.Context(), "access denied - insufficient role",
 				utils.ZapString("path", r.URL.Path),

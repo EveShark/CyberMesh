@@ -978,6 +978,9 @@ func buildWiringConfig(
 	}
 
 	if enableKafka {
+		env := strings.ToLower(strings.TrimSpace(cfgMgr.GetString("ENVIRONMENT", "production")))
+		strictTraceDefault := env == "production" || env == "staging"
+
 		// Each node uses a unique consumer group to consume ALL partitions
 		// This ensures all nodes see all transactions for consensus
 		baseGroupID := cfgMgr.GetString("KAFKA_CONSUMER_GROUP_ID", "cybermesh-consensus")
@@ -993,7 +996,10 @@ func buildWiringConfig(
 			Topics:   consumerTopics,
 			DLQTopic: cfgMgr.GetString("KAFKA_DLQ_TOPIC", "ai.dlq.v1"),
 			VerifierCfg: kafka.VerifierConfig{
-				MaxTimestampSkew: cfgMgr.GetDuration("KAFKA_MAX_TIMESTAMP_SKEW", 5*time.Minute),
+				MaxTimestampSkew:      cfgMgr.GetDuration("KAFKA_MAX_TIMESTAMP_SKEW", 5*time.Minute),
+				PolicyRequireTrace:    cfgMgr.GetBool("CONTROL_POLICY_TRACE_STRICT", strictTraceDefault),
+				PolicyRequireQCRef:    cfgMgr.GetBool("CONTROL_POLICY_QC_REFERENCE_REQUIRED", strictTraceDefault),
+				PolicyTraceFutureSkew: cfgMgr.GetDuration("CONTROL_POLICY_TRACE_FUTURE_SKEW", 5*time.Minute),
 			},
 			RetryMax:         cfgMgr.GetInt("KAFKA_CONSUMER_RETRY_MAX", 5),
 			RetryBackoffBase: time.Duration(cfgMgr.GetInt("KAFKA_CONSUMER_RETRY_BACKOFF_MS", 100)) * time.Millisecond,

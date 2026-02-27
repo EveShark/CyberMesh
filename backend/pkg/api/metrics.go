@@ -238,6 +238,32 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 			fmt.Fprintf(w, "# HELP cockroach_slow_transactions_total Total slow CockroachDB transactions (above threshold).\n")
 			fmt.Fprintf(w, "# TYPE cockroach_slow_transactions_total counter\n")
 			fmt.Fprintf(w, "cockroach_slow_transactions_total %d\n", snap.SlowTransactionCount)
+			for _, stage := range []string{"upsert_block", "upsert_transactions", "upsert_snapshot", "commit"} {
+				count, ok := snap.PersistStageCount[stage]
+				if !ok || count == 0 {
+					continue
+				}
+				base := "cockroach_persist_" + stage + "_latency_seconds"
+				fmt.Fprintf(w, "# HELP %s Histogram of CockroachDB persist stage latency in seconds.\n", base)
+				fmt.Fprintf(w, "# TYPE %s histogram\n", base)
+				writePrometheusHistogram(w, base, snap.PersistStageBuckets[stage], count, snap.PersistStageSumMs[stage])
+				fmt.Fprintf(w, "# HELP %s_p95_seconds 95th percentile persist stage latency in seconds.\n", base)
+				fmt.Fprintf(w, "# TYPE %s_p95_seconds gauge\n", base)
+				fmt.Fprintf(w, "%s_p95_seconds %.6f\n", base, snap.PersistStageP95Ms[stage]/1000.0)
+			}
+			if len(snap.PersistFailureClassTotals) > 0 {
+				fmt.Fprintf(w, "# HELP cockroach_persist_failures_total Total CockroachDB persist failures by stage/class.\n")
+				fmt.Fprintf(w, "# TYPE cockroach_persist_failures_total counter\n")
+				for key, count := range snap.PersistFailureClassTotals {
+					stage := key
+					class := "other"
+					if idx := strings.Index(key, ":"); idx > 0 && idx < len(key)-1 {
+						stage = key[:idx]
+						class = key[idx+1:]
+					}
+					fmt.Fprintf(w, "cockroach_persist_failures_total{stage=\"%s\",class=\"%s\"} %d\n", stage, class, count)
+				}
+			}
 		}
 	}
 
@@ -297,6 +323,9 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 			fmt.Fprintf(w, "# TYPE kafka_producer_publish_latency_p95_seconds gauge\n")
 			fmt.Fprintf(w, "kafka_producer_publish_latency_p95_seconds %.6f\n", prodStats.LatencyP95Ms/1000.0)
 		}
+		fmt.Fprintf(w, "# HELP kafka_producer_logs_throttled_total Total producer success logs suppressed by throttling.\n")
+		fmt.Fprintf(w, "# TYPE kafka_producer_logs_throttled_total counter\n")
+		fmt.Fprintf(w, "kafka_producer_logs_throttled_total %d\n", prodStats.LogsThrottled)
 	}
 
 	if s.kafkaCons != nil {
@@ -317,6 +346,254 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 			fmt.Fprintf(w, "# TYPE kafka_consumer_process_latency_p95_seconds gauge\n")
 			fmt.Fprintf(w, "kafka_consumer_process_latency_p95_seconds %.6f\n", consStats.ProcessLatencyP95Ms/1000.0)
 		}
+	}
+
+	if s.outboxStats != nil {
+		if commitStats, ok := s.outboxStats.GetCommitPathStats(); ok {
+			fmt.Fprintf(w, "# HELP control_commit_log_sample_every_n Commit info log sampling interval.\n")
+			fmt.Fprintf(w, "# TYPE control_commit_log_sample_every_n gauge\n")
+			fmt.Fprintf(w, "control_commit_log_sample_every_n %d\n", commitStats.LogSampleEvery)
+			fmt.Fprintf(w, "# HELP control_commit_logs_suppressed_total Total commit-path logs suppressed by sampling/throttling.\n")
+			fmt.Fprintf(w, "# TYPE control_commit_logs_suppressed_total counter\n")
+			fmt.Fprintf(w, "control_commit_logs_suppressed_total %d\n", commitStats.LogsSuppressed)
+		}
+
+		if ackStats, ok := s.outboxStats.GetPolicyAckConsumerStats(); ok {
+			fmt.Fprintf(w, "# HELP control_policy_ack_processed_total Total ACK events successfully persisted.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_ack_processed_total counter\n")
+			fmt.Fprintf(w, "control_policy_ack_processed_total %d\n", ackStats.ProcessedTotal)
+			fmt.Fprintf(w, "# HELP control_policy_ack_rejected_total Total ACK events rejected as invalid/permanent.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_ack_rejected_total counter\n")
+			fmt.Fprintf(w, "control_policy_ack_rejected_total %d\n", ackStats.RejectedTotal)
+			fmt.Fprintf(w, "# HELP control_policy_ack_store_retry_attempts_total Total ACK store retry attempts.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_ack_store_retry_attempts_total counter\n")
+			fmt.Fprintf(w, "control_policy_ack_store_retry_attempts_total %d\n", ackStats.StoreRetryAttempts)
+			fmt.Fprintf(w, "# HELP control_policy_ack_store_retry_exhausted_total Total ACK events that exhausted store retries.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_ack_store_retry_exhausted_total counter\n")
+			fmt.Fprintf(w, "control_policy_ack_store_retry_exhausted_total %d\n", ackStats.StoreRetryExhausted)
+			fmt.Fprintf(w, "# HELP control_policy_ack_dlq_published_total Total ACK rejects published to DLQ.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_ack_dlq_published_total counter\n")
+			fmt.Fprintf(w, "control_policy_ack_dlq_published_total %d\n", ackStats.DLQPublishedTotal)
+			fmt.Fprintf(w, "# HELP control_policy_ack_dlq_publish_failures_total Total ACK DLQ publish failures.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_ack_dlq_publish_failures_total counter\n")
+			fmt.Fprintf(w, "control_policy_ack_dlq_publish_failures_total %d\n", ackStats.DLQPublishFailures)
+			fmt.Fprintf(w, "# HELP control_policy_ack_loop_errors_total Total consumer-loop errors from Kafka Consume.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_ack_loop_errors_total counter\n")
+			fmt.Fprintf(w, "control_policy_ack_loop_errors_total %d\n", ackStats.LoopErrors)
+			fmt.Fprintf(w, "# HELP control_policy_ack_work_queue_waits_total Total times ACK consume loop waited for worker queue capacity.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_ack_work_queue_waits_total counter\n")
+			fmt.Fprintf(w, "control_policy_ack_work_queue_waits_total %d\n", ackStats.WorkQueueWaits)
+			fmt.Fprintf(w, "# HELP control_policy_ack_soft_throttle_activations_total Total soft-throttle activations in ACK consumer.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_ack_soft_throttle_activations_total counter\n")
+			fmt.Fprintf(w, "control_policy_ack_soft_throttle_activations_total %d\n", ackStats.SoftThrottleActivations)
+			fmt.Fprintf(w, "# HELP control_policy_ack_logs_throttled_total Total ACK consumer logs suppressed by throttling.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_ack_logs_throttled_total counter\n")
+			fmt.Fprintf(w, "control_policy_ack_logs_throttled_total %d\n", ackStats.LogsThrottled)
+		}
+		if causal, ok := s.outboxStats.GetPolicyAckCausalStats(); ok {
+			fmt.Fprintf(w, "# HELP control_policy_causal_skew_corrections_total Total causal latency corrections due to clock skew.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_causal_skew_corrections_total counter\n")
+			fmt.Fprintf(w, "control_policy_causal_skew_corrections_total %d\n", causal.SkewCorrectionsTotal)
+			if causal.AIToAckCount > 0 {
+				fmt.Fprintf(w, "# HELP control_policy_causal_ai_to_ack_latency_seconds Histogram of corrected AI-to-ACK causal latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_causal_ai_to_ack_latency_seconds histogram\n")
+				writePrometheusHistogram(w, "control_policy_causal_ai_to_ack_latency_seconds", causal.AIToAckBuckets, causal.AIToAckCount, causal.AIToAckSumMs)
+				fmt.Fprintf(w, "# HELP control_policy_causal_ai_to_ack_latency_p95_seconds 95th percentile corrected AI-to-ACK latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_causal_ai_to_ack_latency_p95_seconds gauge\n")
+				fmt.Fprintf(w, "control_policy_causal_ai_to_ack_latency_p95_seconds %.6f\n", causal.AIToAckP95Ms/1000.0)
+			}
+			if causal.PublishToAckCount > 0 {
+				fmt.Fprintf(w, "# HELP control_policy_causal_publish_to_ack_latency_seconds Histogram of corrected publish-to-ACK causal latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_causal_publish_to_ack_latency_seconds histogram\n")
+				writePrometheusHistogram(w, "control_policy_causal_publish_to_ack_latency_seconds", causal.PublishToAckBuckets, causal.PublishToAckCount, causal.PublishToAckSumMs)
+				fmt.Fprintf(w, "# HELP control_policy_causal_publish_to_ack_latency_p95_seconds 95th percentile corrected publish-to-ACK latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_causal_publish_to_ack_latency_p95_seconds gauge\n")
+				fmt.Fprintf(w, "control_policy_causal_publish_to_ack_latency_p95_seconds %.6f\n", causal.PublishToAckP95Ms/1000.0)
+			}
+		}
+
+		if outbox, ok := s.outboxStats.GetPolicyOutboxDispatcherStats(); ok {
+			fmt.Fprintf(w, "# HELP control_policy_outbox_dispatcher_lease_acquire_attempts_total Total lease acquire attempts by dispatcher.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_dispatcher_lease_acquire_attempts_total counter\n")
+			fmt.Fprintf(w, "control_policy_outbox_dispatcher_lease_acquire_attempts_total %d\n", outbox.LeaseAcquireAttempts)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_dispatcher_lease_acquire_success_total Total successful lease acquisitions.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_dispatcher_lease_acquire_success_total counter\n")
+			fmt.Fprintf(w, "control_policy_outbox_dispatcher_lease_acquire_success_total %d\n", outbox.LeaseAcquireSuccesses)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_dispatcher_lease_acquire_errors_total Total lease acquisition errors.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_dispatcher_lease_acquire_errors_total counter\n")
+			fmt.Fprintf(w, "control_policy_outbox_dispatcher_lease_acquire_errors_total %d\n", outbox.LeaseAcquireErrors)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_dispatcher_lease_held Dispatcher lease ownership state (1=held).\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_dispatcher_lease_held gauge\n")
+			if outbox.LeaseHeld {
+				fmt.Fprintf(w, "control_policy_outbox_dispatcher_lease_held 1\n")
+			} else {
+				fmt.Fprintf(w, "control_policy_outbox_dispatcher_lease_held 0\n")
+			}
+			fmt.Fprintf(w, "# HELP control_policy_outbox_dispatcher_last_epoch Last observed lease epoch.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_dispatcher_last_epoch gauge\n")
+			fmt.Fprintf(w, "control_policy_outbox_dispatcher_last_epoch %d\n", outbox.LastLeaseEpoch)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_dispatcher_ticks_total Total dispatcher loop ticks.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_dispatcher_ticks_total counter\n")
+			fmt.Fprintf(w, "control_policy_outbox_dispatcher_ticks_total %d\n", outbox.TicksTotal)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_rows_claimed_total Total rows claimed by dispatcher.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_rows_claimed_total counter\n")
+			fmt.Fprintf(w, "control_policy_outbox_rows_claimed_total %d\n", outbox.RowsClaimedTotal)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_current_batch_size Current adaptive outbox claim batch size.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_current_batch_size gauge\n")
+			fmt.Fprintf(w, "control_policy_outbox_current_batch_size %d\n", outbox.CurrentBatchSize)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_batch_scale_up_total Total adaptive claim batch size scale-up actions.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_batch_scale_up_total counter\n")
+			fmt.Fprintf(w, "control_policy_outbox_batch_scale_up_total %d\n", outbox.BatchScaleUpTotal)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_batch_scale_down_total Total adaptive claim batch size scale-down actions.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_batch_scale_down_total counter\n")
+			fmt.Fprintf(w, "control_policy_outbox_batch_scale_down_total %d\n", outbox.BatchScaleDownTotal)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_publish_queue_waits_total Total times dispatcher publish queue hit capacity.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_publish_queue_waits_total counter\n")
+			fmt.Fprintf(w, "control_policy_outbox_publish_queue_waits_total %d\n", outbox.PublishQueueWaits)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_mark_queue_waits_total Total times dispatcher mark queue hit capacity.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_mark_queue_waits_total counter\n")
+			fmt.Fprintf(w, "control_policy_outbox_mark_queue_waits_total %d\n", outbox.MarkQueueWaits)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_published_total Total outbox rows published to Kafka.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_published_total counter\n")
+			fmt.Fprintf(w, "control_policy_outbox_published_total %d\n", outbox.PublishedTotal)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_retry_total Total outbox rows scheduled for retry.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_retry_total counter\n")
+			fmt.Fprintf(w, "control_policy_outbox_retry_total %d\n", outbox.RetryTotal)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_terminal_failed_total Total outbox rows marked terminal failed.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_terminal_failed_total counter\n")
+			fmt.Fprintf(w, "control_policy_outbox_terminal_failed_total %d\n", outbox.TerminalFailedTotal)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_fenced_update_failures_total Total fenced/no-op state transitions.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_fenced_update_failures_total counter\n")
+			fmt.Fprintf(w, "control_policy_outbox_fenced_update_failures_total %d\n", outbox.FencedUpdateFailures)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_throttled_logs_total Total outbox logs suppressed by throttle.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_throttled_logs_total counter\n")
+			fmt.Fprintf(w, "control_policy_outbox_throttled_logs_total %d\n", outbox.ThrottledLogsTotal)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_skew_corrections_total Total outbox causal latency corrections due to clock skew.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_skew_corrections_total counter\n")
+			fmt.Fprintf(w, "control_policy_outbox_skew_corrections_total %d\n", outbox.SkewCorrectionsTotal)
+			if outbox.PublishLatencyCount > 0 {
+				fmt.Fprintf(w, "# HELP control_policy_outbox_publish_latency_seconds Histogram of durable outbox publish latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_outbox_publish_latency_seconds histogram\n")
+				writePrometheusHistogram(w, "control_policy_outbox_publish_latency_seconds", outbox.PublishLatencyBuckets, outbox.PublishLatencyCount, outbox.PublishLatencySumMs)
+				fmt.Fprintf(w, "# HELP control_policy_outbox_publish_latency_p95_seconds 95th percentile durable outbox publish latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_outbox_publish_latency_p95_seconds gauge\n")
+				fmt.Fprintf(w, "control_policy_outbox_publish_latency_p95_seconds %.6f\n", outbox.PublishLatencyP95Ms/1000.0)
+			}
+			if outbox.ClaimLatencyCount > 0 {
+				fmt.Fprintf(w, "# HELP control_policy_outbox_claim_latency_seconds Histogram of outbox claim query latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_outbox_claim_latency_seconds histogram\n")
+				writePrometheusHistogram(w, "control_policy_outbox_claim_latency_seconds", outbox.ClaimLatencyBuckets, outbox.ClaimLatencyCount, outbox.ClaimLatencySumMs)
+				fmt.Fprintf(w, "# HELP control_policy_outbox_claim_latency_p95_seconds 95th percentile outbox claim query latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_outbox_claim_latency_p95_seconds gauge\n")
+				fmt.Fprintf(w, "control_policy_outbox_claim_latency_p95_seconds %.6f\n", outbox.ClaimLatencyP95Ms/1000.0)
+			}
+			if outbox.MarkLatencyCount > 0 {
+				fmt.Fprintf(w, "# HELP control_policy_outbox_mark_latency_seconds Histogram of outbox state-mark latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_outbox_mark_latency_seconds histogram\n")
+				writePrometheusHistogram(w, "control_policy_outbox_mark_latency_seconds", outbox.MarkLatencyBuckets, outbox.MarkLatencyCount, outbox.MarkLatencySumMs)
+				fmt.Fprintf(w, "# HELP control_policy_outbox_mark_latency_p95_seconds 95th percentile outbox state-mark latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_outbox_mark_latency_p95_seconds gauge\n")
+				fmt.Fprintf(w, "control_policy_outbox_mark_latency_p95_seconds %.6f\n", outbox.MarkLatencyP95Ms/1000.0)
+			}
+			if outbox.TickLatencyCount > 0 {
+				fmt.Fprintf(w, "# HELP control_policy_outbox_tick_latency_seconds Histogram of dispatcher tick duration in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_outbox_tick_latency_seconds histogram\n")
+				writePrometheusHistogram(w, "control_policy_outbox_tick_latency_seconds", outbox.TickLatencyBuckets, outbox.TickLatencyCount, outbox.TickLatencySumMs)
+				fmt.Fprintf(w, "# HELP control_policy_outbox_tick_latency_p95_seconds 95th percentile dispatcher tick duration in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_outbox_tick_latency_p95_seconds gauge\n")
+				fmt.Fprintf(w, "control_policy_outbox_tick_latency_p95_seconds %.6f\n", outbox.TickLatencyP95Ms/1000.0)
+			}
+			if outbox.AIToPublishCount > 0 {
+				fmt.Fprintf(w, "# HELP control_policy_causal_ai_to_publish_latency_seconds Histogram of corrected AI-to-publish causal latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_causal_ai_to_publish_latency_seconds histogram\n")
+				writePrometheusHistogram(w, "control_policy_causal_ai_to_publish_latency_seconds", outbox.AIToPublishBuckets, outbox.AIToPublishCount, outbox.AIToPublishSumMs)
+				fmt.Fprintf(w, "# HELP control_policy_causal_ai_to_publish_latency_p95_seconds 95th percentile corrected AI-to-publish latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_causal_ai_to_publish_latency_p95_seconds gauge\n")
+				fmt.Fprintf(w, "control_policy_causal_ai_to_publish_latency_p95_seconds %.6f\n", outbox.AIToPublishP95Ms/1000.0)
+			}
+			if outbox.CommitToPublishCount > 0 {
+				fmt.Fprintf(w, "# HELP control_policy_causal_commit_to_publish_latency_seconds Histogram of corrected commit-to-publish causal latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_causal_commit_to_publish_latency_seconds histogram\n")
+				writePrometheusHistogram(w, "control_policy_causal_commit_to_publish_latency_seconds", outbox.CommitToPublishBuckets, outbox.CommitToPublishCount, outbox.CommitToPublishSumMs)
+				fmt.Fprintf(w, "# HELP control_policy_causal_commit_to_publish_latency_p95_seconds 95th percentile corrected commit-to-publish latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_causal_commit_to_publish_latency_p95_seconds gauge\n")
+				fmt.Fprintf(w, "control_policy_causal_commit_to_publish_latency_p95_seconds %.6f\n", outbox.CommitToPublishP95Ms/1000.0)
+			}
+		}
+
+		if backlog, ok := s.outboxStats.GetPolicyOutboxBacklogStats(ctx); ok {
+			fmt.Fprintf(w, "# HELP control_policy_outbox_backlog_pending Number of pending outbox rows.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_backlog_pending gauge\n")
+			fmt.Fprintf(w, "control_policy_outbox_backlog_pending %d\n", backlog.Pending)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_backlog_retry Number of retry outbox rows.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_backlog_retry gauge\n")
+			fmt.Fprintf(w, "control_policy_outbox_backlog_retry %d\n", backlog.Retry)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_backlog_publishing Number of publishing outbox rows.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_backlog_publishing gauge\n")
+			fmt.Fprintf(w, "control_policy_outbox_backlog_publishing %d\n", backlog.Publishing)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_oldest_pending_age_seconds Age of oldest publish-eligible outbox row in seconds.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_oldest_pending_age_seconds gauge\n")
+			fmt.Fprintf(w, "control_policy_outbox_oldest_pending_age_seconds %.3f\n", float64(backlog.OldestPendingAge)/1000.0)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_rows_total Total outbox rows (proxy for committed policy tx count).\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_rows_total gauge\n")
+			fmt.Fprintf(w, "control_policy_outbox_rows_total %d\n", backlog.TotalRows)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_published_rows Number of outbox rows currently in published status.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_published_rows gauge\n")
+			fmt.Fprintf(w, "control_policy_outbox_published_rows %d\n", backlog.PublishedRows)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_acked_rows Number of outbox rows currently in acked status.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_acked_rows gauge\n")
+			fmt.Fprintf(w, "control_policy_outbox_acked_rows %d\n", backlog.AckedRows)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_terminal_rows Number of outbox rows currently in terminal_failed status.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_terminal_rows gauge\n")
+			fmt.Fprintf(w, "control_policy_outbox_terminal_rows %d\n", backlog.TerminalRows)
+			committed := float64(backlog.TotalRows)
+			publishedOrAcked := float64(backlog.PublishedRows + backlog.AckedRows)
+			ackRatio := 1.0
+			coverage := 1.0
+			if committed > 0 {
+				coverage = publishedOrAcked / committed
+			}
+			if publishedOrAcked > 0 {
+				ackRatio = float64(backlog.AckedRows) / publishedOrAcked
+			}
+			fmt.Fprintf(w, "# HELP control_policy_publish_coverage_ratio Ratio of publish-complete rows over committed policy rows.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_publish_coverage_ratio gauge\n")
+			fmt.Fprintf(w, "control_policy_publish_coverage_ratio %.6f\n", coverage)
+			fmt.Fprintf(w, "# HELP control_policy_ack_closure_ratio Ratio of acked rows over publish-complete rows.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_ack_closure_ratio gauge\n")
+			fmt.Fprintf(w, "control_policy_ack_closure_ratio %.6f\n", ackRatio)
+		}
+	}
+	fmt.Fprintf(w, "# HELP control_mutation_blocked_safe_mode_total Total mutation requests blocked by safe mode.\n")
+	fmt.Fprintf(w, "# TYPE control_mutation_blocked_safe_mode_total counter\n")
+	fmt.Fprintf(w, "control_mutation_blocked_safe_mode_total %d\n", s.controlMutationBlockedSafeMode.Load())
+	fmt.Fprintf(w, "# HELP control_mutation_blocked_consensus_gate_total Total mutation requests blocked by consensus health gate.\n")
+	fmt.Fprintf(w, "# TYPE control_mutation_blocked_consensus_gate_total counter\n")
+	fmt.Fprintf(w, "control_mutation_blocked_consensus_gate_total %d\n", s.controlMutationBlockedConsensus.Load())
+	fmt.Fprintf(w, "# HELP control_mutation_blocked_tenant_scope_total Total mutation requests blocked by tenant-scope policy.\n")
+	fmt.Fprintf(w, "# TYPE control_mutation_blocked_tenant_scope_total counter\n")
+	fmt.Fprintf(w, "control_mutation_blocked_tenant_scope_total %d\n", s.controlMutationBlockedTenantScope.Load())
+	fmt.Fprintf(w, "# HELP control_mutation_rate_limited_total Total mutation requests blocked by operator rate limits.\n")
+	fmt.Fprintf(w, "# TYPE control_mutation_rate_limited_total counter\n")
+	fmt.Fprintf(w, "control_mutation_rate_limited_total %d\n", s.controlMutationRateLimitedTotal.Load())
+	fmt.Fprintf(w, "# HELP control_mutation_cooldown_blocked_total Total mutation requests blocked by per-target cooldown windows.\n")
+	fmt.Fprintf(w, "# TYPE control_mutation_cooldown_blocked_total counter\n")
+	fmt.Fprintf(w, "control_mutation_cooldown_blocked_total %d\n", s.controlMutationCooldownBlockedTotal.Load())
+	fmt.Fprintf(w, "# HELP control_api_breaker_open_total Total requests rejected due to open control API circuit breaker.\n")
+	fmt.Fprintf(w, "# TYPE control_api_breaker_open_total counter\n")
+	fmt.Fprintf(w, "control_api_breaker_open_total %d\n", s.controlBreakerOpenTotal.Load())
+	fmt.Fprintf(w, "# HELP control_api_timeout_total Total control API operations that hit deadline exceeded.\n")
+	fmt.Fprintf(w, "# TYPE control_api_timeout_total counter\n")
+	fmt.Fprintf(w, "control_api_timeout_total %d\n", s.controlAPITimeoutTotal.Load())
+	fmt.Fprintf(w, "# HELP control_mutation_timeout_total Total control mutation operations that hit deadline exceeded.\n")
+	fmt.Fprintf(w, "# TYPE control_mutation_timeout_total counter\n")
+	fmt.Fprintf(w, "control_mutation_timeout_total %d\n", s.controlMutationTimeoutTotal.Load())
+	fmt.Fprintf(w, "# HELP control_mutation_safe_mode_enabled Global control mutation safe mode state (1=enabled).\n")
+	fmt.Fprintf(w, "# TYPE control_mutation_safe_mode_enabled gauge\n")
+	if s.controlMutationsSafeMode.Load() {
+		fmt.Fprintf(w, "control_mutation_safe_mode_enabled 1\n")
+	} else {
+		fmt.Fprintf(w, "control_mutation_safe_mode_enabled 0\n")
 	}
 
 	// Consensus wiring/validation metrics

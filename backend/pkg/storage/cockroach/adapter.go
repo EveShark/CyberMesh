@@ -2,7 +2,9 @@ package cockroach
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -459,7 +461,12 @@ func (a *adapter) PersistBlock(ctx context.Context, blk *block.AppBlock, receipt
 	defer tx.Rollback() // Safe to call even after commit
 
 	// 1. UPSERT block
+	stageStart := time.Now()
 	if err := a.upsertBlock(ctx, tx, blk, stateRoot); err != nil {
+		if a.metrics != nil {
+			a.metrics.observePersistStage("upsert_block", time.Since(stageStart))
+			a.metrics.observePersistFailureClass("upsert_block", err)
+		}
 		if a.auditLogger != nil {
 			_ = a.auditLogger.Error("block_persist_failed", map[string]interface{}{
 				"height": blk.GetHeight(),
@@ -468,9 +475,17 @@ func (a *adapter) PersistBlock(ctx context.Context, blk *block.AppBlock, receipt
 		}
 		return fmt.Errorf("upsert block: %w", err)
 	}
+	if a.metrics != nil {
+		a.metrics.observePersistStage("upsert_block", time.Since(stageStart))
+	}
 
 	// 2. UPSERT transactions
+	stageStart = time.Now()
 	if err := a.upsertTransactions(ctx, tx, blk, receipts); err != nil {
+		if a.metrics != nil {
+			a.metrics.observePersistStage("upsert_transactions", time.Since(stageStart))
+			a.metrics.observePersistFailureClass("upsert_transactions", err)
+		}
 		if a.auditLogger != nil {
 			_ = a.auditLogger.Error("transactions_persist_failed", map[string]interface{}{
 				"height": blk.GetHeight(),
@@ -479,9 +494,17 @@ func (a *adapter) PersistBlock(ctx context.Context, blk *block.AppBlock, receipt
 		}
 		return fmt.Errorf("upsert transactions: %w", err)
 	}
+	if a.metrics != nil {
+		a.metrics.observePersistStage("upsert_transactions", time.Since(stageStart))
+	}
 
 	// 3. UPSERT state snapshot
+	stageStart = time.Now()
 	if err := a.upsertSnapshot(ctx, tx, blk, stateRoot, len(receipts)); err != nil {
+		if a.metrics != nil {
+			a.metrics.observePersistStage("upsert_snapshot", time.Since(stageStart))
+			a.metrics.observePersistFailureClass("upsert_snapshot", err)
+		}
 		if a.auditLogger != nil {
 			_ = a.auditLogger.Error("snapshot_persist_failed", map[string]interface{}{
 				"height": blk.GetHeight(),
@@ -490,9 +513,17 @@ func (a *adapter) PersistBlock(ctx context.Context, blk *block.AppBlock, receipt
 		}
 		return fmt.Errorf("upsert snapshot: %w", err)
 	}
+	if a.metrics != nil {
+		a.metrics.observePersistStage("upsert_snapshot", time.Since(stageStart))
+	}
 
 	// Commit transaction
+	stageStart = time.Now()
 	if err := tx.Commit(); err != nil {
+		if a.metrics != nil {
+			a.metrics.observePersistStage("commit", time.Since(stageStart))
+			a.metrics.observePersistFailureClass("commit", err)
+		}
 		if a.auditLogger != nil {
 			_ = a.auditLogger.Error("block_persist_commit_failed", map[string]interface{}{
 				"height": blk.GetHeight(),
@@ -500,6 +531,9 @@ func (a *adapter) PersistBlock(ctx context.Context, blk *block.AppBlock, receipt
 			})
 		}
 		return fmt.Errorf("commit transaction: %w", err)
+	}
+	if a.metrics != nil {
+		a.metrics.observePersistStage("commit", time.Since(stageStart))
 	}
 
 	// Success audit
@@ -699,7 +733,17 @@ func (a *adapter) upsertTransactions(ctx context.Context, tx *sql.Tx, blk *block
 		}
 
 		if rows, _ := res.RowsAffected(); rows > 0 {
-			continue // Insert succeeded
+			// Insert succeeded; policy transactions must always durable-enqueue outbox within the same DB tx.
+			if stateTx.Type() == state.TxPolicy {
+				policyTx, ok := stateTx.(*state.PolicyTx)
+				if !ok || len(policyTx.Data) == 0 {
+					return fmt.Errorf("%w: policy tx payload missing", ErrInvalidData)
+				}
+				if err := a.upsertPolicyOutbox(ctx, tx, blk.GetHeight(), blk.GetTimestamp().Unix(), i, policyTx.Data); err != nil {
+					return fmt.Errorf("upsert policy outbox: %w", err)
+				}
+			}
+			continue
 		}
 
 		// Conflict occurred (rows == 0), verify idempotency
@@ -743,8 +787,91 @@ func (a *adapter) upsertTransactions(ctx context.Context, tx *sql.Tx, blk *block
 		}
 
 		// Idempotent insert
+		if stateTx.Type() == state.TxPolicy {
+			policyTx, ok := stateTx.(*state.PolicyTx)
+			if !ok || len(policyTx.Data) == 0 {
+				return fmt.Errorf("%w: policy tx payload missing", ErrInvalidData)
+			}
+			if err := a.upsertPolicyOutbox(ctx, tx, blk.GetHeight(), blk.GetTimestamp().Unix(), i, policyTx.Data); err != nil {
+				return fmt.Errorf("upsert policy outbox: %w", err)
+			}
+		}
 	}
 
+	return nil
+}
+
+func parsePolicyID(raw []byte) string {
+	var payload struct {
+		PolicyID string `json:"policy_id"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.PolicyID)
+}
+
+func parsePolicyTrace(raw []byte) (string, int64) {
+	var payload struct {
+		PolicyID string `json:"policy_id"`
+		QCRef    string `json:"qc_reference"`
+		Metadata struct {
+			TraceID      string `json:"trace_id"`
+			AIEventTsMs  int64  `json:"ai_event_ts_ms"`
+			AIEventTSMs2 int64  `json:"ai_event_timestamp_ms"`
+		} `json:"metadata"`
+		Trace struct {
+			ID        string `json:"id"`
+			AIEventMs int64  `json:"ai_event_ts_ms"`
+		} `json:"trace"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return "", 0
+	}
+	traceID := strings.TrimSpace(payload.Metadata.TraceID)
+	if traceID == "" {
+		traceID = strings.TrimSpace(payload.Trace.ID)
+	}
+	if traceID == "" {
+		traceID = strings.TrimSpace(payload.QCRef)
+	}
+	aiEventTsMs := payload.Metadata.AIEventTsMs
+	if aiEventTsMs <= 0 {
+		aiEventTsMs = payload.Metadata.AIEventTSMs2
+	}
+	if aiEventTsMs <= 0 {
+		aiEventTsMs = payload.Trace.AIEventMs
+	}
+	return traceID, aiEventTsMs
+}
+
+func (a *adapter) upsertPolicyOutbox(ctx context.Context, tx *sql.Tx, blockHeight uint64, blockTS int64, txIndex int, payload []byte) error {
+	if len(payload) == 0 {
+		return fmt.Errorf("%w: empty policy payload", ErrInvalidData)
+	}
+
+	ruleHash := sha256.Sum256(payload)
+	policyID := parsePolicyID(payload)
+	if policyID == "" {
+		// Preserve durability even for malformed payloads; dispatcher will terminal-fail with guardrail reason.
+		policyID = "invalid:" + hex.EncodeToString(ruleHash[:8])
+	}
+	traceID, aiEventTsMs := parsePolicyTrace(payload)
+	if traceID == "" {
+		traceID = fmt.Sprintf("trace:%s:%s", policyID, hex.EncodeToString(ruleHash[:8]))
+	}
+
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO control_policy_outbox (
+			block_height, block_ts, tx_index, policy_id, rule_hash, payload, trace_id, ai_event_ts_ms, status, next_retry_at, created_at, updated_at
+		) VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8, 'pending', NOW(), NOW(), NOW()
+		)
+		ON CONFLICT (block_height, tx_index) DO NOTHING
+	`, blockHeight, blockTS, txIndex, policyID, ruleHash[:], payload, traceID, aiEventTsMs)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -1157,29 +1284,36 @@ func (a *adapter) recordTxn(label string) func() {
 
 // MetricsSnapshot contains aggregated latency and slow operation counters.
 type MetricsSnapshot struct {
-	QueryBuckets         []utils.HistogramBucket
-	QueryCount           uint64
-	QuerySumMs           float64
-	QueryP95Ms           float64
-	TxnBuckets           []utils.HistogramBucket
-	TxnCount             uint64
-	TxnSumMs             float64
-	TxnP95Ms             float64
-	SlowQueryCount       uint64
-	SlowTransactionCount uint64
-	SlowQueries          map[string]uint64
-	SlowTransactions     map[string]uint64
+	QueryBuckets              []utils.HistogramBucket
+	QueryCount                uint64
+	QuerySumMs                float64
+	QueryP95Ms                float64
+	TxnBuckets                []utils.HistogramBucket
+	TxnCount                  uint64
+	TxnSumMs                  float64
+	TxnP95Ms                  float64
+	SlowQueryCount            uint64
+	SlowTransactionCount      uint64
+	SlowQueries               map[string]uint64
+	SlowTransactions          map[string]uint64
+	PersistStageBuckets       map[string][]utils.HistogramBucket
+	PersistStageCount         map[string]uint64
+	PersistStageSumMs         map[string]float64
+	PersistStageP95Ms         map[string]float64
+	PersistFailureClassTotals map[string]uint64
 }
 
 type dbMetrics struct {
-	queryLatency         *utils.LatencyHistogram
-	txnLatency           *utils.LatencyHistogram
-	slowQueryThresholdMs float64
-	slowTxnThresholdMs   float64
-	slowQueryCount       atomic.Uint64
-	slowTxnCount         atomic.Uint64
-	slowQueryLabels      sync.Map
-	slowTxnLabels        sync.Map
+	queryLatency          *utils.LatencyHistogram
+	txnLatency            *utils.LatencyHistogram
+	slowQueryThresholdMs  float64
+	slowTxnThresholdMs    float64
+	slowQueryCount        atomic.Uint64
+	slowTxnCount          atomic.Uint64
+	slowQueryLabels       sync.Map
+	slowTxnLabels         sync.Map
+	persistStages         sync.Map
+	persistFailureClasses sync.Map
 }
 
 func newDBMetrics() *dbMetrics {
@@ -1215,6 +1349,43 @@ func (m *dbMetrics) observeTxn(label string, d time.Duration) {
 	}
 }
 
+type stageMetric struct {
+	hist *utils.LatencyHistogram
+}
+
+func (m *dbMetrics) observePersistStage(label string, d time.Duration) {
+	if m == nil {
+		return
+	}
+	if label == "" {
+		label = "unknown"
+	}
+	val, ok := m.persistStages.Load(label)
+	if !ok {
+		created := &stageMetric{
+			hist: utils.NewLatencyHistogram([]float64{1, 5, 20, 50, 100, 250, 500, 1000, 2500, 5000}),
+		}
+		actual, loaded := m.persistStages.LoadOrStore(label, created)
+		if loaded {
+			val = actual
+		} else {
+			val = created
+		}
+	}
+	if sm, ok := val.(*stageMetric); ok && sm.hist != nil {
+		sm.hist.Observe(float64(d) / float64(time.Millisecond))
+	}
+}
+
+func (m *dbMetrics) observePersistFailureClass(stage string, err error) {
+	if m == nil || err == nil {
+		return
+	}
+	class := classifyPersistError(err)
+	key := stage + ":" + class
+	incrementLabel(&m.persistFailureClasses, key)
+}
+
 func (m *dbMetrics) snapshot() MetricsSnapshot {
 	if m == nil {
 		return MetricsSnapshot{}
@@ -1222,18 +1393,23 @@ func (m *dbMetrics) snapshot() MetricsSnapshot {
 	queryBuckets, qCount, qSum := m.queryLatency.Snapshot()
 	txnBuckets, tCount, tSum := m.txnLatency.Snapshot()
 	snapshot := MetricsSnapshot{
-		QueryBuckets:         queryBuckets,
-		QueryCount:           qCount,
-		QuerySumMs:           qSum,
-		QueryP95Ms:           m.queryLatency.Quantile(0.95),
-		TxnBuckets:           txnBuckets,
-		TxnCount:             tCount,
-		TxnSumMs:             tSum,
-		TxnP95Ms:             m.txnLatency.Quantile(0.95),
-		SlowQueryCount:       m.slowQueryCount.Load(),
-		SlowTransactionCount: m.slowTxnCount.Load(),
-		SlowQueries:          make(map[string]uint64),
-		SlowTransactions:     make(map[string]uint64),
+		QueryBuckets:              queryBuckets,
+		QueryCount:                qCount,
+		QuerySumMs:                qSum,
+		QueryP95Ms:                m.queryLatency.Quantile(0.95),
+		TxnBuckets:                txnBuckets,
+		TxnCount:                  tCount,
+		TxnSumMs:                  tSum,
+		TxnP95Ms:                  m.txnLatency.Quantile(0.95),
+		SlowQueryCount:            m.slowQueryCount.Load(),
+		SlowTransactionCount:      m.slowTxnCount.Load(),
+		SlowQueries:               make(map[string]uint64),
+		SlowTransactions:          make(map[string]uint64),
+		PersistStageBuckets:       make(map[string][]utils.HistogramBucket),
+		PersistStageCount:         make(map[string]uint64),
+		PersistStageSumMs:         make(map[string]float64),
+		PersistStageP95Ms:         make(map[string]float64),
+		PersistFailureClassTotals: make(map[string]uint64),
 	}
 	m.slowQueryLabels.Range(func(key, value any) bool {
 		if counter, ok := value.(*atomic.Uint64); ok {
@@ -1247,7 +1423,104 @@ func (m *dbMetrics) snapshot() MetricsSnapshot {
 		}
 		return true
 	})
+	m.persistStages.Range(func(key, value any) bool {
+		name, ok := key.(string)
+		if !ok {
+			return true
+		}
+		sm, ok := value.(*stageMetric)
+		if !ok || sm.hist == nil {
+			return true
+		}
+		buckets, count, sum := sm.hist.Snapshot()
+		snapshot.PersistStageBuckets[name] = buckets
+		snapshot.PersistStageCount[name] = count
+		snapshot.PersistStageSumMs[name] = sum
+		snapshot.PersistStageP95Ms[name] = sm.hist.Quantile(0.95)
+		return true
+	})
+	m.persistFailureClasses.Range(func(key, value any) bool {
+		if counter, ok := value.(*atomic.Uint64); ok {
+			if name, ok := key.(string); ok {
+				snapshot.PersistFailureClassTotals[name] = counter.Load()
+			}
+		}
+		return true
+	})
 	return snapshot
+}
+
+func classifyPersistError(err error) string {
+	if err == nil {
+		return "none"
+	}
+	if state := extractSQLState(err); state != "" {
+		switch state {
+		case "40001":
+			return "retry_serialization"
+		case "40P01":
+			return "retry_deadlock"
+		case "55P03":
+			return "retry_lock_not_available"
+		case "57014":
+			return "timeout_query_canceled"
+		case "23505":
+			return "constraint_unique"
+		case "23503":
+			return "constraint_foreign_key"
+		case "23514":
+			return "constraint_check"
+		case "23502":
+			return "constraint_not_null"
+		case "22001", "22003", "22007", "22008", "22P02":
+			return "invalid_data"
+		case "08000", "08001", "08003", "08004", "08006":
+			return "connection"
+		}
+		return "sqlstate_" + strings.ToLower(state)
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "restart transaction"), strings.Contains(msg, "40001"), strings.Contains(msg, "serialization"):
+		return "retry_serialization"
+	case strings.Contains(msg, "40p01"), strings.Contains(msg, "deadlock"):
+		return "retry_deadlock"
+	case strings.Contains(msg, "55p03"), strings.Contains(msg, "lock_not_available"), strings.Contains(msg, "lock timeout"):
+		return "retry_lock_not_available"
+	case strings.Contains(msg, "context deadline exceeded"), strings.Contains(msg, "timeout"):
+		return "timeout"
+	case strings.Contains(msg, "fenced/no-op"):
+		return "fenced"
+	case strings.Contains(msg, "23505"), strings.Contains(msg, "duplicate key"), strings.Contains(msg, "unique constraint"):
+		return "constraint_unique"
+	case strings.Contains(msg, "23503"), strings.Contains(msg, "foreign key"):
+		return "constraint_foreign_key"
+	case strings.Contains(msg, "23514"), strings.Contains(msg, "check constraint"):
+		return "constraint_check"
+	case strings.Contains(msg, "23502"), strings.Contains(msg, "not-null"):
+		return "constraint_not_null"
+	case strings.Contains(msg, "22p02"), strings.Contains(msg, "invalid input syntax"):
+		return "invalid_data"
+	case strings.Contains(msg, "connection reset"), strings.Contains(msg, "connection refused"), strings.Contains(msg, "broken pipe"):
+		return "connection"
+	default:
+		return "other"
+	}
+}
+
+func extractSQLState(err error) string {
+	if err == nil {
+		return ""
+	}
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		return string(pqErr.Code)
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code
+	}
+	return ""
 }
 
 func incrementLabel(store *sync.Map, label string) {

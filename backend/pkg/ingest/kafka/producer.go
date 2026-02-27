@@ -42,6 +42,11 @@ type Producer struct {
 	lastPublishErr                  atomic.Pointer[string]
 	publishLatencyHist              *utils.LatencyHistogram
 	policyPublishLatencyHist        *utils.LatencyHistogram
+	logThrottle                     time.Duration
+	throttledLogs                   atomic.Uint64
+	lastCommitInfoLogNs             int64
+	lastPolicyInfoLogNs             int64
+	lastDLQDebugLogNs               int64
 }
 
 // ProducerTopics holds Kafka topic names for producer
@@ -59,6 +64,7 @@ type ProducerConfig struct {
 	Topics       ProducerTopics
 	Signer       *CommitSigner
 	PolicySigner *CommitSigner
+	LogThrottle  time.Duration
 }
 
 // NewProducer creates a new Kafka producer for publishing control messages
@@ -99,6 +105,10 @@ func NewProducer(ctx context.Context, cfg ProducerConfig, saramaCfg *sarama.Conf
 		closed:       false,
 		brokers:      append([]string(nil), cfg.Brokers...),
 		config:       saramaCfg,
+		logThrottle:  cfg.LogThrottle,
+	}
+	if p.logThrottle <= 0 {
+		p.logThrottle = 10 * time.Second
 	}
 	p.publishLatencyHist = utils.NewLatencyHistogram([]float64{1, 5, 20, 100, 500, 1000, math.Inf(1)})
 	p.policyPublishLatencyHist = utils.NewLatencyHistogram([]float64{1, 5, 20, 100, 500, 1000, math.Inf(1)})
@@ -260,7 +270,7 @@ func (p *Producer) PublishCommit(ctx context.Context, height uint64, hash [32]by
 		})
 	}
 
-	if p.logger != nil {
+	if p.logger != nil && p.shouldLog(&p.lastCommitInfoLogNs) {
 		p.logger.InfoContext(ctx, "Commit published to Kafka",
 			utils.ZapUint64("height", height),
 			utils.ZapString("hash", fmt.Sprintf("%x", hash[:8])),
@@ -274,21 +284,27 @@ func (p *Producer) PublishCommit(ctx context.Context, height uint64, hash [32]by
 
 // PublishPolicy publishes a policy update event to control.policy.v1.
 func (p *Producer) PublishPolicy(ctx context.Context, evt *pb.PolicyUpdateEvent) error {
+	_, _, err := p.PublishPolicyWithAck(ctx, evt)
+	return err
+}
+
+// PublishPolicyWithAck publishes a policy update and returns Kafka partition/offset.
+func (p *Producer) PublishPolicyWithAck(ctx context.Context, evt *pb.PolicyUpdateEvent) (int32, int64, error) {
 	p.mu.RLock()
 	if p.closed {
 		p.mu.RUnlock()
-		return fmt.Errorf("kafka producer: already closed")
+		return 0, 0, fmt.Errorf("kafka producer: already closed")
 	}
 	p.mu.RUnlock()
 
 	if p.topics.Policy == "" {
-		return fmt.Errorf("kafka producer: policy topic not configured")
+		return 0, 0, fmt.Errorf("kafka producer: policy topic not configured")
 	}
 	if p.policySigner == nil {
-		return fmt.Errorf("kafka producer: policy signer unavailable")
+		return 0, 0, fmt.Errorf("kafka producer: policy signer unavailable")
 	}
 	if evt == nil {
-		return fmt.Errorf("kafka producer: policy event is nil")
+		return 0, 0, fmt.Errorf("kafka producer: policy event is nil")
 	}
 
 	if err := p.policySigner.SignPolicy(evt); err != nil {
@@ -297,12 +313,12 @@ func (p *Producer) PublishPolicy(ctx context.Context, evt *pb.PolicyUpdateEvent)
 				utils.ZapError(err),
 				utils.ZapString("policy_id", evt.GetPolicyId()))
 		}
-		return fmt.Errorf("kafka producer: policy sign failed: %w", err)
+		return 0, 0, fmt.Errorf("kafka producer: policy sign failed: %w", err)
 	}
 
 	msg, err := proto.Marshal(evt)
 	if err != nil {
-		return fmt.Errorf("kafka producer: policy marshal failed: %w", err)
+		return 0, 0, fmt.Errorf("kafka producer: policy marshal failed: %w", err)
 	}
 
 	var key sarama.Encoder
@@ -341,7 +357,7 @@ func (p *Producer) PublishPolicy(ctx context.Context, evt *pb.PolicyUpdateEvent)
 				utils.ZapError(err),
 				utils.ZapString("policy_id", evt.GetPolicyId()))
 		}
-		return fmt.Errorf("kafka producer: publish policy failed: %w", err)
+		return partition, offset, fmt.Errorf("kafka producer: publish policy failed: %w", err)
 	}
 
 	p.policyPublishSuccesses.Add(1)
@@ -363,7 +379,7 @@ func (p *Producer) PublishPolicy(ctx context.Context, evt *pb.PolicyUpdateEvent)
 			"offset":    offset,
 		})
 	}
-	if p.logger != nil {
+	if p.logger != nil && p.shouldLog(&p.lastPolicyInfoLogNs) {
 		p.logger.InfoContext(ctx, "Policy published to Kafka",
 			utils.ZapString("policy_id", evt.GetPolicyId()),
 			utils.ZapInt32("partition", partition),
@@ -371,7 +387,7 @@ func (p *Producer) PublishPolicy(ctx context.Context, evt *pb.PolicyUpdateEvent)
 			utils.ZapInt64("expiration_height", evt.GetExpirationHeight()))
 	}
 
-	return nil
+	return partition, offset, nil
 }
 
 // PublishDLQ publishes a raw payload to the configured topic (used for guardrail rejects).
@@ -424,7 +440,7 @@ func (p *Producer) PublishDLQ(ctx context.Context, topic string, key sarama.Enco
 		})
 	}
 
-	if p.logger != nil {
+	if p.logger != nil && p.shouldLog(&p.lastDLQDebugLogNs) {
 		p.logger.DebugContext(ctx, "DLQ payload published",
 			utils.ZapString("topic", topic),
 			utils.ZapInt32("partition", partition),
@@ -457,6 +473,7 @@ type ProducerStats struct {
 	PolicyLatencyP95Ms     float64
 	PolicyLatencyCount     uint64
 	PolicyLatencySumMs     float64
+	LogsThrottled          uint64
 }
 
 // Stats returns a snapshot of producer telemetry counters.
@@ -510,6 +527,7 @@ func (p *Producer) Stats() ProducerStats {
 		stats.PolicyLatencyCount = policyTotal
 		stats.PolicyLatencySumMs = policySum
 	}
+	stats.LogsThrottled = p.throttledLogs.Load()
 	return stats
 }
 
@@ -544,4 +562,16 @@ func encodeUint64(n uint64) []byte {
 	buf := make([]byte, 8)
 	binary.BigEndian.PutUint64(buf, n)
 	return buf
+}
+
+func (p *Producer) shouldLog(lastNs *int64) bool {
+	now := time.Now().UnixNano()
+	prev := atomic.LoadInt64(lastNs)
+	if prev == 0 || time.Duration(now-prev) >= p.logThrottle {
+		if atomic.CompareAndSwapInt64(lastNs, prev, now) {
+			return true
+		}
+	}
+	p.throttledLogs.Add(1)
+	return false
 }

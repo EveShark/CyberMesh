@@ -24,6 +24,7 @@ import (
 
 type policyProducer interface {
 	PublishPolicy(ctx context.Context, evt *pb.PolicyUpdateEvent) error
+	PublishPolicyWithAck(ctx context.Context, evt *pb.PolicyUpdateEvent) (int32, int64, error)
 	PublishDLQ(ctx context.Context, topic string, key sarama.Encoder, payload []byte, headers []sarama.RecordHeader) (int32, int64, error)
 }
 
@@ -43,6 +44,10 @@ type policyPublisher struct {
 	dlqEnabled    bool
 	guardrailMu   sync.Mutex
 	guardrailHits map[string]uint64
+	publishMu     sync.Mutex
+	publishedAt   map[string]time.Time
+	dedupeWindow  time.Duration
+	maxCacheSize  int
 	dlqSuccesses  atomic.Uint64
 	dlqFailures   atomic.Uint64
 }
@@ -83,6 +88,14 @@ func newPolicyPublisher(producer *kafka.Producer, cfgMgr *utils.ConfigManager, t
 	if blockDuration <= 0 {
 		blockDuration = 5 * time.Second
 	}
+	dedupeWindow := cfgMgr.GetDuration("CONTROL_POLICY_PUBLISH_DEDUP_WINDOW", 10*time.Minute)
+	if dedupeWindow < 0 {
+		dedupeWindow = 0
+	}
+	maxCacheSize := cfgMgr.GetInt("CONTROL_POLICY_PUBLISH_DEDUP_CACHE", 10000)
+	if maxCacheSize <= 0 {
+		maxCacheSize = 10000
+	}
 
 	dlqTopic := strings.TrimSpace(cfgMgr.GetString("CONTROL_POLICY_DLQ_TOPIC", ""))
 	dlqEnabled := cfgMgr.GetBool("POLICY_DLQ_ENABLED", dlqTopic != "")
@@ -107,6 +120,9 @@ func newPolicyPublisher(producer *kafka.Producer, cfgMgr *utils.ConfigManager, t
 		dlqTopic:      dlqTopic,
 		dlqEnabled:    dlqEnabled,
 		guardrailHits: make(map[string]uint64),
+		publishedAt:   make(map[string]time.Time),
+		dedupeWindow:  dedupeWindow,
+		maxCacheSize:  maxCacheSize,
 	}
 
 	// Optional: when set, any policy payload that targets this namespace is treated as a
@@ -164,6 +180,14 @@ func (p *policyPublisher) Publish(ctx context.Context, height uint64, ts int64, 
 			p.guardrailReject(ctx, policyID, height, reason, err, raw)
 			continue
 		}
+		if p.alreadyPublishedRecently(policyID, blockTime) {
+			if p.logger != nil {
+				p.logger.InfoContext(ctx, "Skipping duplicate policy publish within dedupe window",
+					utils.ZapString("policy_id", policyID),
+					utils.ZapDuration("dedupe_window", p.dedupeWindow))
+			}
+			continue
+		}
 
 		if err := p.producer.PublishPolicy(ctx, evt); err != nil {
 			if p.logger != nil {
@@ -189,6 +213,93 @@ func (p *policyPublisher) Publish(ctx context.Context, height uint64, ts int64, 
 				"height":            height,
 				"expiration_height": evt.GetExpirationHeight(),
 			})
+		}
+		p.markPublished(policyID, blockTime)
+	}
+}
+
+// PublishFromOutbox publishes one durable outbox payload and returns policy id and Kafka coordinates.
+// It bypasses time-window dedupe because outbox rows are already idempotent at write-time.
+func (p *policyPublisher) PublishFromOutbox(ctx context.Context, height uint64, ts int64, raw []byte) (string, int32, int64, error) {
+	if p == nil || !p.enabled {
+		return "", 0, 0, fmt.Errorf("policy publisher disabled")
+	}
+	blockTime := time.Unix(ts, 0)
+	if blockTime.IsZero() {
+		blockTime = time.Now().UTC()
+	}
+	evt, policyID, reason, err := p.prepareEvent(height, blockTime, raw)
+	if reason != "" || err != nil {
+		p.guardrailReject(ctx, policyID, height, reason, err, raw)
+		if err == nil {
+			err = fmt.Errorf("%s", reason)
+		}
+		return policyID, 0, 0, err
+	}
+
+	partition, offset, err := p.producer.PublishPolicyWithAck(ctx, evt)
+	if err != nil {
+		p.guardrailReject(ctx, policyID, height, "policy_publish_failed", err, raw)
+		return policyID, partition, offset, err
+	}
+
+	if p.audit != nil {
+		_ = p.audit.Info("policy_published_outbox", map[string]interface{}{
+			"policy_id": policyID,
+			"height":    height,
+			"partition": partition,
+			"offset":    offset,
+		})
+	}
+	return policyID, partition, offset, nil
+}
+
+func (p *policyPublisher) alreadyPublishedRecently(policyID string, now time.Time) bool {
+	if p == nil || p.dedupeWindow <= 0 || policyID == "" {
+		return false
+	}
+	p.publishMu.Lock()
+	defer p.publishMu.Unlock()
+	p.prunePublishedLocked(now)
+	last, ok := p.publishedAt[policyID]
+	if !ok {
+		return false
+	}
+	return now.Sub(last) <= p.dedupeWindow
+}
+
+func (p *policyPublisher) markPublished(policyID string, now time.Time) {
+	if p == nil || p.dedupeWindow <= 0 || policyID == "" {
+		return
+	}
+	p.publishMu.Lock()
+	defer p.publishMu.Unlock()
+	p.prunePublishedLocked(now)
+	p.publishedAt[policyID] = now
+}
+
+func (p *policyPublisher) prunePublishedLocked(now time.Time) {
+	if p == nil {
+		return
+	}
+	// Time-window eviction first.
+	if p.dedupeWindow > 0 {
+		cutoff := now.Add(-p.dedupeWindow)
+		for k, ts := range p.publishedAt {
+			if ts.Before(cutoff) {
+				delete(p.publishedAt, k)
+			}
+		}
+	}
+	// Size cap to prevent unbounded growth.
+	if p.maxCacheSize > 0 && len(p.publishedAt) > p.maxCacheSize {
+		excess := len(p.publishedAt) - p.maxCacheSize
+		for k := range p.publishedAt {
+			delete(p.publishedAt, k)
+			excess--
+			if excess <= 0 {
+				break
+			}
 		}
 	}
 }

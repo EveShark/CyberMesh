@@ -84,6 +84,19 @@ type APIConfig struct {
 	// Optional node alias configuration for telemetry overlays
 	NodeAliasMap  map[string]string
 	NodeAliasList []string
+
+	// Control-plane mutation safety flags
+	ControlMutationsEnabled         bool
+	ControlMutationsSafeMode        bool
+	ControlMutationRequireConsensus bool
+	ControlMutationRequireTenant    bool
+	ControlMutationTimeout          time.Duration
+	ControlTraceTimeout             time.Duration
+	ControlAPIBreakerEnabled        bool
+	ControlAPIBreakerErrorThreshold int
+	ControlAPIBreakerCooldown       time.Duration
+	ControlMutationCooldown         time.Duration
+	ControlMutationMaxPerMinute     int
 }
 
 // RateLimitOverride configures per-route rate limiting policies.
@@ -124,18 +137,32 @@ func DefaultAPIConfig() *APIConfig {
 			"storage_",
 			"state_",
 			"mempool_",
+			"control_policy_",
+			"control_commit_",
+			"control_",
 		},
-		MetricsCompress:        true,
-		MaxRequestSize:         1024 * 1024, // 1MB
-		MaxHeaderSize:          1024 * 1024, // 1MB
-		MaxConcurrentReqs:      100,
-		RequestTimeout:         30 * time.Second,
-		DashboardBlockLimit:    50,
-		DashboardCacheTTL:      3 * time.Second,
-		Environment:            "production",
-		AllowDegradedBootstrap: false,
-		AIServiceTimeout:       2 * time.Second,
-		AllowedRoles:           defaultRoleMapping(),
+		MetricsCompress:                 true,
+		MaxRequestSize:                  1024 * 1024, // 1MB
+		MaxHeaderSize:                   1024 * 1024, // 1MB
+		MaxConcurrentReqs:               100,
+		RequestTimeout:                  30 * time.Second,
+		DashboardBlockLimit:             50,
+		DashboardCacheTTL:               3 * time.Second,
+		Environment:                     "production",
+		AllowDegradedBootstrap:          false,
+		AIServiceTimeout:                2 * time.Second,
+		AllowedRoles:                    defaultRoleMapping(),
+		ControlMutationsEnabled:         false,
+		ControlMutationsSafeMode:        false,
+		ControlMutationRequireConsensus: true,
+		ControlMutationRequireTenant:    true,
+		ControlMutationTimeout:          10 * time.Second,
+		ControlTraceTimeout:             15 * time.Second,
+		ControlAPIBreakerEnabled:        true,
+		ControlAPIBreakerErrorThreshold: 5,
+		ControlAPIBreakerCooldown:       15 * time.Second,
+		ControlMutationCooldown:         3 * time.Second,
+		ControlMutationMaxPerMinute:     30,
 	}
 }
 
@@ -290,6 +317,31 @@ func LoadAPIConfig(cm *utils.ConfigManager) (*APIConfig, error) {
 
 	if aliasListEnv := cm.GetString("NETWORK_NODE_ALIAS_LIST", ""); aliasListEnv != "" {
 		cfg.NodeAliasList = parseCommaSeparated(aliasListEnv)
+	}
+
+	// Control-plane mutation safety flags
+	cfg.ControlMutationsEnabled = cm.GetBool("CONTROL_MUTATIONS_ENABLED", false)
+	cfg.ControlMutationsSafeMode = cm.GetBool("CONTROL_MUTATIONS_SAFE_MODE", false)
+	cfg.ControlMutationRequireConsensus = cm.GetBool("CONTROL_MUTATION_REQUIRE_CONSENSUS", true)
+	cfg.ControlMutationRequireTenant = cm.GetBool("CONTROL_MUTATION_REQUIRE_TENANT", true)
+	if timeout := cm.GetDuration("CONTROL_API_TIMEOUT_MUTATION", 0); timeout > 0 {
+		cfg.ControlMutationTimeout = timeout
+	}
+	if timeout := cm.GetDuration("CONTROL_API_TIMEOUT_TRACE", 0); timeout > 0 {
+		cfg.ControlTraceTimeout = timeout
+	}
+	cfg.ControlAPIBreakerEnabled = cm.GetBool("CONTROL_API_BREAKER_ENABLED", true)
+	if threshold := cm.GetInt("CONTROL_API_BREAKER_ERROR_THRESHOLD", 0); threshold > 0 {
+		cfg.ControlAPIBreakerErrorThreshold = threshold
+	}
+	if cooldown := cm.GetDuration("CONTROL_API_BREAKER_COOLDOWN", 0); cooldown > 0 {
+		cfg.ControlAPIBreakerCooldown = cooldown
+	}
+	if cooldown := cm.GetDuration("CONTROL_MUTATION_COOLDOWN", 0); cooldown > 0 {
+		cfg.ControlMutationCooldown = cooldown
+	}
+	if rpm := cm.GetInt("CONTROL_MUTATION_MAX_ACTIONS_PER_MINUTE", 0); rpm > 0 {
+		cfg.ControlMutationMaxPerMinute = rpm
 	}
 
 	return cfg, nil
@@ -517,6 +569,13 @@ func defaultRoleMapping() map[string][]string {
 			"/state",
 			"/validators",
 			"/stats",
+			"/network",
+			"/consensus",
+			"/anomalies",
+			"/ai",
+			"/policies",
+			"/control",
+			"/frontend-config",
 		},
 		"block_reader": {
 			"/health",
@@ -542,6 +601,61 @@ func defaultRoleMapping() map[string][]string {
 			"/health",
 			"/ready",
 			"/metrics",
+		},
+		"policy_reader": {
+			"/health",
+			"/ready",
+			"/policies",
+		},
+		"network_reader": {
+			"/health",
+			"/ready",
+			"/network",
+		},
+		"consensus_reader": {
+			"/health",
+			"/ready",
+			"/consensus",
+		},
+		"ai_reader": {
+			"/health",
+			"/ready",
+			"/ai",
+		},
+		"anomaly_reader": {
+			"/health",
+			"/ready",
+			"/anomalies",
+		},
+		"control_outbox_reader": {
+			"/health",
+			"/ready",
+			"/control/outbox",
+		},
+		"control_trace_reader": {
+			"/health",
+			"/ready",
+			"/control/trace",
+		},
+		"control_lease_reader": {
+			"/health",
+			"/ready",
+			"/control/leases",
+		},
+		"control_ack_reader": {
+			"/health",
+			"/ready",
+			"/control/acks",
+		},
+		"control_outbox_operator": {
+			"/health",
+			"/ready",
+			"/control/outbox",
+		},
+		"control_lease_admin": {
+			"/health",
+			"/ready",
+			"/control/leases",
 		},
 	}
 }

@@ -27,6 +27,9 @@ const (
 type VerifierConfig struct {
 	MaxTimestampSkew      time.Duration       // Max clock skew allowed (default: 5m)
 	PolicyPubKeyAllowlist map[string]struct{} // Hex-encoded Ed25519 pubkeys allowed to publish policies
+	PolicyRequireTrace    bool                // Require trace contract fields in ai.policy payload
+	PolicyRequireQCRef    bool                // Require qc_reference in ai.policy payload
+	PolicyTraceFutureSkew time.Duration       // Max future skew for ai_event_ts_ms
 }
 
 // DefaultVerifierConfig returns default verification configuration
@@ -34,6 +37,9 @@ func DefaultVerifierConfig() VerifierConfig {
 	return VerifierConfig{
 		MaxTimestampSkew:      5 * time.Minute,
 		PolicyPubKeyAllowlist: nil,
+		PolicyRequireTrace:    false,
+		PolicyRequireQCRef:    false,
+		PolicyTraceFutureSkew: 5 * time.Minute,
 	}
 }
 
@@ -378,6 +384,9 @@ func VerifyPolicyMsg(msg *PolicyMsg, cfg VerifierConfig, log *utils.Logger) (*st
 			return nil, fmt.Errorf("policy producer %s not allowlisted", keyHex)
 		}
 	}
+	if err := validatePolicyTraceContract(msg.Params, cfg); err != nil {
+		return nil, fmt.Errorf("policy trace contract invalid: %w", err)
+	}
 
 	// Convert to state.PolicyTx
 	// Note: PolicyTx.Data will contain the policy parameters
@@ -395,4 +404,91 @@ func VerifyPolicyMsg(msg *PolicyMsg, cfg VerifierConfig, log *utils.Logger) (*st
 	}
 
 	return tx, nil
+}
+
+func validatePolicyTraceContract(params []byte, cfg VerifierConfig) error {
+	if !cfg.PolicyRequireTrace && !cfg.PolicyRequireQCRef {
+		return nil
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(params, &payload); err != nil {
+		return fmt.Errorf("params json decode failed: %w", err)
+	}
+
+	var (
+		qcReference string
+		traceID     string
+		traceIDAlt  string
+		aiEventTSMs int64
+		traceTSMs   int64
+	)
+
+	if rawQC, ok := payload["qc_reference"].(string); ok {
+		qcReference = rawQC
+	}
+
+	if metadata, ok := payload["metadata"].(map[string]any); ok {
+		if v, ok := metadata["trace_id"].(string); ok {
+			traceID = v
+		}
+		if n, ok := metadata["ai_event_ts_ms"].(float64); ok {
+			aiEventTSMs = int64(n)
+		}
+		if n, ok := metadata["ai_event_timestamp_ms"].(float64); ok && aiEventTSMs == 0 {
+			aiEventTSMs = int64(n)
+		}
+	}
+
+	if trace, ok := payload["trace"].(map[string]any); ok {
+		if v, ok := trace["id"].(string); ok {
+			traceIDAlt = v
+		}
+		if n, ok := trace["ai_event_ts_ms"].(float64); ok {
+			traceTSMs = int64(n)
+		}
+	}
+
+	if cfg.PolicyRequireQCRef && qcReference == "" {
+		return fmt.Errorf("missing qc_reference")
+	}
+	if cfg.PolicyRequireTrace {
+		if traceID == "" && traceIDAlt == "" {
+			return fmt.Errorf("missing trace_id")
+		}
+		if aiEventTSMs == 0 && traceTSMs == 0 {
+			return fmt.Errorf("missing ai_event_ts_ms")
+		}
+	}
+	if traceID != "" && traceIDAlt != "" && traceID != traceIDAlt {
+		return fmt.Errorf("trace id mismatch between metadata.trace_id and trace.id")
+	}
+	if qcReference != "" {
+		activeTraceID := traceID
+		if activeTraceID == "" {
+			activeTraceID = traceIDAlt
+		}
+		if activeTraceID != "" && qcReference != activeTraceID {
+			return fmt.Errorf("qc_reference does not match trace id")
+		}
+	}
+
+	effectiveEventTS := aiEventTSMs
+	if effectiveEventTS == 0 {
+		effectiveEventTS = traceTSMs
+	}
+	if effectiveEventTS > 0 {
+		maxFutureSkew := cfg.PolicyTraceFutureSkew
+		if maxFutureSkew <= 0 {
+			maxFutureSkew = cfg.MaxTimestampSkew
+		}
+		if maxFutureSkew <= 0 {
+			maxFutureSkew = 5 * time.Minute
+		}
+		if effectiveEventTS > time.Now().Add(maxFutureSkew).UnixMilli() {
+			return fmt.Errorf("ai_event_ts_ms exceeds allowed future skew")
+		}
+	}
+
+	return nil
 }

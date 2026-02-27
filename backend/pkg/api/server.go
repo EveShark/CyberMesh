@@ -15,6 +15,7 @@ import (
 
 	"backend/pkg/config"
 	consapi "backend/pkg/consensus/api"
+	"backend/pkg/control/policyoutbox"
 	"backend/pkg/ingest/kafka"
 	"backend/pkg/mempool"
 	"backend/pkg/p2p"
@@ -26,6 +27,44 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 )
+
+type PolicyOutboxStatsProvider interface {
+	GetPolicyOutboxDispatcherStats() (policyoutbox.DispatcherStats, bool)
+	GetPolicyOutboxBacklogStats(ctx context.Context) (policyoutbox.BacklogStats, bool)
+	GetCommitPathStats() (CommitPathStats, bool)
+	GetPolicyAckConsumerStats() (PolicyAckConsumerStats, bool)
+	GetPolicyAckCausalStats() (PolicyAckCausalStats, bool)
+}
+
+type CommitPathStats struct {
+	LogSampleEvery uint64
+	LogsSuppressed uint64
+}
+
+type PolicyAckConsumerStats struct {
+	ProcessedTotal          uint64
+	RejectedTotal           uint64
+	StoreRetryAttempts      uint64
+	StoreRetryExhausted     uint64
+	DLQPublishedTotal       uint64
+	DLQPublishFailures      uint64
+	LoopErrors              uint64
+	WorkQueueWaits          uint64
+	SoftThrottleActivations uint64
+	LogsThrottled           uint64
+}
+
+type PolicyAckCausalStats struct {
+	SkewCorrectionsTotal uint64
+	AIToAckBuckets       []utils.HistogramBucket
+	AIToAckCount         uint64
+	AIToAckSumMs         float64
+	AIToAckP95Ms         float64
+	PublishToAckBuckets  []utils.HistogramBucket
+	PublishToAckCount    uint64
+	PublishToAckSumMs    float64
+	PublishToAckP95Ms    float64
+}
 
 // Server provides read-only API access to backend state
 type Server struct {
@@ -44,6 +83,7 @@ type Server struct {
 	kafkaCons    *kafka.Consumer
 	redisClient  *redis.Client
 	redisMetrics *redisTelemetry
+	outboxStats  PolicyOutboxStatsProvider
 
 	nodeAliases   map[string]string
 	nodeAliasList []string
@@ -91,6 +131,20 @@ type Server struct {
 	threatFallbackCount   atomic.Uint64
 	threatFallbackUpdated atomic.Int64
 	threatFallbackReason  atomic.Value
+
+	controlMutationsSafeMode            atomic.Bool
+	controlBreakers                     *controlBreakerRegistry
+	controlMutationBlockedSafeMode      atomic.Uint64
+	controlMutationBlockedConsensus     atomic.Uint64
+	controlMutationBlockedTenantScope   atomic.Uint64
+	controlMutationTimeoutTotal         atomic.Uint64
+	controlAPITimeoutTotal              atomic.Uint64
+	controlBreakerOpenTotal             atomic.Uint64
+	controlMutationRateLimitedTotal     atomic.Uint64
+	controlMutationCooldownBlockedTotal atomic.Uint64
+	controlMutationLimiter              *RateLimiter
+	controlMutationLastActionMu         sync.Mutex
+	controlMutationLastActionByTarget   map[string]time.Time
 }
 
 type rateLimitKey struct {
@@ -153,6 +207,7 @@ type Dependencies struct {
 	P2PRouter     *p2p.Router
 	KafkaProd     *kafka.Producer
 	KafkaCons     *kafka.Consumer
+	OutboxStats   PolicyOutboxStatsProvider
 	NodeAliases   map[string]string
 	NodeAliasList []string
 }
@@ -194,10 +249,23 @@ func NewServer(deps Dependencies) (*Server, error) {
 		p2pRouter:        deps.P2PRouter,
 		kafkaProd:        deps.KafkaProd,
 		kafkaCons:        deps.KafkaCons,
+		outboxStats:      deps.OutboxStats,
 		stopCh:           make(chan struct{}),
 		processStartTime: time.Now().Unix(),
 		routeMetrics:     make(map[requestMetricKey]*routeMetric),
 	}
+	s.controlMutationsSafeMode.Store(deps.Config.ControlMutationsSafeMode)
+	if deps.Config.ControlAPIBreakerEnabled {
+		s.controlBreakers = newControlBreakerRegistry(deps.Config.ControlAPIBreakerErrorThreshold, deps.Config.ControlAPIBreakerCooldown)
+	}
+	if deps.Config.ControlMutationMaxPerMinute > 0 {
+		s.controlMutationLimiter = NewRateLimiter(RateLimiterConfig{
+			RequestsPerMinute: deps.Config.ControlMutationMaxPerMinute,
+			Burst:             deps.Config.ControlMutationMaxPerMinute,
+			Logger:            deps.Logger,
+		})
+	}
+	s.controlMutationLastActionByTarget = make(map[string]time.Time)
 
 	s.loopStatus.Store("unknown")
 	s.loopIssues.Store("")

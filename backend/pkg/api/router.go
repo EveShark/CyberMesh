@@ -66,12 +66,26 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc(basePath+"/policies/acks", s.handlePolicyAcks)
 	mux.HandleFunc(basePath+"/policies/acks/", s.handlePolicyAcks)
 
+	// Frontend runtime config.
+	mux.HandleFunc(basePath+"/frontend-config", s.handleFrontendConfig)
+
+	// Control-plane APIs (Wave 1 read visibility).
+	mux.HandleFunc(basePath+"/control/outbox/backlog", s.handleControlOutboxBacklog)
+	mux.HandleFunc(basePath+"/control/outbox", s.handleControlOutboxList)
+	mux.HandleFunc(basePath+"/control/outbox/", s.handleControlOutboxGet)
+	mux.HandleFunc(basePath+"/control/trace", s.handleControlTraceList)
+	mux.HandleFunc(basePath+"/control/trace/", s.handleControlTraceByPolicy)
+	mux.HandleFunc(basePath+"/control/leases", s.handleControlLeases)
+	mux.HandleFunc(basePath+"/control/leases:force-takeover", s.handleControlLeases)
+	mux.HandleFunc(basePath+"/control/safe-mode:toggle", s.handleControlSafeModeToggle)
+	mux.HandleFunc(basePath+"/control/acks", s.handleControlAcksList)
+
 	// P2P info (for peer discovery) - DISABLED: handler method missing
 	// mux.HandleFunc(basePath+"/p2p/info", s.handleP2PInfo)
 
 	s.logger.Info("routes registered",
 		utils.ZapString("base_path", basePath),
-		utils.ZapInt("endpoint_count", 21))
+		utils.ZapInt("endpoint_count", 30))
 }
 
 // middlewareChain applies middleware in order
@@ -186,7 +200,7 @@ func (s *Server) isPublicEndpoint(path string) bool {
 }
 
 // getRequiredRole returns the required role for an endpoint
-func (s *Server) getRequiredRole(path string) string {
+func (s *Server) getRequiredRole(method, path string) string {
 	basePath := s.config.BasePath
 
 	// Admin has access to everything
@@ -222,6 +236,30 @@ func (s *Server) getRequiredRole(path string) string {
 	}
 	if strings.HasPrefix(path, basePath+"/policies/acks") {
 		return "policy_reader"
+	}
+	if strings.HasPrefix(path, basePath+"/frontend-config") {
+		return "stats_reader"
+	}
+	if strings.HasPrefix(path, basePath+"/control/outbox") {
+		if method == http.MethodPost {
+			return "control_outbox_operator"
+		}
+		return "control_outbox_reader"
+	}
+	if strings.HasPrefix(path, basePath+"/control/trace") {
+		return "control_trace_reader"
+	}
+	if strings.HasPrefix(path, basePath+"/control/leases") {
+		if method == http.MethodPost {
+			return "control_lease_admin"
+		}
+		return "control_lease_reader"
+	}
+	if strings.HasPrefix(path, basePath+"/control/safe-mode") {
+		return "control_lease_admin"
+	}
+	if strings.HasPrefix(path, basePath+"/control/acks") {
+		return "control_ack_reader"
 	}
 
 	// Default: no specific role required (public endpoint)

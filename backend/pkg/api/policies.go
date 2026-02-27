@@ -4,8 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
-	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -38,6 +36,7 @@ type policyAckResponse struct {
 }
 
 type policyAckPayload struct {
+	PolicyID           string `json:"policy_id,omitempty"`
 	ControllerInstance string `json:"controller_instance"`
 	ScopeIdentifier    string `json:"scope_identifier,omitempty"`
 	Tenant             string `json:"tenant,omitempty"`
@@ -59,7 +58,7 @@ type policyAckPayload struct {
 // - GET /policies/acks/<uuid>
 func (s *Server) handlePolicyAcks(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeErrorResponse(w, r, "METHOD_NOT_ALLOWED", "only GET method allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -72,18 +71,13 @@ func (s *Server) handlePolicyAcks(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if policyID == "" {
-		http.Error(w, "policy_id required", http.StatusBadRequest)
+		writeErrorResponse(w, r, "INVALID_POLICY_ID", "policy_id required", http.StatusBadRequest)
 		return
 	}
 
-	provider, ok := s.storage.(interface{ GetDB() *sql.DB })
-	if !ok {
-		http.Error(w, "storage adapter does not support GetDB()", http.StatusInternalServerError)
-		return
-	}
-	db := provider.GetDB()
-	if db == nil {
-		http.Error(w, "db not available", http.StatusServiceUnavailable)
+	db, err := s.getDB()
+	if err != nil {
+		writeErrorResponse(w, r, "STORAGE_UNAVAILABLE", "storage unavailable", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -109,7 +103,7 @@ func (s *Server) handlePolicyAcks(w http.ResponseWriter, r *http.Request) {
 		if s.logger != nil {
 			s.logger.WarnContext(ctx, "policy acks query failed", utils.ZapString("policy_id", policyID), utils.ZapError(err))
 		}
-		http.Error(w, fmt.Sprintf("query failed: %v", err), http.StatusInternalServerError)
+		writeErrorResponse(w, r, "ACKS_QUERY_FAILED", "failed to query policy acks", http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
@@ -126,10 +120,11 @@ func (s *Server) handlePolicyAcks(w http.ResponseWriter, r *http.Request) {
 			&row.RuleHash, &row.ProducerID,
 			&row.ObservedAt,
 		); scanErr != nil {
-			http.Error(w, fmt.Sprintf("scan failed: %v", scanErr), http.StatusInternalServerError)
+			writeErrorResponse(w, r, "ACKS_SCAN_FAILED", "failed to read policy ack row", http.StatusInternalServerError)
 			return
 		}
 		p := policyAckPayload{
+			PolicyID:           row.PolicyID,
 			ControllerInstance: row.ControllerInstance,
 			Result:             row.Result,
 			FastPath:           row.FastPath,
@@ -168,7 +163,7 @@ func (s *Server) handlePolicyAcks(w http.ResponseWriter, r *http.Request) {
 		acks = append(acks, p)
 	}
 	if err := rows.Err(); err != nil {
-		http.Error(w, fmt.Sprintf("iterate failed: %v", err), http.StatusInternalServerError)
+		writeErrorResponse(w, r, "ACKS_ITERATION_FAILED", "failed to iterate policy acks", http.StatusInternalServerError)
 		return
 	}
 
@@ -178,11 +173,5 @@ func (s *Server) handlePolicyAcks(w http.ResponseWriter, r *http.Request) {
 		Acks:     acks,
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	enc := json.NewEncoder(w)
-	enc.SetEscapeHTML(true)
-	if err := enc.Encode(resp); err != nil {
-		http.Error(w, fmt.Sprintf("encode failed: %v", err), http.StatusInternalServerError)
-		return
-	}
+	writeJSONResponse(w, r, NewSuccessResponse(resp), http.StatusOK)
 }

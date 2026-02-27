@@ -7,14 +7,18 @@ import (
 
 	"backend/pkg/block"
 	"backend/pkg/consensus/api"
+	ctypes "backend/pkg/consensus/types"
 	"backend/pkg/state"
 	"backend/pkg/utils"
 )
 
 func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
-	s.log.InfoContext(ctx, "onCommit called",
-		utils.ZapUint64("height", b.GetHeight()),
-		utils.ZapBool("has_persistWorker", s.persistWorker != nil))
+	logCommitInfo := s.shouldLogCommitInfo()
+	if logCommitInfo {
+		s.log.InfoContext(ctx, "onCommit called",
+			utils.ZapUint64("height", b.GetHeight()),
+			utils.ZapBool("has_persistWorker", s.persistWorker != nil))
+	}
 
 	start := time.Now()
 
@@ -38,8 +42,10 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 		return nil
 	}
 
-	s.log.InfoContext(ctx, "executing AppBlock in state machine",
-		utils.ZapInt("tx_count", ab.GetTransactionCount()))
+	if logCommitInfo {
+		s.log.InfoContext(ctx, "executing AppBlock in state machine",
+			utils.ZapInt("tx_count", ab.GetTransactionCount()))
+	}
 
 	// Execute deterministically against state store (use block timestamp, not wall clock)
 	blockTime := ab.GetTimestamp()
@@ -98,11 +104,13 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 	s.mp.Remove(hashes...)
 
 	// Audit with state root
-	s.log.InfoContext(ctx, "block committed",
-		utils.ZapUint64("height", ab.GetHeight()),
-		utils.ZapInt("tx_count", ab.GetTransactionCount()),
-		utils.ZapString("state_root", fmt.Sprintf("%x", root[:8])),
-		utils.ZapUint64("version", version))
+	if logCommitInfo {
+		s.log.InfoContext(ctx, "block committed",
+			utils.ZapUint64("height", ab.GetHeight()),
+			utils.ZapInt("tx_count", ab.GetTransactionCount()),
+			utils.ZapString("state_root", fmt.Sprintf("%x", root[:8])),
+			utils.ZapUint64("version", version))
+	}
 
 	// Prune old state versions to prevent memory growth
 	if memStore, ok := s.store.(*state.MemStore); ok {
@@ -116,8 +124,10 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 
 	// Enqueue async persistence if enabled
 	if s.persistWorker != nil {
-		s.log.InfoContext(ctx, "enqueueing persistence task",
-			utils.ZapUint64("height", ab.GetHeight()))
+		if logCommitInfo {
+			s.log.InfoContext(ctx, "enqueueing persistence task",
+				utils.ZapUint64("height", ab.GetHeight()))
+		}
 
 		task := &PersistenceTask{
 			Block:     ab,
@@ -130,27 +140,53 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 			s.log.WarnContext(ctx, "failed to enqueue persistence task",
 				utils.ZapError(err),
 				utils.ZapUint64("height", ab.GetHeight()))
-		} else {
+		} else if logCommitInfo {
 			s.log.InfoContext(ctx, "persistence task enqueued successfully")
 		}
 
-		// Policy publication is control-plane critical and must not be blocked by
-		// async persistence backpressure/integrity retries.
-		if s.policyPublisher != nil {
-			meta := extractCommitMetadata(ab, s.log)
-			if meta.policyCount > 0 {
-				s.policyPublisher.Publish(ctx, ab.GetHeight(), ab.GetTimestamp().Unix(), meta.policyCount, meta.policyPayloads)
-			}
-		}
 	} else {
-		s.log.WarnContext(ctx, "persistWorker is nil, cannot persist to database")
-		if s.policyPublisher != nil {
-			meta := extractCommitMetadata(ab, s.log)
-			if meta.policyCount > 0 {
-				s.policyPublisher.Publish(ctx, ab.GetHeight(), ab.GetTimestamp().Unix(), meta.policyCount, meta.policyPayloads)
-			}
+		if s.shouldLogCommitWarn(&s.lastPersistNilWarnNs, s.commitWarnThrottle) {
+			s.log.WarnContext(ctx, "persistWorker is nil, cannot persist to database")
 		}
 	}
 
 	return nil
+}
+
+func shouldPublishPolicyFromCommit(commitEnabled bool, proposerOnly bool, localNodeID ctypes.ValidatorID, proposerID ctypes.ValidatorID) bool {
+	if !commitEnabled {
+		return false
+	}
+	if !proposerOnly {
+		return true
+	}
+	return localNodeID == proposerID
+}
+
+func (s *Service) shouldPublishPolicyOnCommit(ab *block.AppBlock) bool {
+	if s == nil || ab == nil || s.policyPublisher == nil {
+		return false
+	}
+	status := s.eng.GetStatus()
+	allowed := shouldPublishPolicyFromCommit(s.policyPublishOnCommit, s.policyCommitProposerOnly, status.NodeID, ab.Proposer())
+	if !allowed && s.policyPublishOnCommit && s.policyCommitProposerOnly {
+		s.log.Debug("Skipping commit policy publish on non-proposer validator",
+			utils.ZapUint64("height", ab.GetHeight()))
+	}
+	return allowed
+}
+
+func (s *Service) logCommitPolicySummary(ab *block.AppBlock, policyCount int, publishEnabled bool, willPublish bool) {
+	if s == nil || ab == nil || s.log == nil {
+		return
+	}
+	status := s.eng.GetStatus()
+	isProposer := status.NodeID == ab.Proposer()
+	s.log.Info("commit policy summary",
+		utils.ZapUint64("height", ab.GetHeight()),
+		utils.ZapInt("policy_count", policyCount),
+		utils.ZapBool("publish_enabled", publishEnabled),
+		utils.ZapBool("commit_writer_proposer_only", s.policyCommitProposerOnly),
+		utils.ZapBool("is_block_proposer", isProposer),
+		utils.ZapBool("will_publish", willPublish))
 }
