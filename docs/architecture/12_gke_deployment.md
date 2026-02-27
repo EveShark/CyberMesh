@@ -1,7 +1,7 @@
 # Architecture 12: GKE Deployment
 ## Kubernetes Manifests and Runtime Topology (k8s_gke/)
 
-**Last Updated:** 2026-02-18
+**Last Updated:** 2026-02-25
 
 This document summarizes how the current CyberMesh manifests deploy the system across GKE and Azure-oriented manifest sets.
 It intentionally avoids including any sensitive values (no keys, passwords, usernames, or full DSNs).
@@ -224,8 +224,11 @@ Redis is deployed via:
 - Cloud Armor backend configs:
   - `k8s_gke/cloud-armor-backendconfig.yaml`
 - Secrets/config:
-  - `k8s_gke/configmap.yaml` (backend env)
-  - `k8s_gke/secret.yaml` + service-specific secrets/configmaps
+- `k8s_gke/configmap.yaml` (backend env)
+- `k8s_gke/secret.yaml` + service-specific secrets/configmaps
+
+Operational note:
+- Backend control-plane runtime in `k8s_gke/configmap.yaml` includes `CONTROL_POLICY_OUTBOX_*` and `CONTROL_POLICY_ACK_*` settings for commit->publish->ack behavior.
 
 ---
 

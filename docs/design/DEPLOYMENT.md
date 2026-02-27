@@ -1,7 +1,7 @@
 # CyberMesh Deployment (GKE + Azure Manifests)
 
 **Version:** 1
-**Last Updated:** 2026-02-20
+**Last Updated:** 2026-02-25
 
 ---
 
@@ -245,6 +245,10 @@ Related:
 | `telemetry-config` | Telemetry layer runtime config (stream/transform/adapters/pcap) |
 | `db-root-cert` | CockroachDB root CA cert bundle |
 | `ai-service-entrypoint` | AI service entrypoint script |
+
+> [!NOTE]
+> `cybermesh-config` also carries control-plane durability/perf knobs used by backend outbox + ACK workers, including:
+> `CONTROL_POLICY_OUTBOX_*` and `CONTROL_POLICY_ACK_*` settings.
 
 ### 6.2 Secrets
 

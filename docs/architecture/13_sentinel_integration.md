@@ -1,7 +1,7 @@
 # Architecture 13: Sentinel Integration
 ## Telemetry -> Sentinel -> AI -> Backend -> Enforcement
 
-**Last Updated:** 2026-02-18
+**Last Updated:** 2026-02-25
 
 This document is the source of truth for how Sentinel runs in the platform today.
 
@@ -17,7 +17,7 @@ This document is the source of truth for how Sentinel runs in the platform today
 | AI Adapter Input | `sentinel.verdicts.v1` |
 | AI Outputs from Sentinel path | `ai.anomalies.v1`, `ai.policy.v1` |
 | Backend Policy Output | `control.policy.v1` |
-| Enforcement ACK | `control.enforcement_ack.v1` |
+| Enforcement ACK | `control.enforcement_ack.v1` (backend primary consumer; AI optional) |
 | Deployment Mode (current) | Sentinel Kafka worker job in `k8s_azure/sentinel/sentinel-kafka-ai-integration-job.yaml` |
 
 ---
@@ -56,9 +56,10 @@ graph LR
     Kafka -->|sentinel.verdicts.v1| AI
     AI -->|ai.anomalies.v1 / ai.policy.v1| Kafka
     Kafka -->|ai.*| BE
-    BE -->|control.policy.v1| Kafka
+    BE -->|commit -> outbox -> leased dispatcher -> control.policy.v1| Kafka
     Kafka -->|control.policy.v1| EA
     EA -->|control.enforcement_ack.v1| Kafka
+    Kafka -->|control.enforcement_ack.v1| BE
     Kafka -->|control.enforcement_ack.v1| AI
 ```
 
@@ -78,7 +79,8 @@ flowchart TB
     P2 --> K2[(ai.policy.v1)]
     K1 --> B[Backend consume + consensus]
     K2 --> B
-    B --> K3[(control.policy.v1)]
+    B --> O[Policy outbox + dispatcher]
+    O --> K3[(control.policy.v1)]
     K3 --> E[Enforcement apply]
     E --> K4[(control.enforcement_ack.v1)]
 ```
@@ -107,9 +109,11 @@ sequenceDiagram
     AI->>K: ai.policy.v1 (when policy candidate exists)
 
     K->>BE: consume ai.anomalies.v1 / ai.policy.v1
-    BE->>K: control.policy.v1
+    BE->>BE: commit block + persist outbox row
+    BE->>K: control.policy.v1 (from leased outbox dispatcher)
     K->>EA: consume control.policy.v1
     EA->>K: control.enforcement_ack.v1
+    K->>BE: consume control.enforcement_ack.v1 (ack correlation)
     K->>AI: consume control.enforcement_ack.v1
 ```
 
@@ -132,7 +136,9 @@ sequenceDiagram
 
 ### 5.3 Backend + Enforcement
 - Backend consume ai.policy: `backend/pkg/ingest/kafka/consumer.go`
-- Backend publish control.policy: `backend/pkg/ingest/kafka/producer.go`
+- Backend outbox publish path: `backend/pkg/control/policyoutbox/store.go`, `backend/pkg/control/policyoutbox/dispatcher.go`
+- Backend policy producer implementation: `backend/pkg/ingest/kafka/producer.go`
+- Backend ACK correlation: `backend/pkg/control/policyack/store.go`
 - Enforcement consume control.policy + ack publish: `enforcement-agent/internal/config/config.go`, `enforcement-agent/internal/controller/*`, `enforcement-agent/internal/ack/*`
 
 ---

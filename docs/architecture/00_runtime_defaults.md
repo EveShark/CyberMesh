@@ -1,7 +1,7 @@
 # Architecture 0: Runtime Defaults
 ## Source-of-Truth Defaults Used by Current Code
 
-**Last Updated:** 2026-02-18
+**Last Updated:** 2026-02-25
 
 This file captures runtime defaults that frequently drift in higher-level docs.
 
@@ -88,3 +88,43 @@ Current env gates used by AI service:
 Primary sources:
 - `ai-service/src/service/sentinel_adapter.py`
 - `k8s_azure/ai-service/configmap.yaml`
+
+## 6. Backend Control-Policy Outbox Defaults
+
+Current backend defaults (when outbox is enabled):
+
+- `CONTROL_POLICY_OUTBOX_ENABLED=true`
+- `CONTROL_POLICY_OUTBOX_LEASE_KEY=control.policy.dispatcher`
+- `CONTROL_POLICY_OUTBOX_LEASE_TTL=10s`
+- `CONTROL_POLICY_OUTBOX_RECLAIM_AFTER=30s`
+- `CONTROL_POLICY_OUTBOX_POLL_INTERVAL=500ms`
+- `CONTROL_POLICY_OUTBOX_DRAIN_MAX_DURATION=2s`
+- `CONTROL_POLICY_OUTBOX_BATCH_SIZE=100`
+- `CONTROL_POLICY_OUTBOX_BATCH_SIZE_MIN=25`
+- `CONTROL_POLICY_OUTBOX_BATCH_SIZE_MAX=400`
+- `CONTROL_POLICY_OUTBOX_ADAPTIVE_BATCH=true`
+- `CONTROL_POLICY_OUTBOX_MAX_IN_FLIGHT=8`
+- `CONTROL_POLICY_OUTBOX_MARK_WORKERS=4`
+- `CONTROL_POLICY_OUTBOX_INTERNAL_QUEUE_SIZE=256`
+- `CONTROL_POLICY_OUTBOX_DRAIN_BATCHES=4`
+- `CONTROL_POLICY_OUTBOX_MAX_RETRIES=8`
+- `CONTROL_POLICY_OUTBOX_RETRY_INITIAL=250ms`
+- `CONTROL_POLICY_OUTBOX_RETRY_MAX=30s`
+- `CONTROL_POLICY_OUTBOX_RETRY_JITTER_RATIO=0.2`
+- `CONTROL_POLICY_OUTBOX_LOG_THROTTLE=5s`
+
+Primary source:
+- `backend/pkg/wiring/service.go`
+
+## 7. Backend ACK Consumer Worker Defaults
+
+Current backend ACK consumer defaults:
+
+- `CONTROL_POLICY_ACK_WORKERS=4`
+- `CONTROL_POLICY_ACK_WORK_QUEUE_SIZE=256`
+- `CONTROL_POLICY_ACK_SOFT_THROTTLE_ENABLED=true`
+- `CONTROL_POLICY_ACK_SOFT_THROTTLE_SLEEP=200ms`
+- `CONTROL_POLICY_ACK_SOFT_THROTTLE_WINDOW=3`
+
+Primary source:
+- `backend/pkg/control/policyack/config.go`

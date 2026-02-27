@@ -1,7 +1,7 @@
 # CyberMesh Frontend - Low-Level Design (LLD)
 
 **Version:** 1
-**Last Updated:** 2026-02-05
+**Last Updated:** 2026-02-25
 
 ---
 
@@ -173,12 +173,12 @@ export const useDashboardData = ({ pollingInterval = 15000 } = {}) =>
 
 | Hook | Key | Refetch Interval |
 |------|-----|------------------|
-| `useDashboardData` | `['dashboard-overview']` | 30s (Dashboard) |
+| `useDashboardData` | `['dashboard-overview']` | 15s (default) |
 | `useThreatsData` | `['threats-summary']` | 15s |
 | `useNetworkData` | `['network-status']` | 15s |
-| `useBlockchainData` | `['blockchain-data', limit]` | 30s |
-| `useAIEngineData` | `['ai-engine-status']` | 15s |
-| `useSystemHealthData` | `['system-health']` | 15s |
+| `useBlockchainData` | `['blockchain-data', limit]` | 15s |
+| `useAIEngineData` | `['ai-engine-status']` | 10s |
+| `useSystemHealthData` | `['system-health']` | 20s |
 
 ### 7.2 UI State (React Context)
 
@@ -219,8 +219,13 @@ flowchart LR
 |----------|--------|-----------|
 | `/api/v1/dashboard/overview` | GET | Dashboard + derived pages |
 | `/api/v1/ready` | GET | BackendStatusPanel / SystemHealth |
-| `/api/v1/health` | GET | SystemHealth |
 | `/api/v1/blocks?limit=N` | GET | Blockchain page (optional) |
+| `/api/v1/frontend-config` | GET | Runtime config bootstrap (`src/config/runtime.ts`) |
+
+> [!NOTE]
+> Current frontend data hooks derive AI/Threats/Network/SystemHealth from `/api/v1/dashboard/overview`.
+> `BackendStatusPanel` separately polls `/api/v1/ready`.
+> Runtime config loader calls `/api/v1/frontend-config` first, then falls back to build-time env vars if unavailable.
 
 ---
 

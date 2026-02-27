@@ -1,7 +1,7 @@
 # Architecture 11: System Timeline
 ## Operational Timing Across AI, Consensus, and Enforcement
 
-**Last Updated:** 2026-02-14
+**Last Updated:** 2026-02-25
 
 This document summarizes the key "clocks" in CyberMesh. Values are taken from code defaults and/or the current GKE manifests.
 
@@ -115,6 +115,16 @@ The enforcement agent consumes policies from Kafka and exposes metrics/health on
 - `METRICS_ADDR` default `:9094` in `k8s_gke/daemonset.yaml`
 
 Policy apply latency depends on backend (cilium/gateway/iptables/nftables/k8s) and host performance; it is not fixed in code defaults.
+
+## 4.1 Backend Control-Policy Queueing Stages
+
+After consensus commit, policy publication and closure run through backend queueing stages:
+
+- `commit -> transactional outbox write`
+- `outbox claim/publish (leased dispatcher)`
+- `publish -> ack correlation`
+
+These stages are bounded by outbox/ack worker settings (`CONTROL_POLICY_OUTBOX_*`, `CONTROL_POLICY_ACK_*`) and are key contributors to p95/p99 tail behavior under load.
 
 ---
 

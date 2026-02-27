@@ -1,7 +1,7 @@
 # Architecture 4: Kafka Message Bus
 ## Topics, Producers/Consumers, Wire Contracts, Verification
 
-**Last Updated:** 2026-02-18
+**Last Updated:** 2026-02-25
 
 This document describes how CyberMesh uses Kafka to connect the telemetry layer, AI service, backend validators, and enforcement agent.
 
@@ -11,6 +11,8 @@ Primary code references:
 - Backend verification: `backend/pkg/ingest/kafka/verifier.go`
 - Backend producer signing (control topics): `backend/pkg/ingest/kafka/signing.go`
 - Backend wiring (env knobs, signers): `backend/pkg/wiring/service.go`
+- Backend durable publish path: `backend/pkg/control/policyoutbox/*`
+- Backend ACK correlation path: `backend/pkg/control/policyack/*`
 - AI producer: `ai-service/src/kafka/producer.py`
 - AI consumer: `ai-service/src/kafka/consumer.py`
 - Agent Kafka client + ack publishing: `enforcement-agent/internal/kafka/*`, `enforcement-agent/internal/ack/*`
@@ -60,6 +62,7 @@ graph LR
         F5[pcap.request.v1]
         F6[pcap.result.v1]
         T1[ai.anomalies.v1]
+        T1b[ai.policy.v1]
         T2[control.commits.v1]
         T3[control.policy.v1]
         T4[control.enforcement_ack.v1]
@@ -85,17 +88,18 @@ graph LR
     TL -.->|via Sentinel worker| S1
 
     AI -->|Signed Anomalies| T1
-    AI -->|Signed Policy Candidates| aiPolicy[ai.policy.v1]
+    AI -->|Signed Policy Candidates| T1b
     T1 --> BEC
-    aiPolicy --> BEC
+    T1b --> BEC
     
     BE -->|Commit Events| T2
     T2 --> AIC
     
-    BE -->|Policy Updates| T3
+    BE -->|Policy Updates via durable outbox dispatcher| T3
     T3 --> AGC
     
     AG -->|Policy Acks| T4
+    T4 --> BEC
     T4 --> AIC
     
     BEC -.->|Invalid Signature| DLQ
@@ -105,7 +109,7 @@ graph LR
     classDef con fill:#e8f5e9,stroke:#1b5e20,color:#000;
     
     class TL,AI,BE,AG pro;
-    class F1,F2,F3,F4,S1,S2,F5,F6,T1,T2,T3,T4,aiPolicy,DLQ top;
+    class F1,F2,F3,F4,S1,S2,F5,F6,T1,T1b,T2,T3,T4,DLQ top;
     class BEC,AIC,AGC,TLC con;
 ```
 
@@ -171,6 +175,8 @@ The backend publishes protobuf events (from `backend/proto/*`) and signs them:
 
 - `control.commits.v1` (CommitEvent)
 - `control.policy.v1` (PolicyUpdateEvent)
+
+`control.policy.v1` publication authority is implemented via durable outbox + leased dispatcher (single logical writer), not direct multi-writer publish from commit handlers.
 
 ### 4.3 Telemetry Topics
 

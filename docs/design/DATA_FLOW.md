@@ -1,7 +1,7 @@
 # CyberMesh Data Flow Documentation
 
 **Version:** 1
-**Last Updated:** 2026-02-20
+**Last Updated:** 2026-02-25
 
 ---
 
@@ -42,6 +42,7 @@ sequenceDiagram
     participant Val as Validators
     participant DB as CockroachDB
     participant Agent as Enforcement Agent
+    participant Outbox as Policy Outbox Dispatcher
     
     Net->>TL: Telemetry data (flows/alerts/pcap)
     TL->>Kafka: telemetry.flow.v1 / telemetry.deepflow.v1
@@ -63,9 +64,10 @@ sequenceDiagram
     
     Val->>Val: HotStuff Consensus (2-chain)
     Val->>Val: State machine execute
-    Val->>DB: Persist block
+    Val->>DB: Persist block + outbox rows (single transaction)
     Val->>Kafka: control.commits.v1
-    Val->>Kafka: control.policy.v1
+    Val->>Outbox: claim pending policy rows (lease/fencing)
+    Outbox->>Kafka: control.policy.v1
     
     Kafka->>AI: Commit notification
     AI->>AI: Update feedback tracker
@@ -75,6 +77,7 @@ sequenceDiagram
     Agent->>Agent: Parse policy
     Agent->>Agent: Apply cilium/gateway/iptables/nftables/k8s
     Agent->>Kafka: control.enforcement_ack.v1 (default)
+    Kafka->>Val: ACK consume + correlate to outbox row
 ```
 
 ---
@@ -202,6 +205,39 @@ stateDiagram-v2
     
     Normal --> Normal: Heartbeat every 500ms
 ```
+
+### 4.3 Commit -> Publish Outbox Path
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Consensus Commit
+    participant DB as CockroachDB
+    participant O as control_policy_outbox
+    participant D as Dispatcher (lease holder)
+    participant K as Kafka control.policy.v1
+    participant A as ACK Consumer
+
+    C->>DB: BEGIN
+    C->>DB: write blocks + txs
+    C->>O: upsert outbox rows (pending)
+    C->>DB: COMMIT
+
+    D->>DB: acquire/renew lease epoch
+    D->>O: claim pending/retry rows
+    D->>K: publish policy
+    D->>O: mark published(partition,offset)
+
+    A->>DB: upsert policy_acks
+    A->>O: mark correlated row acked
+```
+
+Properties of this path:
+
+- single logical writer (lease + fencing epoch)
+- durable idempotency at outbox identity
+- retry/backoff with terminal failure state
+- ACK closure tracked from `policy_acks` back to outbox rows
 
 ---
 
@@ -355,7 +391,7 @@ flowchart LR
     AI[AI Service] -->|ai.policy.v1| BE[Backend Consensus]
     BE -->|control.policy.v1| AG[Enforcement Agent]
     AG -->|program rules| DP[Kernel/CNI/Gateway Data Plane]
-    AG -->|control.enforcement_ack.v1| FB[AI Feedback]
+    AG -->|control.enforcement_ack.v1| FB[Backend ACK Correlation]
 ```
 
 Plane responsibilities:
@@ -474,7 +510,7 @@ flowchart LR
 | `control.commits.v1` | Backend | AI | Protobuf (CommitEvent) | ~1KB |
 | `control.policy.v1` | Backend | Agent | Protobuf (PolicyUpdateEvent) | ~2KB |
 | `control.reputation.v1` | Backend | AI | Protobuf (ReputationEvent) | ~500B |
-| `control.enforcement_ack.v1` | Agent | AI | Protobuf (PolicyAckEvent) | ~1KB |
+| `control.enforcement_ack.v1` | Agent | Backend (AI optional) | Protobuf (PolicyAckEvent) | ~1KB |
 | `ai.dlq.v1` | Backend | - | Original + error | Varies |
 
 > [!WARNING]
@@ -498,6 +534,7 @@ sequenceDiagram
     participant PW as Persistence Worker
     participant Q as Queue (1024)
     participant DB as CockroachDB
+    participant O as control_policy_outbox
     
     SM->>Q: Enqueue block
     
@@ -506,6 +543,7 @@ sequenceDiagram
         PW->>DB: BEGIN TRANSACTION
         PW->>DB: INSERT INTO blocks
         PW->>DB: INSERT INTO transactions
+        PW->>O: UPSERT outbox rows (policy tx only)
         PW->>DB: UPDATE validators
         PW->>DB: COMMIT
     end
@@ -534,6 +572,18 @@ erDiagram
         string type
         bytes payload
         bytes signature
+    }
+
+    control_policy_outbox {
+        uuid id PK
+        bigint block_height
+        string policy_id
+        bytes rule_hash
+        string status
+        int retries
+        timestamp created_at
+        timestamp published_at
+        timestamp acked_at
     }
     
     validators {
@@ -564,7 +614,7 @@ sequenceDiagram
     CF->>FE: Proxy
     FE->>User: React App (SPA)
     
-    User->>CF: GET /api/dashboard/overview
+    User->>CF: GET /api/v1/dashboard/overview
     CF->>BE: Proxy (sticky session)
     
     BE->>Cache: Check cache

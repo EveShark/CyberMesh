@@ -1,7 +1,7 @@
 # CyberMesh Backend - Low-Level Design (LLD)
 
 **Version:** 1
-**Last Updated:** 2026-01-30
+**Last Updated:** 2026-02-25
 
 ---
 
@@ -272,7 +272,7 @@ erDiagram
 ```mermaid
 classDiagram
     class KafkaConsumer {
-        -client sarama.ConsumerGroup
+        -client IBM Sarama ConsumerGroup
         -handlers map~string~Handler
         +Start()
         +Stop()
@@ -390,7 +390,7 @@ classDiagram
     class CockroachAdapter {
         -db *sql.DB
         -pool *pgxpool.Pool
-        +SaveBlock(block) error
+        +PersistBlock(block) error
         +GetBlock(height) Block
     }
     
@@ -427,6 +427,45 @@ sequenceDiagram
         end
     end
 ```
+
+### 7.3 Durable Policy Outbox (Commit -> Publish)
+
+Current backend write semantics include a durable transactional outbox.
+
+- Commit persistence writes business rows and outbox rows in the same DB transaction.
+- A leased single dispatcher publishes `control.policy.v1`.
+- Dispatcher applies retries/backoff and marks terminal failures after max retries.
+- ACK correlation updates outbox status to `acked` when matching ACK is stored.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Consensus Commit
+    participant DB as CockroachDB
+    participant O as control_policy_outbox
+    participant D as Leased Dispatcher
+    participant K as Kafka (control.policy.v1)
+    participant A as ACK Consumer/Store
+
+    C->>DB: PersistBlock BEGIN
+    C->>DB: INSERT blocks + txs
+    C->>O: UPSERT pending outbox rows
+    C->>DB: COMMIT
+
+    D->>DB: Acquire/Renew lease (epoch)
+    D->>O: Claim pending/retry rows
+    D->>K: Publish policy
+    D->>O: Mark published(partition, offset)
+
+    A->>DB: UPSERT policy_acks
+    A->>O: Mark matching outbox row acked
+```
+
+Primary outbox tables/migrations:
+
+- `pkg/storage/cockroach/migrations/006_control_policy_outbox.sql`
+- `pkg/storage/cockroach/migrations/007_control_policy_outbox_tx_identity.sql`
+- `pkg/storage/cockroach/migrations/009_control_policy_outbox_perf_indexes.sql`
 
 ---
 
@@ -493,9 +532,21 @@ All endpoints are served under `/api/v1`:
 | `/state/{key}` | GET | State lookup |
 | `/validators` | GET | List validators |
 | `/validators/{id}` | GET | Validator details |
+| `/stats` | GET | Consolidated runtime stats |
+| `/network/overview` | GET | Network topology/health view |
+| `/consensus/overview` | GET | Consensus health/leader view |
 | `/dashboard/overview` | GET | Dashboard overview |
 | `/anomalies` | GET | List anomalies |
+| `/anomalies/stats` | GET | Anomaly aggregate stats |
+| `/anomalies/suspicious-nodes` | GET | Suspicious node summary |
 | `/ai/metrics` | GET | AI metrics (proxy) |
+| `/ai/variants` | GET | AI variant metrics |
+| `/ai/history` | GET | AI detection history |
+| `/ai/suspicious-nodes` | GET | AI suspicious nodes |
+| `/policies/acks` | GET | Enforcement ACK lookup/list |
+
+> [!NOTE]
+> `handleFrontendConfig` exists in `pkg/api/frontend_config.go`, but `/api/v1/frontend-config` is not currently registered in `pkg/api/router.go`.
 
 ### 9.2 Middleware & Auth
 
@@ -542,6 +593,10 @@ flowchart LR
 | `pkg/ingest/kafka/verifier.go` | Signature verification |
 | `pkg/mempool/mempool.go` | Transaction pool |
 | `pkg/storage/cockroach/adapter.go` | DB adapter |
+| `pkg/control/policyoutbox/dispatcher.go` | Leased outbox dispatcher |
+| `pkg/control/policyoutbox/store.go` | Outbox claim/mark/lease store |
+| `pkg/control/policyack/store.go` | ACK persistence + outbox correlation |
+| `pkg/api/router.go` | API route registration |
 
 ---
 

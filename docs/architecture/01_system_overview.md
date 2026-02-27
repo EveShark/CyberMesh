@@ -1,7 +1,7 @@
 # Architecture 1: System Overview
 ## End-to-End Pipeline (Code-Backed)
 
-**Last Updated:** 2026-02-18
+**Last Updated:** 2026-02-25
 
 This document describes the CyberMesh system at the "whole product" level: what each major component does and how data moves through the system from telemetry to enforcement.
 
@@ -69,7 +69,7 @@ Topic names are environment/config driven. Defaults include:
 - `ai.policy.v1` (AI -> Backend, optional depending on configuration)
 - `control.commits.v1` (Backend -> AI)
 - `control.policy.v1` (Backend -> Enforcement Agent)
-- `control.enforcement_ack.v1` (Enforcement Agent -> AI, optional; configurable via `TOPIC_CONTROL_POLICY_ACK`)
+- `control.enforcement_ack.v1` (Enforcement Agent -> Backend primary consumer, AI optional; configurable)
 - `ai.dlq.v1` (Backend consumer DLQ)
 
 ### 1.3 Backend Validators (Go)
@@ -79,7 +79,7 @@ Topic names are environment/config driven. Defaults include:
 - Admits valid items into a mempool.
 - Builds blocks from the mempool and runs HotStuff (2-chain) consensus over the block stream.
 - Executes a deterministic state machine and persists results to CockroachDB.
-- Produces commit and policy outputs to Kafka.
+- Produces commit output to Kafka and policy output through durable outbox dispatch.
 
 Primary code references:
 - `backend/pkg/ingest/kafka/consumer.go`
@@ -88,6 +88,9 @@ Primary code references:
 - `backend/pkg/consensus/api/engine.go`
 - `backend/pkg/consensus/pbft/pbft.go` (HotStuff implementation despite folder name)
 - `backend/pkg/mempool/mempool.go`
+- `backend/pkg/control/policyoutbox/dispatcher.go`
+- `backend/pkg/control/policyoutbox/store.go`
+- `backend/pkg/control/policyack/store.go`
 
 ### 1.4 CockroachDB (Persistence)
 
@@ -101,7 +104,7 @@ Primary code references:
 - Consumes `control.policy.v1` from Kafka.
 - Verifies signature and parses the policy spec.
 - Applies enforcement using a configured backend (cilium, gateway, iptables, nftables, kubernetes/k8s, or noop).
-- Optionally publishes policy acknowledgements for AI feedback.
+- Optionally publishes policy acknowledgements for backend/AI feedback.
   - Topic name is config-driven via `TOPIC_CONTROL_POLICY_ACK` (AI), `CONTROL_POLICY_ACK_TOPIC` (backend), and `ACK_TOPIC` (agent). Current default is `control.enforcement_ack.v1`.
 
 Primary code references:
@@ -152,6 +155,7 @@ sequenceDiagram
     participant Backend as "Backend Validator"
     participant DB as "CockroachDB"
     participant Agent as "Enforcement Agent"
+    participant Outbox as "Backend Outbox Dispatcher"
 
     %% Phase 1: Detection
     Telemetry->>TL: Flows/Alerts/PCAP Requests
@@ -177,9 +181,10 @@ sequenceDiagram
     Backend->>Backend: Add to Mempool
     Backend->>Backend: Core Consensus (Proposal -> Vote -> QC)
     Backend->>Backend: Execute State Machine
-    Backend->>DB: Persist Block & State
+    Backend->>DB: Persist Block & State + Outbox Rows
     Backend-->>Kafka: Publish control.commits.v1
-    Backend-->>Kafka: Publish control.policy.v1
+    Backend->>Outbox: Claim pending policy intents (lease/fencing)
+    Outbox-->>Kafka: Publish control.policy.v1
     deactivate Backend
 
     %% Phase 3: Enforcement & Feedback
@@ -191,7 +196,8 @@ sequenceDiagram
         Agent-->>Kafka: Publish control.enforcement_ack.v1
         deactivate Agent
     and Feedback
-        Kafka-->>AI: Consume Commit/Ack
+        Kafka-->>Backend: Consume enforcement ACK for correlation
+        Kafka-->>AI: Consume Commit/Ack (optional)
         activate AI
         AI->>AI: Update Training State
         deactivate AI

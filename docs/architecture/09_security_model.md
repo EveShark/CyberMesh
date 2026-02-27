@@ -1,7 +1,7 @@
 # Architecture 9: Security Model
 ## Transport, Auth, Message Signing, Verification, Replay Defense
 
-**Last Updated:** 2026-01-29
+**Last Updated:** 2026-02-25
 
 This document summarizes the security mechanisms implemented in the CyberMesh codebase. It focuses on what is enforced in code (not aspirational controls).
 
@@ -122,6 +122,8 @@ Signing implementation (`backend/pkg/ingest/kafka/signing.go`):
 
 There is no version/timestamp/nonce signature wrapper on these control-topic protobuf messages.
 
+Control-policy publish authority is enforced by backend durable outbox + lease/fencing (single logical writer), reducing duplicate publish amplification and split-brain risk in commit->publish path.
+
 ---
 
 ## 4. Consensus / P2P Message Signing (Non-Kafka)
@@ -161,4 +163,3 @@ Examples of enforced limits:
 - Kafka bus: `docs/architecture/04_kafka_message_bus.md`
 - Genesis bootstrap: `docs/architecture/07_genesis_bootstrap.md`
 - Backend LLD: `docs/design/LLD-backend.md`
-

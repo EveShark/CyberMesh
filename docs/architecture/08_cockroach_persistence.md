@@ -1,7 +1,7 @@
 # Architecture 8: Cockroach Persistence
 ## Schema, Migrations, and Write Paths (Backend)
 
-**Last Updated:** 2026-01-29
+**Last Updated:** 2026-02-25
 
 This document describes what the backend persists to CockroachDB and how.
 
@@ -10,6 +10,8 @@ Primary code references:
 - Migrations: `backend/pkg/storage/cockroach/migrations/*.sql`
 - Consensus persistence tables: `backend/pkg/storage/cockroach/migrations/002_consensus_persistence.sql`
 - Genesis certificate table: `backend/pkg/storage/cockroach/migrations/003_genesis_certificate.sql` and `004_genesis_certificate_keyed.sql`
+- Control policy outbox tables: `backend/pkg/storage/cockroach/migrations/006_control_policy_outbox.sql`, `007_control_policy_outbox_tx_identity.sql`
+- Outbox performance indexes: `backend/pkg/storage/cockroach/migrations/009_control_policy_outbox_perf_indexes.sql`
 
 ---
 
@@ -25,6 +27,7 @@ The backend persists:
 - Reputation/quarantine/policy state tables (schema exists; usage depends on code paths)
 - Consensus restart state (proposals, votes, QCs, metadata)
 - Genesis certificate (for durable bootstrap restore)
+- Control-policy publish intents and dispatcher leases (outbox)
 
 ---
 
@@ -63,6 +66,10 @@ Consensus persistence:
 
 Genesis:
   genesis_certificates
+
+Control-policy publish durability:
+  control_policy_outbox
+  control_dispatcher_leases
 ```
 
 ---
@@ -83,6 +90,7 @@ Key properties from `backend/pkg/storage/cockroach/adapter.go`:
     - producer_id, nonce, content_hash, pubkey, signature, alg
     - payload JSONB and optional custody chain JSONB
     - status derived from receipts
+  - outbox rows for policy transactions (same DB transaction as block persistence)
 
 ```mermaid
 flowchart TD
@@ -101,6 +109,8 @@ flowchart TD
     Loop --> Insert2[Insert Tx with Metadata]
     Insert2 --> Store[Store: producer_id, nonce, hash,<br/>signature, payload JSONB]
     Store --> Loop
+    Loop -- Policy Tx --> Outbox[UPSERT control_policy_outbox row]
+    Outbox --> Upsert3
     
     Loop -- Done --> Upsert3[Upsert State Version]
     Upsert3 --> Commit[COMMIT Transaction]
@@ -128,7 +138,24 @@ This data is intended to support restarting the HotStuff engine without losing c
 
 ---
 
-## 5. Genesis Certificate Persistence
+## 5. Durable Policy Outbox and ACK Correlation
+
+The backend commit-to-publish path uses a transactional outbox model:
+
+- `PersistBlock` writes outbox rows atomically with committed block/tx rows.
+- A leased dispatcher claims outbox rows and publishes to `control.policy.v1`.
+- Publish metadata (topic/partition/offset) is persisted.
+- ACK store upserts `policy_acks` and marks correlated outbox row as `acked`.
+
+This enforces:
+
+- single logical publisher authority
+- idempotent identity across commit/publish retries
+- durable forensic trace from commit -> publish -> ack
+
+---
+
+## 6. Genesis Certificate Persistence
 
 The genesis coordinator persists the genesis certificate through the storage backend:
 
@@ -139,9 +166,8 @@ The schema starts as a singleton row (migration 003) and is later extended to a 
 
 ---
 
-## 6. Related Documents
+## 7. Related Documents
 
 - System overview: `docs/architecture/01_system_overview.md`
 - Genesis bootstrap: `docs/architecture/07_genesis_bootstrap.md`
 - Security model: `docs/architecture/09_security_model.md`
-

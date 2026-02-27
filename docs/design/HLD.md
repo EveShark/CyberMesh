@@ -1,7 +1,7 @@
 # CyberMesh High-Level Design (HLD)
 
 **Version:** 1
-**Last Updated:** 2026-02-20  
+**Last Updated:** 2026-02-25  
 **Authors:** Architecture Team
 
 ---
@@ -28,6 +28,7 @@ CyberMesh is a **distributed cybersecurity threat detection and response platfor
 | ⚡ **Real-time Detection** | Sentinel + AI layered detection with Kafka-driven routing |
 | 🛡️ **BFT Consensus** | 5 validator nodes, tolerates 1 Byzantine failure |
 | 🔐 **Cryptographic Integrity** | Ed25519 signatures on all messages |
+| 📦 **Durable Control Publish** | Commit -> transactional outbox -> leased dispatcher -> publish |
 | 🔄 **Adaptive Learning** | Validator feedback loop for threshold tuning |
 | 🚀 **Automated Enforcement** | Cilium/Gateway/iptables/nftables/Kubernetes policy automation |
 
@@ -106,7 +107,7 @@ graph TB
     BE -->|Persist Blocks| DB
     AI -->|Feedback State| Redis
     Agent -->|Subscribe Policies| Kafka
-    Agent -.->|ACK Optional| Kafka
+    Agent -.->|ACK (configurable)| Kafka
     
     classDef frontend fill:#61dafb,stroke:#000,color:#000;
     classDef backend fill:#00add8,stroke:#000,color:#fff;
@@ -159,6 +160,7 @@ flowchart LR
         KF5[pcap.request.v1]
         KF6[pcap.result.v1]
         K1[ai.anomalies.v1]
+        K1b[ai.policy.v1]
         K2[control.commits.v1]
         K3[control.policy.v1]
         K4[control.enforcement_ack.v1]
@@ -170,6 +172,8 @@ flowchart LR
         CO[HotStuff Consensus]
         SM[State Machine]
         PE[Persistence]
+        OB[Transactional Outbox]
+        DP[Leased Dispatcher]
     end
     
     subgraph Enforcement["Enforcement Agent"]
@@ -186,9 +190,11 @@ flowchart LR
     IN --> KF1 --> GW --> OR --> AG --> KF2 --> SA --> DE --> EV --> SG
     FT --> KF3
     SG --> K1
+    SG --> K1b
     K1 --> VE --> MP --> CO --> SM --> PE --> DB
+    K1b --> VE
     CO --> K2
-    CO --> K3
+    PE --> OB --> DP --> K3
     AC --> K4
     K3 --> PC --> EN2
     EN2 --> AC
@@ -201,8 +207,8 @@ flowchart LR
     
     class IN,SP,FT agent;
     class GW,OR,AG,SA,DE,EV,SG ai;
-    class KF1,KF2,KF3,KF4,KF5,KF6,K1,K2,K3,K4 topic;
-    class VE,MP,CO,SM,PE backend;
+    class KF1,KF2,KF3,KF4,KF5,KF6,K1,K1b,K2,K3,K4 topic;
+    class VE,MP,CO,SM,PE,OB,DP backend;
     class PC,EN2,AC agent;
     class DB db;
 ```
@@ -332,6 +338,15 @@ flowchart TB
 > [!WARNING]
 > All Kafka messages MUST be signed with Ed25519. Messages without valid signatures are rejected to the DLQ topic.
 
+### 5.4 Commit-to-Publish Correctness
+
+Backend policy publication uses a durable outbox path:
+
+- Commit persistence and outbox row creation are atomic in CockroachDB.
+- A lease/fencing model enforces a single active dispatcher writer.
+- Publish is retried with bounded backoff and terminal failure states.
+- Enforcement ACKs are correlated back to outbox rows for closure tracking.
+
 ---
 
 ## 6. Deployment Architecture
@@ -425,10 +440,11 @@ graph LR
         F6[pcap.result.v1]
         T1[ai.anomalies.v1]
         T2[ai.evidence.v1]
-        T3[control.commits.v1]
-        T4[control.policy.v1]
-        T5[control.enforcement_ack.v1]
-        T6[ai.dlq.v1]
+        T3[ai.policy.v1]
+        T4[control.commits.v1]
+        T5[control.policy.v1]
+        T6[control.enforcement_ack.v1]
+        T7[ai.dlq.v1]
     end
     
     subgraph Consumers
@@ -443,23 +459,23 @@ graph LR
     S_C --> F1
     S_P --> F2
     TL_C --> F5
-    AI_P --> T1 & T2
-    BE_P --> T3 & T4
-    EA_C --> T5
-    
+    AI_P --> T1 & T2 & T3
+    BE_P --> T4 & T5
+    EA_C --> T6
+
     F2 --> AI_C
-    T1 & T2 --> BE_C
-    T3 --> AI_C
-    T4 --> EA_C
-    
-    BE_C -.->|Invalid Msgs| T6
+    T1 & T2 & T3 --> BE_C
+    T4 --> AI_C
+    T5 --> EA_C
+
+    BE_C -.->|Invalid Msgs| T7
     
     classDef producer fill:#e3f2fd,stroke:#1565c0,color:#000;
     classDef topic fill:#fff9c4,stroke:#f57f17,color:#000;
     classDef consumer fill:#c8e6c9,stroke:#2e7d32,color:#000;
     
     class AI_P,BE_P,TL_P,S_P producer;
-    class F1,F2,F3,F4,F5,F6,T1,T2,T3,T4,T5,T6 topic;
+    class F1,F2,F3,F4,F5,F6,T1,T2,T3,T4,T5,T6,T7 topic;
     class S_C,BE_C,AI_C,EA_C,TL_C consumer;
 ```
 
@@ -535,7 +551,7 @@ graph LR
 | Layer | Technology |
 |-------|------------|
 | **Frontend** | React 18, TypeScript, Vite, TailwindCSS, Recharts |
-| **Backend** | Go 1.25.1, libp2p, IBM Sarama (Kafka), pgx (DB) |
+| **Backend** | Go 1.25.1, libp2p, IBM Sarama (Kafka), pgx/CockroachDB |
 | **AI** | Python 3.11, LightGBM, scikit-learn, confluent-kafka |
 | **Enforcement** | Go 1.25.1, cilium CRDs, gateway policy translation, iptables, nftables, client-go |
 | **Database** | CockroachDB 21+, PostgreSQL 12+ |
