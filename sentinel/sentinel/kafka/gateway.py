@@ -320,6 +320,7 @@ class KafkaGatewayWorker:
             "source": "sentinel.kafka.gateway",
             "schema_version": "sentinel.result.v1",
             "payload_type": "sentinel_result",
+            "labels": dict(event.labels or {}),
             "payload": {
                 "input": {
                     "id": event.id,
@@ -366,6 +367,8 @@ class KafkaGatewayWorker:
         msg.input.modality = event.modality.value
         msg.input.features_version = event.features_version
         msg.input.timestamp = float(event.timestamp)
+        if event.labels:
+            msg.labels.update({str(k): str(v) for k, v in event.labels.items()})
 
         findings = result.get("findings") or []
         if isinstance(findings, list):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -165,6 +166,7 @@ def _to_flow_event(topic: str, payload: Dict[str, Any], raw_bytes: bytes) -> Can
         raise ValueError(format_error(ERR_INVALID_FIELDS, detail))
 
     source = f"kafka:{topic}"
+    labels = _derive_labels_for_flow(payload)
     raw_context = {
         "_source_topic": topic,
         "_source_schema": payload.get("schema", ""),
@@ -178,7 +180,62 @@ def _to_flow_event(topic: str, payload: Dict[str, Any], raw_bytes: bytes) -> Can
         source=source,
         event_id=str(payload.get("flow_id") or _hash_event_id(topic, raw_bytes)),
         timestamp=float(payload.get("ts") or time.time()),
+        labels=labels,
     )
+
+
+def _parse_source_port(source_id: str) -> str:
+    text = (source_id or "").strip()
+    if not text:
+        return ""
+    # net.JoinHostPort format for IPv6: [ip]:port
+    match = re.search(r":(\d+)$", text)
+    if not match:
+        return ""
+    return match.group(1)
+
+
+def _parse_port_map(raw: str) -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+    for item in (raw or "").split(","):
+        token = item.strip()
+        if not token or ":" not in token:
+            continue
+        port, value = token.split(":", 1)
+        port = port.strip()
+        value = value.strip()
+        if port and value:
+            mapping[port] = value
+    return mapping
+
+
+def _derive_labels_for_flow(payload: Dict[str, Any]) -> Dict[str, str]:
+    labels: Dict[str, str] = {}
+
+    # Direct payload labels (if present) take priority.
+    for key in ("profile_mode", "scenario"):
+        val = payload.get(key)
+        if val is not None:
+            sval = str(val).strip()
+            if sval:
+                labels[key] = sval
+
+    if labels.get("profile_mode") and labels.get("scenario"):
+        return labels
+
+    source_id = str(payload.get("source_id") or "")
+    source_port = _parse_source_port(source_id)
+    if not source_port:
+        return labels
+
+    profile_map = _parse_port_map(os.getenv("SENTINEL_SOURCE_PORT_PROFILE_MAP", ""))
+    scenario_map = _parse_port_map(os.getenv("SENTINEL_SOURCE_PORT_SCENARIO_MAP", ""))
+
+    if "profile_mode" not in labels and source_port in profile_map:
+        labels["profile_mode"] = profile_map[source_port]
+    if "scenario" not in labels and source_port in scenario_map:
+        labels["scenario"] = scenario_map[source_port]
+    return labels
 
 
 def _to_deepflow_event(topic: str, payload: Dict[str, Any], raw_bytes: bytes) -> CanonicalEvent:
