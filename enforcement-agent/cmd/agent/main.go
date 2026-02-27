@@ -176,7 +176,7 @@ func main() {
 		ledgerProvider = ledger.NewFileProvider(cfg.LedgerSnapshotPath, cfg.LedgerDriftGrace)
 	}
 
-	consumer, err := kafka.NewConsumer(kafka.Config{
+	consumer, err := createKafkaConsumerWithRetry(ctx, logger, kafka.Config{
 		Brokers:         cfg.Kafka.Brokers,
 		GroupID:         cfg.Kafka.GroupID,
 		Topic:           cfg.Kafka.Topic,
@@ -192,7 +192,7 @@ func main() {
 		Metrics:         recorder,
 	}, ctrl)
 	if err != nil {
-		logger.Fatal("failed to create kafka consumer", zap.Error(err))
+		logger.Fatal("failed to create kafka consumer after retries", zap.Error(err))
 	}
 	defer consumer.Close()
 
@@ -275,6 +275,37 @@ func buildLogger(level string) (*zap.Logger, error) {
 	}
 	cfg.EncoderConfig.TimeKey = "ts"
 	return cfg.Build()
+}
+
+func createKafkaConsumerWithRetry(ctx context.Context, logger *zap.Logger, cfg kafka.Config, handler kafka.MessageHandler) (*kafka.Consumer, error) {
+	backoff := 2 * time.Second
+	maxBackoff := 30 * time.Second
+	attempt := 0
+
+	for {
+		attempt++
+		consumer, err := kafka.NewConsumer(cfg, handler)
+		if err == nil {
+			if attempt > 1 {
+				logger.Info("kafka consumer connected after retry", zap.Int("attempt", attempt))
+			}
+			return consumer, nil
+		}
+
+		logger.Warn("kafka consumer init failed; retrying", zap.Int("attempt", attempt), zap.Error(err), zap.Duration("next_backoff", backoff))
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoff):
+		}
+
+		if backoff < maxBackoff {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
 }
 
 func buildHTTPServer(addr string, registry *prometheus.Registry, backend enforcer.Enforcer, kill *control.KillSwitch, recorder *metrics.Recorder, logger *zap.Logger) *http.Server {

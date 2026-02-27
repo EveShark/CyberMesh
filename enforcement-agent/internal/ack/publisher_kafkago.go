@@ -79,7 +79,7 @@ func (p *KafkaGoPublisher) Publish(ctx context.Context, payload Payload) error {
 		ErrorCode:          payload.ErrorCode,
 		AppliedAt:          payload.AppliedAt.Unix(),
 		AckedAt:            payload.AckedAt.Unix(),
-		QcReference:        payload.QCRef,
+		QcReference:        effectiveQCRef(payload),
 		ControllerInstance: payload.Controller,
 		FastPath:           payload.FastPath,
 		RuleHash:           append([]byte(nil), payload.RuleHash...),

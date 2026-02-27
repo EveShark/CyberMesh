@@ -2,6 +2,7 @@ package ack
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"time"
 
@@ -9,9 +10,9 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 
+	pb "backend/proto"
 	"github.com/CyberMesh/enforcement-agent/internal/metrics"
 	"github.com/CyberMesh/enforcement-agent/internal/policy"
-	pb "backend/proto"
 )
 
 type syncProducer interface {
@@ -124,7 +125,7 @@ func (p *KafkaPublisher) Publish(ctx context.Context, payload Payload) error {
 		ErrorCode:          payload.ErrorCode,
 		AppliedAt:          payload.AppliedAt.Unix(),
 		AckedAt:            payload.AckedAt.Unix(),
-		QcReference:        payload.QCRef,
+		QcReference:        effectiveQCRef(payload),
 		ControllerInstance: payload.Controller,
 		FastPath:           payload.FastPath,
 		RuleHash:           append([]byte(nil), payload.RuleHash...),
@@ -182,6 +183,20 @@ func (p *KafkaPublisher) Publish(ctx context.Context, payload Payload) error {
 		p.metrics.ObserveAckPublish("failure")
 	}
 	return fmt.Errorf("ack publish: %w", lastErr)
+}
+
+func effectiveQCRef(payload Payload) string {
+	if payload.QCRef != "" {
+		return payload.QCRef
+	}
+	if len(payload.RuleHash) > 0 {
+		hexHash := hex.EncodeToString(payload.RuleHash)
+		if len(hexHash) > 16 {
+			hexHash = hexHash[:16]
+		}
+		return fmt.Sprintf("trace:%s:%s", payload.Event.Spec.ID, hexHash)
+	}
+	return fmt.Sprintf("trace:%s", payload.Event.Spec.ID)
 }
 
 // PublishBatch emits multiple payloads sequentially.
