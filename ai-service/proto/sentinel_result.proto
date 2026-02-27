@@ -39,4 +39,5 @@ message SentinelResultEvent {
   bool degraded = 13;
   string verdict = 14;
   string model_version = 15;
+  map<string, string> labels = 16;
 }

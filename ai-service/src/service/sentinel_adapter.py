@@ -339,10 +339,20 @@ class SentinelKafkaAdapter:
             findings = []
 
         network_context = self._extract_network_context(payload, findings)
+        labels = envelope.get("labels") if isinstance(envelope, dict) else None
+        if not isinstance(labels, dict):
+            labels = {}
         metadata = {
             "tenant_id": envelope.get("tenant_id"),
             "region": envelope.get("region"),
             "source": envelope.get("source"),
+            "profile_mode": labels.get("profile_mode"),
+            "scenario": labels.get("scenario"),
+            "sample_count": labels.get("sample_count"),
+            "false_positive_rate": labels.get("false_positive_rate"),
+            "harmful_fp_rate": labels.get("harmful_fp_rate"),
+            "acceptance_rate": labels.get("acceptance_rate"),
+            "findings_count": len(findings),
         }
 
         decision = build_policy_candidate(
@@ -545,6 +555,7 @@ class SentinelKafkaAdapter:
             "timestamp": msg.timestamp,
             "source": msg.source,
             "payload_type": msg.payload_type,
+            "labels": dict(msg.labels),
             "payload": {
                 "input": {
                     "id": msg.input.id,

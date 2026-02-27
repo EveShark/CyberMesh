@@ -4,9 +4,11 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 import ipaddress
 import os
+import time
 import uuid
 
 from ..config.settings import PolicyPublishingConfig
+from .policy_decision_engine import PolicyDecisionEngine
 
 
 @dataclass(frozen=True)
@@ -33,6 +35,18 @@ class PolicyDecision:
     reason: Optional[str]
 
 
+_ENGINE_CACHE: Dict[int, PolicyDecisionEngine] = {}
+
+
+def _get_engine(config: PolicyPublishingConfig) -> PolicyDecisionEngine:
+    cache_key = id(config)
+    engine = _ENGINE_CACHE.get(cache_key)
+    if engine is None:
+        engine = PolicyDecisionEngine(config)
+        _ENGINE_CACHE[cache_key] = engine
+    return engine
+
+
 def build_policy_candidate(
     context: PolicyContext,
     config: PolicyPublishingConfig,
@@ -49,8 +63,9 @@ def build_policy_candidate(
     if context.severity < config.severity_threshold:
         return PolicyDecision(candidate=None, reason="severity_below_threshold")
 
-    if context.confidence < config.confidence_threshold:
-        return PolicyDecision(candidate=None, reason="confidence_below_threshold")
+    decision = _get_engine(config).evaluate(context)
+    if not decision.should_publish:
+        return PolicyDecision(candidate=None, reason=decision.reason or "policy_suppressed")
 
     target_ip = _select_target_ip(context.network_context)
     if not target_ip:
@@ -119,21 +134,36 @@ def build_policy_candidate(
     if config.max_targets > 0:
         guardrails["max_targets"] = int(config.max_targets)
 
+    trace_id = str(uuid.uuid4())
+    ai_event_ts_ms = int(time.time() * 1000)
+
     payload: Dict[str, Any] = {
         "schema_version": 1,
         "policy_id": policy_id,
         "rule_type": "block",
         "action": enforcement_action,
+        # Reused by enforcement ACK as qc_reference for cross-service causal tracing.
+        "qc_reference": trace_id,
         "target": {k: v for k, v in target.items() if v not in (None, [], {})},
         "guardrails": guardrails,
         "criteria": {
             "severity": context.severity,
-            "min_confidence": config.confidence_threshold,
+            "min_confidence": decision.effective_confidence_threshold,
             "anomaly_type": context.anomaly_type,
         },
         "metadata": {
             "anomaly_id": context.anomaly_id,
             "anomaly_type": context.anomaly_type,
+            "trace_id": trace_id,
+            "ai_event_ts_ms": ai_event_ts_ms,
+            "source_service": "ai-service",
+            "trace_version": 1,
+        },
+        "trace": {
+            "id": trace_id,
+            "ai_event_ts_ms": ai_event_ts_ms,
+            "source": "ai-service",
+            "version": 1,
         },
     }
 

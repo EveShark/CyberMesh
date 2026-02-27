@@ -327,9 +327,30 @@ class _InMemoryRedisClient:
         self._sorted_sets: Dict[str, Dict[str, float]] = defaultdict(dict)
 
     # Basic string operations -------------------------------------------------
-    def set(self, key: str, value: Any):
+    def set(
+        self,
+        key: str,
+        value: Any,
+        ex: Optional[int] = None,
+        px: Optional[int] = None,
+        nx: bool = False,
+        xx: bool = False,
+        keepttl: bool = False,
+        get: bool = False,
+    ):
+        # TTL arguments are accepted for compatibility with redis-py API.
+        # In-memory stub does not enforce expiration windows.
+        _ = (ex, px, keepttl)
+
+        exists = key in self._strings
+        if nx and exists:
+            return self._strings.get(key) if get else False
+        if xx and not exists:
+            return None if get else False
+
+        old = self._strings.get(key)
         self._strings[key] = str(value)
-        return True
+        return old if get else True
 
     def setex(self, key: str, ttl: int, value: Any):
         self._strings[key] = str(value)

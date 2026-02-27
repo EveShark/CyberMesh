@@ -422,13 +422,21 @@ class MessageHandlers:
         Future: Update validation rules, reload detection models
         """
         try:
+            # PolicyUpdateEvent does not expose a top-level "version" attribute.
+            # Use rule_data.schema_version when present, fallback to v1 for logs.
+            policy_version = 1
+            if isinstance(getattr(event, "rule_data", None), dict):
+                schema_version = event.rule_data.get("schema_version")
+                if isinstance(schema_version, int) and schema_version > 0:
+                    policy_version = schema_version
+
             self.logger.info(
                 "Policy updated by backend",
                 extra={
                     "event_type": "policy_update",
                     "policy_id": event.policy_id,
-                    "policy_version": event.version,
-                    "policy_type": event.policy_type,
+                    "policy_version": policy_version,
+                    "policy_type": event.rule_type,
                     "action": event.action,  # "add", "update", "remove"
                     "timestamp": event.timestamp,
                 }
