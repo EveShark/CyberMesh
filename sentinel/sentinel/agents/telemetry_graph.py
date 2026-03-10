@@ -13,6 +13,7 @@ from .flow_agent import FlowAgent
 from .telemetry_agent import TelemetryThreatIntelAgent
 from .merge_utils import run_parallel_agents, run_sequential_agents
 from .coordinator import CoordinatorAgent
+from ..contracts import CanonicalEvent
 from ..contracts.schemas import NetworkFlowFeaturesV1
 from ..providers.base import ThreatLevel, AnalysisResult
 from ..logging import get_logger
@@ -29,6 +30,8 @@ class TelemetryState(TypedDict, total=False):
     """Telemetry graph state."""
     flow_features: Optional[NetworkFlowFeaturesV1]
     raw_context: Dict[str, Any]
+    event: Optional[CanonicalEvent]
+    file_path: str
 
     current_stage: AnalysisStage
     stages_completed: Annotated[List[str], operator.add]
@@ -119,14 +122,36 @@ class TelemetryAnalysisEngine:
             sequential=sequential,
         )
 
+    @staticmethod
+    def _flow_display_name(event: Optional[CanonicalEvent], raw_context: Optional[Dict[str, Any]]) -> str:
+        if event is not None:
+            labels = event.labels if isinstance(event.labels, dict) else {}
+            scenario = str(labels.get("scenario") or "").strip()
+            profile_mode = str(labels.get("profile_mode") or "").strip()
+            source_event_id = str(labels.get("source_event_id") or event.id or "").strip()
+            modality = getattr(event.modality, "value", str(event.modality))
+            parts = [part for part in (scenario, profile_mode, modality) if part]
+            prefix = "/".join(parts) if parts else modality or "flow"
+            if source_event_id:
+                return f"{prefix}:{source_event_id}"
+            return prefix
+        if isinstance(raw_context, dict):
+            event_id = str(raw_context.get("source_event_id") or "").strip()
+            if event_id:
+                return f"network_flow:{event_id}"
+        return "network_flow"
+
     def analyze_flow(
         self,
         features: NetworkFlowFeaturesV1,
         raw_context: Optional[Dict[str, Any]] = None,
+        event: Optional[CanonicalEvent] = None,
     ) -> TelemetryState:
         initial_state: TelemetryState = {
             "flow_features": features,
             "raw_context": raw_context or {},
+            "event": event,
+            "file_path": self._flow_display_name(event, raw_context),
             "current_stage": AnalysisStage.INIT,
             "stages_completed": [],
             "static_results": [],

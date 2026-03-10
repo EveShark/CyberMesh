@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -17,6 +18,7 @@ if str(BASE_DIR) not in sys.path:
 from sentinel.agents import SentinelOrchestrator
 from sentinel.kafka import ConfluentKafkaClient, KafkaGatewayWorker, load_kafka_worker_config
 from sentinel.logging import configure_logging
+from sentinel.utils.metrics import start_metrics_server
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -41,6 +43,8 @@ def main() -> int:
         print(json.dumps({"error": "ENABLE_KAFKA is false; worker is disabled"}, sort_keys=True))
         return 2
 
+    metrics_server = start_metrics_server(os.getenv("SENTINEL_METRICS_ADDR", ":9202"))
+
     kafka_client = ConfluentKafkaClient(cfg)
     orchestrator = SentinelOrchestrator(
         enable_llm=args.enable_llm,
@@ -54,6 +58,9 @@ def main() -> int:
         stats = worker.run(max_messages=args.max_messages, stop_on_idle=args.stop_on_idle)
     finally:
         worker.close()
+        if metrics_server is not None:
+            metrics_server.shutdown()
+            metrics_server.server_close()
 
     print(json.dumps({"status": "ok", "stats": stats}, sort_keys=True))
     return 0

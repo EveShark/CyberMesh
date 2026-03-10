@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"cybermesh/telemetry-layer/adapters/internal/dlq"
+	"cybermesh/telemetry-layer/adapters/internal/telemetrymetrics"
 	"cybermesh/telemetry-layer/adapters/utils"
 	"github.com/IBM/sarama"
 )
@@ -85,7 +86,13 @@ func (p *Producer) Close() error {
 }
 
 func (p *Producer) sendToTopic(topic, key string, payload []byte, headers ...sarama.RecordHeader) error {
+	start := time.Now()
+	operation := "kafka_send"
+	if topic == p.dlqTopic {
+		operation = "dlq_send"
+	}
 	if topic == "" {
+		telemetrymetrics.Global().RecordOperation(operation, "error", time.Since(start))
 		return errors.New("kafka topic required")
 	}
 	msg := &sarama.ProducerMessage{
@@ -100,6 +107,11 @@ func (p *Producer) sendToTopic(topic, key string, payload []byte, headers ...sar
 	if err != nil && p.logger != nil {
 		p.logger.Warn("kafka send error", utils.ZapError(err))
 	}
+	status := "ok"
+	if err != nil {
+		status = "error"
+	}
+	telemetrymetrics.Global().RecordOperation(operation, status, time.Since(start))
 	return err
 }
 

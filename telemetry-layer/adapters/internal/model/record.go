@@ -2,6 +2,7 @@ package model
 
 type Record struct {
 	Timestamp        int64    `json:"ts"`
+	SourceEventTsMs  int64    `json:"source_event_ts_ms,omitempty"`
 	TenantID         string   `json:"tenant_id"`
 	SrcIP            string   `json:"src_ip"`
 	DstIP            string   `json:"dst_ip"`

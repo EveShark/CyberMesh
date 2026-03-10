@@ -24,6 +24,13 @@ def _get_int(name: str, default: int) -> int:
     return int(value)
 
 
+def _get_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return float(value)
+
+
 def _parse_duration_seconds(value: str, default_seconds: int) -> int:
     raw = (value or "").strip().lower()
     if not raw:
@@ -63,6 +70,13 @@ class KafkaWorkerConfig:
     max_timestamp_skew_seconds: int
     require_nonzero_duration_for_counted_flows: bool
     poll_timeout_seconds: float
+    producer_linger_ms: int
+    producer_flush_interval_ms: int
+    producer_flush_timeout_seconds: float
+    producer_max_pending_commits: int
+    producer_queue_full_retries: int
+    producer_queue_full_backoff_ms: int
+    gateway_backpressure_sleep_ms: int
 
     def validate(self) -> None:
         if self.enabled and not self.bootstrap_servers:
@@ -71,6 +85,20 @@ class KafkaWorkerConfig:
             raise ValueError("KAFKA_MAX_MESSAGE_SIZE must be > 0")
         if self.poll_timeout_seconds <= 0:
             raise ValueError("poll_timeout_seconds must be > 0")
+        if self.producer_linger_ms < 0:
+            raise ValueError("producer_linger_ms must be >= 0")
+        if self.producer_flush_interval_ms <= 0:
+            raise ValueError("producer_flush_interval_ms must be > 0")
+        if self.producer_flush_timeout_seconds <= 0:
+            raise ValueError("producer_flush_timeout_seconds must be > 0")
+        if self.producer_max_pending_commits <= 0:
+            raise ValueError("producer_max_pending_commits must be > 0")
+        if self.producer_queue_full_retries <= 0:
+            raise ValueError("producer_queue_full_retries must be > 0")
+        if self.producer_queue_full_backoff_ms <= 0:
+            raise ValueError("producer_queue_full_backoff_ms must be > 0")
+        if self.gateway_backpressure_sleep_ms <= 0:
+            raise ValueError("gateway_backpressure_sleep_ms must be > 0")
         if not self.input_topic:
             raise ValueError("Kafka input topic must be non-empty")
         if not self.input_topics:
@@ -174,6 +202,13 @@ def load_kafka_worker_config() -> KafkaWorkerConfig:
             False,
         ),
         poll_timeout_seconds=float(_get_env("KAFKA_POLL_TIMEOUT_SECONDS", "1.0")),
+        producer_linger_ms=_get_int("KAFKA_PRODUCER_LINGER_MS", 10),
+        producer_flush_interval_ms=_get_int("KAFKA_PRODUCER_FLUSH_INTERVAL_MS", 200),
+        producer_flush_timeout_seconds=_get_float("KAFKA_PRODUCER_FLUSH_TIMEOUT_SECONDS", 2.0),
+        producer_max_pending_commits=_get_int("KAFKA_PRODUCER_MAX_PENDING_COMMITS", 64),
+        producer_queue_full_retries=_get_int("KAFKA_PRODUCER_QUEUE_FULL_RETRIES", 5),
+        producer_queue_full_backoff_ms=_get_int("KAFKA_PRODUCER_QUEUE_FULL_BACKOFF_MS", 10),
+        gateway_backpressure_sleep_ms=_get_int("KAFKA_GATEWAY_BACKPRESSURE_SLEEP_MS", 20),
     )
     cfg.validate()
     return cfg

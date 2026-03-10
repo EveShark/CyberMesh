@@ -314,7 +314,21 @@ class CoordinatorAgent(BaseAgent):
     ) -> str:
         """Generate final reasoning summary."""
         parsed_file = state.get("parsed_file")
-        file_name = parsed_file.file_name if parsed_file else "unknown"
+        if parsed_file:
+            file_name = parsed_file.file_name
+        else:
+            file_name = state.get("file_path") or "unknown"
+            if file_name == "unknown":
+                event = state.get("event")
+                labels = getattr(event, "labels", {}) if event is not None else {}
+                scenario = str(labels.get("scenario") or "").strip() if isinstance(labels, dict) else ""
+                profile_mode = str(labels.get("profile_mode") or "").strip() if isinstance(labels, dict) else ""
+                source_event_id = str(labels.get("source_event_id") or getattr(event, "id", "") or "").strip() if isinstance(labels, dict) else ""
+                modality = getattr(getattr(event, "modality", None), "value", "") if event is not None else ""
+                parts = [part for part in (scenario, profile_mode, modality) if part]
+                file_name = "/".join(parts) if parts else "unknown"
+                if source_event_id:
+                    file_name = f"{file_name}:{source_event_id}"
         
         lines = [f"Analysis of {file_name}:"]
         

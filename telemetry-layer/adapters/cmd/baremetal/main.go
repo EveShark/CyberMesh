@@ -10,6 +10,7 @@ import (
 
 	"cybermesh/telemetry-layer/adapters/internal/adapter"
 	"cybermesh/telemetry-layer/adapters/internal/kafka"
+	"cybermesh/telemetry-layer/adapters/internal/telemetrymetrics"
 	"cybermesh/telemetry-layer/adapters/utils"
 )
 
@@ -84,6 +85,7 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	telemetrymetrics.StartServer(ctx, cm.GetString("METRICS_ADDR", ":9102"), logger)
 
 	if err := adapter.Run(ctx, cfg, logger); err != nil {
 		logger.Fatal("adapter failed", utils.ZapError(err))

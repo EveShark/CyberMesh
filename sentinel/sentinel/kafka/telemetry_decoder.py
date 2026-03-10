@@ -80,6 +80,8 @@ def _decode_proto_flow_v1(value: bytes) -> Dict[str, Any]:
         "pkts_bwd": int(msg.pkts_bwd or 0),
         "duration_ms": int(msg.duration_ms or 0),
         "source_id": msg.source_id or "",
+        "source_event_ts_ms": int(getattr(msg, "source_event_ts_ms", 0) or 0),
+        "telemetry_ingest_ts_ms": int(getattr(msg, "telemetry_ingest_ts_ms", 0) or 0),
     }
     if msg.source_type:
         record["source_type"] = int(msg.source_type)
@@ -166,7 +168,9 @@ def _to_flow_event(topic: str, payload: Dict[str, Any], raw_bytes: bytes) -> Can
         raise ValueError(format_error(ERR_INVALID_FIELDS, detail))
 
     source = f"kafka:{topic}"
-    labels = _derive_labels_for_flow(payload)
+    event_id = str(payload.get("flow_id") or _hash_event_id(topic, raw_bytes))
+    event_ts = float(payload.get("ts") or time.time())
+    labels = _ensure_trace_labels(_derive_labels_for_flow(payload), event_id=event_id, timestamp_s=event_ts, payload=payload)
     raw_context = {
         "_source_topic": topic,
         "_source_schema": payload.get("schema", ""),
@@ -178,8 +182,8 @@ def _to_flow_event(topic: str, payload: Dict[str, Any], raw_bytes: bytes) -> Can
         raw_context=raw_context,
         tenant_id=tenant_id,
         source=source,
-        event_id=str(payload.get("flow_id") or _hash_event_id(topic, raw_bytes)),
-        timestamp=float(payload.get("ts") or time.time()),
+        event_id=event_id,
+        timestamp=event_ts,
         labels=labels,
     )
 
@@ -238,10 +242,39 @@ def _derive_labels_for_flow(payload: Dict[str, Any]) -> Dict[str, str]:
     return labels
 
 
+def _normalize_event_ts_ms(value: Any) -> int:
+    if value is None:
+        return 0
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if parsed <= 0:
+        return 0
+    if parsed >= 946684800000:
+        return int(parsed)
+    return int(parsed * 1000.0)
+
+
+def _ensure_trace_labels(labels: Dict[str, str], *, event_id: str, timestamp_s: float, payload: Dict[str, Any] | None = None) -> Dict[str, str]:
+    out = dict(labels or {})
+    out.setdefault("trace_id", event_id)
+    out.setdefault("source_event_id", event_id)
+    payload = payload or {}
+    source_event_ts_ms = _normalize_event_ts_ms(payload.get("source_event_ts_ms"))
+    telemetry_ingest_ts_ms = _normalize_event_ts_ms(payload.get("telemetry_ingest_ts_ms"))
+    out.setdefault("source_event_ts_ms", str(source_event_ts_ms or int(float(timestamp_s) * 1000.0)))
+    if telemetry_ingest_ts_ms > 0:
+        out.setdefault("telemetry_ingest_ts_ms", str(telemetry_ingest_ts_ms))
+    return out
+
+
 def _to_deepflow_event(topic: str, payload: Dict[str, Any], raw_bytes: bytes) -> CanonicalEvent:
     tenant_id = str(payload.get("tenant_id") or "").strip()
     if not tenant_id:
         raise ValueError(format_error(ERR_MISSING_TENANT, "missing tenant_id"))
+    event_id = str(payload.get("flow_id") or _hash_event_id(topic, raw_bytes))
+    event_ts = float(payload.get("ts") or time.time())
     severity = str(payload.get("severity") or "medium")
     signature = str(payload.get("signature") or payload.get("alert_type") or "deepflow_alert")
     signature_id = str(payload.get("signature_id") or "deepflow")
@@ -271,8 +304,9 @@ def _to_deepflow_event(topic: str, payload: Dict[str, Any], raw_bytes: bytes) ->
         raw_context=raw_context,
         tenant_id=tenant_id,
         source=f"kafka:{topic}",
-        event_id=str(payload.get("flow_id") or _hash_event_id(topic, raw_bytes)),
-        timestamp=float(payload.get("ts") or time.time()),
+        event_id=event_id,
+        timestamp=event_ts,
+        labels=_ensure_trace_labels({}, event_id=event_id, timestamp_s=event_ts, payload=payload),
     )
 
 

@@ -163,8 +163,11 @@ type FlowV1 struct {
 	// Derivation metadata (optional).
 	TimingDerived    bool   `protobuf:"varint,53,opt,name=timing_derived,json=timingDerived,proto3" json:"timing_derived,omitempty"`
 	DerivationPolicy string `protobuf:"bytes,54,opt,name=derivation_policy,json=derivationPolicy,proto3" json:"derivation_policy,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Lineage timestamps (optional).
+	SourceEventTsMs     int64 `protobuf:"varint,55,opt,name=source_event_ts_ms,json=sourceEventTsMs,proto3" json:"source_event_ts_ms,omitempty"`
+	TelemetryIngestTsMs int64 `protobuf:"varint,56,opt,name=telemetry_ingest_ts_ms,json=telemetryIngestTsMs,proto3" json:"telemetry_ingest_ts_ms,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *FlowV1) Reset() {
@@ -575,6 +578,20 @@ func (x *FlowV1) GetDerivationPolicy() string {
 	return ""
 }
 
+func (x *FlowV1) GetSourceEventTsMs() int64 {
+	if x != nil {
+		return x.SourceEventTsMs
+	}
+	return 0
+}
+
+func (x *FlowV1) GetTelemetryIngestTsMs() int64 {
+	if x != nil {
+		return x.TelemetryIngestTsMs
+	}
+	return 0
+}
+
 type Identity struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Namespace     string                 `protobuf:"bytes,1,opt,name=namespace,proto3" json:"namespace,omitempty"`
@@ -639,7 +656,7 @@ var File_telemetry_flow_v1_proto protoreflect.FileDescriptor
 
 const file_telemetry_flow_v1_proto_rawDesc = "" +
 	"\n" +
-	"\x17telemetry_flow_v1.proto\x12\x16cybermesh.telemetry.v1\"\xd9\r\n" +
+	"\x17telemetry_flow_v1.proto\x12\x16cybermesh.telemetry.v1\"\xbb\x0e\n" +
 	"\x06FlowV1\x12\x16\n" +
 	"\x06schema\x18\x01 \x01(\tR\x06schema\x12\x0e\n" +
 	"\x02ts\x18\x02 \x01(\x03R\x02ts\x12\x1b\n" +
@@ -714,7 +731,9 @@ const file_telemetry_flow_v1_proto_rawDesc = "" +
 	"\fece_flag_cnt\x184 \x01(\x01R\n" +
 	"eceFlagCnt\x12%\n" +
 	"\x0etiming_derived\x185 \x01(\bR\rtimingDerived\x12+\n" +
-	"\x11derivation_policy\x186 \x01(\tR\x10derivationPolicy\"N\n" +
+	"\x11derivation_policy\x186 \x01(\tR\x10derivationPolicy\x12+\n" +
+	"\x12source_event_ts_ms\x187 \x01(\x03R\x0fsourceEventTsMs\x123\n" +
+	"\x16telemetry_ingest_ts_ms\x188 \x01(\x03R\x13telemetryIngestTsMs\"N\n" +
 	"\bIdentity\x12\x1c\n" +
 	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x12\x10\n" +
 	"\x03pod\x18\x02 \x01(\tR\x03pod\x12\x12\n" +

@@ -37,10 +37,26 @@ class EventAnalysisEngine:
         ]
         self._coordinator = CoordinatorAgent()
 
+    @staticmethod
+    def _event_display_name(event: CanonicalEvent) -> str:
+        labels = event.labels if isinstance(event.labels, dict) else {}
+        scenario = str(labels.get("scenario") or "").strip()
+        profile_mode = str(labels.get("profile_mode") or "").strip()
+        source_event_id = str(labels.get("source_event_id") or event.id or "").strip()
+        source = str(event.source or "sentinel").strip()
+        modality = getattr(event.modality, "value", str(event.modality))
+
+        parts = [part for part in (scenario, profile_mode, modality) if part]
+        prefix = "/".join(parts) if parts else modality or "event"
+        if source_event_id:
+            return f"{prefix}:{source_event_id}"
+        return f"{prefix}:{source}"
+
     def analyze_event(self, event: CanonicalEvent) -> Dict[str, Any]:
         t0 = time.perf_counter()
         state: Dict[str, Any] = {
             "event": event,
+            "file_path": self._event_display_name(event),
             "current_stage": AnalysisStage.INIT,
             "stages_completed": [],
             "static_results": [],

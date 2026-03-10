@@ -89,6 +89,10 @@ message FlowV1 {
   // Derivation metadata (optional).
   bool timing_derived = 53;
   string derivation_policy = 54;
+
+  // Lineage timestamps (optional).
+  int64 source_event_ts_ms = 55;
+  int64 telemetry_ingest_ts_ms = 56;
 }
 
 message Identity {

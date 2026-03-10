@@ -100,4 +100,6 @@ message CicFeaturesV1 {
   // Provenance for dual-lane and multi-sensor operation.
   string source_type = 88;
   string source_id = 89;
+  int64 source_event_ts_ms = 90;
+  int64 telemetry_ingest_ts_ms = 91;
 }

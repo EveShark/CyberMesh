@@ -112,10 +112,12 @@ type CicFeaturesV1 struct {
 	IdleMax         float64                `protobuf:"fixed64,86,opt,name=idle_max,json=idleMax,proto3" json:"idle_max,omitempty"`
 	IdleMin         float64                `protobuf:"fixed64,87,opt,name=idle_min,json=idleMin,proto3" json:"idle_min,omitempty"`
 	// Provenance for dual-lane and multi-sensor operation.
-	SourceType    string `protobuf:"bytes,88,opt,name=source_type,json=sourceType,proto3" json:"source_type,omitempty"`
-	SourceId      string `protobuf:"bytes,89,opt,name=source_id,json=sourceId,proto3" json:"source_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	SourceType          string `protobuf:"bytes,88,opt,name=source_type,json=sourceType,proto3" json:"source_type,omitempty"`
+	SourceId            string `protobuf:"bytes,89,opt,name=source_id,json=sourceId,proto3" json:"source_id,omitempty"`
+	SourceEventTsMs     int64  `protobuf:"varint,90,opt,name=source_event_ts_ms,json=sourceEventTsMs,proto3" json:"source_event_ts_ms,omitempty"`
+	TelemetryIngestTsMs int64  `protobuf:"varint,91,opt,name=telemetry_ingest_ts_ms,json=telemetryIngestTsMs,proto3" json:"telemetry_ingest_ts_ms,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *CicFeaturesV1) Reset() {
@@ -771,11 +773,25 @@ func (x *CicFeaturesV1) GetSourceId() string {
 	return ""
 }
 
+func (x *CicFeaturesV1) GetSourceEventTsMs() int64 {
+	if x != nil {
+		return x.SourceEventTsMs
+	}
+	return 0
+}
+
+func (x *CicFeaturesV1) GetTelemetryIngestTsMs() int64 {
+	if x != nil {
+		return x.TelemetryIngestTsMs
+	}
+	return 0
+}
+
 var File_telemetry_feature_v1_proto protoreflect.FileDescriptor
 
 const file_telemetry_feature_v1_proto_rawDesc = "" +
 	"\n" +
-	"\x1atelemetry_feature_v1.proto\x12\x16cybermesh.telemetry.v1\"\x86\x18\n" +
+	"\x1atelemetry_feature_v1.proto\x12\x16cybermesh.telemetry.v1\"\xe8\x18\n" +
 	"\rCicFeaturesV1\x12\x16\n" +
 	"\x06schema\x18\x01 \x01(\tR\x06schema\x12\x0e\n" +
 	"\x02ts\x18\x02 \x01(\x03R\x02ts\x12\x1b\n" +
@@ -889,7 +905,9 @@ const file_telemetry_feature_v1_proto_rawDesc = "" +
 	"\bidle_min\x18W \x01(\x01R\aidleMin\x12\x1f\n" +
 	"\vsource_type\x18X \x01(\tR\n" +
 	"sourceType\x12\x1b\n" +
-	"\tsource_id\x18Y \x01(\tR\bsourceIdB4Z2cybermesh/telemetry-layer/proto/gen/go;telemetrypbb\x06proto3"
+	"\tsource_id\x18Y \x01(\tR\bsourceId\x12+\n" +
+	"\x12source_event_ts_ms\x18Z \x01(\x03R\x0fsourceEventTsMs\x123\n" +
+	"\x16telemetry_ingest_ts_ms\x18[ \x01(\x03R\x13telemetryIngestTsMsB4Z2cybermesh/telemetry-layer/proto/gen/go;telemetrypbb\x06proto3"
 
 var (
 	file_telemetry_feature_v1_proto_rawDescOnce sync.Once

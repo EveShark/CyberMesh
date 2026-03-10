@@ -66,8 +66,13 @@ class SentinelOrchestrator:
         self,
         features: NetworkFlowFeaturesV1,
         raw_context: Optional[Dict[str, Any]] = None,
+        event: Optional[CanonicalEvent] = None,
     ) -> Dict[str, Any]:
-        return self.telemetry_engine.analyze_flow(features, raw_context=raw_context)
+        return self.telemetry_engine.analyze_flow(
+            features,
+            raw_context=raw_context,
+            event=event,
+        )
 
     def analyze_event(self, event: CanonicalEvent) -> Dict[str, Any]:
         if event.modality == Modality.FILE:
@@ -82,7 +87,7 @@ class SentinelOrchestrator:
 
         if event.modality == Modality.NETWORK_FLOW:
             features = NetworkFlowFeaturesV1.from_dict(event.features)
-            result = self.analyze_flow(features, raw_context=event.raw_context)
+            result = self.analyze_flow(features, raw_context=event.raw_context, event=event)
             return self._apply_opa_gate(result, event)
 
         if event.modality in (

@@ -112,6 +112,8 @@ def _flow_from_proto(flow_msg) -> Dict[str, Any]:
         "metrics_known": bool(flow_msg.metrics_known),
         "source_type": int(flow_msg.source_type),
         "source_id": flow_msg.source_id or "",
+        "source_event_ts_ms": int(getattr(flow_msg, "source_event_ts_ms", 0) or 0),
+        "telemetry_ingest_ts_ms": int(getattr(flow_msg, "telemetry_ingest_ts_ms", 0) or 0),
         "feature_mask": flow_msg.feature_mask.hex() if flow_msg.feature_mask else "",
         "timing_known": bool(flow_msg.timing_known),
         "timing_derived": bool(flow_msg.timing_derived),
@@ -224,6 +226,8 @@ def _feature_to_proto(event: Dict[str, Any], feature_names: List[str]):
     msg.protocol = int(event.get("protocol", 0) or 0)
     msg.source_type = str(event.get("source_type", "") or "")
     msg.source_id = str(event.get("source_id", "") or "")
+    msg.source_event_ts_ms = int(event.get("source_event_ts_ms", 0) or 0)
+    msg.telemetry_ingest_ts_ms = int(event.get("telemetry_ingest_ts_ms", 0) or 0)
     mask = event.get("feature_mask", "")
     if mask:
         try:
@@ -474,6 +478,8 @@ def transform_flow(flow: Dict[str, Any], feature_names: List[str], mask_enabled:
         "protocol": int(flow.get("proto", 0) or 0),
         "source_type": _normalize_source_type(flow.get("source_type")),
         "source_id": str(flow.get("source_id", "") or ""),
+        "source_event_ts_ms": int(flow.get("source_event_ts_ms", 0) or 0),
+        "telemetry_ingest_ts_ms": int(flow.get("telemetry_ingest_ts_ms", 0) or 0),
     }
     if mask_enabled:
         event["feature_mask"] = mask

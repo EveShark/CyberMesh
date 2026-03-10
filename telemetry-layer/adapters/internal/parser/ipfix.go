@@ -34,6 +34,7 @@ func RecordFromIPFIX(fields []ipfix.InterpretedField) (model.Record, error) {
 			rec.BytesFwd = int64(numberValue(f.Value))
 		case "flowstartmilliseconds":
 			startMS = numberValue(f.Value)
+			rec.SourceEventTsMs = int64(startMS)
 			rec.Timestamp = int64(startMS / 1000)
 		case "flowendmilliseconds":
 			endMS = numberValue(f.Value)
