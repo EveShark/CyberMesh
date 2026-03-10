@@ -8,7 +8,8 @@ export function adaptNetwork(raw?: NetworkOverviewRaw, blockMetrics?: DashboardB
     return {
       telemetry: {
         connectedPeers: "0",
-        avgLatency: 0,
+        networkAverageLatencyMs: 0,
+        networkAverageMessageGapMs: 0,
         consensusRound: 0,
         leaderStability: 0,
         inboundRate: "0 B/s",
@@ -66,9 +67,10 @@ export function adaptNetwork(raw?: NetworkOverviewRaw, blockMetrics?: DashboardB
   const totalVotes = consensus?.votes?.reduce((sum, v) => sum + v.count, 0) || 0;
 
   return {
-    telemetry: {
-      connectedPeers: raw.connected_peers.toString(),
-      avgLatency: Math.round(raw.average_latency_ms * 100) / 100, // Round to 2 decimals
+      telemetry: {
+        connectedPeers: raw.connected_peers.toString(),
+      networkAverageLatencyMs: Math.round(raw.average_latency_ms * 100) / 100,
+      networkAverageMessageGapMs: raw.average_message_gap_ms ? Math.round(raw.average_message_gap_ms * 100) / 100 : 0,
       consensusRound: raw.consensus_round,
       leaderStability: Math.round(leaderStabilityPercent * 10) / 10, // Round to 1 decimal
       inboundRate: formatRate(raw.inbound_rate_bps) || "0 B/s",
@@ -134,10 +136,11 @@ function adaptNodes(rawNodes: NetworkNodeRaw[], leaderName: string | undefined, 
       name: getNodeName(node.id),
       hash: truncateNodeId(node.id, 6, 4),
       fullId: node.id, // Full ID for leader matching
-      latency: formatMs(node.latency) || "0ms",
+      latencyMs: Math.round((node.ping_latency_ms ?? node.latency) * 100) / 100,
+      messageGapMs: node.message_gap_ms !== undefined ? Math.round(node.message_gap_ms * 100) / 100 : undefined,
       uptime: `${Math.min(uptimeValue, 100).toFixed(1)}%`, // Cap at 100%
       role: isLeader ? "leader" : "validator" as NodeRole,
-      status: getNodeStatus(node.status, node.latency)
+      status: getNodeStatus(node.status, node.ping_latency_ms ?? node.latency)
     };
   });
 }
@@ -161,7 +164,8 @@ function adaptValidators(
       name: getNodeName(node.id),
       hash: truncateNodeId(node.id, 6, 4),
       status: isVoting ? nodeStatus : "Warning" as NodeStatus,
-      latency: formatMs(node.latency) || "0ms",
+      latency: formatMs(node.ping_latency_ms ?? node.latency) || "0ms",
+      messageGap: node.message_gap_ms !== undefined ? formatMs(node.message_gap_ms) : "--",
       lastSeen: node.last_seen ? formatLastSeen(node.last_seen) : "Just now",
       role: isLeader ? "leader" : "validator" as NodeRole
     };
@@ -275,5 +279,3 @@ function getRiskLevel(connected: number, total: number, stability: number): Risk
   if (connectivity >= 0.2) return "HIGH";
   return "CRITICAL";
 }
-
-

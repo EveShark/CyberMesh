@@ -45,10 +45,10 @@ const DetectionStreamFeed = ({ data }: DetectionStreamFeedProps) => {
             {hasEvents && (
               <div className="flex items-center gap-2">
                 <span className="relative flex h-2 w-2">
-                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                  <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                  <span className="absolute inline-flex h-full w-full rounded-full bg-status-healthy/35"></span>
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-status-healthy"></span>
                 </span>
-                <span className="text-xs text-emerald-400">Live</span>
+                <span className="text-xs text-status-healthy">Live</span>
               </div>
             )}
           </div>
@@ -75,7 +75,7 @@ const DetectionStreamFeed = ({ data }: DetectionStreamFeedProps) => {
 
                     <div className="flex items-center gap-4">
                       <span className="text-sm text-foreground">
-                        <span className="text-emerald-400 font-semibold">{event.confidence}%</span> confidence
+                        <span className="text-status-healthy font-semibold">{event.confidence}%</span> confidence
                       </span>
                     </div>
 
@@ -84,7 +84,7 @@ const DetectionStreamFeed = ({ data }: DetectionStreamFeedProps) => {
                         Final score: <span className="text-foreground font-medium">{event.finalScore}%</span>
                       </span>
                       <span>
-                        Decision: <span className="text-emerald-400 font-medium">{event.decision}</span>
+                        Decision: <span className="text-status-healthy font-medium">{event.decision}</span>
                       </span>
                     </div>
 
@@ -138,11 +138,11 @@ const DetectionStreamFeed = ({ data }: DetectionStreamFeedProps) => {
               <span className="text-muted-foreground">Summary:</span>
               <span className="text-foreground font-medium">{data.totalCount} total</span>
               <span className="text-muted-foreground">|</span>
-              <span className="text-emerald-400 font-medium">
+              <span className="text-status-healthy font-medium">
                 {data.publishedCount} published ({publishRate}%)
               </span>
               <span className="text-muted-foreground">|</span>
-              <span className="text-amber-400 font-medium">{data.heldForReview} held for review</span>
+              <span className="text-status-warning font-medium">{data.heldForReview} held for review</span>
             </div>
           </div>
         </CardContent>

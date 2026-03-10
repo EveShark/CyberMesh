@@ -4,6 +4,7 @@ import { Helmet } from "react-helmet-async";
 import { Home, LayoutDashboard, AlertTriangle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import Logo from "@/components/brand/Logo";
+import { LANDING_URL } from "@/config/routes";
 
 const NotFound = () => {
   const location = useLocation();
@@ -59,10 +60,10 @@ const NotFound = () => {
           {/* Action buttons */}
           <div className="flex flex-col sm:flex-row items-center justify-center gap-3">
             <Button asChild className="gradient-ember text-primary-foreground font-semibold hover:scale-105 transition-transform ember-glow-sm">
-              <Link to="/">
+              <a href={LANDING_URL}>
                 <Home className="w-4 h-4 mr-2" />
                 Return Home
-              </Link>
+              </a>
             </Button>
             <Button asChild variant="outline" className="border-border hover:border-frost/40 hover:bg-frost/5 transition-colors">
               <Link to="/dashboard">

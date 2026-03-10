@@ -30,9 +30,11 @@ export const useAIEngineData = (options: UseAIEngineDataOptions = {}) => {
         const response = await apiClient.aiEngine.getStatus(signal);
         return response;
       },
-    refetchInterval: demoMode ? 5000 : pollingInterval,
+    refetchInterval: demoMode ? false : pollingInterval,
     enabled: demoMode ? true : enabled,
-    staleTime: demoMode ? 0 : 8000,
+    staleTime: demoMode ? Infinity : 8000,
+    refetchOnMount: demoMode ? false : true,
+    refetchOnWindowFocus: demoMode ? false : true,
     gcTime: 1000 * 60 * 5,
     placeholderData: (previousData) => previousData,
   });

@@ -28,9 +28,11 @@ export const useSystemHealthData = (options: UseSystemHealthDataOptions = {}) =>
         validateApiResponse(systemHealthResponseSchema, response, 'system-health');
         return response;
       },
-    refetchInterval: demoMode ? 2000 : pollingInterval,
+    refetchInterval: demoMode ? false : pollingInterval,
     enabled: demoMode ? true : enabled,
-    staleTime: demoMode ? 0 : 15000,
+    staleTime: demoMode ? Infinity : 15000,
+    refetchOnMount: demoMode ? false : true,
+    refetchOnWindowFocus: demoMode ? false : true,
     gcTime: 1000 * 60 * 5,
     placeholderData: (previousData) => previousData,
   });

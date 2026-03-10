@@ -87,13 +87,13 @@ const getBaseUrl = (): string => {
   // In production, use full backend URL
   const backendUrl = import.meta.env.VITE_BACKEND_URL;
   if (!backendUrl) {
-    console.warn("VITE_BACKEND_URL is not set, defaulting to https://api.cybermesh.qzz.io:9441");
-    return "https://api.cybermesh.qzz.io:9441/api/v1";
+    console.warn("VITE_BACKEND_URL is not set, defaulting to https://api.cybermesh.qzz.io");
+    return "https://api.cybermesh.qzz.io/api/v1";
   }
   return `${backendUrl}/api/v1`;
 };
 
-// Default timeout for requests (15 seconds)
+// Default timeout for requests (60 seconds)
 const DEFAULT_TIMEOUT = 60000;
 
 // Rate limiting configuration

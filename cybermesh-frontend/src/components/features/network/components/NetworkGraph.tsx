@@ -5,7 +5,8 @@ interface NetworkNode {
   id: string
   name: string
   status: string
-  latency?: number
+  latencyMs?: number
+  messageGapMs?: number
   lastSeen?: string | null
   uptime?: number
 }
@@ -22,6 +23,7 @@ interface NetworkGraphProps {
   edges: NetworkEdge[]
   leader?: string
   leaderId?: string
+  networkAverageLatencyMs?: number
   isLoading?: boolean
   error?: Error | null
 }
@@ -49,7 +51,7 @@ function formatNodeId(id?: string) {
   return `${id.slice(0, 6)}…${id.slice(-4)}`
 }
 
-export default function NetworkGraph({ nodes, edges, leader, leaderId, isLoading, error }: NetworkGraphProps) {
+export default function NetworkGraph({ nodes, edges, leader, leaderId, networkAverageLatencyMs, isLoading, error }: NetworkGraphProps) {
   const [selectedNode, setSelectedNode] = useState<PositionedNode | null>(null)
   const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null)
   const [isMobile, setIsMobile] = useState(false)
@@ -77,13 +79,6 @@ export default function NetworkGraph({ nodes, edges, leader, leaderId, isLoading
     if (validators.length <= 1) return true
     return edges.length > 0
   }, [validators, edges])
-
-  // Calculate stats for Key Insights - must be before any early returns
-  const avgLatency = useMemo(() => {
-    const latencies = validators.filter(n => typeof n.latency === 'number').map(n => n.latency!)
-    if (latencies.length === 0) return 0
-    return Math.round(latencies.reduce((a, b) => a + b, 0) / latencies.length)
-  }, [validators])
 
   const leaderNode = useMemo(() => {
     return validators.find(n => n.isLeader)
@@ -220,7 +215,7 @@ export default function NetworkGraph({ nodes, edges, leader, leaderId, isLoading
                 key={node.id}
                 type="button"
                 onClick={() => handleSelect({ ...node, x: 0, y: 0 })}
-                className={`text-left rounded-2xl border transition-all duration-300 backdrop-blur-xl p-4 ${isSelected ? "border-primary/50 bg-background/80 shadow-xl" : "border-border/30 bg-background/60 shadow-lg"
+                className={`text-left rounded-2xl border transition-all duration-300 p-4 ${isSelected ? "border-primary/50 bg-background/90 shadow-md" : "border-border/40 bg-background/95 shadow-sm"
                   }`}
               >
                 <div className="flex items-center justify-between mb-3">
@@ -238,15 +233,15 @@ export default function NetworkGraph({ nodes, edges, leader, leaderId, isLoading
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <div>
-                    <p className="text-xs text-muted-foreground">Latency</p>
+                    <p className="text-xs text-muted-foreground">Ping RTT</p>
                     <p className="text-lg font-bold" style={{ color: styles.text }}>
-                      {typeof node.latency === "number" ? `${Math.round(node.latency)}ms` : "--"}
+                      {typeof node.latencyMs === "number" ? formatLatencyMs(node.latencyMs) : "--"}
                     </p>
                   </div>
                   <div>
-                    <p className="text-xs text-muted-foreground">Uptime</p>
+                    <p className="text-xs text-muted-foreground">Msg Gap</p>
                     <p className="text-lg font-bold text-foreground">
-                      {typeof node.uptime === "number" ? `${node.uptime.toFixed(1)}%` : "--"}
+                      {typeof node.messageGapMs === "number" ? formatLatencyMs(node.messageGapMs) : "--"}
                     </p>
                   </div>
                 </div>
@@ -305,9 +300,9 @@ export default function NetworkGraph({ nodes, edges, leader, leaderId, isLoading
             <p className="text-xs text-muted-foreground">current leader</p>
           </div>
           <div className="rounded-xl border border-border/40 bg-background/70 p-4">
-            <p className="text-xs text-muted-foreground">Avg Latency</p>
-            <p className="mt-1 text-2xl font-bold text-foreground">{avgLatency}ms</p>
-            <p className="text-xs text-muted-foreground">network avg</p>
+            <p className="text-xs text-muted-foreground">Avg Ping RTT</p>
+            <p className="mt-1 text-2xl font-bold text-foreground">{formatLatencyMs(networkAverageLatencyMs)}</p>
+            <p className="text-xs text-muted-foreground">across connected peers</p>
           </div>
           <div className="rounded-xl border border-border/40 bg-background/70 p-4">
             <p className="text-xs text-muted-foreground">Connection Status</p>
@@ -327,8 +322,8 @@ export default function NetworkGraph({ nodes, edges, leader, leaderId, isLoading
         <div className="absolute inset-0 flex items-center justify-center">
           <div className="relative">
             <div
-              className={`flex h-24 w-24 items-center justify-center rounded-full border backdrop-blur-xl transition-colors duration-500 ${allHealthyConnected
-                  ? "border-primary/60 bg-primary/15 shadow-[0_0_35px_hsl(var(--primary)/0.35)]"
+              className={`flex h-24 w-24 items-center justify-center rounded-full border transition-colors duration-500 ${allHealthyConnected
+                  ? "border-primary/60 bg-primary/10 shadow-sm"
                   : "border-border/40 bg-primary/10"
                 }`}
             >
@@ -338,12 +333,10 @@ export default function NetworkGraph({ nodes, edges, leader, leaderId, isLoading
               </div>
             </div>
             <div
-              className={`absolute inset-0 rounded-full border transition-colors duration-500 ${allHealthyConnected ? "border-primary/50 animate-pulse" : "border-primary/20"
+              className={`absolute inset-0 rounded-full border transition-colors duration-500 ${allHealthyConnected ? "border-primary/50" : "border-primary/20"
                 }`}
             />
-            {allHealthyConnected && (
-              <div className="absolute inset-0 rounded-full bg-primary/10 blur-xl" />
-            )}
+            {allHealthyConnected && <div className="absolute inset-0 rounded-full bg-primary/5" />}
           </div>
         </div>
 
@@ -358,11 +351,11 @@ export default function NetworkGraph({ nodes, edges, leader, leaderId, isLoading
               onClick={() => handleSelect(node)}
               onMouseEnter={() => setHoveredNodeId(node.id)}
               onMouseLeave={() => setHoveredNodeId(null)}
-              className={`group absolute flex w-40 sm:w-44 -translate-x-1/2 -translate-y-1/2 flex-col rounded-2xl border backdrop-blur-xl transition-transform duration-300 ${isSelected
-                  ? "scale-105 border-primary/60 bg-background/90 shadow-2xl"
-                  : isHovered
-                    ? "scale-105 border-border/40 bg-background/80 shadow-xl"
-                    : "scale-100 border-border/20 bg-background/60 shadow-lg"
+              className={`group absolute flex w-40 sm:w-44 -translate-x-1/2 -translate-y-1/2 flex-col rounded-2xl border transition-transform duration-300 ${isSelected
+                  ? "scale-105 border-primary/60 bg-background shadow-md"
+                    : isHovered
+                    ? "scale-105 border-border/60 bg-background shadow-sm"
+                    : "scale-100 border-border/50 bg-background/95 shadow-sm"
                 }`}
               style={{ left: node.x, top: node.y }}
             >
@@ -377,10 +370,7 @@ export default function NetworkGraph({ nodes, edges, leader, leaderId, isLoading
                 style={{ backgroundColor: styles.bg }}
               />
               {isHovered || isSelected ? (
-                <span
-                  className="absolute inset-0 rounded-2xl opacity-40 blur-xl"
-                  style={{ backgroundColor: styles.bg }}
-                />
+                <span className="absolute inset-0 rounded-2xl opacity-10" style={{ backgroundColor: styles.bg }} />
               ) : null}
               <div className="relative flex h-full flex-col justify-between gap-3 p-4 text-left">
                 <div>
@@ -396,15 +386,15 @@ export default function NetworkGraph({ nodes, edges, leader, leaderId, isLoading
                 </div>
                 <div className="space-y-2 text-xs">
                   <div className="flex items-center justify-between text-muted-foreground">
-                    <span>Latency</span>
+                    <span>Ping RTT</span>
                     <span className="font-mono font-semibold" style={{ color: styles.text }}>
-                      {typeof node.latency === "number" ? `${Math.round(node.latency)}ms` : "--"}
+                      {typeof node.latencyMs === "number" ? formatLatencyMs(node.latencyMs) : "--"}
                     </span>
                   </div>
                   <div className="flex items-center justify-between text-muted-foreground">
-                    <span>Uptime</span>
+                    <span>Msg Gap</span>
                     <span className="font-semibold text-foreground">
-                      {typeof node.uptime === "number" ? `${node.uptime.toFixed(1)}%` : "--"}
+                      {typeof node.messageGapMs === "number" ? formatLatencyMs(node.messageGapMs) : "--"}
                     </span>
                   </div>
                 </div>
@@ -415,7 +405,7 @@ export default function NetworkGraph({ nodes, edges, leader, leaderId, isLoading
       </div>
 
       {selectedNode && (
-        <div className="rounded-2xl border border-border/40 bg-background/70 p-6 backdrop-blur-xl">
+        <div className="rounded-2xl border border-border/40 bg-background p-6">
           <div className="flex items-start justify-between gap-4">
             <div>
               <h3 className="text-lg font-semibold text-foreground flex items-center gap-2">
@@ -434,7 +424,7 @@ export default function NetworkGraph({ nodes, edges, leader, leaderId, isLoading
               <XCircle className="h-5 w-5" />
             </button>
           </div>
-          <div className="mt-4 grid grid-cols-1 gap-3 text-sm sm:grid-cols-3">
+          <div className="mt-4 grid grid-cols-1 gap-3 text-sm sm:grid-cols-4">
             <div className="rounded-xl border border-border/30 bg-background/80 p-4">
               <div className="flex items-center gap-2 text-muted-foreground">
                 <Activity className="h-4 w-4" />
@@ -450,10 +440,19 @@ export default function NetworkGraph({ nodes, edges, leader, leaderId, isLoading
             <div className="rounded-xl border border-border/30 bg-background/80 p-4">
               <div className="flex items-center gap-2 text-muted-foreground">
                 <Zap className="h-4 w-4" />
-                <span>Latency</span>
+                <span>Ping RTT</span>
               </div>
               <p className="mt-2 text-lg font-semibold text-foreground">
-                {typeof selectedNode.latency === "number" ? `${Math.round(selectedNode.latency)}ms` : "--"}
+                {typeof selectedNode.latencyMs === "number" ? formatLatencyMs(selectedNode.latencyMs) : "--"}
+              </p>
+            </div>
+            <div className="rounded-xl border border-border/30 bg-background/80 p-4">
+              <div className="flex items-center gap-2 text-muted-foreground">
+                <Activity className="h-4 w-4" />
+                <span>Msg Gap</span>
+              </div>
+              <p className="mt-2 text-lg font-semibold text-foreground">
+                {typeof selectedNode.messageGapMs === "number" ? formatLatencyMs(selectedNode.messageGapMs) : "--"}
               </p>
             </div>
             <div className="rounded-xl border border-border/30 bg-background/80 p-4">
@@ -547,4 +546,10 @@ function formatRelativeTime(date: Date) {
   if (diffSec < 60) return `${diffSec}s ago`
   if (diffMin < 60) return `${diffMin}m ago`
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+}
+
+function formatLatencyMs(latencyMs?: number | null) {
+  if (latencyMs === null || latencyMs === undefined || Number.isNaN(latencyMs)) return "--"
+  if (latencyMs < 1000) return `${Math.round(latencyMs)}ms`
+  return `${(latencyMs / 1000).toFixed(2)}s`
 }

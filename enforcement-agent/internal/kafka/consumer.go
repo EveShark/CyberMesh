@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io/ioutil"
 	"sync"
+	"time"
 
 	"github.com/IBM/sarama"
+	"go.uber.org/zap"
 
 	"github.com/CyberMesh/enforcement-agent/internal/metrics"
 )
@@ -27,6 +29,7 @@ type Consumer struct {
 	closed    bool
 	metrics   *metrics.Recorder
 	errorOnce sync.Once
+	logger    *zap.Logger
 }
 
 // Config represents the options for constructing a consumer.
@@ -46,6 +49,7 @@ type Config struct {
 	SASLUsername    string
 	SASLPassword    string
 	Metrics         *metrics.Recorder
+	Logger          *zap.Logger
 }
 
 // NewConsumer creates a Consumer instance.
@@ -105,6 +109,7 @@ func NewConsumer(cfg Config, handler MessageHandler) (*Consumer, error) {
 		handler: handler,
 		topic:   cfg.Topic,
 		metrics: cfg.Metrics,
+		logger:  cfg.Logger,
 	}, nil
 }
 
@@ -121,7 +126,7 @@ func (c *Consumer) Close() error {
 
 // Run starts consuming messages until the context is cancelled.
 func (c *Consumer) Run(ctx context.Context) error {
-	consumer := &groupHandler{handler: c.handler, metrics: c.metrics}
+	consumer := &groupHandler{handler: c.handler, metrics: c.metrics, logger: c.logger}
 
 	c.errorOnce.Do(func() {
 		go c.observeErrors(ctx)
@@ -160,29 +165,105 @@ func (c *Consumer) observeErrors(ctx context.Context) {
 type groupHandler struct {
 	handler MessageHandler
 	metrics *metrics.Recorder
+	logger  *zap.Logger
 }
 
-func (g *groupHandler) Setup(_ sarama.ConsumerGroupSession) error   { return nil }
-func (g *groupHandler) Cleanup(_ sarama.ConsumerGroupSession) error { return nil }
-
-func (g *groupHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
-	for message := range claim.Messages() {
-		if g.metrics != nil {
-			lag := claim.HighWaterMarkOffset() - message.Offset - 1
-			if lag < 0 {
-				lag = 0
-			}
-			g.metrics.ObserveKafkaLag(message.Partition, lag)
-		}
-		if err := g.handler.HandleMessage(session.Context(), message); err != nil {
+func (g *groupHandler) Setup(session sarama.ConsumerGroupSession) error {
+	if session == nil {
+		return nil
+	}
+	for topic, partitions := range session.Claims() {
+		for _, partition := range partitions {
 			if g.metrics != nil {
-				g.metrics.ObserveKafkaError("handler")
+				g.metrics.ObservePartitionAssigned(partition)
 			}
-			return err
+			if g.logger != nil {
+				g.logger.Info("policy consumer partition assigned",
+					zap.String("topic", topic),
+					zap.Int32("partition", partition),
+					zap.String("member_id", session.MemberID()),
+					zap.Int32("generation", session.GenerationID()))
+			}
 		}
-		session.MarkMessage(message, "")
 	}
 	return nil
+}
+
+func (g *groupHandler) Cleanup(session sarama.ConsumerGroupSession) error {
+	if session == nil {
+		return nil
+	}
+	for topic, partitions := range session.Claims() {
+		for _, partition := range partitions {
+			if g.metrics != nil {
+				g.metrics.ObservePartitionRevoked(partition)
+			}
+			if g.logger != nil {
+				g.logger.Info("policy consumer partition revoked",
+					zap.String("topic", topic),
+					zap.Int32("partition", partition),
+					zap.String("member_id", session.MemberID()),
+					zap.Int32("generation", session.GenerationID()))
+			}
+		}
+	}
+	return nil
+}
+
+func (g *groupHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+	if g.logger != nil {
+		g.logger.Info("policy consumer claim started",
+			zap.String("topic", claim.Topic()),
+			zap.Int32("partition", claim.Partition()),
+			zap.Int64("initial_offset", claim.InitialOffset()),
+			zap.Int64("high_watermark", claim.HighWaterMarkOffset()))
+	}
+	defer func() {
+		if g.logger != nil {
+			g.logger.Info("policy consumer claim stopped",
+				zap.String("topic", claim.Topic()),
+				zap.Int32("partition", claim.Partition()))
+		}
+	}()
+
+	for {
+		select {
+		case <-session.Context().Done():
+			return nil
+		case message, ok := <-claim.Messages():
+			if !ok {
+				return nil
+			}
+			if g.metrics != nil {
+				lag := claim.HighWaterMarkOffset() - message.Offset - 1
+				if lag < 0 {
+					lag = 0
+				}
+				g.metrics.ObserveKafkaLag(message.Partition, lag)
+				if !message.Timestamp.IsZero() {
+					publishToConsume := time.Since(message.Timestamp)
+					if publishToConsume >= 0 {
+						g.metrics.ObservePublishToConsume(publishToConsume.Seconds())
+					}
+				}
+			}
+			if err := g.handler.HandleMessage(session.Context(), message); err != nil {
+				if g.metrics != nil {
+					g.metrics.ObserveKafkaError("handler")
+					g.metrics.ObserveKafkaConsumed(message.Partition, "error")
+				}
+				return err
+			}
+			if g.metrics != nil {
+				g.metrics.ObserveKafkaConsumed(message.Partition, "success")
+			}
+			markStart := time.Now()
+			session.MarkMessage(message, "")
+			if g.metrics != nil {
+				g.metrics.ObserveOffsetMark(time.Since(markStart))
+			}
+		}
+	}
 }
 
 func buildTLSConfig(cfg Config) (*tls.Config, error) {

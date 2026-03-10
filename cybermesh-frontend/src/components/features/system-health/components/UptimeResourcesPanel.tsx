@@ -58,7 +58,7 @@ const UptimeResourcesPanel = ({ data }: UptimeResourcesPanelProps) => {
             </span>
           </div>
           <div className="flex justify-between items-center">
-            <span className="text-sm text-muted-foreground">Detection Loop</span>
+            <span className="text-sm text-muted-foreground">Since Last Iteration</span>
             <span className="text-sm font-medium text-foreground">
               {displayValue(data.aiUptime.detectionLoopUptime)}
             </span>

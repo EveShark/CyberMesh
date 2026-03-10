@@ -23,7 +23,7 @@ const BlockDetailsPanel = ({ block, maxTransactionsToShow = 5 }: BlockDetailsPan
     return (
       <div className="glass-frost rounded-lg p-4 md:p-6">
         <div className="flex items-center gap-2 mb-4">
-          <Box className="h-4 w-4 md:h-5 md:w-5 text-frost" />
+          <Box className="h-4 w-4 md:h-5 md:w-5 text-primary" />
           <h3 className="text-base md:text-lg font-semibold text-foreground">Block Details</h3>
         </div>
         <div className="h-32 md:h-48 flex items-center justify-center text-sm text-muted-foreground">
@@ -39,7 +39,7 @@ const BlockDetailsPanel = ({ block, maxTransactionsToShow = 5 }: BlockDetailsPan
   return (
     <div className="glass-frost rounded-lg p-4 md:p-6 min-w-0">
       <div className="flex items-center gap-2 mb-4 md:mb-6">
-        <Box className="h-4 w-4 md:h-5 md:w-5 text-frost shrink-0" />
+        <Box className="h-4 w-4 md:h-5 md:w-5 text-primary shrink-0" />
         <h3 className="text-base md:text-lg font-semibold text-foreground truncate">
           Block #{block.height.toLocaleString()}
         </h3>

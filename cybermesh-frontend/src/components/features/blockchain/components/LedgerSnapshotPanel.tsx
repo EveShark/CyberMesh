@@ -18,7 +18,7 @@ const LedgerSnapshotPanel = ({ ledger }: LedgerSnapshotPanelProps) => {
   return (
     <div className="glass-frost rounded-lg p-6">
       <div className="flex items-center gap-2 mb-6">
-        <Database className="h-5 w-5 text-frost" />
+        <Database className="h-5 w-5 text-primary" />
         <h3 className="text-lg font-semibold text-foreground">Ledger Snapshot</h3>
       </div>
       
@@ -45,7 +45,7 @@ const LedgerSnapshotPanel = ({ ledger }: LedgerSnapshotPanelProps) => {
             <span className="text-sm font-medium text-muted-foreground">Rolling Metrics & Governance</span>
           </div>
           <div className="space-y-1">
-            <StatItem label="Avg Block Time" value={ledger.rollingBlockTime} />
+            <StatItem label="Avg Block Interval" value={ledger.rollingBlockTime} />
             <StatItem label="Avg Block Size" value={ledger.rollingBlockSize} />
             <StatItem label="Reputation Changes" value={ledger.reputationChanges} />
             <StatItem label="Policy Updates" value={ledger.policyUpdates} />

@@ -15,6 +15,7 @@ type Config struct {
 		Brokers         []string
 		Topic           string
 		GroupID         string
+		ConsumptionMode string
 		ProtocolVersion string
 		TLS             bool
 		TLSCAPath       string
@@ -113,6 +114,7 @@ type Config struct {
 	FastPathSignalsRequired int64
 
 	LogLevel string
+	NodeName string
 	Security struct {
 		ReplayWindow          time.Duration
 		ReplayFutureSkew      time.Duration
@@ -121,17 +123,24 @@ type Config struct {
 }
 
 const (
-	defaultTopic              = "control.policy.v1"
+	defaultTopic              = "control.policy.v2"
 	defaultGroupID            = "policy-enforcement-agent"
+	defaultConsumptionMode    = consumptionModeSharedGroup
 	defaultMetricsAddr        = ":9094"
 	defaultReconcileInterval  = 30 * time.Second
 	defaultExpirationInterval = 5 * time.Second
 	defaultShutdownTimeout    = 15 * time.Second
 )
 
+const (
+	consumptionModeSharedGroup   = "shared_group"
+	consumptionModeFanoutPerNode = "fanout_per_node"
+)
+
 // Load reads configuration from environment variables with sensible defaults.
 func Load() (Config, error) {
 	var cfg Config
+	cfg.NodeName = strings.TrimSpace(os.Getenv("NODE_NAME"))
 
 	brokers := strings.TrimSpace(os.Getenv("CONTROL_POLICY_BROKERS"))
 	if brokers == "" {
@@ -141,6 +150,19 @@ func Load() (Config, error) {
 
 	cfg.Kafka.Topic = envWithDefault("CONTROL_POLICY_TOPIC", defaultTopic)
 	cfg.Kafka.GroupID = envWithDefault("CONTROL_POLICY_GROUP", defaultGroupID)
+	cfg.Kafka.ConsumptionMode = strings.ToLower(strings.TrimSpace(envWithDefault("CONTROL_POLICY_CONSUMPTION_MODE", defaultConsumptionMode)))
+	switch cfg.Kafka.ConsumptionMode {
+	case consumptionModeSharedGroup:
+	case consumptionModeFanoutPerNode:
+		if cfg.NodeName == "" {
+			return cfg, fmt.Errorf("NODE_NAME is required when CONTROL_POLICY_CONSUMPTION_MODE=%s", consumptionModeFanoutPerNode)
+		}
+		if cfg.Kafka.GroupID == defaultGroupID || !strings.Contains(cfg.Kafka.GroupID, cfg.NodeName) {
+			return cfg, fmt.Errorf("CONTROL_POLICY_GROUP must include NODE_NAME when CONTROL_POLICY_CONSUMPTION_MODE=%s", consumptionModeFanoutPerNode)
+		}
+	default:
+		return cfg, fmt.Errorf("unsupported CONTROL_POLICY_CONSUMPTION_MODE %q", cfg.Kafka.ConsumptionMode)
+	}
 	cfg.Kafka.ProtocolVersion = envWithDefault("KAFKA_PROTOCOL_VERSION", "3.6.0")
 	cfg.Kafka.TLS = parseBool(os.Getenv("CONTROL_POLICY_TLS"))
 	cfg.Kafka.TLSCAPath = strings.TrimSpace(os.Getenv("CONTROL_POLICY_TLS_CA"))

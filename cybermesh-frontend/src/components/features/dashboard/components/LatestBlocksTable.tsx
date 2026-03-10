@@ -53,22 +53,22 @@ const LatestBlocksTable = forwardRef<HTMLDivElement, LatestBlocksTableProps>(
   };
 
     return (
-      <div ref={ref} className={cn("rounded-xl p-5 glass-frost", className)}>
-        <div className="flex items-center justify-between mb-4">
+      <div ref={ref} className={cn("rounded-xl p-5 md:p-6 glass-frost", className)}>
+        <div className="flex items-center justify-between gap-4 mb-5">
           <div className="flex items-center gap-3">
-            <div className="p-2 rounded-lg bg-frost/10">
-              <Blocks className="w-5 h-5 text-frost" />
+            <div className="p-2 rounded-lg bg-accent/10 border border-accent/20">
+              <Blocks className="w-5 h-5 text-primary" />
             </div>
             <div>
-              <h3 className="font-semibold text-foreground">Latest Blocks</h3>
-              <p className="text-xs text-muted-foreground">
+              <h3 className="text-base font-semibold tracking-tight text-foreground">Latest Blocks</h3>
+              <p className="text-xs leading-relaxed text-muted-foreground">
                 Showing #{rangeStart.toLocaleString()} - #{rangeEnd.toLocaleString()} of ~{total.toLocaleString()}
               </p>
             </div>
           </div>
           <Link 
             to="/blockchain"
-            className="flex items-center gap-2 text-sm text-frost hover:text-frost-glow transition-colors group"
+            className="inline-flex items-center gap-2 text-sm font-medium text-primary hover:text-accent transition-colors group"
           >
             View All Blocks
             <ArrowRight className="w-4 h-4 group-hover:translate-x-1 transition-transform" />
@@ -79,11 +79,11 @@ const LatestBlocksTable = forwardRef<HTMLDivElement, LatestBlocksTableProps>(
           <Table>
             <TableHeader>
               <TableRow className="border-border/50 hover:bg-transparent">
-                <TableHead className="text-muted-foreground font-medium">HEIGHT</TableHead>
-                <TableHead className="text-muted-foreground font-medium">TIME</TableHead>
-                <TableHead className="text-muted-foreground font-medium">TXS</TableHead>
-                <TableHead className="text-muted-foreground font-medium">HASH</TableHead>
-                <TableHead className="text-muted-foreground font-medium">PROPOSER</TableHead>
+                <TableHead className="text-[11px] tracking-wide text-muted-foreground font-medium">HEIGHT</TableHead>
+                <TableHead className="text-[11px] tracking-wide text-muted-foreground font-medium">TIME</TableHead>
+                <TableHead className="text-[11px] tracking-wide text-muted-foreground font-medium">TXS</TableHead>
+                <TableHead className="text-[11px] tracking-wide text-muted-foreground font-medium">HASH</TableHead>
+                <TableHead className="text-[11px] tracking-wide text-muted-foreground font-medium">PROPOSER</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -99,10 +99,11 @@ const LatestBlocksTable = forwardRef<HTMLDivElement, LatestBlocksTableProps>(
                     key={block.height} 
                     className="border-border/30 hover:bg-secondary/30 transition-colors"
                   >
-                    <TableCell className="font-mono text-frost">#{block.height.toLocaleString()}</TableCell>
+                    <TableCell className="font-mono text-primary">#{block.height.toLocaleString()}</TableCell>
+                    
                     <TableCell className="text-muted-foreground">{block.time}</TableCell>
                     <TableCell>
-                      <span className="px-2 py-1 rounded bg-frost/10 text-frost text-xs font-medium">
+                      <span className="px-2 py-1 rounded bg-accent/10 text-primary text-xs font-medium">
                         {block.txs}tx
                       </span>
                     </TableCell>
@@ -110,7 +111,7 @@ const LatestBlocksTable = forwardRef<HTMLDivElement, LatestBlocksTableProps>(
                       <button 
                         onClick={() => handleCopy(block.hash)}
                         aria-label={`Copy block hash ${block.hash}`}
-                        className="flex items-center gap-2 font-mono text-sm text-foreground hover:text-frost transition-colors group"
+                        className="flex items-center gap-2 font-mono text-sm text-foreground hover:text-primary transition-colors group"
                       >
                         {block.hash}
                         <Copy className="w-3 h-3 opacity-0 group-hover:opacity-100 transition-opacity" aria-hidden="true" />
@@ -120,7 +121,7 @@ const LatestBlocksTable = forwardRef<HTMLDivElement, LatestBlocksTableProps>(
                       <button 
                         onClick={() => handleCopy(block.proposer)}
                         aria-label={`Copy proposer address ${block.proposer}`}
-                        className="flex items-center gap-2 font-mono text-sm text-muted-foreground hover:text-frost transition-colors group"
+                        className="flex items-center gap-2 font-mono text-sm text-muted-foreground hover:text-primary transition-colors group"
                       >
                         {truncateHash(block.proposer, 10)}
                         <Copy className="w-3 h-3 opacity-0 group-hover:opacity-100 transition-opacity" aria-hidden="true" />

@@ -32,9 +32,11 @@ export const useThreatsData = (options: UseThreatsDataOptions = {}) => {
         validateApiResponse(threatsResponseSchema, response, 'threats-summary');
         return response;
       },
-    refetchInterval: demoMode ? 5000 : pollingInterval,
+    refetchInterval: demoMode ? false : pollingInterval,
     enabled: demoMode ? true : enabled,
-    staleTime: demoMode ? 0 : 10000,
+    staleTime: demoMode ? Infinity : 10000,
+    refetchOnMount: demoMode ? false : true,
+    refetchOnWindowFocus: demoMode ? false : true,
     gcTime: 1000 * 60 * 5,
     placeholderData: (previousData) => previousData,
   });

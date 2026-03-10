@@ -22,18 +22,18 @@ interface MetricCardProps {
 }
 
 const colorMap = {
-  frost: "text-frost",
-  fire: "text-fire",
-  emerald: "text-emerald-400",
-  amber: "text-amber-400",
+  frost: "text-primary",
+  fire: "text-primary",
+  emerald: "text-status-healthy",
+  amber: "text-status-warning",
   destructive: "text-destructive",
 };
 
 const statusColorMap = {
-  emerald: "bg-emerald-500/20 text-emerald-400 border-emerald-500/30",
-  amber: "bg-amber-500/20 text-amber-400 border-amber-500/30",
+  emerald: "bg-status-healthy/10 text-status-healthy border-status-healthy/30",
+  amber: "bg-status-warning/10 text-status-warning border-status-warning/30",
   destructive: "bg-destructive/20 text-destructive border-destructive/30",
-  frost: "bg-frost/20 text-frost border-frost/30",
+  frost: "bg-accent/10 text-primary border-accent/30",
 };
 
 const MetricCard = ({ 
@@ -51,26 +51,26 @@ const MetricCard = ({
   
   return (
     <div className={cn(
-      "rounded-xl p-5 transition-all duration-300 hover:scale-[1.02]",
+      "rounded-xl p-5 md:p-6 transition-all duration-200 hover:border-accent/40",
       glassClass,
       className
     )}>
-      <div className="flex items-start justify-between mb-4">
+      <div className="flex items-start justify-between gap-3 mb-5">
         <div className="flex items-center gap-3">
           <div className={cn(
             "p-2 rounded-lg",
-            variant === "fire" ? "bg-fire/10" : "bg-frost/10"
+            "bg-accent/10 border border-accent/20"
           )}>
             <Icon className={cn(
               "w-5 h-5",
-              variant === "fire" ? "text-fire" : "text-frost"
+              "text-primary"
             )} />
           </div>
-          <h3 className="font-semibold text-foreground">{title}</h3>
+          <h3 className="text-base font-semibold tracking-tight text-foreground">{title}</h3>
         </div>
         {status && (
           <span className={cn(
-            "px-2 py-1 rounded-full text-xs font-medium border max-w-[80px] truncate whitespace-nowrap shrink-0",
+            "px-2 py-1 rounded-full text-[11px] font-medium tracking-wide border max-w-[96px] truncate whitespace-nowrap shrink-0",
             statusColorMap[statusColor]
           )}>
             {status}
@@ -78,7 +78,7 @@ const MetricCard = ({
         )}
       </div>
       
-      <div className="space-y-3">
+      <div className="space-y-3.5">
         {metrics.map((metric, index) => (
           <div key={index} className="flex justify-between items-center">
             <span className="text-sm text-muted-foreground">{metric.label}</span>
@@ -95,7 +95,7 @@ const MetricCard = ({
       {actionLabel && href && (
         <Link 
           to={href}
-          className="mt-4 flex items-center gap-2 text-sm text-frost hover:text-frost-glow transition-colors group"
+          className="mt-5 inline-flex items-center gap-2 text-sm font-medium text-primary hover:text-accent transition-colors group"
         >
           {actionLabel}
           <ArrowRight className="w-4 h-4 group-hover:translate-x-1 transition-transform" />

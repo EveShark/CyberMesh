@@ -59,8 +59,13 @@ const ValidatorStatusGrid = ({ validators, leader }: ValidatorStatusGridProps) =
               <div className="space-y-2 text-xs">
                 <div className="flex items-center gap-2 text-muted-foreground">
                   <Clock className="h-3 w-3" />
-                  <span>Latency:</span>
+                  <span>Ping RTT:</span>
                   <span className="text-cyan-400 ml-auto">{validator.latency}</span>
+                </div>
+                <div className="flex items-center gap-2 text-muted-foreground">
+                  <Activity className="h-3 w-3" />
+                  <span>Msg gap:</span>
+                  <span className="text-foreground ml-auto">{validator.messageGap || "--"}</span>
                 </div>
                 <div className="flex items-center gap-2 text-muted-foreground">
                   <Eye className="h-3 w-3" />

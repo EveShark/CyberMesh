@@ -17,11 +17,11 @@ interface StatusCardProps {
 }
 
 const statusStyles = {
-  ready: "bg-emerald-500/20 text-emerald-400 border-emerald-500/30",
-  running: "bg-frost/20 text-frost border-frost/30",
-  active: "bg-emerald-500/20 text-emerald-400 border-emerald-500/30",
-  healthy: "bg-emerald-500/20 text-emerald-400 border-emerald-500/30",
-  warning: "bg-amber-500/20 text-amber-400 border-amber-500/30",
+  ready: "bg-status-healthy/10 text-status-healthy border-status-healthy/30",
+  running: "bg-accent/10 text-primary border-accent/30",
+  active: "bg-status-healthy/10 text-status-healthy border-status-healthy/30",
+  healthy: "bg-status-healthy/10 text-status-healthy border-status-healthy/30",
+  warning: "bg-status-warning/10 text-status-warning border-status-warning/30",
   error: "bg-destructive/20 text-destructive border-destructive/30",
 };
 
@@ -30,38 +30,38 @@ const StatusCard = ({ title, icon: Icon, status, metrics, className, variant = "
   
   return (
     <div className={cn(
-      "rounded-xl p-5 transition-all duration-300 hover:scale-[1.02]",
+      "rounded-xl p-5 md:p-6 transition-all duration-200 hover:border-accent/40",
       glassClass,
       className
     )}>
-      <div className="flex items-start justify-between mb-4">
+      <div className="flex items-start justify-between gap-3 mb-5">
         <div className="flex items-center gap-3">
           <div className={cn(
             "p-2 rounded-lg",
-            variant === "fire" ? "bg-fire/10" : "bg-frost/10"
+            "bg-accent/10 border border-accent/20"
           )}>
             <Icon className={cn(
               "w-5 h-5",
-              variant === "fire" ? "text-fire" : "text-frost"
+              "text-primary"
             )} />
           </div>
-          <h3 className="font-semibold text-foreground">{title}</h3>
+          <h3 className="text-base font-semibold tracking-tight text-foreground">{title}</h3>
         </div>
         <span className={cn(
-          "px-2 py-1 rounded-full text-xs font-medium border uppercase max-w-[80px] truncate whitespace-nowrap shrink-0",
+          "px-2 py-1 rounded-full text-[11px] font-medium border uppercase tracking-wide max-w-[96px] truncate whitespace-nowrap shrink-0",
           statusStyles[status]
         )}>
           {status}
         </span>
       </div>
       
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-3">
         {metrics.map((metric, index) => (
-          <div key={index} className="space-y-1">
+          <div key={index} className="space-y-1.5">
             <p className="text-xs text-muted-foreground">{metric.label}</p>
             <p className={cn(
               "text-sm font-medium",
-              metric.highlight ? "text-frost" : "text-foreground"
+              metric.highlight ? "text-primary" : "text-foreground"
             )}>
               {metric.value}
             </p>

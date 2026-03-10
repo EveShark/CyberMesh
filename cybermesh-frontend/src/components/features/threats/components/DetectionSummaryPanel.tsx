@@ -29,6 +29,8 @@ const DetectionSummaryPanel = ({
 }: DetectionSummaryPanelProps) => {
   const isLive = systemStatus === "LIVE";
   const displayValue = (value: number | string) => (isLive ? value : "--");
+  const compact = (value: number) =>
+    new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(value);
 
   return (
     <Card className="glass-frost border-border/50">
@@ -48,20 +50,20 @@ const DetectionSummaryPanel = ({
             <div className="space-y-2">
               <div className="flex justify-between items-baseline gap-2">
                 <span className="text-xs text-muted-foreground shrink-0">Detected</span>
-                <span className="font-mono font-bold text-foreground text-sm truncate">
-                  {displayValue(lifetimeTotal.toLocaleString())}
+                <span className="font-mono font-bold text-foreground text-sm truncate" title={lifetimeTotal.toLocaleString()}>
+                  {displayValue(compact(lifetimeTotal))}
                 </span>
               </div>
               <div className="flex justify-between items-baseline gap-2">
                 <span className="text-xs text-muted-foreground shrink-0">Published</span>
-                <span className="font-mono text-emerald-400 text-sm truncate">
-                  {displayValue(`${publishedCount.toLocaleString()} (${publishedPercent})`)}
+                <span className="font-mono text-emerald-400 text-sm truncate" title={`${publishedCount.toLocaleString()} (${publishedPercent})`}>
+                  {displayValue(`${compact(publishedCount)} (${publishedPercent})`)}
                 </span>
               </div>
               <div className="flex justify-between items-baseline gap-2">
                 <span className="text-xs text-muted-foreground shrink-0">Abstained</span>
-                <span className="font-mono text-amber-400 text-sm truncate">
-                  {displayValue(`${abstainedCount.toLocaleString()} (${abstainedPercent})`)}
+                <span className="font-mono text-amber-400 text-sm truncate" title={`${abstainedCount.toLocaleString()} (${abstainedPercent})`}>
+                  {displayValue(`${compact(abstainedCount)} (${abstainedPercent})`)}
                 </span>
               </div>
             </div>

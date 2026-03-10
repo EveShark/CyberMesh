@@ -15,6 +15,7 @@ export default {
     extend: {
       fontFamily: {
         sans: ['Inter', 'system-ui', '-apple-system', 'sans-serif'],
+        display: ['Playfair Display', 'Georgia', 'serif'],
       },
       colors: {
         border: "hsl(var(--border))",
@@ -50,6 +51,10 @@ export default {
           DEFAULT: "hsl(var(--card))",
           foreground: "hsl(var(--card-foreground))",
         },
+        "stat-bg": "hsl(var(--stat-bg))",
+        "cta-bg": "hsl(var(--cta-bg))",
+        "cta-foreground": "hsl(var(--cta-foreground))",
+        "cta-muted": "hsl(var(--cta-muted))",
         // Fire & Ember tokens
         ember: {
           DEFAULT: "hsl(var(--ember))",

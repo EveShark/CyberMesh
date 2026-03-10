@@ -58,7 +58,8 @@ const Network = () => {
       id: node.fullId || node.hash, // Use full ID for leader matching
       name: node.name,
       status: node.status || "Healthy",
-      latency: parseInt(node.latency.replace("ms", ""), 10),
+      latencyMs: node.latencyMs,
+      messageGapMs: node.messageGapMs,
       uptime: parseFloat(node.uptime.replace("%", "")),
       lastSeen: networkData.consensus.validators.find((v) => v.name === node.name)?.lastSeen || null,
     }));
@@ -100,7 +101,7 @@ const Network = () => {
           isRefreshing={isRefreshing}
           progress={progress}
         />
-        <div className="container mx-auto px-4 sm:px-6 py-8 max-w-7xl space-y-6">
+        <div className="container mx-auto px-4 sm:px-6 py-8 sm:py-10 max-w-7xl space-y-8">
           <NetworkHeader onRefresh={handleRefresh} isRefreshing={isRefreshing} />
 
           {showSkeleton ? (
@@ -116,10 +117,10 @@ const Network = () => {
           {showSkeleton ? (
             <div className="rounded-xl p-5 glass-frost h-80 flex items-center justify-center">
               <div className="text-center space-y-3">
-                <div className="w-16 h-16 mx-auto rounded-full bg-muted animate-pulse" />
+                <div className="w-16 h-16 mx-auto rounded-full bg-muted/70" />
                 <div className="space-y-2">
-                  <div className="h-4 w-32 mx-auto bg-muted animate-pulse rounded" />
-                  <div className="h-3 w-24 mx-auto bg-muted animate-pulse rounded" />
+                  <div className="h-4 w-32 mx-auto bg-muted/70 rounded" />
+                  <div className="h-3 w-24 mx-auto bg-muted/70 rounded" />
                 </div>
               </div>
             </div>
@@ -129,6 +130,7 @@ const Network = () => {
               edges={graphEdges}
               leader={networkData.topology.leader}
               leaderId={networkData.topology.leaderId}
+              networkAverageLatencyMs={networkData.telemetry.networkAverageLatencyMs}
               isLoading={isRefreshing}
             />
           )}

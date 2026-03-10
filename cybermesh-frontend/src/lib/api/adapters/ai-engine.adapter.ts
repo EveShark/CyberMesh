@@ -1,5 +1,5 @@
-import type { AIEngineData, LoopStatusData, DetectionLoopMetrics, ValidatorsData, DetectionStreamData, EnginePerformance } from "@/types/ai-engine";
-import type { DashboardAIRaw, AiSuspiciousNodeRaw, AiDetectionHistoryEntryRaw, AiEngineMetricRaw } from "../types/raw";
+import type { AIEngineData, LoopStatusData, DetectionLoopMetrics, SuspiciousEntitiesData, DetectionStreamData, EnginePerformance, SentinelPerformance, SuspiciousEntityType } from "@/types/ai-engine";
+import type { DashboardAIRaw, AiSuspiciousNodeRaw, AiDetectionHistoryEntryRaw, AiEngineMetricRaw, AiSentinelMetricRaw } from "../types/raw";
 import { formatSeconds, formatPercent, getSeverityFromScore, truncateHash } from "./utils";
 import { getNodeName } from "@/config/validator-names";
 
@@ -26,9 +26,10 @@ export function adaptAIEngine(raw?: DashboardAIRaw): AIEngineData {
         targetLatency: 100,
         iterationsCount: 0
       },
-      validators: { validators: [], networkStatus: "Unknown" },
+      suspiciousEntities: { entities: [], networkStatus: "Unknown" },
       detectionStream: { events: [], totalCount: 0, publishedCount: 0, heldForReview: 0 },
       engines: [],
+      sentinel: null,
       updatedAt: new Date().toISOString()
     };
   }
@@ -42,10 +43,11 @@ export function adaptAIEngine(raw?: DashboardAIRaw): AIEngineData {
     ? (counters.detections_published / counters.detections_total) * 100
     : null;
 
-  // Calculate interval from iterations rate if available
-  const interval = derived?.iterations_per_minute
-    ? `~${(60 / derived.iterations_per_minute).toFixed(1)}s`
-    : (loop?.avg_latency_ms ? `~${(loop.avg_latency_ms / 1000 * 5).toFixed(1)}s` : null);
+  const interval = loop?.configured_interval_seconds != null
+    ? `~${loop.configured_interval_seconds.toFixed(0)}s`
+    : (derived?.iterations_per_minute
+      ? `~${(60 / derived.iterations_per_minute).toFixed(1)}s`
+      : null);
 
   return {
     loopStatus: {
@@ -80,22 +82,24 @@ export function adaptAIEngine(raw?: DashboardAIRaw): AIEngineData {
       targetLatency: 100,
       iterationsCount: counters?.loop_iterations ?? 0,
     },
-    validators: adaptValidators(raw.suspicious?.nodes ?? []),
+    suspiciousEntities: adaptSuspiciousEntities(raw.suspicious?.nodes ?? []),
     detectionStream: adaptDetectionStream(raw.history?.detections ?? []),
     engines: adaptEngines(raw.metrics?.engines ?? []),
+    sentinel: adaptSentinel(raw.metrics?.sentinel),
     updatedAt: new Date().toISOString(),
   };
 }
 
-function adaptValidators(nodes: AiSuspiciousNodeRaw[]): ValidatorsData {
-  const activeValidators = nodes.map((node) => {
+function adaptSuspiciousEntities(nodes: AiSuspiciousNodeRaw[]): SuspiciousEntitiesData {
+  const entities = nodes.map((node) => {
     // Suspicion score from backend could be 0-1 or already 0-100
     // Normalize to 0-100 range for display
     const rawScore = node.suspicion_score;
     const normalizedScore = rawScore > 1 ? Math.min(rawScore, 100) : rawScore * 100;
+    const entityType = normalizeEntityType(node.entity_type);
 
     return {
-      name: getNodeName(node.id), // Use mapped name (e.g., "Draco") instead of "Node-xxxx"
+      name: getEntityName(node.id, entityType),
       events: node.event_count,
       maxSeverity: node.suspicion_score > 80 ? 100 : Math.round(node.suspicion_score),
       lastSeen: node.last_seen,
@@ -104,15 +108,51 @@ function adaptValidators(nodes: AiSuspiciousNodeRaw[]): ValidatorsData {
       score: Math.round(normalizedScore * 100) / 100, // Round to 2 decimal places
       threats: (node.threat_types ?? []).map(t => t.toUpperCase()), // Capitalize: ddos -> DDOS
       severity: getSeverityFromScore(rawScore > 1 ? rawScore / 100 : rawScore),
+      entityType,
+      kindLabel: entityTypeLabel(entityType),
     };
   });
 
   return {
-    validators: activeValidators,
-    networkStatus: activeValidators.length === 0
+    entities,
+    networkStatus: entities.length === 0
       ? "All clear"
-      : `${activeValidators.length} validator${activeValidators.length > 1 ? 's' : ''} flagged`,
+      : `${entities.length} suspicious ${entities.length > 1 ? "entities" : "entity"} flagged`,
   };
+}
+
+function normalizeEntityType(value?: string): SuspiciousEntityType {
+  switch ((value || "").toLowerCase()) {
+    case "validator":
+      return "validator";
+    case "network_source":
+      return "network_source";
+    case "network_target":
+      return "network_target";
+    default:
+      return "unknown";
+  }
+}
+
+function entityTypeLabel(entityType: SuspiciousEntityType): string {
+  switch (entityType) {
+    case "validator":
+      return "Validator";
+    case "network_source":
+      return "Source";
+    case "network_target":
+      return "Target";
+    default:
+      return "Entity";
+  }
+}
+
+function getEntityName(id: string, entityType: SuspiciousEntityType): string {
+  if (entityType === "validator") {
+    return getNodeName(id);
+  }
+  const value = id.includes(":") ? id.split(":").slice(1).join(":") : id;
+  return value || id;
 }
 
 function adaptDetectionStream(detections: AiDetectionHistoryEntryRaw[]): DetectionStreamData {
@@ -146,4 +186,49 @@ function adaptEngines(engines: AiEngineMetricRaw[]): EnginePerformance[] {
       : "--",
     published: e.published
   }));
+}
+
+function adaptSentinel(raw?: AiSentinelMetricRaw): SentinelPerformance | null {
+  if (!raw) {
+    return null;
+  }
+
+  const entityType = normalizeEntityType(raw.last_entity_type);
+  const entityLabel = raw.last_entity_type ? entityTypeLabel(entityType) : null;
+  const entityName = raw.last_entity_id ? getEntityName(raw.last_entity_id, entityType) : null;
+
+  let status: SentinelPerformance["status"] = "Idle";
+  if ((raw.detections_total ?? 0) > 0) {
+    status = "Active";
+  } else if ((raw.events_total ?? 0) > 0) {
+    status = "Observing";
+  }
+
+  return {
+    status,
+    eventsTotal: raw.events_total ?? 0,
+    detectionsTotal: raw.detections_total ?? 0,
+    publishRate: formatPercent(raw.publish_ratio) || "0%",
+    topThreat: raw.top_threat_type ? raw.top_threat_type.toUpperCase() : null,
+    lastEntity: entityName,
+    entityLabel,
+    lastDetection: formatUnixSeconds(raw.last_detection_time),
+  };
+}
+
+function formatUnixSeconds(timestamp?: number): string | null {
+  if (timestamp == null || !Number.isFinite(timestamp)) {
+    return null;
+  }
+
+  const date = new Date(timestamp * 1000);
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+
+  return date.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
 }

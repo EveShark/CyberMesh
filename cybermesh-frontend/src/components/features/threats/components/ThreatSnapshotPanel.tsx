@@ -69,14 +69,14 @@ const ThreatSnapshotPanel = ({
                   variant="outline"
                   className={
                     snapshot.loopStatus === "LIVE"
-                      ? "bg-emerald-500/20 text-emerald-400 border-emerald-500/30"
-                      : "bg-muted/20 text-muted-foreground border-muted/30"
+                      ? "bg-status-healthy/10 text-status-healthy border-status-healthy/30"
+                      : "bg-muted/50 text-muted-foreground border-border"
                   }
                 >
                   {isLive && snapshot.loopStatus === "LIVE" && (
                     <span className="relative flex h-2 w-2 mr-2">
-                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
-                      <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
+                      <span className="absolute inline-flex h-full w-full rounded-full bg-status-healthy/35" />
+                      <span className="relative inline-flex rounded-full h-2 w-2 bg-status-healthy" />
                     </span>
                   )}
                   {isLive ? snapshot.loopStatus : "HALTED"}

@@ -173,6 +173,10 @@ Note: This README intentionally excludes `bin/` and `test/` (per project usage),
 
 - `CONTROL_POLICY_TOPIC` (default: `control.policy.v1`)
 - `CONTROL_POLICY_GROUP` (default: `policy-enforcement-agent`)
+- `CONTROL_POLICY_CONSUMPTION_MODE` (`shared_group|fanout_per_node`, default: `shared_group`)
+  - Use `fanout_per_node` for host-level DaemonSet enforcement where each node must consume and apply policies locally
+  - Use `shared_group` for shared control-plane style consumers
+  - In `fanout_per_node` mode, `CONTROL_POLICY_GROUP` must include `NODE_NAME`
 - `CONTROL_POLICY_TLS` (`true|false`)
 - `CONTROL_POLICY_TLS_CA`, `CONTROL_POLICY_TLS_CERT`, `CONTROL_POLICY_TLS_KEY` (optional TLS materials)
 - `KAFKA_SASL_ENABLED` (`true|false`), `KAFKA_SASL_MECHANISM` (`PLAIN|SCRAM-SHA-256|SCRAM-SHA-512`), `KAFKA_SASL_USERNAME`, `KAFKA_SASL_PASSWORD`

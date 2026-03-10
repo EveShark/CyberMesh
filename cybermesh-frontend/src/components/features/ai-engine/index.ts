@@ -3,4 +3,5 @@ export { default as AIEnginePerformanceTable } from './components/AIEnginePerfor
 export { default as DetectionLoopCard } from './components/DetectionLoopCard';
 export { default as DetectionStreamFeed } from './components/DetectionStreamFeed';
 export { default as LoopStatusCard } from './components/LoopStatusCard';
+export { default as SentinelPipelineCard } from './components/SentinelPipelineCard';
 export { default as SuspiciousValidatorsCard } from './components/SuspiciousValidatorsCard';

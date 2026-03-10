@@ -18,11 +18,11 @@ const LoopStatusCard = ({ data }: LoopStatusCardProps) => {
       case "Running":
         return {
           icon: Play,
-          iconBg: "bg-emerald-500/10",
-          iconColor: "text-emerald-400",
-          badgeBg: "bg-emerald-500/20",
-          badgeText: "text-emerald-400",
-          badgeBorder: "border-emerald-500/30",
+          iconBg: "bg-status-healthy/10",
+          iconColor: "text-status-healthy",
+          badgeBg: "bg-status-healthy/10",
+          badgeText: "text-status-healthy",
+          badgeBorder: "border-status-healthy/30",
         };
       case "Stopped":
         return {
@@ -36,11 +36,11 @@ const LoopStatusCard = ({ data }: LoopStatusCardProps) => {
       default:
         return {
           icon: HelpCircle,
-          iconBg: "bg-amber-500/10",
-          iconColor: "text-amber-400",
-          badgeBg: "bg-amber-500/20",
-          badgeText: "text-amber-400",
-          badgeBorder: "border-amber-500/30",
+          iconBg: "bg-status-warning/10",
+          iconColor: "text-status-warning",
+          badgeBg: "bg-status-warning/10",
+          badgeText: "text-status-warning",
+          badgeBorder: "border-status-warning/30",
         };
     }
   };
@@ -52,19 +52,19 @@ const LoopStatusCard = ({ data }: LoopStatusCardProps) => {
     { label: "Detections/min", value: formatValue(data.detectionsPerMin) },
     { label: "Publish Success", value: formatValue(data.publishSuccess, "%") },
     { label: "Publish to candidate ratio", value: formatValue(data.publishToCandidateRatio) },
-    { label: "Last iteration", value: formatValue(data.lastIteration) },
-    { label: "Since last iteration", value: formatValue(data.sinceLastIteration) },
+    { label: "Since last iteration", value: formatValue(data.lastIteration) },
+    { label: "Since last detection", value: formatValue(data.sinceLastIteration) },
   ];
 
   return (
-    <Card className="glass-frost border-border/50 backdrop-blur-xl">
-      <CardHeader className="pb-3">
+    <Card className="glass-frost border-border/60">
+      <CardHeader className="pb-4">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className={`p-2 rounded-lg ${config.iconBg}`}>
               <StatusIcon className={`w-5 h-5 ${config.iconColor}`} />
             </div>
-            <CardTitle className="text-lg font-semibold text-foreground">Loop Status</CardTitle>
+            <CardTitle className="text-lg font-semibold tracking-tight text-foreground">Loop Status</CardTitle>
           </div>
           <Badge className={`${config.badgeBg} ${config.badgeText} ${config.badgeBorder} hover:${config.badgeBg}`}>
             {data.status}
@@ -72,8 +72,8 @@ const LoopStatusCard = ({ data }: LoopStatusCardProps) => {
         </div>
         <p className="text-sm text-muted-foreground mt-1">{data.statusMessage}</p>
       </CardHeader>
-      <CardContent>
-        <div className="grid grid-cols-2 gap-4">
+      <CardContent className="pt-0">
+        <div className="grid grid-cols-2 gap-x-4 gap-y-3">
           {metrics.map((metric, index) => (
             <div key={index} className="space-y-1">
               <p className="text-xs text-muted-foreground">{metric.label}</p>

@@ -8,12 +8,14 @@ FROM golang:1.25 AS builder
 
 WORKDIR /workspace
 
-# Copy backend module for protobuf dependencies
-COPY backend /backend
-
 # Cache go modules first
 COPY enforcement-agent/go.mod enforcement-agent/go.sum ./
+# Provide only backend module metadata needed by replace backend => ../backend.
+COPY backend/go.mod backend/go.sum /backend/
 RUN go mod download
+
+# Copy backend protobuf package required by enforcement imports.
+COPY backend/proto /backend/proto/
 
 # Copy enforcement agent sources
 COPY enforcement-agent/. ./

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -36,6 +37,31 @@ type commandRunner func(ctx context.Context, args ...string) error
 type testHooks struct {
 	beforeEnsure func(int, rule) error
 	beforeDelete func(int, rule)
+}
+
+type iptablesCommandError struct {
+	args     []string
+	output   string
+	exitCode int
+	cause    error
+}
+
+func (e *iptablesCommandError) Error() string {
+	if e == nil {
+		return ""
+	}
+	cmd := strings.Join(e.args, " ")
+	if e.output == "" {
+		return fmt.Sprintf("iptables %s: %v", cmd, e.cause)
+	}
+	return fmt.Sprintf("iptables %s: %s: %v", cmd, e.output, e.cause)
+}
+
+func (e *iptablesCommandError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
 }
 
 // New constructs an iptables enforcement backend.
@@ -174,6 +200,9 @@ func (e *Enforcer) ensureRule(ctx context.Context, r rule, dryRun bool) (bool, e
 			e.log.Info("iptables rule already present", zap.String("chain", r.Chain), zap.Strings("args", r.Args), zap.String("action", r.Action))
 		}
 		return false, nil
+	} else if !isRuleAbsentError(err) {
+		// For non-absence failures (e.g. binary/runtime failures), fail closed.
+		return false, err
 	}
 
 	addArgs := append([]string{"-I", r.Chain}, append(r.Args, "-j", r.Action)...)
@@ -194,9 +223,8 @@ func (e *Enforcer) deleteRule(ctx context.Context, r rule, dryRun bool) error {
 
 	delArgs := append([]string{"-D", r.Chain}, append(r.Args, "-j", r.Action)...)
 	if err := e.runCmd(ctx, delArgs...); err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			// Rule already absent; treat as success.
+		if isRuleAbsentError(err) {
+			// Rule already absent; idempotent success.
 			return nil
 		}
 		return err
@@ -206,17 +234,73 @@ func (e *Enforcer) deleteRule(ctx context.Context, r rule, dryRun bool) error {
 
 func (e *Enforcer) run(ctx context.Context, args ...string) error {
 	cmd := exec.CommandContext(ctx, e.bin, args...)
+	// Force stable English output for deterministic error classification across locales.
+	cmd.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
 	output, err := cmd.CombinedOutput()
+	outputStr := strings.TrimSpace(string(output))
 	if err != nil {
-		if e.log != nil {
-			e.log.Error("iptables command failed", zap.String("binary", e.bin), zap.Strings("args", args), zap.ByteString("output", output), zap.Error(err))
+		exitCode := -1
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			exitCode = exitErr.ExitCode()
 		}
-		return fmt.Errorf("%s %s: %w", e.bin, strings.Join(args, " "), err)
+		cmdErr := &iptablesCommandError{
+			args:     append([]string(nil), args...),
+			output:   outputStr,
+			exitCode: exitCode,
+			cause:    err,
+		}
+
+		if e.log != nil {
+			if isRuleAbsentError(cmdErr) {
+				e.log.Debug("iptables rule already absent", zap.String("binary", e.bin), zap.Strings("args", args), zap.String("output", outputStr))
+			} else {
+				e.log.Error("iptables command failed", zap.String("binary", e.bin), zap.Strings("args", args), zap.String("output", outputStr), zap.Error(err))
+			}
+		}
+		return cmdErr
 	}
 	if e.log != nil {
 		e.log.Debug("iptables command", zap.String("binary", e.bin), zap.Strings("args", args))
 	}
 	return nil
+}
+
+func isRuleAbsentError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Structured classification when command context is available.
+	var cmdErr *iptablesCommandError
+	if errors.As(err, &cmdErr) {
+		if len(cmdErr.args) == 0 {
+			return false
+		}
+		op := cmdErr.args[0]
+		if op != "-C" && op != "-D" {
+			return false
+		}
+		// iptables returns exit code 1 for "rule not found"/"doesn't exist" in check/delete paths.
+		if cmdErr.exitCode != 1 {
+			return false
+		}
+		out := strings.ToLower(strings.TrimSpace(cmdErr.output))
+		if out == "" {
+			return false
+		}
+		return strings.Contains(out, "bad rule (does a matching rule exist in that chain?)") ||
+			strings.Contains(out, "rule does not exist") ||
+			strings.Contains(out, "no chain/target/match by that name") ||
+			strings.Contains(out, "rule missing")
+	}
+
+	// Fallback for tests/mocks that return plain errors.
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "bad rule (does a matching rule exist in that chain?)") ||
+		strings.Contains(msg, "rule does not exist") ||
+		strings.Contains(msg, "no chain/target/match by that name") ||
+		strings.Contains(msg, "rule missing")
 }
 
 func (e *Enforcer) logInfo(msg string, r rule) {

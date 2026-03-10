@@ -44,6 +44,26 @@ type Controller struct {
 	replay     replayConfig
 	replaySeen map[string]time.Time
 	replayMu   sync.Mutex
+	decisionMu sync.RWMutex
+	decisions  []DecisionRecord
+	decMax     int
+}
+
+type DecisionRecord struct {
+	PolicyID       string    `json:"policy_id"`
+	Action         string    `json:"action"`
+	Scope          string    `json:"scope"`
+	Tenant         string    `json:"tenant,omitempty"`
+	Result         string    `json:"result"`
+	ErrorCode      string    `json:"error_code,omitempty"`
+	Reason         string    `json:"reason,omitempty"`
+	AppliedAt      time.Time `json:"applied_at,omitempty"`
+	AckEnqueueAt   time.Time `json:"ack_enqueue_at,omitempty"`
+	AckJournaledAt time.Time `json:"ack_journaled_at,omitempty"`
+	AckedAt        time.Time `json:"acked_at,omitempty"`
+	AckRequired    bool      `json:"ack_required"`
+	AckAttempted   bool      `json:"ack_attempted"`
+	AckStatus      string    `json:"ack_status"`
 }
 
 type FastPathConfig struct {
@@ -116,6 +136,7 @@ func New(trust *policy.TrustedKeys, store *state.Store, backend enforcer.Enforce
 			requirePayload: true,
 		},
 		replaySeen: make(map[string]time.Time, replayMax),
+		decMax:     500,
 	}
 	c.loadPendingApprovals()
 	return c
@@ -152,6 +173,7 @@ func (c *Controller) loadPendingApprovals() {
 
 // HandleMessage satisfies kafka.MessageHandler.
 func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMessage) error {
+	consumeStart := time.Now()
 	c.metrics.ObserveIngest()
 	if c.logger != nil {
 		c.logger.Info(
@@ -214,6 +236,10 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 			c.logger.Debug("duplicate policy event treated as idempotent noop", zap.String("policy_id", evt.Spec.ID))
 		}
 		appliedAt = time.Now().UTC()
+		if c.metrics != nil {
+			c.metrics.ObserveConsumeToApply("duplicate", time.Since(consumeStart))
+			c.metrics.ObserveDuplicateScope(scopeKindLabel(evt.Spec))
+		}
 		c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultApplied, "duplicate_noop", "policy duplicate detected", appliedAt)
 		return nil
 	}
@@ -324,11 +350,17 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 			_ = reservation.Release(ctx)
 		}
 		c.metrics.ObserveApplyError(time.Since(start))
+		if c.metrics != nil {
+			c.metrics.ObserveConsumeToApply("error", time.Since(consumeStart))
+		}
 		c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultFailed, "apply_error", err.Error(), time.Now().UTC())
 		return fmt.Errorf("controller: apply policy %s: %w", evt.Spec.ID, err)
 	}
 	appliedAt = time.Now().UTC()
 	c.metrics.ObserveApplied(time.Since(start))
+	if c.metrics != nil {
+		c.metrics.ObserveConsumeToApply("success", time.Since(consumeStart))
+	}
 	if c.logger != nil {
 		c.logger.Info("policy apply succeeded", zap.String("policy_id", evt.Spec.ID), zap.Duration("latency", time.Since(start)))
 	}
@@ -340,11 +372,16 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 		}
 	}
 
+	persistStart := time.Now()
 	if err := c.store.Upsert(evt.Spec, time.Now().UTC()); err != nil {
+		if c.metrics != nil {
+			c.metrics.ObserveApplyPersist("error", time.Since(persistStart))
+		}
 		if c.logger != nil {
 			c.logger.Error("failed to persist policy state", zap.String("policy_id", evt.Spec.ID), zap.Error(err))
 		}
 	} else if c.metrics != nil {
+		c.metrics.ObserveApplyPersist("success", time.Since(persistStart))
 		c.metrics.SetActivePolicies(c.store.ActiveCount())
 	}
 
@@ -652,9 +689,40 @@ func (c *Controller) clearPendingApproval(key string) {
 }
 
 func (c *Controller) emitAck(ctx context.Context, evt policy.Event, requiresAck bool, fastPath FastPathEligibility, result ack.Result, errorCode, reason string, appliedAt time.Time) {
-	if !requiresAck || c.acks == nil {
+	ackAttempted := requiresAck && c.acks != nil
+	ackStatus := "skipped"
+	ackEnqueueAt := time.Time{}
+	ackJournaledAt := time.Time{}
+	ackedAt := time.Time{}
+	if ackAttempted {
+		ackStatus = "enqueue_requested"
+	}
+	defer func() {
+		c.recordDecision(DecisionRecord{
+			PolicyID:       evt.Spec.ID,
+			Action:         evt.Spec.Action,
+			Scope:          scopeIdentifier(evt.Spec),
+			Tenant:         effectiveTenant(evt.Spec),
+			Result:         string(result),
+			ErrorCode:      errorCode,
+			Reason:         reason,
+			AppliedAt:      appliedAt,
+			AckEnqueueAt:   ackEnqueueAt,
+			AckJournaledAt: ackJournaledAt,
+			AckedAt:        ackedAt,
+			AckRequired:    requiresAck,
+			AckAttempted:   ackAttempted,
+			AckStatus:      ackStatus,
+		})
+	}()
+
+	if !ackAttempted {
+		if c.metrics != nil && !appliedAt.IsZero() {
+			c.metrics.ObserveApplyToAckEnqueue("skipped", time.Since(appliedAt))
+		}
 		return
 	}
+	ackEnqueueAt = time.Now().UTC()
 	if c.metrics != nil {
 		c.metrics.ObserveGatewayAckPublish("enqueue_requested")
 	}
@@ -673,7 +741,6 @@ func (c *Controller) emitAck(ctx context.Context, evt policy.Event, requiresAck 
 		Reason:     reason,
 		ErrorCode:  errorCode,
 		AppliedAt:  appliedAt,
-		AckedAt:    time.Now().UTC(),
 		FastPath:   fastPath.Eligible,
 		Scope:      scopeIdentifier(evt.Spec),
 		Tenant:     effectiveTenant(evt.Spec),
@@ -683,19 +750,85 @@ func (c *Controller) emitAck(ctx context.Context, evt policy.Event, requiresAck 
 		RuleHash:   append([]byte(nil), evt.Proto.GetRuleHash()...),
 		ProducerID: append([]byte(nil), evt.Proto.GetProducerId()...),
 	}
-	if err := c.acks.Publish(ctx, payload); err != nil && c.logger != nil {
+	if err := c.acks.Publish(ctx, payload); err != nil {
+		if c.metrics != nil && !appliedAt.IsZero() {
+			c.metrics.ObserveApplyToAckEnqueue("error", time.Since(appliedAt))
+		}
 		if c.metrics != nil {
 			c.metrics.ObserveGatewayAckPublish("enqueue_failed")
 		}
-		c.logger.Error("failed to enqueue ack", zap.String("policy_id", evt.Spec.ID), zap.String("result", string(result)), zap.String("error_code", errorCode), zap.Error(err))
+		ackStatus = "enqueue_failed"
+		if c.logger != nil {
+			c.logger.Error("failed to enqueue ack", zap.String("policy_id", evt.Spec.ID), zap.String("result", string(result)), zap.String("error_code", errorCode), zap.Error(err))
+		}
 		return
 	}
+	ackJournaledAt = time.Now().UTC()
+	ackedAt = ackJournaledAt
 	if c.metrics != nil {
+		if !appliedAt.IsZero() {
+			c.metrics.ObserveApplyToAckEnqueue("success", time.Since(appliedAt))
+		}
 		c.metrics.ObserveGatewayAckPublish("enqueue_ok")
 	}
+	ackStatus = "enqueue_ok"
 	if c.logger != nil {
 		c.logger.Info("ack publish succeeded", zap.String("policy_id", evt.Spec.ID), zap.String("result", string(result)))
 	}
+}
+
+func scopeKindLabel(spec policy.PolicySpec) string {
+	scope := strings.ToLower(strings.TrimSpace(spec.Target.Scope))
+	switch scope {
+	case "namespace", "node", "tenant", "region", "cluster", "global":
+		return scope
+	case "", "any", "both":
+		return "global"
+	default:
+		return "unknown"
+	}
+}
+
+func (c *Controller) recordDecision(dec DecisionRecord) {
+	if c == nil {
+		return
+	}
+	c.decisionMu.Lock()
+	defer c.decisionMu.Unlock()
+	c.decisions = append(c.decisions, dec)
+	max := c.decMax
+	if max <= 0 {
+		max = 500
+	}
+	if len(c.decisions) > max {
+		c.decisions = append([]DecisionRecord(nil), c.decisions[len(c.decisions)-max:]...)
+	}
+}
+
+func (c *Controller) ListDecisions(limit int, policyID string, result string) []DecisionRecord {
+	c.decisionMu.RLock()
+	defer c.decisionMu.RUnlock()
+
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	out := make([]DecisionRecord, 0, limit)
+	policyID = strings.TrimSpace(policyID)
+	result = strings.ToLower(strings.TrimSpace(result))
+	for idx := len(c.decisions) - 1; idx >= 0 && len(out) < limit; idx-- {
+		dec := c.decisions[idx]
+		if policyID != "" && dec.PolicyID != policyID {
+			continue
+		}
+		if result != "" && strings.ToLower(dec.Result) != result {
+			continue
+		}
+		out = append(out, dec)
+	}
+	return out
 }
 
 func extractQCReference(spec policy.PolicySpec) string {

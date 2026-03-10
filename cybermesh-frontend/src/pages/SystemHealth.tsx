@@ -62,10 +62,10 @@ const SystemHealth = () => {
         <meta name="description" content="Service health monitoring, resource utilization, and infrastructure metrics in real-time." />
       </Helmet>
 
-      <div className="container mx-auto px-4 sm:px-6 py-8 max-w-7xl">
+      <div className="container mx-auto px-4 sm:px-6 py-8 sm:py-10 max-w-7xl space-y-8">
         {/* Inline error banner - non-blocking */}
         {showError && (
-          <div className="mb-6">
+          <div>
             <InlineErrorBanner
               message="Failed to load live data. Showing cached data."
               onRetry={() => refetch()}
@@ -74,7 +74,7 @@ const SystemHealth = () => {
         )}
 
         {showSkeleton ? (
-          <div className="space-y-6">
+          <div className="space-y-8">
             <SkeletonCard rows={2} />
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               {[1, 2, 3, 4].map((i) => (
@@ -100,7 +100,7 @@ const SystemHealth = () => {
 
             {/* Backend Status Panel - Only show in live mode */}
             {!isDemoMode() && (
-              <div className="mt-6">
+              <div className="pt-1">
                 <BackendStatusPanel />
               </div>
             )}

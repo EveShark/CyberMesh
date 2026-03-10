@@ -71,6 +71,7 @@ export const getMockAIEngineRaw = (): DashboardAIRaw => {
   const allPossibleNodes = [
     {
       id: "d9661d66c0", // Draco (simulated)
+      entity_type: "validator",
       status: "suspicious",
       suspicion_score: 1.0,
       event_count: 56,
@@ -79,6 +80,7 @@ export const getMockAIEngineRaw = (): DashboardAIRaw => {
     },
     {
       id: "b722e1a4f2", // Cassiopeia (simulated)
+      entity_type: "validator",
       status: "suspicious",
       suspicion_score: 0.65,
       event_count: 12,

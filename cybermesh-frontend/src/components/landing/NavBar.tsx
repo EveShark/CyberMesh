@@ -11,10 +11,10 @@ const NavBar = ({ demoUrl = "/dashboard" }: NavBarProps) => {
     <nav className="fixed top-0 left-0 right-0 z-50">
       {/* Glass background */}
       <div className="absolute inset-0 glass-ember" />
-      
+
       {/* Ember accent line at bottom */}
       <div className="absolute bottom-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-ember/30 to-transparent" />
-      
+
       <div className="relative max-w-5xl mx-auto px-4 md:px-6 py-2.5 md:py-3 flex items-center justify-between">
         {/* Logo */}
         <Link to="/" className="flex items-center">

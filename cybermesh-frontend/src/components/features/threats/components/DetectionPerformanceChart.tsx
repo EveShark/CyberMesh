@@ -52,6 +52,8 @@ const DetectionPerformanceChart = ({
     }, [latencyHistory, timeWindow]);
 
     const hasData = isLive && filteredData.length > 0;
+    const compact = (value: number) =>
+        new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(value);
     // Success rate should compare lifetime published to lifetime total (they should match)
     const successRate = lifetimeTotal > 0 ? 100 : 0; // All published = 100%
 
@@ -70,9 +72,9 @@ const DetectionPerformanceChart = ({
 
 
     return (
-        <div className="glass-frost rounded-lg p-6 space-y-6">
+        <div className="glass-frost rounded-lg p-6 space-y-6 overflow-hidden">
             {/* Header */}
-            <div className="flex items-start justify-between gap-3">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
                 <div className="flex items-start gap-3">
                     <div className="rounded-lg border border-primary/30 bg-primary/10 p-2">
                         <Zap className="h-5 w-5 text-primary" />
@@ -88,13 +90,14 @@ const DetectionPerformanceChart = ({
                 </div>
 
                 {/* Time Window Toggle */}
-                <div className="flex bg-muted/20 p-1 rounded-lg border border-border/40">
+                <div className="flex flex-wrap bg-muted/20 p-1 rounded-lg border border-border/40">
                     {TIME_WINDOW_OPTIONS.map((opt) => (
                         <button
                             key={opt}
                             onClick={() => setTimeWindow(opt)}
                             className={`
-                                px-3 py-1 text-xs font-medium rounded-md transition-all duration-200
+                                px-2.5 py-1 text-xs font-medium rounded-md transition-all duration-200
+                                min-w-[2.5rem]
                                 ${timeWindow === opt
                                     ? "bg-background text-foreground shadow-sm border border-border/50"
                                     : "text-muted-foreground hover:text-foreground hover:bg-muted/40"}
@@ -109,19 +112,21 @@ const DetectionPerformanceChart = ({
             {hasData ? (
                 <>
                     {/* Key Insights Cards */}
-                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
                         {/* Lifetime Total */}
-                        <Card className="bg-card/40 border border-border/40 p-4">
+                        <Card className="bg-card/40 border border-border/40 p-4 min-w-0 overflow-hidden">
                             <div className="flex items-center gap-2 mb-1">
                                 <Activity className="h-4 w-4 text-primary" />
                                 <p className="text-xs text-muted-foreground">Lifetime Detections</p>
                             </div>
-                            <p className="text-2xl font-bold text-foreground">{lifetimeTotal.toLocaleString()}</p>
+                            <p className="text-xl sm:text-2xl font-bold text-foreground tabular-nums truncate" title={lifetimeTotal.toLocaleString()}>
+                                {compact(lifetimeTotal)}
+                            </p>
                             <p className="text-xs text-muted-foreground">Running total</p>
                         </Card>
 
                         {/* Avg Latency */}
-                        <Card className="bg-card/40 border border-border/40 p-4">
+                        <Card className="bg-card/40 border border-border/40 p-4 min-w-0 overflow-hidden">
                             <div className="flex items-center gap-2 mb-1">
                                 <Clock className="h-4 w-4 text-accent" />
                                 <p className="text-xs text-muted-foreground">Avg Latency (Window)</p>
@@ -131,7 +136,7 @@ const DetectionPerformanceChart = ({
                         </Card>
 
                         {/* Candidates */}
-                        <Card className="bg-card/40 border border-border/40 p-4">
+                        <Card className="bg-card/40 border border-border/40 p-4 min-w-0 overflow-hidden">
                             <div className="flex items-center gap-2 mb-1">
                                 <TrendingUp className="h-4 w-4 text-emerald-400" />
                                 <p className="text-xs text-muted-foreground">Throughput</p>
@@ -141,18 +146,20 @@ const DetectionPerformanceChart = ({
                         </Card>
 
                         {/* Success Rate */}
-                        <Card className="bg-card/40 border border-border/40 p-4">
+                        <Card className="bg-card/40 border border-border/40 p-4 min-w-0 overflow-hidden">
                             <div className="flex items-center gap-2 mb-1">
                                 <CheckCircle2 className="h-4 w-4 text-green-500" />
                                 <p className="text-xs text-muted-foreground">Success Rate</p>
                             </div>
                             <p className="text-2xl font-bold text-foreground">{successRate.toFixed(0)}%</p>
-                            <p className="text-xs text-muted-foreground">{lifetimeTotal.toLocaleString()} published</p>
+                            <p className="text-xs text-muted-foreground truncate" title={`${lifetimeTotal.toLocaleString()} published`}>
+                                {compact(publishedCount)} published
+                            </p>
                         </Card>
                     </div>
 
                     {/* Chart - Histogram/Bar Chart */}
-                    <div className="rounded-xl border border-border/40 bg-background/70 p-4">
+                    <div className="rounded-xl border border-border/40 bg-background/70 p-3 sm:p-4 overflow-x-hidden">
                         <ResponsiveContainer width="100%" height={320}>
                             <BarChart data={filteredData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
                                 <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border) / 0.3)" vertical={false} />
@@ -203,7 +210,7 @@ const DetectionPerformanceChart = ({
                         </ResponsiveContainer>
 
                         {/* Legend for color coding */}
-                        <div className="flex items-center justify-center gap-6 mt-4 text-xs">
+                        <div className="flex flex-wrap items-center justify-center gap-3 sm:gap-6 mt-4 text-xs">
                             <div className="flex items-center gap-2">
                                 <div className="w-3 h-3 rounded" style={{ backgroundColor: "hsl(var(--status-healthy))" }} />
                                 <span className="text-muted-foreground">&lt; 50ms (Excellent)</span>

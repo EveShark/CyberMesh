@@ -13,5 +13,6 @@ export { default as SovereignDifference } from './SovereignDifference';
 export { default as SpeedComparison } from './SpeedComparison';
 export { default as StatsCards } from './StatsCards';
 export { default as ThreatLandscape } from './ThreatLandscape';
+export { default as ThreatTicker } from './ThreatTicker';
 export { default as TrustBadges } from './TrustBadges';
 export { default as ValuePillar } from './ValuePillar';

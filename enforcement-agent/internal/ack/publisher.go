@@ -115,51 +115,57 @@ func NewKafkaPublisher(opts Options) (*KafkaPublisher, error) {
 
 // Publish enqueues ACK payload.
 func (p *KafkaPublisher) Publish(ctx context.Context, payload Payload) error {
-	ack := &pb.PolicyAckEvent{
-		PolicyId:           payload.Event.Spec.ID,
-		ScopeIdentifier:    payload.Scope,
-		Tenant:             payload.Tenant,
-		Region:             payload.Region,
-		Result:             string(payload.Result),
-		Reason:             payload.Reason,
-		ErrorCode:          payload.ErrorCode,
-		AppliedAt:          payload.AppliedAt.Unix(),
-		AckedAt:            payload.AckedAt.Unix(),
-		QcReference:        effectiveQCRef(payload),
-		ControllerInstance: payload.Controller,
-		FastPath:           payload.FastPath,
-		RuleHash:           append([]byte(nil), payload.RuleHash...),
-		ProducerId:         append([]byte(nil), payload.ProducerID...),
-	}
-	msgBytes, err := proto.Marshal(ack)
-	if err != nil {
-		p.logError("marshal ack payload", payload.Event.Spec.ID, err)
-		return fmt.Errorf("ack publish: marshal payload: %w", err)
-	}
-	key := payload.Event.Spec.ID
-	kmsg := &sarama.ProducerMessage{
-		Topic: p.topic,
-		Key:   sarama.StringEncoder(key),
-		Value: sarama.ByteEncoder(msgBytes),
-	}
-	if p.signer != nil {
-		out, serr := p.signer.Sign(ctx, payload, msgBytes)
-		if serr != nil {
-			p.logError("sign ack payload", payload.Event.Spec.ID, serr)
-			return fmt.Errorf("ack publish: sign payload: %w", serr)
-		}
-		if len(out.Signature) > 0 {
-			kmsg.Headers = append(kmsg.Headers, sarama.RecordHeader{Key: []byte("ack-signature"), Value: out.Signature})
-			if out.Algorithm != "" {
-				kmsg.Headers = append(kmsg.Headers, sarama.RecordHeader{Key: []byte("ack-signature-alg"), Value: []byte(out.Algorithm)})
-			}
-		}
-	}
 	var lastErr error
 	backoff := p.retryBackoff
 	for attempt := 0; attempt < p.retryMax; attempt++ {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		ackTime := payload.AckedAt
+		if ackTime.IsZero() {
+			ackTime = time.Now().UTC()
+		}
+		ackEvent := &pb.PolicyAckEvent{
+			PolicyId:           payload.Event.Spec.ID,
+			ScopeIdentifier:    payload.Scope,
+			Tenant:             payload.Tenant,
+			Region:             payload.Region,
+			Result:             string(payload.Result),
+			Reason:             payload.Reason,
+			ErrorCode:          payload.ErrorCode,
+			AppliedAt:          payload.AppliedAt.Unix(),
+			AppliedAtMs:        payload.AppliedAt.UnixMilli(),
+			AckedAt:            ackTime.Unix(),
+			AckedAtMs:          ackTime.UnixMilli(),
+			QcReference:        effectiveQCRef(payload),
+			ControllerInstance: payload.Controller,
+			FastPath:           payload.FastPath,
+			RuleHash:           append([]byte(nil), payload.RuleHash...),
+			ProducerId:         append([]byte(nil), payload.ProducerID...),
+		}
+		msgBytes, err := proto.Marshal(ackEvent)
+		if err != nil {
+			p.logError("marshal ack payload", payload.Event.Spec.ID, err)
+			return fmt.Errorf("ack publish: marshal payload: %w", err)
+		}
+		key := payload.Event.Spec.ID
+		kmsg := &sarama.ProducerMessage{
+			Topic: p.topic,
+			Key:   sarama.StringEncoder(key),
+			Value: sarama.ByteEncoder(msgBytes),
+		}
+		if p.signer != nil {
+			out, serr := p.signer.Sign(ctx, payload, msgBytes)
+			if serr != nil {
+				p.logError("sign ack payload", payload.Event.Spec.ID, serr)
+				return fmt.Errorf("ack publish: sign payload: %w", serr)
+			}
+			if len(out.Signature) > 0 {
+				kmsg.Headers = append(kmsg.Headers, sarama.RecordHeader{Key: []byte("ack-signature"), Value: out.Signature})
+				if out.Algorithm != "" {
+					kmsg.Headers = append(kmsg.Headers, sarama.RecordHeader{Key: []byte("ack-signature-alg"), Value: []byte(out.Algorithm)})
+				}
+			}
 		}
 		_, _, err = p.producer.SendMessage(kmsg)
 		if err == nil {

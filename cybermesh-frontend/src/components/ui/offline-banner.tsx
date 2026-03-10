@@ -10,10 +10,10 @@ export const OfflineBanner = () => {
   return (
     <div
       className={cn(
-        "fixed top-14 left-0 right-0 z-40 flex items-center justify-center gap-2 py-2 px-4 text-sm font-medium transition-all duration-300",
+        "fixed top-14 left-0 right-0 z-40 mx-4 mt-2 rounded-lg border flex items-center justify-center gap-2 py-2 px-4 text-sm font-medium transition-all duration-300 shadow-sm",
         !isOnline 
-          ? "bg-destructive/90 text-destructive-foreground backdrop-blur-sm" 
-          : "bg-status-healthy/90 text-primary-foreground backdrop-blur-sm"
+          ? "bg-destructive/10 text-destructive border-destructive/30" 
+          : "bg-status-healthy/10 text-status-healthy border-status-healthy/30"
       )}
     >
       {!isOnline ? (

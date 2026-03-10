@@ -234,9 +234,9 @@ const Dashboard = () => {
 
         <DashboardHeader />
 
-        <div className="w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8 space-y-4 sm:space-y-6">
+        <div className="w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 sm:py-10 space-y-5 sm:space-y-8">
           {/* Row 1: Status Cards */}
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-5">
             {showSkeleton ? (
               <>
                 {[1, 2, 3, 4].map((i) => (
@@ -310,7 +310,7 @@ const Dashboard = () => {
           </div>
 
           {/* Row 2: Operational Metrics */}
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
             {showSkeleton ? (
               <>
                 {[1, 2, 3].map((i) => (
@@ -362,7 +362,7 @@ const Dashboard = () => {
           </div>
 
           {/* Row 3: Infrastructure & Alerts */}
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
             {showSkeleton ? (
               <>
                 <SkeletonCard className="lg:col-span-2" rows={2} />

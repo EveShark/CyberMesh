@@ -8,7 +8,7 @@ import { OfflineBanner } from "@/components/ui/offline-banner";
 import { DemoModeBanner } from "@/components/ui/demo-mode-banner";
 import { ConnectionStatus } from "@/components/ui/connection-status";
 import { RefreshControl } from "@/components/ui/refresh-control";
-import { Menu, Shield, Settings, X } from "lucide-react";
+import { Menu, Settings, X } from "lucide-react";
 import { useSwipe } from "@/hooks/ui/use-swipe";
 import { useIsFetching, useQueryClient } from "@tanstack/react-query";
 import { useConnectionStatus } from "@/hooks/common/use-connection-status";
@@ -18,6 +18,7 @@ import { cn } from "@/lib/utils";
 
 const DashboardContent = () => {
   const isFetching = useIsFetching();
+  const demoMode = isDemoMode();
   const queryClient = useQueryClient();
   const { setOpenMobile, isMobile } = useSidebar();
   const location = useLocation();
@@ -69,9 +70,9 @@ const DashboardContent = () => {
         {/* Header with hamburger menu and branding */}
         <header className="h-14 flex items-center border-b border-border/50 bg-background/95 backdrop-blur-xl px-4 sticky top-0 z-50 relative overflow-hidden">
           {/* Global loading indicator */}
-          {isFetching > 0 && (
+          {!demoMode && isFetching > 0 && (
             <div className="absolute bottom-0 left-0 right-0 h-0.5 overflow-hidden">
-              <div className="h-full w-full bg-gradient-to-r from-frost via-primary to-frost animate-loading-bar" />
+              <div className="h-full w-full bg-gradient-to-r from-accent/40 via-primary/80 to-accent/40 animate-loading-bar" />
             </div>
           )}
           {/* Hamburger menu with branding */}
@@ -82,13 +83,12 @@ const DashboardContent = () => {
 
             {/* Mobile branding - visible on mobile only */}
             <div className="flex md:hidden items-center gap-2">
-              <div className="relative flex-shrink-0">
-                <div className="absolute inset-0 rounded-md bg-gradient-to-br from-frost to-fire opacity-60 blur-sm" />
-                <div className="relative w-7 h-7 rounded-md bg-gradient-to-br from-frost to-frost-glow flex items-center justify-center">
-                  <Shield className="w-4 h-4 text-primary-foreground" />
-                </div>
-              </div>
-              <span className="font-bold text-sm sidebar-logo-shimmer">CyberMesh</span>
+              <img
+                src="/branding/logo/productos-logo-primary.png"
+                alt="CyberMesh logo"
+                className="h-7 w-auto"
+              />
+              <span className="font-display font-bold text-sm text-primary">CyberMesh</span>
             </div>
           </div>
 
@@ -102,7 +102,7 @@ const DashboardContent = () => {
               isOnline={isOnline}
               lastSyncTimeFormatted={lastSyncTimeFormatted}
               syncError={syncError}
-              isFetching={isFetching > 0}
+              isFetching={!demoMode && isFetching > 0}
             />
 
             {/* Mobile Settings shortcut - visible on mobile only */}
@@ -120,8 +120,8 @@ const DashboardContent = () => {
             </Link>
 
             {/* Design Partner Environment indicator */}
-            <div className="hidden lg:flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-frost/10 border border-frost/20 backdrop-blur-sm">
-              <span className="text-[10px] font-medium text-frost tracking-wide">Design Partner Environment</span>
+            <div className="hidden lg:flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-accent/10 border border-accent/20 backdrop-blur-sm">
+              <span className="text-[10px] font-medium text-accent tracking-wide">Design Partner Environment</span>
             </div>
           </div>
         </header>

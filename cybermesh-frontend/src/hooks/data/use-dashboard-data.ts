@@ -26,9 +26,11 @@ export const useDashboardData = (options: UseDashboardDataOptions = {}) => {
         const response = await apiClient.dashboard.getOverview(signal);
         return response;
       },
-    refetchInterval: demoMode ? 3000 : pollingInterval,
+    refetchInterval: demoMode ? false : pollingInterval,
     enabled: demoMode ? true : enabled,
     staleTime: demoMode ? Infinity : 10000,
+    refetchOnMount: demoMode ? false : true,
+    refetchOnWindowFocus: demoMode ? false : true,
     gcTime: 1000 * 60 * 5,
     placeholderData: (previousData) => previousData,
   });

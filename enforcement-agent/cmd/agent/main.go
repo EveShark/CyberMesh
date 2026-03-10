@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -58,6 +59,11 @@ func main() {
 		panic(err)
 	}
 	defer logger.Sync() //nolint:errcheck
+	logger.Info("enforcement consumption mode configured",
+		zap.String("mode", cfg.Kafka.ConsumptionMode),
+		zap.String("group_id", cfg.Kafka.GroupID),
+		zap.String("node_name", cfg.NodeName),
+		zap.String("backend", cfg.EnforcementBackend))
 
 	trust, err := policy.LoadTrustedKeys(cfg.TrustedKeysDir)
 	if err != nil {
@@ -155,7 +161,7 @@ func main() {
 	killSwitch := control.NewKillSwitch(cfg.KillSwitchEnabled)
 	recorder.SetKillSwitch(killSwitch.Enabled())
 
-	ackPublisher, ackCloser := buildAckPublisher(ctx, cfg, recorder, logger)
+	ackPublisher, ackStatus, ackCloser := buildAckPublisher(ctx, cfg, recorder, logger)
 	if ackCloser != nil {
 		defer ackCloser()
 	}
@@ -190,6 +196,7 @@ func main() {
 		SASLUsername:    cfg.Kafka.SASLUsername,
 		SASLPassword:    cfg.Kafka.SASLPassword,
 		Metrics:         recorder,
+		Logger:          logger,
 	}, ctrl)
 	if err != nil {
 		logger.Fatal("failed to create kafka consumer after retries", zap.Error(err))
@@ -203,7 +210,7 @@ func main() {
 	sched := scheduler.New(store, backend, cfg.ExpirationCheckFreq, cfg.SchedulerMaxBackoff, killSwitch, logger, recorder)
 	go sched.Run(ctx)
 
-	metricsServer := buildHTTPServer(cfg.MetricsAddr, registry, backend, killSwitch, recorder, logger)
+	metricsServer := buildHTTPServer(cfg.MetricsAddr, registry, backend, store, ctrl, killSwitch, ackStatus, recorder, logger)
 	go func() {
 		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("metrics server failed", zap.Error(err))
@@ -308,8 +315,75 @@ func createKafkaConsumerWithRetry(ctx context.Context, logger *zap.Logger, cfg k
 	}
 }
 
-func buildHTTPServer(addr string, registry *prometheus.Registry, backend enforcer.Enforcer, kill *control.KillSwitch, recorder *metrics.Recorder, logger *zap.Logger) *http.Server {
+type ackRuntimeStatus struct {
+	Enabled       bool
+	PublisherImpl string
+	Topic         string
+	QueuePath     string
+	QueueMaxSize  int
+	Queue         ack.Queue
+}
+
+type decisionLister interface {
+	ListDecisions(limit int, policyID string, result string) []controller.DecisionRecord
+}
+
+func (s *ackRuntimeStatus) Snapshot(ctx context.Context) map[string]any {
+	out := map[string]any{
+		"enabled":        s != nil && s.Enabled,
+		"publisher_impl": "",
+		"topic":          "",
+		"queue_path":     "",
+		"queue_max_size": 0,
+		"queue_depth":    nil,
+	}
+	if s == nil {
+		return out
+	}
+	out["publisher_impl"] = s.PublisherImpl
+	out["topic"] = s.Topic
+	out["queue_path"] = s.QueuePath
+	out["queue_max_size"] = s.QueueMaxSize
+	if !s.Enabled {
+		return out
+	}
+	if s.Queue == nil {
+		out["queue_depth_error"] = "queue_not_initialized"
+		return out
+	}
+	size, err := s.Queue.Len(ctx)
+	if err != nil {
+		out["queue_depth_error"] = err.Error()
+		return out
+	}
+	out["queue_depth"] = size
+	return out
+}
+
+func buildHTTPServer(addr string, registry *prometheus.Registry, backend enforcer.Enforcer, store *state.Store, ctrl decisionLister, kill *control.KillSwitch, ackStatus *ackRuntimeStatus, recorder *metrics.Recorder, logger *zap.Logger) *http.Server {
 	mux := http.NewServeMux()
+	controlToken := strings.TrimSpace(os.Getenv("ENFORCEMENT_API_TOKEN"))
+	requireControlAuth := parseEnvBoolWithDefault(os.Getenv("ENFORCEMENT_API_REQUIRE_AUTH"), controlToken != "")
+	requireAuth := func(w http.ResponseWriter, r *http.Request) bool {
+		if !requireControlAuth {
+			return true
+		}
+		if controlToken == "" {
+			http.Error(w, "control api auth misconfigured", http.StatusServiceUnavailable)
+			return false
+		}
+		header := strings.TrimSpace(r.Header.Get("Authorization"))
+		if !strings.HasPrefix(header, "Bearer ") {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return false
+		}
+		token := strings.TrimSpace(strings.TrimPrefix(header, "Bearer "))
+		if subtle.ConstantTimeCompare([]byte(token), []byte(controlToken)) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return false
+		}
+		return true
+	}
 	mux.Handle("/metrics", metrics.Handler(registry))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		doHealth(w, r, backend, false, logger)
@@ -318,6 +392,9 @@ func buildHTTPServer(addr string, registry *prometheus.Registry, backend enforce
 		doHealth(w, r, backend, true, logger)
 	})
 	mux.HandleFunc("/control/kill-switch", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAuth(w, r) {
+			return
+		}
 		if kill == nil {
 			http.Error(w, "kill switch not configured", http.StatusNotFound)
 			return
@@ -347,7 +424,163 @@ func buildHTTPServer(addr string, registry *prometheus.Registry, backend enforce
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
 	})
+	mux.HandleFunc("/control/decisions", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAuth(w, r) {
+			return
+		}
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if ctrl == nil {
+			http.Error(w, "controller not configured", http.StatusServiceUnavailable)
+			return
+		}
+		limit := 50
+		if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+			if parsed, err := strconv.Atoi(raw); err == nil {
+				limit = parsed
+			}
+		}
+		policyID := strings.TrimSpace(r.URL.Query().Get("policy_id"))
+		result := strings.TrimSpace(r.URL.Query().Get("result"))
+		decisions := ctrl.ListDecisions(limit, policyID, result)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"count":     len(decisions),
+			"decisions": decisions,
+		})
+	})
+	mux.HandleFunc("/control/effective-rules", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAuth(w, r) {
+			return
+		}
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+
+		var backendRules []policy.PolicySpec
+		var backendErr string
+		if backend != nil {
+			rules, err := backend.List(ctx)
+			if err != nil {
+				backendErr = err.Error()
+			} else {
+				backendRules = rules
+			}
+		}
+
+		storeRecords := []state.Record{}
+		if store != nil {
+			storeRecords = store.List()
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"backend_count": len(backendRules),
+			"store_count":   len(storeRecords),
+			"backend_error": backendErr,
+			"backend_rules": summarizePolicySpecs(backendRules),
+			"store_rules":   summarizeStoreRecords(storeRecords),
+		})
+	})
+	mux.HandleFunc("/control/ack-status", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAuth(w, r) {
+			return
+		}
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+		defer cancel()
+		if ackStatus == nil {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"enabled": false,
+				"error":   "ack_status_not_initialized",
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, ackStatus.Snapshot(ctx))
+	})
 	return &http.Server{Addr: addr, Handler: mux}
+}
+
+func parseEnvBoolWithDefault(raw string, defaultValue bool) bool {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	if value == "" {
+		return defaultValue
+	}
+	switch value {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return defaultValue
+	}
+}
+
+func summarizePolicySpecs(specs []policy.PolicySpec) []map[string]any {
+	out := make([]map[string]any, 0, len(specs))
+	for _, spec := range specs {
+		out = append(out, map[string]any{
+			"policy_id": spec.ID,
+			"action":    spec.Action,
+			"rule_type": spec.RuleType,
+			"scope":     strings.ToLower(strings.TrimSpace(spec.Target.Scope)),
+			"tenant":    effectiveTenantFromSpec(spec),
+			"region":    effectiveRegionFromSpec(spec),
+			"dry_run":   spec.Guardrails.DryRun,
+		})
+	}
+	return out
+}
+
+func summarizeStoreRecords(records []state.Record) []map[string]any {
+	out := make([]map[string]any, 0, len(records))
+	for _, rec := range records {
+		out = append(out, map[string]any{
+			"policy_id":          rec.Spec.ID,
+			"action":             rec.Spec.Action,
+			"rule_type":          rec.Spec.RuleType,
+			"scope":              strings.ToLower(strings.TrimSpace(rec.Spec.Target.Scope)),
+			"tenant":             effectiveTenantFromSpec(rec.Spec),
+			"region":             effectiveRegionFromSpec(rec.Spec),
+			"applied_at":         rec.AppliedAt,
+			"expires_at":         rec.ExpiresAt,
+			"pending_consensus":  rec.PendingConsensus,
+			"fast_path_deadline": rec.FastPathDeadline,
+		})
+	}
+	return out
+}
+
+func effectiveTenantFromSpec(spec policy.PolicySpec) string {
+	if spec.Target.Tenant != "" {
+		return strings.ToLower(strings.TrimSpace(spec.Target.Tenant))
+	}
+	if spec.Tenant != "" {
+		return strings.ToLower(strings.TrimSpace(spec.Tenant))
+	}
+	return ""
+}
+
+func effectiveRegionFromSpec(spec policy.PolicySpec) string {
+	if spec.Target.Region != "" {
+		return strings.ToLower(strings.TrimSpace(spec.Target.Region))
+	}
+	if spec.Region != "" {
+		return strings.ToLower(strings.TrimSpace(spec.Region))
+	}
+	return ""
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
 }
 
 func doHealth(w http.ResponseWriter, r *http.Request, backend enforcer.Enforcer, ready bool, logger *zap.Logger) {
@@ -385,21 +618,29 @@ func controllerInstanceID(clientID string) string {
 	return "controller"
 }
 
-func buildAckPublisher(ctx context.Context, cfg config.Config, recorder *metrics.Recorder, logger *zap.Logger) (ack.Publisher, func()) {
+func buildAckPublisher(ctx context.Context, cfg config.Config, recorder *metrics.Recorder, logger *zap.Logger) (ack.Publisher, *ackRuntimeStatus, func()) {
+	status := &ackRuntimeStatus{
+		Enabled:       cfg.Ack.Enabled,
+		PublisherImpl: cfg.Ack.PublisherImpl,
+		Topic:         cfg.Ack.Topic,
+		QueuePath:     cfg.Ack.QueuePath,
+		QueueMaxSize:  cfg.Ack.QueueMaxSize,
+	}
 	if !cfg.Ack.Enabled {
-		return nil, nil
+		return nil, status, nil
 	}
 	impl := strings.ToLower(strings.TrimSpace(cfg.Ack.PublisherImpl))
 	if impl == "" {
 		impl = "kafkago"
 	}
+	status.PublisherImpl = impl
 	if impl == "sarama" {
-		return buildAckPublisherSarama(ctx, cfg, recorder, logger)
+		return buildAckPublisherSarama(ctx, cfg, recorder, logger, status)
 	}
-	return buildAckPublisherKafkaGo(ctx, cfg, recorder, logger)
+	return buildAckPublisherKafkaGo(ctx, cfg, recorder, logger, status)
 }
 
-func buildAckPublisherSarama(ctx context.Context, cfg config.Config, recorder *metrics.Recorder, logger *zap.Logger) (ack.Publisher, func()) {
+func buildAckPublisherSarama(ctx context.Context, cfg config.Config, recorder *metrics.Recorder, logger *zap.Logger, status *ackRuntimeStatus) (ack.Publisher, *ackRuntimeStatus, func()) {
 	saramaCfg := sarama.NewConfig()
 	versionStr := cfg.Kafka.ProtocolVersion
 	if versionStr == "" {
@@ -525,12 +766,14 @@ func buildAckPublisherSarama(ctx context.Context, cfg config.Config, recorder *m
 		publisher = batcher
 		closers = append([]func(context.Context) error{batcher.Close}, closers...)
 	}
-	return publisher, func() {
+	status.Queue = queue
+	return publisher, status, func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		for _, closer := range closers {
 			_ = closer(ctx)
 		}
+		status.Queue = nil
 		_ = client.Close()
 	}
 }
@@ -545,7 +788,7 @@ func (kw kafkaGoWriter) WriteMessages(ctx context.Context, msgs ...kgo.Message) 
 
 func (kw kafkaGoWriter) Close() error { return kw.w.Close() }
 
-func buildAckPublisherKafkaGo(ctx context.Context, cfg config.Config, recorder *metrics.Recorder, logger *zap.Logger) (ack.Publisher, func()) {
+func buildAckPublisherKafkaGo(ctx context.Context, cfg config.Config, recorder *metrics.Recorder, logger *zap.Logger, status *ackRuntimeStatus) (ack.Publisher, *ackRuntimeStatus, func()) {
 	_ = ctx
 
 	var tlsConfig *tls.Config
@@ -679,12 +922,14 @@ func buildAckPublisherKafkaGo(ctx context.Context, cfg config.Config, recorder *
 		closers = append([]func(context.Context) error{batcher.Close}, closers...)
 	}
 
-	return publisher, func() {
+	status.Queue = queue
+	return publisher, status, func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		for _, closer := range closers {
 			_ = closer(ctx)
 		}
+		status.Queue = nil
 		queue.Close()
 		_ = writer.Close()
 	}

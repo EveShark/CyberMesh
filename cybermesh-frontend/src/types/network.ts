@@ -4,7 +4,8 @@ export type RiskLevel = "SAFE" | "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
 
 export interface Telemetry {
   connectedPeers: string;
-  avgLatency: number;
+  networkAverageLatencyMs: number;
+  networkAverageMessageGapMs?: number;
   consensusRound: number;
   leaderStability: number;
   inboundRate: string;
@@ -15,7 +16,8 @@ export interface TopologyNode {
   name: string;
   hash: string;
   fullId?: string; // Full hex ID for leader matching
-  latency: string;
+  latencyMs: number;
+  messageGapMs?: number;
   uptime: string;
   role: NodeRole;
   status?: NodeStatus;
@@ -53,6 +55,7 @@ export interface ValidatorStatus {
   hash?: string;
   status: NodeStatus;
   latency: string;
+  messageGap?: string;
   lastSeen: string;
   role: NodeRole;
 }

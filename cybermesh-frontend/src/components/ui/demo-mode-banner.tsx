@@ -78,23 +78,20 @@ export const DemoModeBanner = () => {
           : "opacity-0 max-h-0 -translate-y-2"
       )}
     >
-      {/* Animated gradient border */}
-      <div className="absolute inset-0 bg-gradient-to-r from-violet-500/20 via-frost/20 to-violet-500/20 animate-gradient-x" />
-      
-      <div className="relative mx-4 my-3 rounded-xl border border-violet-500/30 bg-gradient-to-br from-violet-500/10 via-background to-frost/5 backdrop-blur-sm">
+      <div className="relative mx-4 my-3 rounded-xl border border-accent/35 bg-card/95 shadow-sm">
         {/* Mobile Layout (stacked) */}
         <div className="flex flex-col gap-2.5 p-3 md:hidden">
           {/* Header row */}
           <div className="flex items-center justify-between gap-2">
             <div className="flex items-center gap-2">
-              <div className="flex items-center justify-center w-8 h-8 rounded-lg bg-violet-500/20 border border-violet-500/30">
-                <FlaskConical className="w-4 h-4 text-violet-400" />
+              <div className="flex items-center justify-center w-8 h-8 rounded-lg bg-accent/15 border border-accent/25">
+                <FlaskConical className="w-4 h-4 text-primary" />
               </div>
-              <span className="font-semibold text-sm text-violet-300">Demo Mode</span>
+              <span className="font-semibold text-sm text-primary">Demo Mode</span>
             </div>
             <button
               onClick={handleDismiss}
-              className="p-1.5 rounded-lg hover:bg-violet-500/20 transition-colors text-muted-foreground hover:text-foreground"
+              className="p-1.5 rounded-lg hover:bg-accent/10 transition-colors text-muted-foreground hover:text-foreground"
               aria-label="Dismiss banner"
             >
               <X className="w-4 h-4" />
@@ -104,14 +101,14 @@ export const DemoModeBanner = () => {
           {/* Message */}
           <p className="text-xs text-muted-foreground leading-relaxed">
             You're viewing demonstration data. Our production system provides{" "}
-            <span className="text-frost font-medium">real-time blockchain telemetry</span>.
+            <span className="text-primary font-medium">real-time blockchain telemetry</span>.
           </p>
           
           {/* CTA Button */}
           <Button
             asChild
             size="sm"
-            className="w-full bg-gradient-to-r from-violet-600 to-frost hover:from-violet-500 hover:to-frost-glow text-white shadow-lg shadow-violet-500/20"
+            className="w-full bg-primary text-primary-foreground hover:bg-primary/90"
           >
             <Link to={ROUTES.SETTINGS} className="flex items-center justify-center gap-2">
               <Sparkles className="w-4 h-4" />
@@ -124,14 +121,14 @@ export const DemoModeBanner = () => {
         {/* Desktop Layout (inline) */}
         <div className="hidden md:flex items-center justify-between gap-4 px-4 py-3">
           <div className="flex items-center gap-4">
-            <div className="flex items-center justify-center w-9 h-9 rounded-lg bg-violet-500/20 border border-violet-500/30">
-              <FlaskConical className="w-5 h-5 text-violet-400" />
+            <div className="flex items-center justify-center w-9 h-9 rounded-lg bg-accent/15 border border-accent/25">
+              <FlaskConical className="w-5 h-5 text-primary" />
             </div>
             <div className="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-3">
-              <span className="font-semibold text-violet-300">Demo Mode</span>
+              <span className="font-semibold text-primary">Demo Mode</span>
               <span className="text-sm text-muted-foreground">
                 Viewing sample data for demonstration.{" "}
-                <span className="text-frost">Real-time blockchain telemetry</span> available.
+                <span className="text-primary">Real-time blockchain telemetry</span> available.
               </span>
             </div>
           </div>
@@ -140,7 +137,7 @@ export const DemoModeBanner = () => {
             <Button
               asChild
               size="sm"
-              className="bg-gradient-to-r from-violet-600 to-frost hover:from-violet-500 hover:to-frost-glow text-white shadow-lg shadow-violet-500/20"
+              className="bg-primary text-primary-foreground hover:bg-primary/90"
             >
               <Link to={ROUTES.SETTINGS} className="gap-2">
                 <Sparkles className="w-3.5 h-3.5" />
@@ -150,7 +147,7 @@ export const DemoModeBanner = () => {
             </Button>
             <button
               onClick={handleDismiss}
-              className="p-2 rounded-lg hover:bg-violet-500/20 transition-colors text-muted-foreground hover:text-foreground"
+              className="p-2 rounded-lg hover:bg-accent/10 transition-colors text-muted-foreground hover:text-foreground"
               aria-label="Dismiss banner"
             >
               <X className="w-4 h-4" />

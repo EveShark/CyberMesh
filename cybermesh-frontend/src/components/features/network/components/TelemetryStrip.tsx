@@ -16,37 +16,37 @@ const TelemetryStrip = ({ telemetry }: TelemetryStripProps) => {
       label: "Connected Peers",
       value: formatValue(telemetry.connectedPeers),
       icon: Users,
-      color: "text-emerald-400",
+      color: "text-status-healthy",
     },
     {
-      label: "Avg Latency",
-      value: telemetry.avgLatency ? `${telemetry.avgLatency} ms` : "--",
+      label: "Avg Ping RTT",
+      value: telemetry.networkAverageLatencyMs ? `${telemetry.networkAverageLatencyMs} ms` : "--",
       icon: Clock,
-      color: telemetry.avgLatency > 2000 ? "text-amber-400" : "text-cyan-400",
+      color: telemetry.networkAverageLatencyMs > 2000 ? "text-status-warning" : "text-primary",
     },
     {
       label: "Consensus Round",
       value: telemetry.consensusRound?.toLocaleString() ?? "--",
       icon: Hash,
-      color: "text-purple-400",
+      color: "text-primary",
     },
     {
       label: "Leader Stability",
       value: telemetry.leaderStability !== undefined ? `${telemetry.leaderStability}%` : "--",
       icon: TrendingUp,
-      color: telemetry.leaderStability < 50 ? "text-amber-400" : "text-emerald-400",
+      color: telemetry.leaderStability < 50 ? "text-status-warning" : "text-status-healthy",
     },
     {
       label: "Inbound Rate",
       value: formatValue(telemetry.inboundRate),
       icon: ArrowDownToLine,
-      color: "text-cyan-400",
+      color: "text-primary",
     },
     {
       label: "Outbound Rate",
       value: formatValue(telemetry.outboundRate),
       icon: ArrowUpFromLine,
-      color: "text-cyan-400",
+      color: "text-primary",
     },
   ];
 
@@ -62,9 +62,8 @@ const TelemetryStrip = ({ telemetry }: TelemetryStripProps) => {
             <span className="text-xs text-muted-foreground truncate">{metric.label}</span>
           </div>
           <div className="flex items-center gap-2">
-            <span className="relative flex h-2 w-2">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+            <span className="relative flex h-2 w-2 rounded-full bg-status-healthy">
+              <span className="absolute inline-flex h-full w-full rounded-full bg-status-healthy/35"></span>
             </span>
             <span className="text-lg font-semibold text-foreground">{metric.value}</span>
           </div>

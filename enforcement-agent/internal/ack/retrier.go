@@ -135,8 +135,6 @@ func (r *RetryingPublisher) drain(ctx context.Context) {
 			attempts = 0
 		}
 		attempts++
-		ackTime := time.Now().UTC()
-		payload.AckedAt = ackTime
 		if err := r.backend.Publish(ctx, payload); err != nil {
 			if r.logger != nil {
 				r.logger.Error("ack retrier: publish failed", zap.Error(err), zap.String("policy_id", payload.Event.Spec.ID), zap.Int("attempt", attempts))
@@ -158,7 +156,8 @@ func (r *RetryingPublisher) drain(ctx context.Context) {
 			r.observeDepth(ctx)
 		}
 		if r.metrics != nil && !payload.AppliedAt.IsZero() {
-			latency := ackTime.Sub(payload.AppliedAt).Seconds()
+			ackObservedAt := time.Now().UTC()
+			latency := ackObservedAt.Sub(payload.AppliedAt).Seconds()
 			if latency >= 0 {
 				r.metrics.ObserveAckLatency(latency)
 			}

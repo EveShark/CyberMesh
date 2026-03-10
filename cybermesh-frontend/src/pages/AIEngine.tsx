@@ -4,6 +4,7 @@ import {
   LoopStatusCard,
   DetectionLoopCard,
   AIEnginePerformanceTable,
+  SentinelPipelineCard,
   SuspiciousValidatorsCard,
   DetectionStreamFeed,
 } from "@/components/features/ai-engine";
@@ -61,11 +62,11 @@ const AIEngine = () => {
           isRefreshing={isRefreshing}
           progress={progress}
         />
-        <div className="container mx-auto px-4 sm:px-6 py-8 max-w-7xl">
+        <div className="container mx-auto px-4 sm:px-6 py-8 sm:py-10 max-w-7xl space-y-8">
           <AIEngineHeader />
 
           {/* Row 1: Status Cards */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             {showSkeleton ? (
               <>
                 <SkeletonCard rows={3} />
@@ -80,25 +81,31 @@ const AIEngine = () => {
           </div>
 
           {/* Row 2: Full Width Performance Table */}
-          <div className="mb-6">
+          <div className="space-y-6">
             {showSkeleton ? (
-              <SkeletonTable rows={4} columns={6} />
+              <>
+                <SkeletonTable rows={4} columns={6} />
+                <SkeletonCard rows={3} />
+              </>
             ) : (
-              <AIEnginePerformanceTable engines={aiData.engines} />
+              <>
+                <AIEnginePerformanceTable engines={aiData.engines} />
+                <SentinelPipelineCard data={aiData.sentinel} />
+              </>
             )}
           </div>
 
-          {/* Row 3: Suspicious Validators (full width) */}
-          <div className="mb-6">
+          {/* Row 3: Suspicious Entities (full width) */}
+          <div>
             {showSkeleton ? (
               <SkeletonCard rows={4} />
             ) : (
-              <SuspiciousValidatorsCard data={aiData.validators} />
+              <SuspiciousValidatorsCard data={aiData.suspiciousEntities} />
             )}
           </div>
 
           {/* Row 4: Full Width Detection Stream */}
-          <div className="mb-6">
+          <div>
             {showSkeleton ? (
               <SkeletonTable rows={6} columns={5} />
             ) : (

@@ -32,7 +32,7 @@ export function MobileBottomNav() {
                 flex flex-col items-center justify-center gap-0.5 
                 py-2 transition-all duration-200
                 ${active 
-                  ? 'text-frost' 
+                  ? 'text-primary' 
                   : 'text-muted-foreground hover:text-foreground'
                 }
               `}
@@ -41,24 +41,21 @@ export function MobileBottomNav() {
                 relative flex items-center justify-center w-7 h-7 rounded-lg
                 transition-all duration-200
                 ${active 
-                  ? 'bg-frost/10' 
+                  ? 'bg-accent/15 border border-accent/25' 
                   : ''
                 }
               `}>
                 <item.icon className={`
                   w-4 h-4 transition-all duration-200
                   ${active 
-                    ? 'drop-shadow-[0_0_8px_hsl(var(--frost)/0.6)]' 
+                    ? 'text-primary' 
                     : ''
                   }
                 `} />
-                {active && (
-                  <div className="absolute inset-0 rounded-lg bg-frost/10 animate-pulse" />
-                )}
               </div>
               <span className={`
                 text-[9px] font-medium transition-all duration-200 text-center leading-tight
-                ${active ? 'text-frost' : ''}
+                ${active ? 'text-primary' : ''}
               `}>
                 {item.shortTitle || item.title.split(' ')[0]}
               </span>

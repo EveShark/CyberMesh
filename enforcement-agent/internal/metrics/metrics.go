@@ -29,7 +29,16 @@ type Recorder struct {
 	backoffGauge        *prometheus.GaugeVec
 	ledgerDrift         *prometheus.CounterVec
 	kafkaLag            *prometheus.GaugeVec
+	kafkaConsumed       *prometheus.CounterVec
 	kafkaErrors         *prometheus.CounterVec
+	kafkaPartitions     *prometheus.GaugeVec
+	kafkaPartitionEvent *prometheus.CounterVec
+	publishToConsume    prometheus.Histogram
+	consumeToApply      *prometheus.HistogramVec
+	applyPersist        *prometheus.HistogramVec
+	applyToAckEnqueue   *prometheus.HistogramVec
+	offsetMark          prometheus.Histogram
+	duplicatesByScope   *prometheus.CounterVec
 	ackPublish          *prometheus.CounterVec
 	ackRetry            prometheus.Counter
 	ackQueueDepth       prometheus.Gauge
@@ -122,10 +131,51 @@ func NewRecorder(reg prometheus.Registerer) *Recorder {
 			Name: "policy_consumer_lag",
 			Help: "Kafka consumer lag by partition",
 		}, []string{"partition"}),
+		kafkaConsumed: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "policy_consumer_messages_total",
+			Help: "Kafka policy messages consumed grouped by partition and handler result",
+		}, []string{"partition", "result"}),
 		kafkaErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "policy_consumer_errors_total",
 			Help: "Kafka consumer errors grouped by reason",
 		}, []string{"reason"}),
+		kafkaPartitions: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "policy_consumer_partition_owned",
+			Help: "Whether this agent instance currently owns a Kafka partition",
+		}, []string{"partition"}),
+		kafkaPartitionEvent: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "policy_consumer_partition_events_total",
+			Help: "Kafka partition assignment lifecycle events grouped by partition and event",
+		}, []string{"partition", "event"}),
+		publishToConsume: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "policy_publish_to_consume_seconds",
+			Help:    "Latency from Kafka publish timestamp to enforcement consume time",
+			Buckets: prometheus.DefBuckets,
+		}),
+		consumeToApply: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "policy_consume_to_apply_seconds",
+			Help:    "Latency from enforcement consume to policy apply result",
+			Buckets: prometheus.DefBuckets,
+		}, []string{"result"}),
+		applyPersist: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "policy_apply_persist_seconds",
+			Help:    "Latency from successful apply to local state persistence result",
+			Buckets: prometheus.DefBuckets,
+		}, []string{"result"}),
+		applyToAckEnqueue: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "policy_apply_to_ack_enqueue_seconds",
+			Help:    "Latency from policy apply completion to ACK enqueue result",
+			Buckets: prometheus.DefBuckets,
+		}, []string{"result"}),
+		offsetMark: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "policy_offset_mark_seconds",
+			Help:    "Latency to mark a consumed Kafka message for offset commit",
+			Buckets: prometheus.DefBuckets,
+		}),
+		duplicatesByScope: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "policy_duplicate_total",
+			Help: "Duplicate or no-op policy deliveries grouped by scope kind",
+		}, []string{"scope_kind"}),
 		ackPublish: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "policy_ack_publish_total",
 			Help: "ACK publish outcomes grouped by status",
@@ -213,7 +263,16 @@ func NewRecorder(reg prometheus.Registerer) *Recorder {
 		r.backoffGauge,
 		r.ledgerDrift,
 		r.kafkaLag,
+		r.kafkaConsumed,
 		r.kafkaErrors,
+		r.kafkaPartitions,
+		r.kafkaPartitionEvent,
+		r.publishToConsume,
+		r.consumeToApply,
+		r.applyPersist,
+		r.applyToAckEnqueue,
+		r.offsetMark,
+		r.duplicatesByScope,
 		r.ackPublish,
 		r.ackRetry,
 		r.ackQueueDepth,
@@ -347,6 +406,17 @@ func (r *Recorder) ObserveKafkaLag(partition int32, lag int64) {
 	}
 }
 
+// ObserveKafkaConsumed increments consumer message counters by partition and result.
+func (r *Recorder) ObserveKafkaConsumed(partition int32, result string) {
+	if r == nil || r.kafkaConsumed == nil {
+		return
+	}
+	if result == "" {
+		result = "unknown"
+	}
+	r.kafkaConsumed.WithLabelValues(fmt.Sprintf("%d", partition), result).Inc()
+}
+
 // ObserveKafkaError increments consumer error counters.
 func (r *Recorder) ObserveKafkaError(reason string) {
 	if reason == "" {
@@ -355,6 +425,94 @@ func (r *Recorder) ObserveKafkaError(reason string) {
 	if r.kafkaErrors != nil {
 		r.kafkaErrors.WithLabelValues(reason).Inc()
 	}
+}
+
+// ObservePartitionAssigned marks a Kafka partition as owned by this process.
+func (r *Recorder) ObservePartitionAssigned(partition int32) {
+	if r == nil {
+		return
+	}
+	label := fmt.Sprintf("%d", partition)
+	if r.kafkaPartitions != nil {
+		r.kafkaPartitions.WithLabelValues(label).Set(1)
+	}
+	if r.kafkaPartitionEvent != nil {
+		r.kafkaPartitionEvent.WithLabelValues(label, "assigned").Inc()
+	}
+}
+
+// ObservePartitionRevoked marks a Kafka partition as no longer owned by this process.
+func (r *Recorder) ObservePartitionRevoked(partition int32) {
+	if r == nil {
+		return
+	}
+	label := fmt.Sprintf("%d", partition)
+	if r.kafkaPartitions != nil {
+		r.kafkaPartitions.WithLabelValues(label).Set(0)
+	}
+	if r.kafkaPartitionEvent != nil {
+		r.kafkaPartitionEvent.WithLabelValues(label, "revoked").Inc()
+	}
+}
+
+// ObservePublishToConsume records Kafka publish-to-consume latency.
+func (r *Recorder) ObservePublishToConsume(seconds float64) {
+	if r == nil || r.publishToConsume == nil || seconds < 0 {
+		return
+	}
+	r.publishToConsume.Observe(seconds)
+}
+
+// ObserveConsumeToApply records enforcement consume-to-apply latency.
+func (r *Recorder) ObserveConsumeToApply(result string, d time.Duration) {
+	if r == nil || r.consumeToApply == nil || d < 0 {
+		return
+	}
+	if result == "" {
+		result = "unknown"
+	}
+	r.consumeToApply.WithLabelValues(result).Observe(d.Seconds())
+}
+
+// ObserveApplyPersist records local state persistence latency after apply.
+func (r *Recorder) ObserveApplyPersist(result string, d time.Duration) {
+	if r == nil || r.applyPersist == nil || d < 0 {
+		return
+	}
+	if result == "" {
+		result = "unknown"
+	}
+	r.applyPersist.WithLabelValues(result).Observe(d.Seconds())
+}
+
+// ObserveApplyToAckEnqueue records latency from apply completion to ACK enqueue result.
+func (r *Recorder) ObserveApplyToAckEnqueue(result string, d time.Duration) {
+	if r == nil || r.applyToAckEnqueue == nil || d < 0 {
+		return
+	}
+	if result == "" {
+		result = "unknown"
+	}
+	r.applyToAckEnqueue.WithLabelValues(result).Observe(d.Seconds())
+}
+
+// ObserveOffsetMark records latency to mark a consumed message for commit.
+func (r *Recorder) ObserveOffsetMark(d time.Duration) {
+	if r == nil || r.offsetMark == nil || d < 0 {
+		return
+	}
+	r.offsetMark.Observe(d.Seconds())
+}
+
+// ObserveDuplicateScope records duplicate/no-op deliveries by scope kind.
+func (r *Recorder) ObserveDuplicateScope(scopeKind string) {
+	if r == nil || r.duplicatesByScope == nil {
+		return
+	}
+	if scopeKind == "" {
+		scopeKind = "unknown"
+	}
+	r.duplicatesByScope.WithLabelValues(scopeKind).Inc()
 }
 
 // ObserveAckPublish records ACK publish outcome.
@@ -514,6 +672,15 @@ func (r *Recorder) ObserveGatewayAckPublish(status string) {
 
 // KafkaLagGauge exposes the consumer lag gauge (used in tests).
 func (r *Recorder) KafkaLagGauge() *prometheus.GaugeVec { return r.kafkaLag }
+
+// KafkaConsumedCounter exposes Kafka consumed counters for tests.
+func (r *Recorder) KafkaConsumedCounter() *prometheus.CounterVec { return r.kafkaConsumed }
+
+// KafkaPartitionGauge exposes partition ownership gauge (used in tests).
+func (r *Recorder) KafkaPartitionGauge() *prometheus.GaugeVec { return r.kafkaPartitions }
+
+// KafkaPartitionEventCounter exposes partition lifecycle counters (used in tests).
+func (r *Recorder) KafkaPartitionEventCounter() *prometheus.CounterVec { return r.kafkaPartitionEvent }
 
 // AppliedCounter exposes the total applied counter (used in tests).
 func (r *Recorder) AppliedCounter() prometheus.Counter { return r.applied }

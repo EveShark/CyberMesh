@@ -74,6 +74,7 @@ export interface NetworkStatsRaw {
   inbound_peers: number;
   outbound_peers: number;
   avg_latency_ms: number;
+  avg_message_gap_ms?: number;
   bytes_received: number;
   bytes_sent: number;
 }
@@ -192,6 +193,7 @@ export interface NetworkOverviewRaw {
   total_peers: number;
   expected_peers: number;
   average_latency_ms: number;
+  average_message_gap_ms?: number;
   consensus_round: number;
   leader_stability: number;
   phase: string;
@@ -211,6 +213,8 @@ export interface NetworkNodeRaw {
   name: string;
   status: string;
   latency: number;
+  ping_latency_ms?: number;
+  message_gap_ms?: number;
   uptime: number;
   throughput_bytes: number;
   last_seen?: string;
@@ -350,6 +354,7 @@ export interface AiDetectionLoopRaw {
   healthy?: boolean;
   avg_latency_ms: number;
   last_latency_ms: number;
+  configured_interval_seconds?: number;
   seconds_since_last_detection?: number;
   seconds_since_last_iteration?: number;
   cache_age_seconds?: number;
@@ -430,6 +435,7 @@ export interface AIMetricsRaw {
   derived?: AiMetricsDerivedRaw;
   engines: AiEngineMetricRaw[];
   variants: AiVariantMetricRaw[];
+  sentinel?: AiSentinelMetricRaw;
 }
 
 export interface AiMetricsDerivedRaw {
@@ -465,6 +471,18 @@ export interface AiVariantMetricRaw {
   last_updated?: number;
 }
 
+export interface AiSentinelMetricRaw {
+  status: string;
+  events_total: number;
+  detections_total: number;
+  publish_ratio: number;
+  last_detection_time?: number;
+  last_history_event_time?: number;
+  top_threat_type?: string;
+  last_entity_id?: string;
+  last_entity_type?: string;
+}
+
 export interface AiDetectionHistoryRaw {
   detections: AiDetectionHistoryEntryRaw[];
   count: number;
@@ -490,6 +508,7 @@ export interface AiSuspiciousNodesRaw {
 
 export interface AiSuspiciousNodeRaw {
   id: string;
+  entity_type?: string;
   status: string;
   suspicion_score: number;
   event_count: number;

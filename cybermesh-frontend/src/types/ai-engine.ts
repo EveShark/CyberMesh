@@ -1,6 +1,7 @@
 export type LoopStatus = "Running" | "Stopped" | "Unknown";
 export type HealthStatus = "Healthy" | "Degraded" | "Unknown";
 export type SeverityLevel = "Critical" | "High" | "Medium" | "Low";
+export type SuspiciousEntityType = "validator" | "network_source" | "network_target" | "unknown";
 
 export interface LoopStatusData {
   status: LoopStatus;
@@ -24,7 +25,7 @@ export interface DetectionLoopMetrics {
   iterationsCount: number;
 }
 
-export interface Validator {
+export interface SuspiciousEntity {
   name: string;
   events: number;
   maxSeverity: number;
@@ -34,10 +35,12 @@ export interface Validator {
   score: number;
   threats: string[];
   severity: SeverityLevel;
+  entityType: SuspiciousEntityType;
+  kindLabel: string;
 }
 
-export interface ValidatorsData {
-  validators: Validator[];
+export interface SuspiciousEntitiesData {
+  entities: SuspiciousEntity[];
   networkStatus: string;
 }
 
@@ -72,11 +75,23 @@ export interface EnginePerformance {
   published: number;
 }
 
+export interface SentinelPerformance {
+  status: "Active" | "Observing" | "Idle";
+  eventsTotal: number;
+  detectionsTotal: number;
+  publishRate: string;
+  topThreat: string | null;
+  lastEntity: string | null;
+  entityLabel: string | null;
+  lastDetection: string | null;
+}
+
 export interface AIEngineData {
   loopStatus: LoopStatusData;
   detectionLoop: DetectionLoopMetrics;
-  validators: ValidatorsData;
+  suspiciousEntities: SuspiciousEntitiesData;
   detectionStream: DetectionStreamData;
   engines: EnginePerformance[];
+  sentinel: SentinelPerformance | null;
   updatedAt: string;
 }

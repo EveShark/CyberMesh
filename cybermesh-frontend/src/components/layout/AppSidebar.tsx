@@ -2,8 +2,7 @@ import { Home } from "lucide-react";
 import { NavLink } from "@/components/landing/NavLink";
 import { useLocation } from "react-router-dom";
 import { SIDEBAR_ITEMS } from "@/config/navigation";
-import { ROUTES } from "@/config/routes";
-import Logo from "@/components/brand/Logo";
+import { LANDING_URL, ROUTES } from "@/config/routes";
 import { useCallback } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { apiClient } from "@/lib/api";
@@ -79,6 +78,7 @@ export function AppSidebar() {
   // Prefetch data on hover to reduce perceived latency
   const handleMouseEnter = useCallback(
     (path: string) => {
+      if (demoMode) return;
       const config = PREFETCH_CONFIG[path];
       if (config && !isActive(path)) {
         queryClient.prefetchQuery({
@@ -88,7 +88,7 @@ export function AppSidebar() {
         });
       }
     },
-    [queryClient, currentPath]
+    [queryClient, currentPath, demoMode]
   );
 
   return (
@@ -100,11 +100,16 @@ export function AppSidebar() {
         {/* Logo Header */}
         <div className="border-b border-border/30 p-4">
           <div className="flex items-center justify-center">
-            <Logo
-              size={collapsed ? 24 : 28}
-              variant={collapsed ? "icon" : "full"}
-              showText={!collapsed}
-            />
+            <div className="flex items-center gap-2">
+              <img
+                src="/branding/logo/productos-logo-primary.png"
+                alt="CyberMesh logo"
+                className={collapsed ? "h-6 w-auto" : "h-7 w-auto"}
+              />
+              {!collapsed && (
+                <span className="text-xl font-display font-bold tracking-tight text-primary">CyberMesh</span>
+              )}
+            </div>
           </div>
         </div>
 
@@ -146,20 +151,17 @@ export function AppSidebar() {
                           transition-all duration-200
                           ${collapsed ? 'w-10 h-10' : 'w-8 h-8'}
                           ${active
-                            ? 'bg-gradient-to-br from-frost/20 to-frost/5'
+                            ? 'bg-accent/15 border border-accent/25'
                             : 'group-hover:bg-muted/80'
                           }
                         `}>
                           <item.icon className={`
                             w-4 h-4 flex-shrink-0 transition-all duration-200
                             ${active
-                              ? 'text-frost drop-shadow-[0_0_6px_hsl(var(--frost)/0.5)]'
+                              ? 'text-primary'
                               : 'group-hover:text-foreground'
                             }
                           `} />
-                          {active && (
-                            <div className="absolute inset-0 rounded-lg bg-frost/10 animate-pulse" />
-                          )}
                         </div>
                         {!collapsed && (
                           <span className={`
@@ -186,12 +188,12 @@ export function AppSidebar() {
         {/* Quick Stats - Only when expanded and not in demo mode */}
         {!collapsed && !demoMode && (
           <div className="p-4">
-            <div className="p-3 rounded-lg bg-gradient-to-br from-muted/50 to-muted/20 border border-border/30">
+            <div className="p-3 rounded-lg bg-card border border-border/60">
               <div className="flex items-center justify-between mb-2">
                 <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-medium">
                   System Status
                 </span>
-                <span className={`flex h-2 w-2 rounded-full animate-pulse ${healthData?.data?.serviceReadiness === "Ready"
+                <span className={`flex h-2 w-2 rounded-full ${healthData?.data?.serviceReadiness === "Ready"
                     ? "bg-status-healthy"
                     : healthData?.data?.serviceReadiness === "Degraded"
                       ? "bg-status-warning"
@@ -233,18 +235,18 @@ export function AppSidebar() {
           tooltip="Exit Dashboard"
           className={collapsed ? 'w-10 h-10 p-0' : 'p-0'}
         >
-          <NavLink
-            to="/"
+          <a
+            href={LANDING_URL}
             onClick={handleNavClick}
-            className={`sidebar-item flex items-center rounded-lg text-muted-foreground hover:text-fire hover:bg-fire/10 transition-all duration-200 group ${collapsed ? 'justify-center w-10 h-10 p-0' : 'gap-3 px-3 py-2.5'}`}
+            className={`sidebar-item flex items-center rounded-lg text-muted-foreground hover:text-primary hover:bg-accent/10 transition-all duration-200 group ${collapsed ? 'justify-center w-10 h-10 p-0' : 'gap-3 px-3 py-2.5'}`}
           >
-            <div className={`flex items-center justify-center rounded-lg group-hover:bg-fire/20 transition-all duration-200 ${collapsed ? 'w-10 h-10' : 'w-8 h-8'}`}>
-              <Home className="w-4 h-4 flex-shrink-0 transition-colors duration-200 group-hover:text-fire" />
+            <div className={`flex items-center justify-center rounded-lg group-hover:bg-accent/15 transition-all duration-200 ${collapsed ? 'w-10 h-10' : 'w-8 h-8'}`}>
+              <Home className="w-4 h-4 flex-shrink-0 transition-colors duration-200 group-hover:text-primary" />
             </div>
             {!collapsed && (
               <span className="text-sm font-medium">Exit Dashboard</span>
             )}
-          </NavLink>
+          </a>
         </SidebarMenuButton>
       </SidebarFooter>
     </Sidebar>

@@ -46,7 +46,7 @@ const AILoopPanel = ({ data }: AILoopPanelProps) => {
                 <Clock className="w-4 h-4 text-primary" />
               </div>
               <div>
-                <p className="text-xs text-muted-foreground">Last Iteration</p>
+                <p className="text-xs text-muted-foreground">Since Last Iteration</p>
                 <p className="text-sm font-semibold text-foreground">
                   {displayValue(data.lastIteration)}
                 </p>

@@ -28,19 +28,34 @@ function colorValue(colorVar: string, alpha?: number) {
 export default function ProposalChart({ proposals, isLoading }: ProposalChartProps) {
   const [timeWindow, setTimeWindow] = useState<TimeWindow>(DEFAULT_TIME_WINDOW)
 
+  const normalizeTs = (ts: number) => (ts < 1_000_000_000_000 ? ts * 1000 : ts)
+
   // Filter proposals by selected time window
   const filteredProposals = useMemo(() => {
     return filterByTimeWindow(proposals || [], timeWindow)
   }, [proposals, timeWindow])
 
+  // Fallback to full dataset if selected window has no points
+  const sourceProposals = filteredProposals.length > 0 ? filteredProposals : (proposals || [])
+
   // Group proposals by hour
   const chartData = useMemo(() => {
-    if (!filteredProposals || filteredProposals.length === 0) return []
+    if (!sourceProposals || sourceProposals.length === 0) {
+      const now = Date.now()
+      return Array.from({ length: 6 }).map((_, index) => {
+        const ts = now - (5 - index) * 30 * 60 * 1000
+        const date = new Date(ts)
+        return {
+          hour: `${date.getMonth() + 1}/${date.getDate()} ${date.getHours().toString().padStart(2, "0")}:00`,
+          count: 0,
+        }
+      })
+    }
 
     const groupedByHour: Record<string, number> = {}
 
-    filteredProposals.forEach((p) => {
-      const date = new Date(p.timestamp)
+    sourceProposals.forEach((p) => {
+      const date = new Date(normalizeTs(p.timestamp))
       const hourKey = `${date.getMonth() + 1}/${date.getDate()} ${date.getHours().toString().padStart(2, "0")}:00`
       groupedByHour[hourKey] = (groupedByHour[hourKey] || 0) + 1
     })
@@ -48,15 +63,15 @@ export default function ProposalChart({ proposals, isLoading }: ProposalChartPro
     return Object.entries(groupedByHour)
       .map(([hour, count]) => ({ hour, count }))
       .sort((a, b) => a.hour.localeCompare(b.hour))
-  }, [filteredProposals])
+  }, [sourceProposals])
 
   // Calculate stats
   const stats = useMemo(() => {
-    if (!filteredProposals || filteredProposals.length === 0) {
+    if (!sourceProposals || sourceProposals.length === 0) {
       return { total: 0, peakRate: 0, avgRate: 0 }
     }
 
-    const total = filteredProposals.length
+    const total = sourceProposals.length
     const counts = chartData.map((d) => d.count)
     const maxCount = counts.length > 0 ? Math.max(...counts) : 0
     const timeSpanHours = chartData.length || 1
@@ -67,7 +82,7 @@ export default function ProposalChart({ proposals, isLoading }: ProposalChartPro
       peakRate: maxCount,
       avgRate,
     }
-  }, [filteredProposals, chartData])
+  }, [sourceProposals, chartData])
 
   if (isLoading) {
     return (
@@ -91,9 +106,12 @@ export default function ProposalChart({ proposals, isLoading }: ProposalChartPro
     )
   }
 
+  const hasRealData = sourceProposals.length > 0
   const hasData = chartData.length > 0
   const activityHours = Math.max(1, chartData.length)
-  const insightMessage = stats.avgRate > 5
+  const insightMessage = !hasRealData
+    ? "No recent proposal events in this time window."
+    : stats.avgRate > 5
     ? "High proposal throughput indicates active consensus participation."
     : "Proposal volume within normal parameters; consensus steady."
 
@@ -108,7 +126,7 @@ export default function ProposalChart({ proposals, isLoading }: ProposalChartPro
           <div>
             <h3 className="text-lg font-semibold text-foreground">Proposal Activity</h3>
             <p className="text-sm text-muted-foreground">
-              {filteredProposals.length > 0 ? `${filteredProposals.length} proposals | ${getTimeWindowLabel(timeWindow)}` : "Recent proposal submissions"}
+              {sourceProposals.length > 0 ? `${sourceProposals.length} proposals | ${getTimeWindowLabel(timeWindow)}` : "Recent proposal submissions"}
             </p>
           </div>
         </div>

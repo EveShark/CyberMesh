@@ -45,9 +45,9 @@ const BlockMetricsGrid = ({ metrics }: BlockMetricsGridProps) => {
     },
     { 
       icon: Clock, 
-      label: "Avg Block Time", 
+      label: "Avg Block Interval", 
       value: metrics.avgBlockTime,
-      sublabel: "Backend-reported average block time"
+      sublabel: "Historical average block spacing from backend"
     },
     { 
       icon: HardDrive, 

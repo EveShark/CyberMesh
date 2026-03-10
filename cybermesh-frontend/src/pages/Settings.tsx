@@ -5,7 +5,6 @@ import { Label } from "@/components/ui/label";
 import { isDemoMode, setDemoMode } from "@/config/demo-mode";
 import { useState, useCallback } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { useNavigate } from "react-router-dom";
 import { FlaskConical, Wifi, Info, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
@@ -13,11 +12,11 @@ import { toast } from "sonner";
 const Settings = () => {
   const [demoEnabled, setDemoEnabled] = useState(isDemoMode());
   const [isSwitching, setIsSwitching] = useState(false);
+  const demoLocked = import.meta.env.VITE_DEMO_MODE === "true";
   const queryClient = useQueryClient();
-  const navigate = useNavigate();
 
   const handleDemoToggle = useCallback(async (checked: boolean) => {
-    if (isSwitching) return;
+    if (isSwitching || demoLocked) return;
 
     setIsSwitching(true);
 
@@ -43,7 +42,7 @@ const Settings = () => {
     window.location.href = "/dashboard";
 
     setIsSwitching(false);
-  }, [queryClient, navigate, isSwitching]);
+  }, [queryClient, isSwitching, demoLocked]);
 
   return (
     <>
@@ -52,27 +51,27 @@ const Settings = () => {
         <meta name="description" content="Configure CyberMesh application settings" />
       </Helmet>
 
-      <div className="p-4 md:p-6 space-y-6">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight">Settings</h1>
-          <p className="text-muted-foreground">Configure your CyberMesh experience</p>
+      <div className="p-4 md:p-6 lg:p-8 space-y-8">
+        <div className="space-y-1.5">
+          <h1 className="text-3xl md:text-4xl font-display font-bold tracking-tight text-primary">Settings</h1>
+          <p className="text-sm md:text-base text-muted-foreground">Configure your CyberMesh experience</p>
         </div>
 
-        <div className="grid gap-6 max-w-2xl">
+        <div className="grid gap-6 max-w-3xl">
           {/* Data Mode Card */}
           <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <FlaskConical className="h-5 w-5 text-violet-400" />
+            <CardHeader className="pb-4">
+              <CardTitle className="flex items-center gap-2 text-xl">
+                <FlaskConical className="h-5 w-5 text-primary" />
                 Data Mode
               </CardTitle>
-              <CardDescription>
-                Choose between live API data or demo mode with sample data
+              <CardDescription className="text-sm leading-relaxed">
+                Choose between live API data or preview mode data
               </CardDescription>
             </CardHeader>
-            <CardContent className="space-y-6">
+            <CardContent className="space-y-7">
               {/* Toggle */}
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-6">
                 <div className="space-y-0.5">
                   <Label htmlFor="demo-mode" className="text-base font-medium">
                     Demo Mode
@@ -89,25 +88,30 @@ const Settings = () => {
                     id="demo-mode"
                     checked={demoEnabled}
                     onCheckedChange={handleDemoToggle}
-                    disabled={isSwitching}
+                    disabled={isSwitching || demoLocked}
                   />
                 </div>
               </div>
+              {demoLocked && (
+                <p className="text-xs text-muted-foreground">
+                  Demo mode is locked by environment configuration for this deployment.
+                </p>
+              )}
 
               {/* Current Status */}
               <div className={cn(
                 "flex items-center gap-3 p-4 rounded-lg border transition-all duration-300",
                 demoEnabled
-                  ? "bg-violet-500/10 border-violet-500/20"
+                  ? "bg-accent/10 border-accent/30"
                   : "bg-status-healthy/10 border-status-healthy/20"
               )}>
                 {demoEnabled ? (
                   <>
-                    <FlaskConical className="h-5 w-5 text-violet-400" />
+                    <FlaskConical className="h-5 w-5 text-primary" />
                     <div>
-                      <p className="font-medium text-violet-400">Demo Mode Active</p>
+                      <p className="font-medium text-primary">Demo Mode Active</p>
                       <p className="text-sm text-muted-foreground">
-                        Displaying sample data for demonstration purposes
+                        Displaying preview data for this environment
                       </p>
                     </div>
                   </>
@@ -127,7 +131,7 @@ const Settings = () => {
               {/* Info */}
               <div className="flex items-start gap-2 text-sm text-muted-foreground">
                 <Info className="h-4 w-4 mt-0.5 flex-shrink-0" />
-                <p>
+                <p className="leading-relaxed">
                   Switching modes will redirect you to the dashboard with fresh data.
                 </p>
               </div>

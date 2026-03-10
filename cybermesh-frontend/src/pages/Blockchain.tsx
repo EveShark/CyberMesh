@@ -150,7 +150,7 @@ const Blockchain = () => {
           progress={progress}
         />
 
-        <div className="container mx-auto px-4 sm:px-6 py-8 max-w-7xl space-y-6">
+        <div className="container mx-auto px-4 sm:px-6 py-8 sm:py-10 max-w-7xl space-y-8">
           {/* Header */}
           {showSkeleton ? (
             <SkeletonCard rows={1} />
@@ -209,7 +209,7 @@ const Blockchain = () => {
           />
 
           {/* Block Details & Latest Blocks Table */}
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 md:gap-6">
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-5 md:gap-6">
             {/* On mobile, show table first, then details */}
             <div className="lg:col-span-2 order-2 lg:order-2 min-w-0">
               {showSkeleton ? (

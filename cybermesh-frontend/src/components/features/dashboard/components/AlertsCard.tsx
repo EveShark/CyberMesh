@@ -31,13 +31,13 @@ const AlertsCard = forwardRef<HTMLDivElement, AlertsCardProps>(
       <div
         ref={ref}
         className={cn(
-          "rounded-xl p-5 glass-fire transition-all duration-300",
+          "rounded-xl p-5 glass-frost transition-all duration-200 border border-destructive/20",
           className
         )}
       >
         <div className="flex items-center gap-3 mb-2">
-          <div className="p-2 rounded-lg bg-fire/10">
-            <AlertTriangle className="w-5 h-5 text-fire" />
+          <div className="p-2 rounded-lg bg-destructive/10 border border-destructive/20">
+            <AlertTriangle className="w-5 h-5 text-destructive" />
           </div>
           <div>
             <h3 className="font-semibold text-foreground">Recent Alerts</h3>
@@ -45,15 +45,14 @@ const AlertsCard = forwardRef<HTMLDivElement, AlertsCardProps>(
           </div>
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 my-4">
+        <div className="space-y-2 my-4">
           {levels.map((level) => (
-            <div key={level.label} className="text-center p-3 rounded-lg bg-secondary/30 border border-border/50 min-w-0">
-              <p className="text-2xl font-bold text-foreground">{level.count}</p>
-              <span className={cn(
-                "inline-block mt-1 px-2 py-0.5 rounded text-xs font-medium",
-                level.color
-              )}>
+            <div key={level.label} className="flex items-center justify-between gap-3 p-2.5 rounded-lg bg-secondary/30 border border-border/50 min-w-0">
+              <span className={cn("text-xs font-medium", level.color)}>
                 {level.label}
+              </span>
+              <span className="text-lg sm:text-xl font-bold text-foreground tabular-nums">
+                {level.count.toLocaleString()}
               </span>
             </div>
           ))}

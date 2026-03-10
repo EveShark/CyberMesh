@@ -37,21 +37,39 @@ function colorValue(colorVar: string, alpha?: number) {
 
 export default function VoteTimeline({ votes, isLoading }: VoteTimelineProps) {
   const [timeWindow, setTimeWindow] = useState<TimeWindow>(DEFAULT_TIME_WINDOW)
+  const normalizeTs = (ts: number) => (ts < 1_000_000_000_000 ? ts * 1000 : ts)
 
   // Filter votes by selected time window
   const filteredVotes = useMemo(() => {
     return filterByTimeWindow(votes || [], timeWindow)
   }, [votes, timeWindow])
 
+  // Fallback to full dataset if selected window has no points
+  const sourceVotes = filteredVotes.length > 0 ? filteredVotes : (votes || [])
+
   const chartData = useMemo<VoteBucket[]>(() => {
-    if (!filteredVotes || filteredVotes.length === 0) return []
+    if (!sourceVotes || sourceVotes.length === 0) {
+      const now = Date.now()
+      return Array.from({ length: 6 }).map((_, index) => {
+        const ts = now - (5 - index) * 5 * 60 * 1000
+        return {
+          timestamp: ts,
+          proposals: 0,
+          votes: 0,
+          commits: 0,
+          view_changes: 0,
+          time: new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+        }
+      })
+    }
 
     const buckets = new Map<number, VoteBucket>()
 
-    filteredVotes.forEach((vote) => {
-      if (!buckets.has(vote.timestamp)) {
-        buckets.set(vote.timestamp, {
-          timestamp: vote.timestamp,
+    sourceVotes.forEach((vote) => {
+      const normalizedTimestamp = normalizeTs(vote.timestamp)
+      if (!buckets.has(normalizedTimestamp)) {
+        buckets.set(normalizedTimestamp, {
+          timestamp: normalizedTimestamp,
           proposals: 0,
           votes: 0,
           commits: 0,
@@ -60,7 +78,7 @@ export default function VoteTimeline({ votes, isLoading }: VoteTimelineProps) {
         })
       }
 
-      const entry = buckets.get(vote.timestamp)!
+      const entry = buckets.get(normalizedTimestamp)!
       const type = vote.type.toLowerCase()
 
       if (type.includes("proposal")) entry.proposals += vote.count
@@ -75,7 +93,7 @@ export default function VoteTimeline({ votes, isLoading }: VoteTimelineProps) {
         ...bucket,
         time: new Date(bucket.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
       }))
-  }, [filteredVotes])
+  }, [sourceVotes])
 
   // Calculate totals across all filtered data (not just last bucket)
   const windowTotals = useMemo(() => {
@@ -125,28 +143,7 @@ export default function VoteTimeline({ votes, isLoading }: VoteTimelineProps) {
     )
   }
 
-  if (chartData.length === 0) {
-    return (
-      <div className="glass-frost rounded-lg p-6 space-y-6">
-        <div className="flex items-start gap-3">
-          <div className="rounded-lg border border-primary/30 bg-primary/10 p-2">
-            <Vote className="h-5 w-5 text-primary" />
-          </div>
-          <div>
-            <h3 className="text-lg font-semibold text-foreground">Vote Timeline</h3>
-            <p className="text-sm text-muted-foreground">Consensus activity (30s buckets)</p>
-          </div>
-        </div>
-        <div className="flex items-center justify-center min-h-[300px]">
-          <div className="space-y-3 text-center">
-            <Activity className="mx-auto h-10 w-10 text-muted-foreground" />
-            <p className="text-sm text-muted-foreground">No vote activity data available</p>
-            <p className="text-xs text-muted-foreground">Waiting for consensus activity...</p>
-          </div>
-        </div>
-      </div>
-    )
-  }
+  const hasRealData = sourceVotes.length > 0
 
   return (
     <div className="glass-frost rounded-lg p-6 space-y-6">
@@ -159,9 +156,9 @@ export default function VoteTimeline({ votes, isLoading }: VoteTimelineProps) {
           <div>
             <h3 className="text-lg font-semibold text-foreground">Vote Timeline</h3>
             <p className="text-sm text-muted-foreground">
-              {filteredVotes.length > 0
+              {hasRealData
                 ? `${chartData.length} buckets | ${getTimeWindowLabel(timeWindow)}`
-                : "Consensus activity (30s buckets)"}
+                : "No recent vote events in this time window"}
             </p>
           </div>
         </div>

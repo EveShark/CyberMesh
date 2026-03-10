@@ -92,7 +92,7 @@ const BlockchainTable = ({
                   </TableCell>
                   <TableCell>
                     <div className="flex items-center gap-1 md:gap-2">
-                      <span className="font-mono text-xs md:text-sm text-frost">
+                      <span className="font-mono text-xs md:text-sm text-primary">
                         {truncateHash(block.hash, 4)}
                       </span>
                       <Button

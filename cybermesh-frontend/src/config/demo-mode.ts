@@ -16,6 +16,11 @@ const DEMO_MODE_KEY = 'cybermesh-demo-mode';
  * Checks localStorage first, then falls back to env var
  */
 export const isDemoMode = (): boolean => {
+  // Hard-lock to demo mode when env flag is enabled
+  if (import.meta.env.VITE_DEMO_MODE === 'true') {
+    return true;
+  }
+
   // Check localStorage first for runtime override
   const storedValue = localStorage.getItem(DEMO_MODE_KEY);
   if (storedValue !== null) {

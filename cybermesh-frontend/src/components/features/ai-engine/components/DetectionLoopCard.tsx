@@ -18,18 +18,18 @@ const DetectionLoopCard = ({ data }: DetectionLoopCardProps) => {
       case "Healthy":
         return {
           icon: CheckCircle,
-          iconColor: "text-emerald-400",
-          badgeBg: "bg-emerald-500/20",
-          badgeText: "text-emerald-400",
-          badgeBorder: "border-emerald-500/30",
+          iconColor: "text-status-healthy",
+          badgeBg: "bg-status-healthy/10",
+          badgeText: "text-status-healthy",
+          badgeBorder: "border-status-healthy/30",
         };
       case "Degraded":
         return {
           icon: AlertTriangle,
-          iconColor: "text-amber-400",
-          badgeBg: "bg-amber-500/20",
-          badgeText: "text-amber-400",
-          badgeBorder: "border-amber-500/30",
+          iconColor: "text-status-warning",
+          badgeBg: "bg-status-warning/10",
+          badgeText: "text-status-warning",
+          badgeBorder: "border-status-warning/30",
         };
       default:
         return {
@@ -55,23 +55,23 @@ const DetectionLoopCard = ({ data }: DetectionLoopCardProps) => {
   ];
 
   return (
-    <Card className="glass-frost border-border/50 backdrop-blur-xl">
-      <CardHeader className="pb-3">
+    <Card className="glass-frost border-border/60">
+      <CardHeader className="pb-4">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="p-2 rounded-lg bg-primary/10">
               <RefreshCw className="w-5 h-5 text-primary" />
             </div>
-            <CardTitle className="text-lg font-semibold text-foreground">Detection Loop Metrics</CardTitle>
+            <CardTitle className="text-lg font-semibold tracking-tight text-foreground">Detection Loop Metrics</CardTitle>
           </div>
         </div>
       </CardHeader>
-      <CardContent className="space-y-4">
-        <div className="grid grid-cols-3 gap-4">
+      <CardContent className="pt-0 space-y-5">
+        <div className="grid grid-cols-2 md:grid-cols-3 gap-x-4 gap-y-3">
           {metrics.map((metric, index) => (
             <div key={index} className="space-y-1">
               <p className="text-xs text-muted-foreground">{metric.label}</p>
-              <p className={`text-sm font-semibold ${metric.warning ? "text-amber-400" : "text-foreground"}`}>
+              <p className={`text-sm font-semibold ${metric.warning ? "text-status-warning" : "text-foreground"}`}>
                 {metric.value}
               </p>
             </div>

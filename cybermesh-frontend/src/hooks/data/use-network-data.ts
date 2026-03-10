@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { apiClient, type NetworkResponse } from "@/lib/api";
 import { useVisibilityPause } from "@/hooks/common/use-visibility-pause";
-import { getMockNetworkRaw, mockBlockMetricsRaw } from "@/mocks/network";
+import { getMockNetworkRaw, getMockConsensusRaw, mockBlockMetricsRaw } from "@/mocks/network";
 import { adaptNetwork } from "@/lib/api/adapters/network.adapter";
 import { isDemoMode } from "@/config/demo-mode";
 
@@ -24,16 +24,19 @@ export const useNetworkData = (options: UseNetworkDataOptions = {}) => {
     queryFn: demoMode
       ? async () => {
         const raw = getMockNetworkRaw();
-        const adapted = adaptNetwork(raw, mockBlockMetricsRaw);
+        const consensus = getMockConsensusRaw();
+        const adapted = adaptNetwork(raw, mockBlockMetricsRaw, consensus);
         return { data: adapted, updatedAt: new Date().toISOString() };
       }
       : async ({ signal }) => {
         const response = await apiClient.network.getStatus(signal);
         return response;
       },
-    refetchInterval: demoMode ? 2000 : pollingInterval,
+    refetchInterval: demoMode ? false : pollingInterval,
     enabled: demoMode ? true : enabled,
     staleTime: demoMode ? Infinity : 10000,
+    refetchOnMount: demoMode ? false : true,
+    refetchOnWindowFocus: demoMode ? false : true,
     gcTime: 1000 * 60 * 5,
     placeholderData: (previousData) => previousData,
   });

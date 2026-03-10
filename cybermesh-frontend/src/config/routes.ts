@@ -13,5 +13,8 @@ export const ROUTES = {
   NOT_FOUND: '/404',
 } as const;
 
+export const LANDING_URL =
+  (import.meta.env.VITE_LANDING_URL as string | undefined)?.trim() || "/";
+
 export type RouteKey = keyof typeof ROUTES;
 export type RoutePath = (typeof ROUTES)[RouteKey];

@@ -20,10 +20,11 @@ export type {
   LoopStatus as AILoopStatus,
   HealthStatus,
   SeverityLevel,
+  SuspiciousEntityType,
   LoopStatusData,
   DetectionLoopMetrics,
-  Validator,
-  ValidatorsData,
+  SuspiciousEntity,
+  SuspiciousEntitiesData,
   DetectionEvent,
   DetectionStreamData,
 } from './ai-engine';

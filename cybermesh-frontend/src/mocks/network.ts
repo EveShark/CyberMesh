@@ -1,5 +1,5 @@
 import type { NetworkData } from "@/types/network";
-import type { NetworkOverviewRaw, DashboardBlockMetricsRaw } from "@/lib/api/types/raw";
+import type { NetworkOverviewRaw, DashboardBlockMetricsRaw, ConsensusOverviewRaw, ConsensusProposalRaw, ConsensusVoteRaw } from "@/lib/api/types/raw";
 import { adaptNetwork } from "@/lib/api/adapters/network.adapter";
 
 export const mockBlockMetricsRaw: DashboardBlockMetricsRaw = {
@@ -52,9 +52,55 @@ export const getMockNetworkRaw = (): NetworkOverviewRaw => {
   };
 };
 
+export const getMockConsensusRaw = (): ConsensusOverviewRaw => {
+  const now = Date.now();
+  const bucketMs = 5 * 60 * 1000; // 5-minute buckets
+  const windowHours = 4;
+  const totalBuckets = (windowHours * 60) / 5;
+
+  const proposals: ConsensusProposalRaw[] = [];
+  const votes: ConsensusVoteRaw[] = [];
+
+  for (let i = totalBuckets - 1; i >= 0; i--) {
+    const ts = now - i * bucketMs;
+
+    // 1-3 proposals per bucket
+    const proposalCount = 1 + Math.floor(Math.random() * 3);
+    for (let p = 0; p < proposalCount; p++) {
+      proposals.push({
+        block: 101500 + (totalBuckets - i) * 2 + p,
+        view: (totalBuckets - i) % 8,
+        hash: `0xmockproposal${(totalBuckets - i).toString(16)}${p.toString(16)}`,
+        proposer: ["Orion", "Lyra", "Draco", "Cygnus", "Vela"][(totalBuckets - i + p) % 5],
+        timestamp: ts,
+      });
+    }
+
+    // votes / commits / occasional view changes
+    votes.push({ type: "vote", count: 8 + Math.floor(Math.random() * 5), timestamp: ts });
+    votes.push({ type: "commit", count: 3 + Math.floor(Math.random() * 3), timestamp: ts });
+    if (i % 6 === 0) {
+      votes.push({ type: "view_change", count: 1 + Math.floor(Math.random() * 2), timestamp: ts });
+    }
+  }
+
+  return {
+    leader: "Orion",
+    leader_id: "node-orion-001",
+    term: 42,
+    phase: "commit",
+    active_peers: 5,
+    quorum_size: 4,
+    proposals,
+    votes,
+    suspicious_nodes: [],
+    updated_at: new Date().toISOString(),
+  };
+};
+
 export const mockNetworkRaw: NetworkOverviewRaw = getMockNetworkRaw();
 
-export const mockNetworkData: NetworkData = adaptNetwork(mockNetworkRaw, mockBlockMetricsRaw);
+export const mockNetworkData: NetworkData = adaptNetwork(mockNetworkRaw, mockBlockMetricsRaw, getMockConsensusRaw());
 
 export interface NetworkResponse extends NetworkData {
   updatedAt: string;
