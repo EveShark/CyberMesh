@@ -16,7 +16,7 @@ This document is the source of truth for how Sentinel runs in the platform today
 | Sentinel Output Topic | `sentinel.verdicts.v1` (protobuf `SentinelResultEvent`) |
 | AI Adapter Input | `sentinel.verdicts.v1` |
 | AI Outputs from Sentinel path | `ai.anomalies.v1`, `ai.policy.v1` |
-| Backend Policy Output | `control.policy.v1` |
+| Backend Policy Output | `control.policy.v2` |
 | Enforcement ACK | `control.enforcement_ack.v1` (backend primary consumer; AI optional) |
 | Deployment Mode (current) | Sentinel Kafka worker job in `k8s_azure/sentinel/sentinel-kafka-ai-integration-job.yaml` |
 
@@ -56,8 +56,8 @@ graph LR
     Kafka -->|sentinel.verdicts.v1| AI
     AI -->|ai.anomalies.v1 / ai.policy.v1| Kafka
     Kafka -->|ai.*| BE
-    BE -->|commit -> outbox -> leased dispatcher -> control.policy.v1| Kafka
-    Kafka -->|control.policy.v1| EA
+    BE -->|commit -> outbox -> leased dispatcher -> control.policy.v2| Kafka
+    Kafka -->|control.policy.v2| EA
     EA -->|control.enforcement_ack.v1| Kafka
     Kafka -->|control.enforcement_ack.v1| BE
     Kafka -->|control.enforcement_ack.v1| AI
@@ -80,7 +80,7 @@ flowchart TB
     K1 --> B[Backend consume + consensus]
     K2 --> B
     B --> O[Policy outbox + dispatcher]
-    O --> K3[(control.policy.v1)]
+    O --> K3[(control.policy.v2)]
     K3 --> E[Enforcement apply]
     E --> K4[(control.enforcement_ack.v1)]
 ```
@@ -110,8 +110,8 @@ sequenceDiagram
 
     K->>BE: consume ai.anomalies.v1 / ai.policy.v1
     BE->>BE: commit block + persist outbox row
-    BE->>K: control.policy.v1 (from leased outbox dispatcher)
-    K->>EA: consume control.policy.v1
+    BE->>K: control.policy.v2 (from leased outbox dispatcher)
+    K->>EA: consume control.policy.v2
     EA->>K: control.enforcement_ack.v1
     K->>BE: consume control.enforcement_ack.v1 (ack correlation)
     K->>AI: consume control.enforcement_ack.v1
@@ -150,7 +150,7 @@ sequenceDiagram
   - `sentinel.verdicts.v1`
   - `ai.anomalies.v1`
   - `ai.policy.v1`
-  - `control.policy.v1`
+  - `control.policy.v2`
   - `control.enforcement_ack.v1`
 - AI Sentinel adapter policy path is gated by:
   - `SENTINEL_ADAPTER_ENABLED`
@@ -166,7 +166,7 @@ In the integrated Sentinel pipeline:
 
 - Control plane:
   - Sentinel + AI + Backend produce and authorize policy intent
-  - `sentinel.verdicts.v1 -> ai.policy.v1 -> control.policy.v1`
+  - `sentinel.verdicts.v1 -> ai.policy.v1 -> control.policy.v2`
 - Data plane:
   - Enforcement backend applies runtime network controls
   - backend choice is config-driven (`gateway`, `cilium`, `iptables`, `nftables`, `k8s`)

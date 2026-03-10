@@ -55,7 +55,7 @@ Notes:
 
 - `k8s_gke/daemonset.yaml`
 - Runs on every node (`hostNetwork: true`, privileged with `NET_ADMIN` capability).
-- Consumes policies from Kafka topic `control.policy.v1`.
+- Consumes policies from Kafka topic `control.policy.v2`.
 - Backend mode is configured by `ENFORCEMENT_BACKEND` and supports:
   - `cilium`, `gateway`, `iptables`, `nftables`, `kubernetes`/`k8s`, `noop`
 - Exposes metrics/health/control on `:9094`.

@@ -6,11 +6,11 @@ Consumes signed policy events from Kafka, validates them (signature + hash), con
 
 Quick path:
 
-`control.policy.v1 -> verify/parse -> guardrails -> backend apply -> control.enforcement_ack.v1`
+`control.policy.v2 -> verify/parse -> guardrails -> backend apply -> control.enforcement_ack.v1`
 
 ```mermaid
 flowchart LR
-    K[Kafka: control.policy.v1] --> C[controller.HandleMessage]
+    K[Kafka: control.policy.v2] --> C[controller.HandleMessage]
     C --> V[Verify signature + rule_hash]
     V --> P[Parse PolicySpec]
     P --> G[Guardrails: dedupe, allowlist, cooldown, rate limit, approval]
@@ -171,7 +171,7 @@ Note: This README intentionally excludes `bin/` and `test/` (per project usage),
 
 ### Common
 
-- `CONTROL_POLICY_TOPIC` (default: `control.policy.v1`)
+- `CONTROL_POLICY_TOPIC` (default: `control.policy.v2`)
 - `CONTROL_POLICY_GROUP` (default: `policy-enforcement-agent`)
 - `CONTROL_POLICY_CONSUMPTION_MODE` (`shared_group|fanout_per_node`, default: `shared_group`)
   - Use `fanout_per_node` for host-level DaemonSet enforcement where each node must consume and apply policies locally

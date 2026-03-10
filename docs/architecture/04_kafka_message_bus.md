@@ -34,12 +34,12 @@ Current default is `control.enforcement_ack.v1`.
 Control/data plane topic boundary:
 - Control plane topics:
   - `ai.policy.v1`
-  - `control.policy.v1`
+  - `control.policy.v2`
 - Data plane result topic:
   - `control.enforcement_ack.v1`
 
 Interpretation:
-- `control.policy.v1` is the control-plane instruction stream.
+- `control.policy.v2` is the control-plane instruction stream.
 - Enforcement backends (`gateway`, `cilium`, `iptables`, `nftables`, `k8s`) are data-plane executors.
 - `control.enforcement_ack.v1` is data-plane execution feedback.
 
@@ -64,7 +64,7 @@ graph LR
         T1[ai.anomalies.v1]
         T1b[ai.policy.v1]
         T2[control.commits.v1]
-        T3[control.policy.v1]
+        T3[control.policy.v2]
         T4[control.enforcement_ack.v1]
         DLQ[ai.dlq.v1]
     end
@@ -174,9 +174,9 @@ DoS limits (enforced by schema validation and verifier):
 The backend publishes protobuf events (from `backend/proto/*`) and signs them:
 
 - `control.commits.v1` (CommitEvent)
-- `control.policy.v1` (PolicyUpdateEvent)
+- `control.policy.v2` (PolicyUpdateEvent)
 
-`control.policy.v1` publication authority is implemented via durable outbox + leased dispatcher (single logical writer), not direct multi-writer publish from commit handlers.
+`control.policy.v2` publication authority is implemented via durable outbox + leased dispatcher (single logical writer), not direct multi-writer publish from commit handlers.
 
 ### 4.3 Telemetry Topics
 
@@ -192,7 +192,7 @@ Schema definitions live under `telemetry-layer/proto/` with generated bindings i
 
 Signing domains are configurable:
 - `CONTROL_SIGNING_DOMAIN` (default: `control.commits.v1`)
-- `CONTROL_POLICY_SIGNING_DOMAIN` (default: `control.policy.v1`)
+- `CONTROL_POLICY_SIGNING_DOMAIN` (default: `control.policy.v2`)
 
 ---
 

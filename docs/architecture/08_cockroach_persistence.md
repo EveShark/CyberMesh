@@ -143,7 +143,7 @@ This data is intended to support restarting the HotStuff engine without losing c
 The backend commit-to-publish path uses a transactional outbox model:
 
 - `PersistBlock` writes outbox rows atomically with committed block/tx rows.
-- A leased dispatcher claims outbox rows and publishes to `control.policy.v1`.
+- A leased dispatcher claims outbox rows and publishes to `control.policy.v2`.
 - Publish metadata (topic/partition/offset) is persisted.
 - ACK store upserts `policy_acks` and marks correlated outbox row as `acked`.
 

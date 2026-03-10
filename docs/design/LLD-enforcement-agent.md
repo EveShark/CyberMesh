@@ -18,7 +18,7 @@
 
 ## 1. Overview
 
-The Enforcement Agent is a Go-based DaemonSet that consumes `control.policy.v1` and applies policy through the configured backend (`cilium`, `gateway`, `iptables`, `nftables`, `kubernetes`/`k8s`, `noop`).
+The Enforcement Agent is a Go-based DaemonSet that consumes `control.policy.v2` and applies policy through the configured backend (`cilium`, `gateway`, `iptables`, `nftables`, `kubernetes`/`k8s`, `noop`).
 Its job is deterministic policy execution plus optional ACK publication for feedback loops.
 
 > [!IMPORTANT]
@@ -29,11 +29,11 @@ Its job is deterministic policy execution plus optional ACK publication for feed
 The enforcement stack is split into a control plane and a data plane:
 
 - Control plane:
-  - `AI -> Backend -> control.policy.v1`
+  - `AI -> Backend -> control.policy.v2`
   - validates signatures, runs consensus, applies guardrails, and emits signed policy updates
 - Data plane:
   - enforcement backend on each node or gateway
-  - consumes `control.policy.v1`, programs runtime rules, and emits `control.enforcement_ack.v1`
+  - consumes `control.policy.v2`, programs runtime rules, and emits `control.enforcement_ack.v1`
 
 Control-plane message flow:
 
@@ -41,7 +41,7 @@ Control-plane message flow:
 flowchart LR
     AI[AI Service] -->|ai.policy.v1| BE[Backend Validators]
     BE -->|consensus + policy validation| CP[Policy Update]
-    CP -->|control.policy.v1| EA[Enforcement Agent]
+    CP -->|control.policy.v2| EA[Enforcement Agent]
     EA -->|control.enforcement_ack.v1| FEEDBACK[AI / Feedback]
 ```
 
@@ -160,7 +160,7 @@ classDiagram
 ```mermaid
 flowchart TB
     subgraph Input
-        K[Kafka Message<br/>control.policy.v1]
+        K[Kafka Message<br/>control.policy.v2]
     end
     
     subgraph Validation

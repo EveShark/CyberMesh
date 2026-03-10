@@ -378,7 +378,7 @@ type KafkaConfig struct {
 	// Topics - Output (Backend → AI)
 	OutputTopicCommits    string `json:"output_topic_commits"`    // control.commits.v1
 	OutputTopicReputation string `json:"output_topic_reputation"` // control.reputation.v1
-	OutputTopicPolicy     string `json:"output_topic_policy"`     // control.policy.v1
+	OutputTopicPolicy     string `json:"output_topic_policy"`     // control.policy.v2
 	OutputTopicEvidence   string `json:"output_topic_evidence"`   // control.evidence.v1
 
 	// Consumer Settings

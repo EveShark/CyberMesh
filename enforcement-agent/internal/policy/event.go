@@ -126,12 +126,12 @@ func (t *TrustedKeys) VerifyAndParse(evt *pb.PolicyUpdateEvent) (Event, error) {
 		ProducerId:       evt.ProducerId,
 	}
 
-	// Domain separation identical to backend producer (control.policy.v1).
+	// Domain separation identical to backend producer (control.policy.v2).
 	bytes, err := proto.Marshal(&signed)
 	if err != nil {
 		return Event{}, fmt.Errorf("policy: marshal sign payload: %w", err)
 	}
-	message := append([]byte("control.policy.v1"), bytes...)
+	message := append([]byte("control.policy.v2"), bytes...)
 	if !ed25519.Verify(pub, message, evt.Signature) {
 		return Event{}, errors.New("policy: signature verification failed")
 	}

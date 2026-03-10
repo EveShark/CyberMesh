@@ -67,7 +67,7 @@ sequenceDiagram
     Val->>DB: Persist block + outbox rows (single transaction)
     Val->>Kafka: control.commits.v1
     Val->>Outbox: claim pending policy rows (lease/fencing)
-    Outbox->>Kafka: control.policy.v1
+    Outbox->>Kafka: control.policy.v2
     
     Kafka->>AI: Commit notification
     AI->>AI: Update feedback tracker
@@ -215,7 +215,7 @@ sequenceDiagram
     participant DB as CockroachDB
     participant O as control_policy_outbox
     participant D as Dispatcher (lease holder)
-    participant K as Kafka control.policy.v1
+    participant K as Kafka control.policy.v2
     participant A as ACK Consumer
 
     C->>DB: BEGIN
@@ -323,7 +323,7 @@ sequenceDiagram
     participant Enf as Enforcer
     participant Net as Network Stack
     
-    Kafka->>Agent: control.policy.v1
+    Kafka->>Agent: control.policy.v2
     Agent->>Agent: Verify signature
     Agent->>Agent: Parse policy spec
     Agent->>Sched: Schedule enforcement
@@ -389,7 +389,7 @@ flowchart TB
 ```mermaid
 flowchart LR
     AI[AI Service] -->|ai.policy.v1| BE[Backend Consensus]
-    BE -->|control.policy.v1| AG[Enforcement Agent]
+    BE -->|control.policy.v2| AG[Enforcement Agent]
     AG -->|program rules| DP[Kernel/CNI/Gateway Data Plane]
     AG -->|control.enforcement_ack.v1| FB[Backend ACK Correlation]
 ```
@@ -398,7 +398,7 @@ Plane responsibilities:
 
 - Control plane:
   - `AI -> Backend` generates and validates policy intent
-  - backend consensus authorizes policy publication to `control.policy.v1`
+  - backend consensus authorizes policy publication to `control.policy.v2`
 - Data plane:
   - enforcement backend programs runtime network controls
   - applies L3/L4 controls and reports execution ACK
@@ -440,7 +440,7 @@ flowchart LR
         T2[ai.evidence.v1]  
         T3[ai.policy.v1]
         T4[control.commits.v1]
-        T5[control.policy.v1]
+        T5[control.policy.v2]
         T6[control.reputation.v1]
         T8[control.enforcement_ack.v1]
         T7[ai.dlq.v1]
@@ -508,7 +508,7 @@ flowchart LR
 | `ai.evidence.v1` | AI | Backend | Protobuf (EvidenceEvent) | ~512KB max |
 | `ai.policy.v1` | AI | Backend | Protobuf (PolicyEvent) | ~1KB |
 | `control.commits.v1` | Backend | AI | Protobuf (CommitEvent) | ~1KB |
-| `control.policy.v1` | Backend | Agent | Protobuf (PolicyUpdateEvent) | ~2KB |
+| `control.policy.v2` | Backend | Agent | Protobuf (PolicyUpdateEvent) | ~2KB |
 | `control.reputation.v1` | Backend | AI | Protobuf (ReputationEvent) | ~500B |
 | `control.enforcement_ack.v1` | Agent | Backend (AI optional) | Protobuf (PolicyAckEvent) | ~1KB |
 | `ai.dlq.v1` | Backend | - | Original + error | Varies |

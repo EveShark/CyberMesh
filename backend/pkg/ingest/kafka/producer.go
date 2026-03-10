@@ -54,7 +54,7 @@ type Producer struct {
 type ProducerTopics struct {
 	Commits    string // control.commits.v1
 	Reputation string // control.reputation.v1 (future)
-	Policy     string // control.policy.v1 (future)
+	Policy     string // control.policy.v2
 	Evidence   string // control.evidence.v1 (future)
 	PolicyDLQ  string // control.policy.dlq.v1 (optional)
 }

@@ -1,7 +1,7 @@
 """
 PolicyUpdateEvent - Backend policy update message (Backend → AI)
 
-Topic: control.policy.v1
+Topic: control.policy.v2
 Backend producer: backend/pkg/ingest/kafka/producer.go
 AI consumer: src/kafka/consumer.py
 
@@ -37,7 +37,7 @@ class PolicyUpdateEvent:
     - Ed25519 signature verification from trusted validators
     - Policy rule validation (type, data format, ranges)
     - Hash verification (rule_hash = SHA-256(rule_data))
-    - Domain separation: "control.policy.v1"
+    - Domain separation: "control.policy.v2"
     
     Supported rule types:
     - threshold: Adjust detection thresholds
@@ -49,7 +49,7 @@ class PolicyUpdateEvent:
     - block: Enforce block policies (ingress/egress network controls)
     """
     
-    DOMAIN = "control.policy.v1"
+    DOMAIN = "control.policy.v2"
     
     # Valid policy actions. "drop"/"reject"/"rate_limit" are emitted by
     # runtime block policies from AI/backend and must be accepted here.

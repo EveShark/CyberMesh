@@ -114,7 +114,7 @@ Replay defense:
 
 The backend signs protobuf events for:
 - `control.commits.v1` (CommitEvent)
-- `control.policy.v1` (PolicyUpdateEvent)
+- `control.policy.v2` (PolicyUpdateEvent)
 
 Signing implementation (`backend/pkg/ingest/kafka/signing.go`):
 - `ed25519.Sign(privateKey, domain || proto_bytes)`

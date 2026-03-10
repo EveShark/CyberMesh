@@ -68,7 +68,7 @@ Topic names are environment/config driven. Defaults include:
 - `ai.evidence.v1` (AI -> Backend, optional depending on configuration)
 - `ai.policy.v1` (AI -> Backend, optional depending on configuration)
 - `control.commits.v1` (Backend -> AI)
-- `control.policy.v1` (Backend -> Enforcement Agent)
+- `control.policy.v2` (Backend -> Enforcement Agent)
 - `control.enforcement_ack.v1` (Enforcement Agent -> Backend primary consumer, AI optional; configurable)
 - `ai.dlq.v1` (Backend consumer DLQ)
 
@@ -101,7 +101,7 @@ Primary code references:
 
 ### 1.5 Enforcement Agent (Go)
 
-- Consumes `control.policy.v1` from Kafka.
+- Consumes `control.policy.v2` from Kafka.
 - Verifies signature and parses the policy spec.
 - Applies enforcement using a configured backend (cilium, gateway, iptables, nftables, kubernetes/k8s, or noop).
 - Optionally publishes policy acknowledgements for backend/AI feedback.
@@ -116,11 +116,11 @@ Primary code references:
 ### 1.5.1 Enforcement Plane Model (L3/L4)
 
 Control plane path:
-- `AI -> Backend -> control.policy.v1`
+- `AI -> Backend -> control.policy.v2`
 - backend consensus is the authorization gate before enforcement
 
 Data plane path:
-- Enforcement agent consumes `control.policy.v1`
+- Enforcement agent consumes `control.policy.v2`
 - selects backend (`cilium`, `gateway`, `iptables`, `nftables`, `k8s`, `noop`)
 - applies L3/L4 controls and emits ACK on `control.enforcement_ack.v1`
 
@@ -184,7 +184,7 @@ sequenceDiagram
     Backend->>DB: Persist Block & State + Outbox Rows
     Backend-->>Kafka: Publish control.commits.v1
     Backend->>Outbox: Claim pending policy intents (lease/fencing)
-    Outbox-->>Kafka: Publish control.policy.v1
+    Outbox-->>Kafka: Publish control.policy.v2
     deactivate Backend
 
     %% Phase 3: Enforcement & Feedback

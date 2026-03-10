@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
@@ -27,7 +27,7 @@ import (
 func main() {
 	var (
 		brokers  = flag.String("brokers", "127.0.0.1:9092", "kafka brokers (comma-separated)")
-		topic    = flag.String("topic", "control.policy.v1", "policy topic")
+		topic    = flag.String("topic", "control.policy.v2", "policy topic")
 		ackTopic = flag.String("ack-topic", "control.enforcement_ack.v1", "ack topic")
 		waitAck  = flag.Bool("wait-ack", true, "wait for an ACK for this policy id")
 		wait     = flag.Duration("wait", 30*time.Second, "max time to wait for ACK")
@@ -331,7 +331,7 @@ func buildSignedPolicyEvent(priv ed25519.PrivateKey, pub ed25519.PublicKey, opts
 	if err != nil {
 		return nil, err
 	}
-	msg := append([]byte("control.policy.v1"), raw...)
+	msg := append([]byte("control.policy.v2"), raw...)
 	evt.Signature = ed25519.Sign(priv, msg)
 	return evt, nil
 }

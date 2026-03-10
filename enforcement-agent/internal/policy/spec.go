@@ -2,7 +2,7 @@ package policy
 
 import "time"
 
-// PolicySpec represents an actionable policy derived from control.policy.v1 events.
+// PolicySpec represents an actionable policy derived from control.policy.v2 events.
 type PolicySpec struct {
 	ID               string
 	RuleType         string

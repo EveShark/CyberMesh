@@ -7,13 +7,13 @@
 
 ## 1. Problem Statement
 
-The current `control.policy.v1` path is not scaling as a production control plane.
+The current `control.policy.v2` path is the active production control plane and must scale correctly.
 
 Observed live behavior:
 - backend publish is fast
 - enforcement ACK publishing is fast once a message is consumed
 - the dominant delay is `control.policy publish -> enforcement consume`
-- `control.policy.v1` currently runs as a single-partition topic
+- `control.policy.v2` currently carries the active control traffic and must not regress to a single-partition lane
 - enforcement processing is effectively serialized on that lane
 
 This is not primarily a DB problem and not primarily a frontend/API problem.
@@ -32,7 +32,7 @@ The current architecture couples:
 That means faster backend publishing only moves the queue downstream into Kafka before enforcement consumption.
 
 Current live shape:
-- topic: `control.policy.v1`
+- topic: `control.policy.v2`
 - partitions: `1`
 - enforcement concurrency: effectively one ordered consumer lane for that topic
 - ordering domain: treated as global today, even though local code already supports narrower scope semantics
@@ -128,7 +128,7 @@ Why:
 
 ### 6.2 Partition Key
 
-The partition key for `control.policy.v1` should be:
+The partition key for `control.policy.v2` should be:
 - `scope_identifier`
 
 Fallback behavior:
@@ -373,7 +373,7 @@ Derived runtime markers:
 ### 11.4 Wiring
 
 Backend:
-- compute `scope_identifier` before publishing `control.policy.v1`
+- compute `scope_identifier` before publishing `control.policy.v2`
 - export it in logs and bounded metrics
 - preserve the exact same value in message payload metadata for debugging
 
@@ -474,7 +474,7 @@ may remain cluster-global until explicitly redesigned.
 Create a new topic version:
 - `control.policy.v2`
 
-Do not repurpose `control.policy.v1` in place for the production migration.
+Do not reintroduce `control.policy.v1` as the active production topic.
 
 ### 12.3 Code Scope
 
@@ -823,4 +823,4 @@ Proceed with:
 4. Phase 4 hot-path persistence redesign
 5. Phase 5 load validation and rollout
 
-Do not continue tuning a single-partition `control.policy.v1` path as if it were production-scale architecture.
+Do not continue tuning a single-partition `control.policy.v2` path as if it were production-scale architecture.

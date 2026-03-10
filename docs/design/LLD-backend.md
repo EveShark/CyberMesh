@@ -433,7 +433,7 @@ sequenceDiagram
 Current backend write semantics include a durable transactional outbox.
 
 - Commit persistence writes business rows and outbox rows in the same DB transaction.
-- A leased single dispatcher publishes `control.policy.v1`.
+- A leased single dispatcher publishes `control.policy.v2`.
 - Dispatcher applies retries/backoff and marks terminal failures after max retries.
 - ACK correlation updates outbox status to `acked` when matching ACK is stored.
 
@@ -444,7 +444,7 @@ sequenceDiagram
     participant DB as CockroachDB
     participant O as control_policy_outbox
     participant D as Leased Dispatcher
-    participant K as Kafka (control.policy.v1)
+    participant K as Kafka (control.policy.v2)
     participant A as ACK Consumer/Store
 
     C->>DB: PersistBlock BEGIN

@@ -334,7 +334,7 @@ Integrated mode path:
 - consume `sentinel.verdicts.v1`
 - map verdict -> anomaly/policy
 - publish `ai.anomalies.v1` and `ai.policy.v1`
-- backend consensus produces `control.policy.v1` for enforcement
+- backend consensus produces `control.policy.v2` for enforcement
 
 ```mermaid
 sequenceDiagram

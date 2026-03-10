@@ -4,7 +4,7 @@ Message handlers for control messages from backend.
 Handles messages from control.* topics:
 - control.commits.v1 - Committed blocks
 - control.reputation.v1 - Reputation updates
-- control.policy.v1 - Policy updates
+- control.policy.v2 - Policy updates
 - control.evidence.v1 - Evidence requests
 
 Security:

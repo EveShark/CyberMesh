@@ -21,7 +21,7 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// PolicyUpdateEvent represents control.policy.v1 message from backend to AI service
+// PolicyUpdateEvent represents control.policy.v2 message from backend to AI service
 // Purpose: Update AI detection rules/policies dynamically
 // TODO: BACKEND - Implement producer (currently no backend implementation)
 type PolicyUpdateEvent struct {

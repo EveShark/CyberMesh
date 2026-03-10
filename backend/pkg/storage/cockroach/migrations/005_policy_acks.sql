@@ -36,10 +36,9 @@ CREATE TABLE IF NOT EXISTS policy_acks (
     INDEX idx_policy_acks_result (result)
 );
 
-COMMENT ON TABLE policy_acks IS 'Enforcement ACKs emitted by agents for control.policy.v1 policies';
+COMMENT ON TABLE policy_acks IS 'Enforcement ACKs emitted by agents for control.policy.v2 policies';
 COMMENT ON COLUMN policy_acks.policy_id IS 'Policy unique identifier (uuid string)';
 COMMENT ON COLUMN policy_acks.controller_instance IS 'Agent instance id emitting the ACK';
 COMMENT ON COLUMN policy_acks.rule_hash IS 'Rule hash for idempotency/traceability';
 
 COMMIT;
-

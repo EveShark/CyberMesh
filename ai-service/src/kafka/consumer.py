@@ -6,7 +6,7 @@ Uses confluent-kafka (production-grade, wraps librdkafka).
 Topics:
 - control.commits.v1
 - control.reputation.v1
-- control.policy.v1
+- control.policy.v2
 - control.evidence.v1
 """
 import os

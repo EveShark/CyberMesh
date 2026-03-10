@@ -1,7 +1,7 @@
 """
 PolicyUpdateEvent - Dynamic policy update (Backend → AI)
 
-Topic: control.policy.v1
+Topic: control.policy.v2
 Purpose: Update AI detection rules/policies dynamically
 """
 import hashlib
@@ -19,10 +19,10 @@ class PolicyUpdateEvent:
     Security:
     - Ed25519 signature verification
     - SHA-256 rule_hash verification
-    - Domain separation: "control.policy.v1"
+    - Domain separation: "control.policy.v2"
     """
     
-    DOMAIN = "control.policy.v1"
+    DOMAIN = "control.policy.v2"
     
     def __init__(
         self,

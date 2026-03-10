@@ -162,7 +162,7 @@ flowchart LR
         K1[ai.anomalies.v1]
         K1b[ai.policy.v1]
         K2[control.commits.v1]
-        K3[control.policy.v1]
+        K3[control.policy.v2]
         K4[control.enforcement_ack.v1]
     end
     
@@ -237,7 +237,7 @@ flowchart LR
 CyberMesh enforcement is split into:
 
 - Control plane:
-  - `AI -> Backend -> control.policy.v1`
+  - `AI -> Backend -> control.policy.v2`
   - policy intent, consensus authorization, signed policy distribution
 - Data plane:
   - `Enforcement Agent -> backend driver -> runtime network stack`
@@ -442,7 +442,7 @@ graph LR
         T2[ai.evidence.v1]
         T3[ai.policy.v1]
         T4[control.commits.v1]
-        T5[control.policy.v1]
+        T5[control.policy.v2]
         T6[control.enforcement_ack.v1]
         T7[ai.dlq.v1]
     end

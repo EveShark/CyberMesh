@@ -283,7 +283,7 @@ def load_kafka_config(environment: str) -> tuple[KafkaTopicsConfig, KafkaProduce
         ai_policy=_get_env("TOPIC_AI_POLICY", "ai.policy.v1"),
         control_commits=_get_env("TOPIC_CONTROL_COMMITS", "control.commits.v1"),
         control_reputation=_get_env("TOPIC_CONTROL_REPUTATION", "control.reputation.v1"),
-        control_policy=_get_env("TOPIC_CONTROL_POLICY", "control.policy.v1"),
+        control_policy=_get_env("TOPIC_CONTROL_POLICY", "control.policy.v2"),
         control_evidence=_get_env("TOPIC_CONTROL_EVIDENCE", "control.evidence.v1"),
         dlq=_get_env("TOPIC_DLQ", "ai.dlq.v1")
     )

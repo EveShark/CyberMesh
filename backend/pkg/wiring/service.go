@@ -467,7 +467,7 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 					policySignerCfg := kafka.CommitSignerConfig{
 						KeyPath:    policyKeyPath,
 						KeyID:      cfg.ConfigManager.GetString("CONTROL_POLICY_SIGNING_KEY_ID", signerCfg.KeyID),
-						Domain:     cfg.ConfigManager.GetString("CONTROL_POLICY_SIGNING_DOMAIN", "control.policy.v1"),
+						Domain:     cfg.ConfigManager.GetString("CONTROL_POLICY_SIGNING_DOMAIN", "control.policy.v2"),
 						ProducerID: cfg.ConfigManager.GetString("CONTROL_POLICY_PRODUCER_ID", cfg.ConfigManager.GetString("CONTROL_PRODUCER_ID", "")),
 						Logger:     log,
 					}

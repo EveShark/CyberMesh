@@ -70,7 +70,7 @@ The backend receives anomaly/policy/evidence events from AI service via Kafka an
 
 - **Incoming**: ai.anomalies.v1, ai.evidence.v1, ai.policy.v1 (AI → Backend)
 - **Feedback Ingestion**: control.enforcement_ack.v1 (Enforcement → Backend policy-ack consumer; persisted for ops/visibility)
-- **Outgoing**: control.commits.v1, control.reputation.v1, control.policy.v1 (Backend → AI/Enforcement)
+- **Outgoing**: control.commits.v1, control.reputation.v1, control.policy.v2 (Backend → AI/Enforcement)
 - **Message Format**: Protobuf with Ed25519 signatures
 
 See `ai-service/README.md` for AI service architecture.
@@ -250,7 +250,7 @@ KAFKA_MAX_TIMESTAMP_SKEW=5m          # Max clock skew tolerance
 ```bash
 CONTROL_COMMITS_TOPIC=control.commits.v1
 CONTROL_REPUTATION_TOPIC=control.reputation.v1
-CONTROL_POLICY_TOPIC=control.policy.v1
+CONTROL_POLICY_TOPIC=control.policy.v2
 CONTROL_EVIDENCE_TOPIC=control.evidence.v1
 ```
 

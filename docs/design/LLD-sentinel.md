@@ -177,8 +177,8 @@ Key env:
   - `ai.policy.v1` (when policy candidate exists)
 
 ### 8.2 Backend + Enforcement
-- Backend consumes `ai.policy.v1` and publishes `control.policy.v1`
-- Enforcement consumes `control.policy.v1` and emits `control.enforcement_ack.v1`
+- Backend consumes `ai.policy.v1` and publishes `control.policy.v2`
+- Enforcement consumes `control.policy.v2` and emits `control.enforcement_ack.v1`
 
 ---
 

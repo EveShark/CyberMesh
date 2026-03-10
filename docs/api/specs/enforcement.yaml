@@ -5,7 +5,7 @@ info:
   description: |
     Go-based enforcement agent for CyberMesh policy execution.
 
-    Consumes policy events from Kafka (`control.policy.v1`) and enforces
+    Consumes policy events from Kafka (`control.policy.v2`) and enforces
     them via configurable backends (Cilium, iptables, nftables, Kubernetes NetworkPolicy, Gateway API).
 
     Provides health probes, Prometheus metrics, and control endpoints for
