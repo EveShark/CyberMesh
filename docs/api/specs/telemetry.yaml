@@ -1,0 +1,48 @@
+openapi: 3.1.0
+info:
+  title: CyberMesh Telemetry Layer API
+  version: 1.0.0
+  description: |
+    Go-based telemetry ingestion layer for CyberMesh.
+
+    The telemetry layer consists of the **Ingest Bridge** and **Stream Processor**.
+    It consumes network telemetry (IPFIX, NetFlow, sFlow) and publishes structured
+    events to Kafka (`telemetry.flow.v1`).
+
+    The only HTTP endpoint is a Prometheus metrics scrape endpoint.
+    All other communication is via Kafka topics.
+
+    **Port:** configurable via `METRICS_PORT` (default `:2112`)
+  contact:
+    name: CyberMesh Team
+    url: https://cybermesh.qzz.io
+
+servers:
+  - url: http://localhost:2112
+    description: Local development
+  - url: http://telemetry-ingest:2112
+    description: In-cluster (Kubernetes)
+
+tags:
+  - name: Metrics
+    description: Prometheus metrics scraping
+
+paths:
+  /metrics:
+    get:
+      tags: [Metrics]
+      summary: Prometheus metrics
+      description: |
+        Exposes telemetry pipeline metrics in Prometheus text format.
+
+        Key metrics include:
+        - `telemetry_flows_ingested_total` — total flows received
+        - `telemetry_flows_published_total` — flows published to Kafka
+        - `telemetry_flows_dropped_total` — flows dropped (errors/backpressure)
+        - `telemetry_ingest_latency_seconds` — histogram of ingest latency
+      operationId: getMetrics
+      responses:
+        "200":
+          description: Prometheus text format metrics
+          content:
+            text/plain: {}

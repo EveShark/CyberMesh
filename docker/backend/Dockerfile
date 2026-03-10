@@ -1,5 +1,5 @@
 # Multi-stage build for CyberMesh Consensus Backend
-# Optimized for size and security
+# Optimized for size and repeat-build speed
 
 # ============================================================
 # Stage 1: Builder
@@ -8,20 +8,11 @@ FROM mirror.gcr.io/library/golang:1.25 AS builder
 
 WORKDIR /src
 
-# Add CA certificates and configure git for network handling
-RUN apt-get update && apt-get install -y ca-certificates git curl && \
-    git config --global http.timeout 60 && \
-    git config --global http.lowSpeedLimit 0 && \
-    git config --global http.lowSpeedTime 999999 && \
-    rm -rf /var/lib/apt/lists/*
-
-# Cache go modules first with fallback proxies
+# Cache go modules first
 COPY backend/go.mod backend/go.sum ./
-ENV GOPROXY=https://proxy.golang.org,https://goproxy.io,https://goproxy.cn,direct
+ENV GOPROXY=https://proxy.golang.org,direct
 ENV GOSUMDB=sum.golang.org
-RUN timeout 600 go mod download || \
-    (echo "Retrying with direct proxy..." && \
-     GOPROXY=direct GOSUMDB=off timeout 300 go mod download)
+RUN go mod download
 
 # Copy source code
 COPY backend/cmd/ ./cmd/

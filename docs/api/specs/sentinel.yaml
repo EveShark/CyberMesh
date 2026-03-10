@@ -1,0 +1,392 @@
+openapi: 3.1.0
+info:
+  title: CyberMesh Sentinel API
+  version: 1.0.0
+  description: |
+    Malware Detection API powered by CyberMesh Sentinel.
+
+    Provides file scanning, hash lookups, threat intelligence,
+    scan history management, and health monitoring.
+
+    Built with **FastAPI**. Interactive docs also available at `/docs` (debug mode).
+  contact:
+    name: CyberMesh Team
+    url: https://cybermesh.qzz.io
+
+servers:
+  - url: http://localhost:8000
+    description: Local development
+  - url: http://sentinel-api:8000
+    description: In-cluster (Kubernetes)
+
+tags:
+  - name: Health
+    description: Health checks and API info
+  - name: Scanning
+    description: File scanning for malware
+  - name: History
+    description: Scan history and user stats
+  - name: Threat Intelligence
+    description: Hash lookups and threat DB stats
+
+paths:
+  /:
+    get:
+      tags: [Health]
+      summary: Root endpoint
+      description: Returns API name, version, and links.
+      operationId: root
+      responses:
+        "200":
+          description: API info
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: { type: string, example: Sentinel API }
+                  version: { type: string }
+                  health: { type: string, example: /health }
+
+  /health:
+    get:
+      tags: [Health]
+      summary: Simple health check
+      operationId: healthCheck
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      status: { type: string, example: healthy }
+                      version: { type: string }
+                      uptime_seconds: { type: integer }
+
+  /health/deep:
+    get:
+      tags: [Health]
+      summary: Deep health check
+      description: |
+        Checks all critical components:
+        - Sentinel engine initialization
+        - Database (Supabase) connectivity
+        - Cache status
+      operationId: deepHealthCheck
+      responses:
+        "200":
+          description: Component-level health
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      status: { type: string, enum: [healthy, degraded] }
+                      components:
+                        type: object
+                        properties:
+                          sentinel: { type: object }
+                          database: { type: object }
+                          cache: { type: object }
+
+  /api/v1/info:
+    get:
+      tags: [Health]
+      summary: API information
+      operationId: apiInfo
+      responses:
+        "200":
+          description: API config and feature flags
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      name: { type: string }
+                      version: { type: string }
+                      features:
+                        type: object
+                        properties:
+                          async_scan: { type: boolean }
+                          rate_limit: { type: boolean }
+                          cache: { type: boolean }
+                      limits:
+                        type: object
+                        properties:
+                          max_file_size_mb: { type: integer }
+                          rate_limit_per_minute: { type: integer }
+
+  /api/v1/scan:
+    post:
+      tags: [Scanning]
+      summary: Scan a file for malware
+      description: |
+        Upload and scan a file for malware.
+        - Supports files up to 50MB (configurable)
+        - Results cached by file hash
+        - Authenticated users get scan history saved to Supabase
+
+        Returns verdict (clean/suspicious/malicious), confidence, detections, and IOCs.
+      operationId: scanFile
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: File to scan (max 50MB)
+      responses:
+        "200":
+          description: Scan result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ScanResponse" }
+        "413": { description: File too large }
+        "422": { description: Validation error }
+        "429": { description: Rate limited }
+
+  /api/v1/scan/hash:
+    post:
+      tags: [Scanning]
+      summary: Lookup file hash
+      description: Check a SHA256 hash against the malware database without uploading a file.
+      operationId: scanHash
+      parameters:
+        - name: hash
+          in: query
+          required: true
+          schema: { type: string, minLength: 64, maxLength: 64 }
+          description: SHA256 hash
+      responses:
+        "200":
+          description: Hash lookup result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      hash: { type: string }
+                      known: { type: boolean }
+                      verdict: { type: string }
+                      family: { type: string }
+
+  /api/v1/scans/{scan_id}:
+    get:
+      tags: [History]
+      summary: Get scan result by ID
+      description: Requires authentication. Users can only access their own scans.
+      operationId: getScan
+      security: [{ SupabaseAuth: [] }]
+      parameters:
+        - name: scan_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Scan detail }
+        "404": { description: Scan not found }
+        "401": { description: Unauthorized }
+
+  /api/v1/history:
+    get:
+      tags: [History]
+      summary: Get scan history
+      description: Paginated scan history for the authenticated user.
+      operationId: getHistory
+      security: [{ SupabaseAuth: [] }]
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20, maximum: 100 }
+      responses:
+        "200":
+          description: Scan history
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      items: { type: array, items: { $ref: "#/components/schemas/ScanHistoryItem" } }
+                      total: { type: integer }
+                      page: { type: integer }
+                      has_more: { type: boolean }
+        "401": { description: Unauthorized }
+
+  /api/v1/history/{scan_id}:
+    delete:
+      tags: [History]
+      summary: Delete scan from history
+      description: Permanent deletion (GDPR compliance). Users can only delete their own scans.
+      operationId: deleteScan
+      security: [{ SupabaseAuth: [] }]
+      parameters:
+        - name: scan_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Deleted successfully }
+        "404": { description: Scan not found }
+        "401": { description: Unauthorized }
+
+  /api/v1/stats:
+    get:
+      tags: [History]
+      summary: Get user scan statistics
+      description: Total scans, breakdown by verdict, detection rate.
+      operationId: getUserStats
+      security: [{ SupabaseAuth: [] }]
+      responses:
+        "200":
+          description: User statistics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      total_scans: { type: integer }
+                      verdicts:
+                        type: object
+                        properties:
+                          clean: { type: integer }
+                          suspicious: { type: integer }
+                          malicious: { type: integer }
+                      detection_rate: { type: number }
+
+  /api/v1/threats/hash/{file_hash}:
+    get:
+      tags: [Threat Intelligence]
+      summary: Lookup hash in threat DB
+      operationId: lookupThreatHash
+      parameters:
+        - name: file_hash
+          in: path
+          required: true
+          schema: { type: string, minLength: 64, maxLength: 64 }
+          description: SHA256 hash (64 hex characters)
+      responses:
+        "200":
+          description: Threat lookup result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      hash: { type: string }
+                      found: { type: boolean }
+                      verdict: { type: string }
+                      family: { type: string }
+                      threat_level: { type: string }
+
+  /api/v1/threats/stats:
+    get:
+      tags: [Threat Intelligence]
+      summary: Threat database statistics
+      operationId: getThreatStats
+      responses:
+        "200":
+          description: Threat DB stats
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      malware_hashes: { type: integer }
+                      yara_rules: { type: integer }
+                      signatures: { type: integer }
+                      engine_initialized: { type: boolean }
+
+components:
+  securitySchemes:
+    SupabaseAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Supabase JWT token from user authentication
+
+  schemas:
+    ScanResponse:
+      type: object
+      properties:
+        success: { type: boolean }
+        data:
+          type: object
+          properties:
+            scan_id: { type: string, example: a1b2c3d4 }
+            verdict: { type: string, enum: [clean, suspicious, malicious] }
+            confidence: { type: number, example: 0.95 }
+            threat_level: { type: string, enum: [none, low, medium, high, critical] }
+            risk_score: { type: number }
+            processing_time_ms: { type: integer, example: 1200 }
+            file:
+              type: object
+              properties:
+                name: { type: string }
+                hash: { type: string }
+                size: { type: integer }
+                size_human: { type: string }
+                type: { type: string }
+            detections: { type: object }
+            iocs: { type: object }
+            charts: { type: object }
+        meta: { $ref: "#/components/schemas/ResponseMeta" }
+
+    ScanHistoryItem:
+      type: object
+      properties:
+        scan_id: { type: string }
+        file_name: { type: string }
+        file_hash: { type: string }
+        file_size: { type: integer }
+        verdict: { type: string }
+        threat_level: { type: string }
+        created_at: { type: string, format: date-time }
+
+    ResponseMeta:
+      type: object
+      properties:
+        request_id: { type: string }
+        processing_time_ms: { type: integer }
+        timestamp: { type: string, format: date-time }

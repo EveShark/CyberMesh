@@ -1,0 +1,590 @@
+openapi: 3.1.0
+info:
+  title: CyberMesh Backend API
+  version: 2.0.0
+  description: |
+    Go backend API for the CyberMesh distributed cybersecurity mesh platform.
+
+    Provides dashboard aggregation, blockchain data, consensus metrics, anomaly detection,
+    AI metrics proxy, policy control plane, and infrastructure health endpoints.
+
+    **Base path:** `/api/v1`
+  contact:
+    name: CyberMesh Team
+    url: https://cybermesh.qzz.io
+  license:
+    name: Proprietary
+
+servers:
+  - url: https://api.cybermesh.qzz.io/api/v1
+    description: Production
+  - url: http://localhost:8080/api/v1
+    description: Local development
+
+tags:
+  - name: Dashboard
+    description: Aggregated dashboard overview (primary frontend endpoint)
+  - name: Blocks
+    description: Blockchain block data and state
+  - name: State
+    description: Ledger state queries
+  - name: Validators
+    description: Validator registry
+  - name: Stats
+    description: System-wide statistics
+  - name: Network
+    description: P2P network topology
+  - name: Consensus
+    description: Consensus engine status
+  - name: Anomalies
+    description: Anomaly detection feed and stats
+  - name: AI
+    description: AI detection engine metrics and history
+  - name: Policies
+    description: Policy acknowledgement tracking
+  - name: Control Plane
+    description: Control plane operations (outbox, traces, leases, safe-mode)
+  - name: Health
+    description: Health and readiness probes
+  - name: Config
+    description: Frontend configuration
+
+paths:
+  # ── Dashboard ──────────────────────────────────────────────
+  /dashboard/overview:
+    get:
+      tags: [Dashboard]
+      summary: Get dashboard overview
+      description: |
+        Returns a comprehensive dashboard aggregation with 8 sections built in parallel (errgroup):
+        backend metrics, blocks, threats, AI, ledger, validators, network, and consensus.
+
+        **This is the primary endpoint consumed by the frontend.** 5 of 6 frontend adapter domains read from this single response.
+      operationId: getDashboardOverview
+      security: [{ BearerAuth: [] }]
+      responses:
+        "200":
+          description: Dashboard overview
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+        "401": { description: Unauthorized }
+        "429": { description: Rate limited }
+        "500": { description: Internal server error }
+
+  # ── Blocks ─────────────────────────────────────────────────
+  /blocks:
+    get:
+      tags: [Blocks]
+      summary: List recent blocks
+      operationId: getBlocks
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 100 }
+          description: Max blocks to return
+        - name: start
+          in: query
+          schema: { type: integer }
+          description: Start height
+      responses:
+        "200":
+          description: Block list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/Block" }
+
+  /blocks/latest:
+    get:
+      tags: [Blocks]
+      summary: Get latest block
+      operationId: getLatestBlock
+      security: [{ BearerAuth: [] }]
+      responses:
+        "200": { description: Latest block }
+
+  /blocks/{height}:
+    get:
+      tags: [Blocks]
+      summary: Get block by height
+      operationId: getBlockByHeight
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: height
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200": { description: Block at height }
+        "404": { description: Not found }
+
+  # ── State ──────────────────────────────────────────────────
+  /state/root:
+    get:
+      tags: [State]
+      summary: Get state root hash
+      operationId: getStateRoot
+      security: [{ BearerAuth: [] }]
+      responses:
+        "200": { description: Current state root }
+
+  /state/{key}:
+    get:
+      tags: [State]
+      summary: Get state value by key
+      operationId: getStateByKey
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: State value }
+        "404": { description: Key not found }
+
+  # ── Validators ─────────────────────────────────────────────
+  /validators:
+    get:
+      tags: [Validators]
+      summary: List validators
+      operationId: getValidators
+      security: [{ BearerAuth: [] }]
+      responses:
+        "200":
+          description: Validator list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  validators:
+                    type: array
+                    items: { $ref: "#/components/schemas/Validator" }
+
+  # ── Stats ──────────────────────────────────────────────────
+  /stats:
+    get:
+      tags: [Stats]
+      summary: Get system-wide statistics
+      operationId: getStats
+      security: [{ BearerAuth: [] }]
+      responses:
+        "200":
+          description: Aggregated stats (chain, consensus, mempool, network, storage, redis)
+
+  # ── Network ────────────────────────────────────────────────
+  /network/overview:
+    get:
+      tags: [Network]
+      summary: Get network topology overview
+      operationId: getNetworkOverview
+      security: [{ BearerAuth: [] }]
+      responses:
+        "200":
+          description: Network overview with peers, latency, edges
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NetworkOverview" }
+
+  # ── Consensus ──────────────────────────────────────────────
+  /consensus/overview:
+    get:
+      tags: [Consensus]
+      summary: Get consensus overview
+      operationId: getConsensusOverview
+      security: [{ BearerAuth: [] }]
+      responses:
+        "200":
+          description: Consensus state with proposals, votes, suspicious nodes
+
+  # ── Anomalies ──────────────────────────────────────────────
+  /anomalies:
+    get:
+      tags: [Anomalies]
+      summary: List anomalies
+      operationId: getAnomalies
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50 }
+        - name: severity
+          in: query
+          schema: { type: string, enum: [critical, high, medium, low] }
+      responses:
+        "200": { description: Anomaly feed }
+
+  /anomalies/stats:
+    get:
+      tags: [Anomalies]
+      summary: Get anomaly statistics
+      operationId: getAnomalyStats
+      responses:
+        "200": { description: Anomaly counts by severity }
+
+  /anomalies/suspicious-nodes:
+    get:
+      tags: [Anomalies]
+      summary: Get suspicious validator nodes
+      operationId: getSuspiciousNodes
+      security: [{ BearerAuth: [] }]
+      responses:
+        "200": { description: Suspicious node list }
+
+  # ── AI ─────────────────────────────────────────────────────
+  /ai/metrics:
+    get:
+      tags: [AI]
+      summary: Get AI detection metrics
+      description: Returns detection loop status, engines, variants, and derived throughput stats.
+      operationId: getAIMetrics
+      security: [{ BearerAuth: [] }]
+      responses:
+        "200":
+          description: AI metrics
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AIMetrics" }
+
+  /ai/variants:
+    get:
+      tags: [AI]
+      summary: Get AI detection variants
+      operationId: getAIVariants
+      security: [{ BearerAuth: [] }]
+      responses:
+        "200": { description: Variant metrics list }
+
+  /ai/history:
+    get:
+      tags: [AI]
+      summary: Get AI detection history
+      operationId: getAIHistory
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 200 }
+        - name: since
+          in: query
+          schema: { type: string, format: date-time }
+        - name: validator_id
+          in: query
+          schema: { type: string }
+      responses:
+        "200": { description: Detection history entries }
+
+  /ai/suspicious-nodes:
+    get:
+      tags: [AI]
+      summary: Get AI-detected suspicious nodes
+      operationId: getAISuspiciousNodes
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20, maximum: 50 }
+      responses:
+        "200": { description: Suspicious node details }
+
+  # ── Policies ───────────────────────────────────────────────
+  /policies/acks:
+    get:
+      tags: [Policies]
+      summary: List policy acknowledgements
+      operationId: getPolicyAcks
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: policy_id
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50 }
+      responses:
+        "200": { description: Policy ACK list }
+
+  /policies/acks/{id}:
+    get:
+      tags: [Policies]
+      summary: Get policy ACK by ID
+      operationId: getPolicyAckById
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Single policy ACK }
+        "404": { description: Not found }
+
+  # ── Control Plane ──────────────────────────────────────────
+  /control/outbox:
+    get:
+      tags: [Control Plane]
+      summary: List outbox entries
+      operationId: getControlOutbox
+      security: [{ BearerAuth: [] }]
+      responses:
+        "200": { description: Outbox entry list }
+
+  /control/outbox/backlog:
+    get:
+      tags: [Control Plane]
+      summary: Get outbox backlog count
+      operationId: getControlOutboxBacklog
+      security: [{ BearerAuth: [] }]
+      responses:
+        "200": { description: Backlog count }
+
+  /control/outbox/{id}:
+    get:
+      tags: [Control Plane]
+      summary: Get outbox entry by ID
+      operationId: getControlOutboxById
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Single outbox entry }
+
+  /control/trace:
+    get:
+      tags: [Control Plane]
+      summary: List policy traces
+      operationId: getControlTraces
+      security: [{ BearerAuth: [] }]
+      responses:
+        "200": { description: Trace list }
+
+  /control/trace/{policyId}:
+    get:
+      tags: [Control Plane]
+      summary: Get trace by policy ID
+      operationId: getControlTraceByPolicy
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: policyId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Policy trace }
+
+  /control/leases:
+    get:
+      tags: [Control Plane]
+      summary: List active leases
+      operationId: getControlLeases
+      security: [{ BearerAuth: [] }]
+      responses:
+        "200": { description: Active leases }
+
+  "/control/leases:force-takeover":
+    post:
+      tags: [Control Plane]
+      summary: Force lease takeover
+      operationId: forceControlLeaseTakeover
+      security: [{ BearerAuth: [] }]
+      responses:
+        "200": { description: Takeover result }
+        "403": { description: Forbidden }
+
+  "/control/safe-mode:toggle":
+    post:
+      tags: [Control Plane]
+      summary: Toggle safe mode
+      operationId: toggleSafeMode
+      security: [{ BearerAuth: [] }]
+      responses:
+        "200": { description: Safe mode toggled }
+
+  /control/acks:
+    get:
+      tags: [Control Plane]
+      summary: List control ACKs
+      operationId: getControlAcks
+      security: [{ BearerAuth: [] }]
+      responses:
+        "200": { description: ACK list }
+
+  # ── Health ─────────────────────────────────────────────────
+  /health:
+    get:
+      tags: [Health]
+      summary: Liveness probe
+      operationId: getHealth
+      responses:
+        "200":
+          description: Service alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: healthy }
+                  timestamp: { type: integer }
+        "503": { description: Unhealthy }
+
+  /ready:
+    get:
+      tags: [Health]
+      summary: Readiness probe
+      operationId: getReady
+      responses:
+        "200":
+          description: Service ready
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ready: { type: boolean }
+                  checks:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        status: { type: string }
+                        latency_ms: { type: number }
+        "503": { description: Not ready }
+
+  /metrics:
+    get:
+      tags: [Health]
+      summary: Prometheus metrics
+      operationId: getMetrics
+      responses:
+        "200":
+          description: Prometheus text format
+          content:
+            text/plain: {}
+
+  # ── Config ─────────────────────────────────────────────────
+  /frontend-config:
+    get:
+      tags: [Config]
+      summary: Get frontend configuration
+      operationId: getFrontendConfig
+      responses:
+        "200": { description: Frontend config object }
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    SuccessResponse:
+      type: object
+      properties:
+        success: { type: boolean, example: true }
+        data: { type: object }
+        meta:
+          type: object
+          properties:
+            request_id: { type: string }
+            timestamp: { type: integer }
+            version: { type: string }
+
+    Block:
+      type: object
+      properties:
+        height: { type: integer, example: 42 }
+        hash: { type: string, example: "0xabc123..." }
+        parent_hash: { type: string }
+        timestamp: { type: integer, description: Seconds since epoch }
+        proposer: { type: string, example: Draco }
+        transaction_count: { type: integer }
+        anomaly_count: { type: integer }
+        size_bytes: { type: integer }
+        transactions:
+          type: array
+          items:
+            type: object
+            properties:
+              hash: { type: string }
+              type: { type: string }
+              size_bytes: { type: integer }
+              status: { type: string }
+
+    Validator:
+      type: object
+      properties:
+        id: { type: string }
+        address: { type: string }
+        status: { type: string, enum: [active, inactive] }
+        alias: { type: string }
+        reputation: { type: number }
+        uptime_percentage: { type: number }
+
+    NetworkOverview:
+      type: object
+      properties:
+        connected_peers: { type: integer }
+        total_peers: { type: integer }
+        average_latency_ms: { type: number }
+        consensus_round: { type: integer }
+        leader: { type: string }
+        leader_id: { type: string }
+        phase: { type: string }
+        nodes:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              name: { type: string }
+              status: { type: string }
+              latency: { type: number }
+              uptime: { type: number }
+
+    AIMetrics:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, degraded, error] }
+        state: { type: string }
+        message: { type: string }
+        loop:
+          type: object
+          properties:
+            running: { type: boolean }
+            status: { type: string }
+            avg_latency_ms: { type: number }
+            last_latency_ms: { type: number }
+            counters:
+              type: object
+              properties:
+                detections_total: { type: integer }
+                detections_published: { type: integer }
+                errors: { type: integer }
+                loop_iterations: { type: integer }
+        engines:
+          type: array
+          items:
+            type: object
+            properties:
+              engine: { type: string }
+              ready: { type: boolean }
+              candidates: { type: integer }
+              published: { type: integer }
+              publish_ratio: { type: number }
+        derived:
+          type: object
+          properties:
+            detections_per_minute: { type: number }
+            publish_success_ratio: { type: number }

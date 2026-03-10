@@ -10,7 +10,7 @@ set -e
 
 # Configuration
 IMAGE_NAME="cybermesh-frontend"
-REGISTRY="gcr.io/YOUR_PROJECT_ID"  # Update with your GCP project ID
+REGISTRY="${REGISTRY:-cybermeshrg.azurecr.io}"
 TAG="${1:-latest}"
 FULL_IMAGE="${REGISTRY}/${IMAGE_NAME}:${TAG}"
 
@@ -45,6 +45,8 @@ docker build \
     --build-arg VITE_SUPABASE_URL="${VITE_SUPABASE_URL}" \
     --build-arg VITE_SUPABASE_PUBLISHABLE_KEY="${VITE_SUPABASE_PUBLISHABLE_KEY}" \
     --build-arg VITE_DEMO_MODE="${VITE_DEMO_MODE:-false}" \
+    --build-arg VITE_BACKEND_URL="${VITE_BACKEND_URL}" \
+    --build-arg VITE_LANDING_URL="${VITE_LANDING_URL:-/}" \
     .
 
 echo -e "${GREEN}✓ Build complete!${NC}"

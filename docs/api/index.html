@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CyberMesh API Documentation</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        .service-bar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            z-index: 9999;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 8px 20px;
+            background: linear-gradient(135deg, #0f0f1a 0%, #1a1a2e 100%);
+            border-bottom: 1px solid rgba(124, 77, 255, 0.3);
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+        }
+
+        .service-bar .logo {
+            font-size: 15px;
+            font-weight: 700;
+            color: #e0e0ff;
+            letter-spacing: 0.5px;
+        }
+
+        .service-bar .logo span {
+            color: #7c4dff;
+        }
+
+        .service-bar select {
+            background: #16162a;
+            color: #c8c8ff;
+            border: 1px solid #333;
+            border-radius: 6px;
+            padding: 5px 10px;
+            font-size: 13px;
+            cursor: pointer;
+            outline: none;
+            font-family: inherit;
+        }
+
+        .service-bar select:hover {
+            border-color: #7c4dff;
+        }
+
+        .service-bar .meta {
+            margin-left: auto;
+            font-size: 11px;
+            color: #666;
+        }
+
+        #api-reference {
+            margin-top: 44px;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="service-bar">
+        <div class="logo">Cyber<span>Mesh</span> API</div>
+        <select id="service-select">
+            <option value="specs/backend.yaml">Backend API (Go) — 30 endpoints</option>
+            <option value="specs/ai-service.yaml">AI Service (Python) — 10 endpoints</option>
+            <option value="specs/sentinel.yaml">Sentinel API (FastAPI) — 12 endpoints</option>
+            <option value="specs/enforcement.yaml">Enforcement Agent (Go) — 7 endpoints</option>
+            <option value="specs/telemetry.yaml">Telemetry Layer (Go) — 1 endpoint</option>
+        </select>
+        <div class="meta">Powered by Scalar</div>
+    </div>
+
+    <div id="api-reference"></div>
+
+    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
+    <script>
+        const container = document.getElementById('api-reference');
+        const select = document.getElementById('service-select');
+
+        function loadSpec(specUrl) {
+            // Clear previous
+            container.innerHTML = '';
+
+            // Create fresh script element for Scalar
+            const script = document.createElement('script');
+            script.id = 'api-reference-script';
+            script.type = 'application/json';
+            script.dataset.url = specUrl;
+            script.dataset.configuration = JSON.stringify({
+                theme: 'kepler',
+                darkMode: true,
+                layout: 'modern',
+                searchHotKey: 'k',
+                hideDownloadButton: false,
+                hiddenClients: [],
+                defaultHttpClient: { targetKey: 'javascript', clientKey: 'fetch' }
+            });
+            container.appendChild(script);
+
+            // Reload Scalar by re-adding its script
+            const oldScalar = document.querySelector('script[src*="@scalar/api-reference"]');
+            if (oldScalar) {
+                const newScalar = document.createElement('script');
+                newScalar.src = oldScalar.src;
+                oldScalar.remove();
+                document.body.appendChild(newScalar);
+            }
+        }
+
+        // Load initial spec
+        loadSpec(select.value);
+
+        // Switch on dropdown change
+        select.addEventListener('change', () => {
+            loadSpec(select.value);
+        });
+    </script>
+</body>
+
+</html>

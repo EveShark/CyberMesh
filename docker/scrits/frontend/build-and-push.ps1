@@ -7,20 +7,17 @@
 
 param(
     [string]$Tag = "latest",
-    [string]$Region = "us-central1",
-    [string]$ProjectId = "sunny-vehicle-482107-p5",
-    [string]$Repository = "cybermesh-repo",
+    [string]$Registry = "cybermeshrg.azurecr.io",
     [switch]$Push = $false
 )
 
 $ImageName = "cybermesh-frontend"
-$Registry = "${Region}-docker.pkg.dev/${ProjectId}/${Repository}"
 $FullImage = "${Registry}/${ImageName}:${Tag}"
 
 Write-Host "=== Building CyberMesh Frontend Docker Image ===" -ForegroundColor Green
 Write-Host "Image: $FullImage" -ForegroundColor Yellow
-Write-Host "Registry: GKE Artifact Registry ($Region)" -ForegroundColor Cyan
-Write-Host "Repository: $Repository" -ForegroundColor Cyan
+Write-Host "Registry: Azure Container Registry" -ForegroundColor Cyan
+Write-Host "Login Server: $Registry" -ForegroundColor Cyan
 Write-Host ""
 
 # Navigate to project root
@@ -44,11 +41,14 @@ if (Test-Path $envFile) {
     $VITE_SUPABASE_URL = $envVars['VITE_SUPABASE_URL']
     $VITE_SUPABASE_PUBLISHABLE_KEY = $envVars['VITE_SUPABASE_PUBLISHABLE_KEY']
     $VITE_DEMO_MODE = $envVars['VITE_DEMO_MODE']
+    $VITE_BACKEND_URL = $envVars['VITE_BACKEND_URL']
+    $VITE_LANDING_URL = $envVars['VITE_LANDING_URL']
     
     if (-not $VITE_SUPABASE_PROJECT_ID) {
         Write-Host "Error: VITE_SUPABASE_PROJECT_ID not found in .env" -ForegroundColor Red
         exit 1
     }
+    $LandingUrlForBuild = if ([string]::IsNullOrWhiteSpace($VITE_LANDING_URL)) { "/" } else { $VITE_LANDING_URL }
 } else {
     Write-Host "Error: .env file not found at $envFile" -ForegroundColor Red
     exit 1
@@ -65,6 +65,8 @@ docker build `
     --build-arg "VITE_SUPABASE_URL=$VITE_SUPABASE_URL" `
     --build-arg "VITE_SUPABASE_PUBLISHABLE_KEY=$VITE_SUPABASE_PUBLISHABLE_KEY" `
     --build-arg "VITE_DEMO_MODE=$VITE_DEMO_MODE" `
+    --build-arg "VITE_BACKEND_URL=$VITE_BACKEND_URL" `
+    --build-arg "VITE_LANDING_URL=$LandingUrlForBuild" `
     .
 
 if ($LASTEXITCODE -ne 0) {

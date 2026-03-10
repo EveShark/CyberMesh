@@ -1,0 +1,315 @@
+openapi: 3.1.0
+info:
+  title: CyberMesh AI Service API
+  version: 1.0.0
+  description: |
+    Python-based AI detection service for CyberMesh.
+
+    Provides health/readiness probes, Prometheus metrics, detection loop statistics,
+    detection history, suspicious node analysis, and Kafka operational endpoints.
+
+    **Port:** 8080 (configurable)
+  contact:
+    name: CyberMesh Team
+    url: https://cybermesh.qzz.io
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+  - url: http://ai-service:8080
+    description: In-cluster (Kubernetes)
+
+tags:
+  - name: Health
+    description: Liveness and readiness probes
+  - name: Metrics
+    description: Prometheus metrics scraping
+  - name: Detections
+    description: Detection loop stats and history
+  - name: Operations
+    description: Kafka consumer and emitter operational endpoints (requires auth)
+
+security: []
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Liveness probe
+      description: Returns 200 if the service process is running. Returns 503 if the service is in an error or stopped state.
+      operationId: getHealth
+      responses:
+        "200":
+          description: Service alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [healthy, unhealthy], example: healthy }
+                  state: { type: string, example: running }
+                  uptime_seconds: { type: number, example: 3600 }
+        "503":
+          description: Service unhealthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: unhealthy }
+                  state: { type: string }
+                  error: { type: string }
+        "500": { description: Exception during health check }
+
+  /ready:
+    get:
+      tags: [Health]
+      summary: Readiness probe
+      description: |
+        Checks critical components:
+        - Service state is RUNNING
+        - Kafka producer initialized
+        - Kafka consumer initialized
+        - Circuit breaker not OPEN
+        - Detection loop not blocking/critical
+      operationId: getReady
+      responses:
+        "200":
+          description: Service ready
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ready: { type: boolean, example: true }
+                  state: { type: string }
+                  components:
+                    type: object
+                    properties:
+                      producer: { type: boolean }
+                      consumer: { type: boolean }
+                  circuit_breaker: { type: string, enum: [closed, open, half_open] }
+                  detection_loop: { type: object }
+        "503": { description: Service not ready }
+
+  /metrics:
+    get:
+      tags: [Metrics]
+      summary: Prometheus metrics
+      description: Returns metrics in Prometheus text exposition format.
+      operationId: getMetrics
+      responses:
+        "200":
+          description: Prometheus metrics
+          content:
+            text/plain: {}
+
+  /detections/stats:
+    get:
+      tags: [Detections]
+      summary: Detection loop statistics
+      description: |
+        Returns comprehensive detection loop metrics including:
+        - Loop running state, status, issues
+        - Cached metrics (detections_total, published, rate_limited, errors)
+        - Derived rates (detections/min, publish/min, error/hour)
+        - Publisher and handler metrics
+        - Kafka producer/consumer telemetry
+        - Engine and variant breakdowns
+
+        Always returns HTTP 200 when the service manager is available.
+      operationId: getDetectionStats
+      responses:
+        "200":
+          description: Detection statistics
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetectionStats" }
+        "503": { description: Service manager not initialized }
+
+  /detections/history:
+    get:
+      tags: [Detections]
+      summary: Get detection history
+      description: Returns recent detection events. Requires Bearer token authentication.
+      operationId: getDetectionHistory
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 200 }
+        - name: since
+          in: query
+          schema: { type: string, description: "Unix timestamp or ISO8601" }
+        - name: validator_id
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Detection history
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  detections:
+                    type: array
+                    items: { $ref: "#/components/schemas/DetectionEntry" }
+                  count: { type: integer }
+                  updated_at: { type: string, format: date-time }
+        "401": { description: Unauthorized }
+
+  /detections/suspicious-nodes:
+    get:
+      tags: [Detections]
+      summary: Get suspicious validator nodes
+      operationId: getSuspiciousNodes
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 10, maximum: 50 }
+      responses:
+        "200":
+          description: Suspicious nodes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  nodes: { type: array, items: { $ref: "#/components/schemas/SuspiciousNode" } }
+                  updated_at: { type: string, format: date-time }
+        "401": { description: Unauthorized }
+
+  /ops/consumer-status:
+    get:
+      tags: [Operations]
+      summary: Kafka consumer status
+      operationId: getConsumerStatus
+      security: [{ BearerAuth: [] }]
+      responses:
+        "200": { description: Consumer status object }
+        "401": { description: Unauthorized }
+
+  /ops/offsets:
+    get:
+      tags: [Operations]
+      summary: Kafka consumer offsets
+      operationId: getOffsets
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: topic
+          in: query
+          schema: { type: string }
+      responses:
+        "200": { description: Offset data }
+        "401": { description: Unauthorized }
+
+  /ops/poison-messages:
+    get:
+      tags: [Operations]
+      summary: Recent poison messages
+      operationId: getPoisonMessages
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 200 }
+      responses:
+        "200": { description: Poison message list }
+        "401": { description: Unauthorized }
+
+  /ops/emitter-status:
+    get:
+      tags: [Operations]
+      summary: Policy emitter status
+      operationId: getEmitterStatus
+      security: [{ BearerAuth: [] }]
+      responses:
+        "200": { description: Emitter status }
+        "401": { description: Unauthorized }
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: Set via AI_SERVICE_API_TOKEN environment variable
+
+  schemas:
+    DetectionStats:
+      type: object
+      properties:
+        status: { type: string, example: running }
+        state: { type: string }
+        uptime_seconds: { type: number }
+        detection_loop:
+          type: object
+          properties:
+            running: { type: boolean }
+            status: { type: string }
+            message: { type: string }
+            issues: { type: array, items: { type: string } }
+            blocking: { type: boolean }
+            healthy: { type: boolean }
+            cache_age_seconds: { type: number }
+            avg_latency_ms: { type: number }
+            last_latency_ms: { type: number }
+            seconds_since_last_detection: { type: number }
+            seconds_since_last_iteration: { type: number }
+            metrics:
+              type: object
+              properties:
+                detections_total: { type: integer }
+                detections_published: { type: integer }
+                detections_rate_limited: { type: integer }
+                errors: { type: integer }
+                loop_iterations: { type: integer }
+        derived:
+          type: object
+          properties:
+            detections_per_minute: { type: number }
+            publish_rate_per_minute: { type: number }
+            iterations_per_minute: { type: number }
+            error_rate_per_hour: { type: number }
+            publish_success_ratio: { type: number }
+        engines:
+          type: array
+          items:
+            type: object
+            properties:
+              engine: { type: string }
+              ready: { type: boolean }
+              candidates: { type: integer }
+              published: { type: integer }
+        variants:
+          type: array
+          items:
+            type: object
+            properties:
+              variant: { type: string }
+              total: { type: integer }
+              published: { type: integer }
+
+    DetectionEntry:
+      type: object
+      properties:
+        timestamp: { type: string, format: date-time }
+        source: { type: string }
+        validator_id: { type: string }
+        threat_type: { type: string }
+        severity: { type: number }
+        confidence: { type: number }
+        final_score: { type: number }
+        should_publish: { type: boolean }
+
+    SuspiciousNode:
+      type: object
+      properties:
+        id: { type: string }
+        status: { type: string }
+        suspicion_score: { type: number }
+        event_count: { type: integer }
+        last_seen: { type: string, format: date-time }
+        threat_types: { type: array, items: { type: string } }
+        reason: { type: string }

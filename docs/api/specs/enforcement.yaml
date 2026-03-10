@@ -1,0 +1,235 @@
+openapi: 3.1.0
+info:
+  title: CyberMesh Enforcement Agent API
+  version: 1.0.0
+  description: |
+    Go-based enforcement agent for CyberMesh policy execution.
+
+    Consumes policy events from Kafka (`control.policy.v1`) and enforces
+    them via configurable backends (Cilium, iptables, nftables, Kubernetes NetworkPolicy, Gateway API).
+
+    Provides health probes, Prometheus metrics, and control endpoints for
+    kill-switch management, decision auditing, and rule introspection.
+
+    **Port:** configurable via `METRICS_ADDR` (default `:9090`)
+  contact:
+    name: CyberMesh Team
+    url: https://cybermesh.qzz.io
+
+servers:
+  - url: http://localhost:9090
+    description: Local development
+  - url: http://enforcement-agent:9090
+    description: In-cluster (Kubernetes)
+
+tags:
+  - name: Health
+    description: Liveness and readiness probes
+  - name: Metrics
+    description: Prometheus metrics
+  - name: Control
+    description: Operational control endpoints (requires Bearer auth)
+
+paths:
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Liveness probe
+      description: Returns 200 if the enforcement backend is healthy.
+      operationId: getHealthz
+      responses:
+        "200":
+          description: Healthy
+          content:
+            text/plain:
+              schema: { type: string, example: ok }
+        "503": { description: Backend health check failed }
+
+  /readyz:
+    get:
+      tags: [Health]
+      summary: Readiness probe
+      description: Returns 200 if the enforcement backend is ready to accept traffic (e.g., Kubernetes API reachable).
+      operationId: getReadyz
+      responses:
+        "200":
+          description: Ready
+          content:
+            text/plain:
+              schema: { type: string, example: ok }
+        "503": { description: Backend ready check failed }
+
+  /metrics:
+    get:
+      tags: [Metrics]
+      summary: Prometheus metrics
+      description: |
+        Exposes all enforcement agent metrics in Prometheus text format.
+        Includes Go runtime metrics, process metrics, and custom counters
+        for policy enforcement, ACK publishing, and reconciliation.
+      operationId: getMetrics
+      responses:
+        "200":
+          description: Prometheus metrics
+          content:
+            text/plain: {}
+
+  /control/kill-switch:
+    get:
+      tags: [Control]
+      summary: Get kill switch state
+      description: Returns whether the kill switch is currently enabled. When enabled, all policy enforcement is halted.
+      operationId: getKillSwitch
+      security: [{ BearerAuth: [] }]
+      responses:
+        "200":
+          description: Kill switch state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled: { type: boolean, example: false }
+        "401": { description: Unauthorized }
+    post:
+      tags: [Control]
+      summary: Set kill switch state
+      description: Enable or disable the global kill switch. When enabled, the agent stops enforcing any new policies.
+      operationId: setKillSwitch
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: enabled
+          in: query
+          required: true
+          schema: { type: boolean }
+          description: "true to halt enforcement, false to resume"
+      responses:
+        "204": { description: State updated }
+        "400": { description: Missing or invalid enabled parameter }
+        "401": { description: Unauthorized }
+
+  /control/decisions:
+    get:
+      tags: [Control]
+      summary: List recent enforcement decisions
+      description: Returns recent policy enforcement decisions made by the controller. Useful for auditing.
+      operationId: getDecisions
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50 }
+        - name: policy_id
+          in: query
+          schema: { type: string }
+          description: Filter by policy ID
+        - name: result
+          in: query
+          schema: { type: string, enum: [applied, rejected, deferred, expired] }
+          description: Filter by decision result
+      responses:
+        "200":
+          description: Decision list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count: { type: integer }
+                  decisions:
+                    type: array
+                    items: { $ref: "#/components/schemas/DecisionRecord" }
+        "401": { description: Unauthorized }
+
+  /control/effective-rules:
+    get:
+      tags: [Control]
+      summary: Get effective enforcement rules
+      description: |
+        Returns both backend-enforced rules (live in Cilium/iptables/etc.) and
+        store-tracked rules (persisted state), for reconciliation auditing.
+      operationId: getEffectiveRules
+      security: [{ BearerAuth: [] }]
+      responses:
+        "200":
+          description: Effective rules comparison
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  backend_count: { type: integer }
+                  store_count: { type: integer }
+                  backend_error: { type: string }
+                  backend_rules:
+                    type: array
+                    items: { $ref: "#/components/schemas/RuleSummary" }
+                  store_rules:
+                    type: array
+                    items: { $ref: "#/components/schemas/StoreRuleSummary" }
+        "401": { description: Unauthorized }
+
+  /control/ack-status:
+    get:
+      tags: [Control]
+      summary: Get ACK publisher status
+      description: Returns the state of the acknowledgement publisher, including queue depth and configuration.
+      operationId: getAckStatus
+      security: [{ BearerAuth: [] }]
+      responses:
+        "200":
+          description: ACK publisher status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled: { type: boolean }
+                  publisher_impl: { type: string, example: kafkago }
+                  topic: { type: string, example: control.enforcement_ack.v1 }
+                  queue_path: { type: string }
+                  queue_max_size: { type: integer }
+                  queue_depth: { type: integer }
+        "401": { description: Unauthorized }
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: Set via ENFORCEMENT_API_TOKEN environment variable
+
+  schemas:
+    DecisionRecord:
+      type: object
+      properties:
+        policy_id: { type: string }
+        action: { type: string }
+        result: { type: string, enum: [applied, rejected, deferred, expired] }
+        reason: { type: string }
+        timestamp: { type: string, format: date-time }
+
+    RuleSummary:
+      type: object
+      properties:
+        policy_id: { type: string }
+        action: { type: string }
+        rule_type: { type: string }
+        scope: { type: string }
+        tenant: { type: string }
+        region: { type: string }
+        dry_run: { type: boolean }
+
+    StoreRuleSummary:
+      type: object
+      properties:
+        policy_id: { type: string }
+        action: { type: string }
+        rule_type: { type: string }
+        scope: { type: string }
+        tenant: { type: string }
+        region: { type: string }
+        applied_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        pending_consensus: { type: boolean }
+        fast_path_deadline: { type: string, format: date-time }
