@@ -23,7 +23,7 @@ class TelemetrySource(ABC):
     """
     
     @abstractmethod
-    def get_network_flows(self, limit: int = 100) -> List[Dict]:
+    def get_network_flows(self, limit: int = 100, *, wait_policy: Optional[str] = None) -> List[Dict]:
         """
         Retrieve network flow records.
         
@@ -56,6 +56,10 @@ class TelemetrySource(ABC):
     def has_data(self) -> bool:
         """Check if source has available data."""
         pass
+
+    def get_last_fetch_stats(self) -> Dict:
+        """Return implementation-specific fetch stats for the most recent call."""
+        return {}
 
 
 class FileTelemetrySource(TelemetrySource):
@@ -112,7 +116,7 @@ class FileTelemetrySource(TelemetrySource):
             f"Initialized FileTelemetrySource: flows={self.flows_path}, files={self.files_path}"
         )
     
-    def get_network_flows(self, limit: int = 100) -> List[Dict]:
+    def get_network_flows(self, limit: int = 100, *, wait_policy: Optional[str] = None) -> List[Dict]:
         """
         Load network flow data from JSON files.
         

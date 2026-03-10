@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 from .errors import ValidationError, TimestampSkewError
 from .time import now
@@ -58,6 +59,25 @@ def validate_timestamp(timestamp: int, max_skew_seconds: int = None):
     if max_skew_seconds is None:
         from .limits import TIME_LIMITS
         max_skew_seconds = TIME_LIMITS.TIMESTAMP_SKEW_SECONDS
+        configured = os.getenv("LIMITS_TIMESTAMP_SKEW_SECONDS", "").strip()
+        if configured:
+            try:
+                parsed = int(configured)
+                if parsed > 0:
+                    max_skew_seconds = parsed
+                else:
+                    raise ValidationError(
+                        f"LIMITS_TIMESTAMP_SKEW_SECONDS must be positive, got: {configured}"
+                    )
+            except ValueError:
+                raise ValidationError(
+                    f"Invalid LIMITS_TIMESTAMP_SKEW_SECONDS value: {configured}"
+                )
+
+    if max_skew_seconds <= 0:
+        raise ValidationError(
+            f"Timestamp skew must be positive, got: {max_skew_seconds}"
+        )
     
     from .time import now
     current_time = now()

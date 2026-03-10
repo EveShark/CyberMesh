@@ -67,6 +67,18 @@ class APIHandler(BaseHTTPRequestHandler):
         elif path == '/detections/suspicious-nodes':
             if self._require_auth():
                 self._handle_suspicious_nodes(query_params)
+        elif path == '/ops/consumer-status':
+            if self._require_auth():
+                self._handle_consumer_status()
+        elif path == '/ops/offsets':
+            if self._require_auth():
+                self._handle_offsets(query_params)
+        elif path == '/ops/poison-messages':
+            if self._require_auth():
+                self._handle_poison_messages(query_params)
+        elif path == '/ops/emitter-status':
+            if self._require_auth():
+                self._handle_emitter_status()
         else:
             self.send_error(404, "Not Found")
     
@@ -140,7 +152,9 @@ class APIHandler(BaseHTTPRequestHandler):
             detection_snapshot = health.get('detection_loop') or self.service_manager.get_detection_metrics()
             if detection_snapshot:
                 loop_status = detection_snapshot.get('status')
-                if detection_snapshot.get('blocking') or loop_status in ('critical', 'stopped'):
+                # Detection freshness is operational quality, not service readiness.
+                # Only fail readiness when the loop is actually stopped.
+                if loop_status == 'stopped':
                     ready = False
 
             status_code = 200 if ready else 503
@@ -248,6 +262,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     "issues": detection_snapshot.get('issues', []),
                     "blocking": detection_snapshot.get('blocking', False),
                     "healthy": detection_snapshot.get('healthy', False),
+                    "configured_interval_seconds": self.service_manager.get_detection_interval_seconds(),
                     "last_updated": detection_snapshot.get('last_updated'),
                     "cache_age_seconds": cache_age,
                     "metrics": metrics,
@@ -255,6 +270,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     "seconds_since_last_iteration": _age(metrics.get('last_iteration_time')),
                     "avg_latency_ms": metrics.get('avg_latency_ms'),
                     "last_latency_ms": metrics.get('last_latency_ms'),
+                    "telemetry_fetch": metrics.get('telemetry_fetch', {}),
                 },
                 "derived": derived,
                 "publisher_metrics": health.get('publisher_metrics', {}),
@@ -266,6 +282,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 },
                 "engines": self.service_manager.get_engine_metrics_summary(),
                 "variants": self.service_manager.get_variant_metrics_summary(),
+                "sentinel": self.service_manager.get_sentinel_metrics_summary(),
             }
 
             self._send_json(200, response)
@@ -304,12 +321,52 @@ class APIHandler(BaseHTTPRequestHandler):
                 return
 
             limit = self._parse_limit(query_params.get('limit', ['10'])[0], default=10, max_value=50)
-            nodes = self.service_manager.get_ai_suspicious_nodes(limit=limit)
+            entity_type = query_params.get('entity_type', [None])[0]
+            nodes = self.service_manager.get_ai_suspicious_nodes(limit=limit, entity_type=entity_type)
 
             self._send_json(200, {
                 "nodes": nodes,
+                "entity_type": entity_type or "all",
                 "updated_at": datetime.utcnow().isoformat() + "Z",
             })
+        except Exception as exc:
+            self._send_json(500, {"error": str(exc)})
+
+    def _handle_consumer_status(self):
+        try:
+            if self.service_manager is None:
+                self._send_json(503, {"error": "service_manager_not_initialized"})
+                return
+            self._send_json(200, self.service_manager.get_kafka_consumer_status())
+        except Exception as exc:
+            self._send_json(500, {"error": str(exc)})
+
+    def _handle_offsets(self, query_params):
+        try:
+            if self.service_manager is None:
+                self._send_json(503, {"error": "service_manager_not_initialized"})
+                return
+            topic = query_params.get('topic', [None])[0]
+            self._send_json(200, self.service_manager.get_kafka_consumer_offsets(topic=topic))
+        except Exception as exc:
+            self._send_json(500, {"error": str(exc)})
+
+    def _handle_poison_messages(self, query_params):
+        try:
+            if self.service_manager is None:
+                self._send_json(503, {"error": "service_manager_not_initialized"})
+                return
+            limit = self._parse_limit(query_params.get('limit', ['50'])[0], default=50, max_value=200)
+            self._send_json(200, self.service_manager.get_recent_poison_messages(limit=limit))
+        except Exception as exc:
+            self._send_json(500, {"error": str(exc)})
+
+    def _handle_emitter_status(self):
+        try:
+            if self.service_manager is None:
+                self._send_json(503, {"error": "service_manager_not_initialized"})
+                return
+            self._send_json(200, self.service_manager.get_policy_emitter_status())
         except Exception as exc:
             self._send_json(500, {"error": str(exc)})
 
@@ -317,8 +374,13 @@ class APIHandler(BaseHTTPRequestHandler):
     # Helpers
     # ------------------------------------------------------------------
 
+    def _current_api_bearer_token(self) -> str:
+        # Resolve token from env at request-time to support runtime secret rotation.
+        return os.getenv("AI_SERVICE_API_TOKEN", API_BEARER_TOKEN)
+
     def _require_auth(self) -> bool:
-        if not API_BEARER_TOKEN:
+        expected_token = self._current_api_bearer_token()
+        if not expected_token:
             return True
 
         header = self.headers.get('Authorization', '')
@@ -327,7 +389,7 @@ class APIHandler(BaseHTTPRequestHandler):
             return False
 
         token = header.split('Bearer ', 1)[1].strip()
-        if not token or not secrets.compare_digest(token, API_BEARER_TOKEN):
+        if not token or not secrets.compare_digest(token, expected_token):
             self._send_json(401, {"error": "unauthorized"})
             return False
 

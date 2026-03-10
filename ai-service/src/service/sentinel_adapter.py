@@ -8,14 +8,16 @@ the existing AI anomaly publish path.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
+import queue
 import re
 import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Callable
 
 from confluent_kafka import Consumer, KafkaException
 
@@ -25,6 +27,7 @@ from ..feedback.tracker import AnomalyLifecycleTracker
 from .policy_emitter import PolicyContext, build_policy_candidate
 from .publisher import MessagePublisher
 from ..utils.errors import StorageError, ValidationError
+from ..utils.metrics import get_metrics_collector
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -44,6 +47,30 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _stage_markers_enabled() -> bool:
+    return os.getenv("POLICY_STAGE_MARKERS_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _normalize_event_ts_ms(value: Any) -> int:
+    if value is None:
+        return 0
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if numeric <= 0:
+        return 0
+    if 946684800 <= numeric <= 4102444800:
+        return int(numeric * 1000)
+    if 946684800000 <= numeric <= 4102444800000:
+        return int(numeric)
+    if 946684800000000 <= numeric <= 4102444800000000:
+        return int(numeric / 1000)
+    if 946684800000000000 <= numeric <= 4102444800000000000:
+        return int(numeric / 1_000_000)
+    return 0
+
+
 @dataclass(frozen=True)
 class SentinelAdapterConfig:
     enabled: bool
@@ -55,6 +82,13 @@ class SentinelAdapterConfig:
     require_schema_version: str
     input_encoding: str
     policy_enabled: bool
+    commit_every: int
+    commit_interval_ms: int
+    commit_async: bool
+    loop_error_backoff_ms: int
+    policy_publish_async: bool
+    policy_publish_workers: int
+    policy_publish_queue_size: int
 
     @classmethod
     def from_env(cls, settings: Settings) -> "SentinelAdapterConfig":
@@ -75,6 +109,13 @@ class SentinelAdapterConfig:
             require_schema_version=os.getenv("SENTINEL_REQUIRED_SCHEMA", "sentinel.result.v1").strip(),
             input_encoding=encoding,
             policy_enabled=_env_bool("SENTINEL_POLICY_ENABLED", False),
+            commit_every=max(1, _env_int("SENTINEL_COMMIT_EVERY", 32)),
+            commit_interval_ms=max(1, _env_int("SENTINEL_COMMIT_INTERVAL_MS", 200)),
+            commit_async=_env_bool("SENTINEL_COMMIT_ASYNC", False),
+            loop_error_backoff_ms=max(10, _env_int("SENTINEL_LOOP_ERROR_BACKOFF_MS", 250)),
+            policy_publish_async=_env_bool("SENTINEL_POLICY_PUBLISH_ASYNC", True),
+            policy_publish_workers=max(1, _env_int("SENTINEL_POLICY_PUBLISH_WORKERS", 2)),
+            policy_publish_queue_size=max(1, _env_int("SENTINEL_POLICY_PUBLISH_QUEUE_SIZE", 512)),
         )
 
 
@@ -87,16 +128,22 @@ class SentinelKafkaAdapter:
         publisher: MessagePublisher,
         logger,
         tracker: Optional[AnomalyLifecycleTracker] = None,
+        event_recorder: Optional[Callable[..., None]] = None,
     ):
         self._settings = settings
         self._publisher = publisher
         self._logger = logger
         self._tracker = tracker
+        self._event_recorder = event_recorder
         self._cfg = SentinelAdapterConfig.from_env(settings)
         self._policy_cfg = settings.policy_publishing
+        self._service_metrics = get_metrics_collector()
+        self._validator_ip_map = dict(getattr(settings, "sentinel_validator_ip_map", {}) or {})
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._policy_workers: list[threading.Thread] = []
+        self._policy_publish_queue: Optional[queue.Queue] = None
         self._seen: Dict[str, float] = {}
         self._metrics = {
             "received": 0,
@@ -111,7 +158,15 @@ class SentinelKafkaAdapter:
             "policy_skipped": 0,
             "policy_skipped_missing_target": 0,
             "policy_skipped_threshold": 0,
+            "policy_enqueued": 0,
+            "policy_queue_overflow_sync": 0,
+            "commit_batches": 0,
+            "commit_errors": 0,
         }
+        self._metrics_lock = threading.Lock()
+        self._pending_commit_msg = None
+        self._pending_commit_count = 0
+        self._last_commit_at = time.monotonic()
 
         self._consumer = Consumer(self._build_consumer_config())
         self._consumer.subscribe([self._cfg.input_topic])
@@ -120,10 +175,29 @@ class SentinelKafkaAdapter:
     def enabled(self) -> bool:
         return self._cfg.enabled
 
+    def _metric_inc(self, key: str, value: int = 1) -> None:
+        with self._metrics_lock:
+            self._metrics[key] = int(self._metrics.get(key, 0)) + int(value)
+
+    def _metrics_snapshot(self) -> Dict[str, int]:
+        with self._metrics_lock:
+            return dict(self._metrics)
+
     def start(self) -> None:
         if not self._cfg.enabled or self._running:
             return
         self._running = True
+        if self._cfg.policy_enabled and self._cfg.policy_publish_async and self._policy_publish_queue is None:
+            self._policy_publish_queue = queue.Queue(maxsize=self._cfg.policy_publish_queue_size)
+        if self._policy_publish_queue is not None and not self._policy_workers:
+            for idx in range(self._cfg.policy_publish_workers):
+                worker = threading.Thread(
+                    target=self._policy_publish_loop,
+                    name=f"sentinel-policy-publish-{idx}",
+                    daemon=True,
+                )
+                worker.start()
+                self._policy_workers.append(worker)
         self._thread = threading.Thread(target=self._loop, name="sentinel-adapter", daemon=True)
         self._thread.start()
         self._logger.info(
@@ -139,11 +213,19 @@ class SentinelKafkaAdapter:
         self._running = False
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=timeout)
+        deadline = time.time() + max(1.0, timeout)
+        for worker in self._policy_workers:
+            remain = max(0.1, deadline - time.time())
+            if worker.is_alive():
+                worker.join(timeout=remain)
+        self._policy_workers = []
+        self._policy_publish_queue = None
+        self._flush_commit(force=True)
         try:
             self._consumer.close()
         except Exception:
             pass
-        self._logger.info("Sentinel adapter stopped", extra={"metrics": dict(self._metrics)})
+        self._logger.info("Sentinel adapter stopped", extra={"metrics": self._metrics_snapshot()})
 
     def _build_consumer_config(self) -> Dict[str, Any]:
         consumer_cfg = self._settings.kafka_consumer
@@ -181,119 +263,231 @@ class SentinelKafkaAdapter:
             try:
                 msg = self._consumer.poll(timeout=1.0)
                 if msg is None:
+                    self._flush_commit(force=False)
                     continue
                 if msg.error():
                     continue
-                self._metrics["received"] += 1
+                self._metric_inc("received")
                 self._handle(msg.value() or b"")
-                self._consumer.commit(message=msg, asynchronous=False)
+                self._mark_commit(msg)
+                self._flush_commit(force=False)
             except KafkaException as exc:
                 self._logger.error("Sentinel adapter Kafka error", extra={"error": str(exc)})
-                time.sleep(1)
+                self._flush_commit(force=False)
+                time.sleep(float(self._cfg.loop_error_backoff_ms) / 1000.0)
             except Exception as exc:  # defensive: never crash background thread
                 self._logger.error("Sentinel adapter loop error", extra={"error": str(exc)}, exc_info=True)
-                time.sleep(1)
+                self._flush_commit(force=False)
+                time.sleep(float(self._cfg.loop_error_backoff_ms) / 1000.0)
+
+    def _mark_commit(self, msg) -> None:
+        self._pending_commit_msg = msg
+        self._pending_commit_count += 1
+
+    def _flush_commit(self, *, force: bool) -> None:
+        if self._pending_commit_count <= 0 or self._pending_commit_msg is None:
+            return
+        now = time.monotonic()
+        elapsed_ms = int((now - self._last_commit_at) * 1000)
+        if (
+            not force
+            and self._pending_commit_count < self._cfg.commit_every
+            and elapsed_ms < self._cfg.commit_interval_ms
+        ):
+            return
+        try:
+            self._consumer.commit(message=self._pending_commit_msg, asynchronous=self._cfg.commit_async)
+            self._metric_inc("commit_batches")
+            self._pending_commit_count = 0
+            self._pending_commit_msg = None
+            self._last_commit_at = now
+        except Exception as exc:  # pragma: no cover - defensive
+            self._metric_inc("commit_errors")
+            self._logger.error("Sentinel adapter commit failed", extra={"error": str(exc)})
+
+    def _policy_publish_loop(self) -> None:
+        while self._running or (self._policy_publish_queue is not None and not self._policy_publish_queue.empty()):
+            if self._policy_publish_queue is None:
+                return
+            try:
+                task = self._policy_publish_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                self._publish_policy_task(task)
+            finally:
+                self._policy_publish_queue.task_done()
 
     def _handle(self, raw: bytes) -> None:
+        handle_start = time.monotonic()
+        ai_consume_ts_ms = int(time.time() * 1000)
+        handle_status = "ok"
         if len(raw) > self._cfg.max_message_bytes:
-            self._metrics["invalid"] += 1
+            handle_status = "error"
+            self._metric_inc("invalid")
             self._logger.warning("Sentinel envelope exceeds max size", extra={"size": len(raw)})
             return
-        envelope = self._decode_envelope(raw)
-        if envelope is None:
-            self._metrics["invalid"] += 1
-            self._logger.warning("Sentinel envelope decode failed", extra={"encoding": self._cfg.input_encoding})
-            return
-        if not isinstance(envelope, dict):
-            self._metrics["invalid"] += 1
-            return
-
-        schema_version = str(envelope.get("schema_version") or "")
-        if self._cfg.require_schema_version and schema_version != self._cfg.require_schema_version:
-            self._metrics["invalid"] += 1
-            self._logger.warning(
-                "Sentinel schema mismatch",
-                extra={"got": schema_version, "want": self._cfg.require_schema_version},
-            )
-            return
-
-        event_id = str(envelope.get("event_id") or "")
-        if not event_id:
-            self._metrics["invalid"] += 1
-            return
-        if self._is_duplicate(event_id):
-            self._metrics["deduped"] += 1
-            return
-
-        payload = envelope.get("payload") or {}
-        analysis = payload.get("analysis") if isinstance(payload, dict) else {}
-        if not isinstance(analysis, dict):
-            self._metrics["invalid"] += 1
-            return
-
-        threat_level = str(analysis.get("threat_level") or "").lower()
-        if threat_level in ("clean", "unknown", ""):
-            self._metrics["skipped_clean"] += 1
-            return
-
-        anomaly_type = self._map_anomaly_type(analysis)
-        confidence = self._safe_float(analysis.get("confidence"), default=0.75)
-        severity = self._map_severity(analysis)
-        source = self._extract_source(envelope)
-
-        anomaly_id = self._stable_uuid4(event_id)
-        payload_bytes = self._build_anomaly_payload(
-            envelope,
-            severity=severity,
-            confidence=confidence,
-            max_size=self._cfg.max_message_bytes,
-        )
-        now = int(time.time())
-
-        if self._cfg.mode == "shadow":
-            self._metrics["forwarded"] += 1
-            self._logger.info(
-                "Sentinel shadow detection observed",
-                extra={"event_id": event_id, "anomaly_type": anomaly_type, "severity": severity},
-            )
-            return
-
         try:
-            if self._tracker:
-                self._tracker.record_detected(
+            envelope = self._decode_envelope(raw)
+            if envelope is None:
+                handle_status = "error"
+                self._metric_inc("invalid")
+                self._logger.warning("Sentinel envelope decode failed", extra={"encoding": self._cfg.input_encoding})
+                return
+            if not isinstance(envelope, dict):
+                handle_status = "error"
+                self._metric_inc("invalid")
+                return
+
+            schema_version = str(envelope.get("schema_version") or "")
+            if self._cfg.require_schema_version and schema_version != self._cfg.require_schema_version:
+                handle_status = "error"
+                self._metric_inc("invalid")
+                self._logger.warning(
+                    "Sentinel schema mismatch",
+                    extra={"got": schema_version, "want": self._cfg.require_schema_version},
+                )
+                return
+
+            event_id = str(envelope.get("event_id") or "")
+            if not event_id:
+                handle_status = "error"
+                self._metric_inc("invalid")
+                return
+            labels = envelope.get("labels") if isinstance(envelope, dict) else {}
+            if not isinstance(labels, dict):
+                labels = {}
+            if _stage_markers_enabled():
+                trace_id = str(labels.get("trace_id") or labels.get("source_event_id") or event_id).strip()
+                self._logger.info(
+                    "policy stage marker",
+                    extra={
+                        "stage": "t_ai_sentinel_consume",
+                        "trace_id": trace_id,
+                        "event_id": event_id,
+                        "t_ms": int(time.time() * 1000),
+                    },
+                )
+            if self._is_duplicate(event_id):
+                handle_status = "duplicate"
+                self._metric_inc("deduped")
+                return
+
+            payload = envelope.get("payload") or {}
+            analysis = payload.get("analysis") if isinstance(payload, dict) else {}
+            if not isinstance(analysis, dict):
+                handle_status = "error"
+                self._metric_inc("invalid")
+                return
+
+            threat_level = str(analysis.get("threat_level") or "").lower()
+            if threat_level in ("clean", "unknown", ""):
+                handle_status = "skipped"
+                self._metric_inc("skipped_clean")
+                return
+
+            anomaly_type = self._map_anomaly_type(analysis, envelope=envelope)
+            confidence = self._safe_float(analysis.get("confidence"), default=0.75)
+            severity = self._map_severity(analysis)
+            source = self._extract_source(envelope)
+
+            anomaly_id = self._stable_uuid4(event_id)
+            payload_bytes = self._build_anomaly_payload(
+                envelope,
+                severity=severity,
+                confidence=confidence,
+                max_size=self._cfg.max_message_bytes,
+            )
+            now = int(time.time())
+
+            if self._cfg.mode == "shadow":
+                handle_status = "shadow"
+                self._metric_inc("forwarded")
+                self._logger.info(
+                    "Sentinel shadow detection observed",
+                    extra={"event_id": event_id, "anomaly_type": anomaly_type, "severity": severity},
+                )
+                return
+
+            try:
+                event_metadata = {
+                    "timestamp": now,
+                    "source_event_id": event_id,
+                    "source": source,
+                }
+                network_context = self._extract_network_context(payload, analysis.get("findings") or [])
+                for key in ("src_ip", "source_ip", "dst_ip", "destination_ip", "source_event_ts_ms"):
+                    if key in network_context:
+                        event_metadata[key] = network_context[key]
+                for key in ("scenario", "profile_mode", "trace_id", "source_event_id"):
+                    value = labels.get(key)
+                    if isinstance(value, str) and value:
+                        event_metadata[key] = value
+                if self._event_recorder:
+                    validator_id = self._resolve_validator_id(
+                        envelope=envelope,
+                        payload=payload,
+                        network_context=network_context,
+                    )
+                    if validator_id:
+                        event_metadata["validator_id"] = validator_id
+                    self._event_recorder(
+                        source="sentinel",
+                        validator_id=validator_id,
+                        threat_type=anomaly_type,
+                        severity=severity,
+                        confidence=confidence,
+                        final_score=self._safe_float(analysis.get("final_score"), default=confidence) or confidence,
+                        should_publish=True,
+                        metadata=event_metadata,
+                    )
+                if self._tracker:
+                    self._tracker.record_detected(
+                        anomaly_id=anomaly_id,
+                        anomaly_type=anomaly_type,
+                        confidence=confidence,
+                        severity=severity,
+                        raw_score=self._safe_float(analysis.get("final_score"), default=None),
+                        timestamp=float(now),
+                    )
+                self._publisher.publish_anomaly(
                     anomaly_id=anomaly_id,
                     anomaly_type=anomaly_type,
-                    confidence=confidence,
+                    source=source,
                     severity=severity,
-                    raw_score=self._safe_float(analysis.get("final_score"), default=None),
-                    timestamp=float(now),
+                    confidence=confidence,
+                    payload=payload_bytes,
+                    model_version="sentinel-kafka.v1",
                 )
-            self._publisher.publish_anomaly(
-                anomaly_id=anomaly_id,
-                anomaly_type=anomaly_type,
-                source=source,
-                severity=severity,
-                confidence=confidence,
-                payload=payload_bytes,
-                model_version="sentinel-kafka.v1",
-            )
-            if self._tracker:
-                self._tracker.record_published(anomaly_id=anomaly_id, timestamp=float(now))
-            self._maybe_publish_policy(
-                event_id=event_id,
-                anomaly_id=anomaly_id,
-                anomaly_type=anomaly_type,
-                severity=severity,
-                confidence=confidence,
-                envelope=envelope,
-            )
-            self._metrics["forwarded"] += 1
-        except (ValidationError, StorageError) as exc:
-            self._metrics["publish_failed"] += 1
-            self._logger.error("Sentinel adapter tracker error", extra={"error": str(exc)})
-        except Exception as exc:
-            self._metrics["publish_failed"] += 1
-            self._logger.error("Sentinel adapter publish failed", extra={"error": str(exc)}, exc_info=True)
+                if self._tracker:
+                    self._tracker.record_published(anomaly_id=anomaly_id, timestamp=float(now))
+                self._maybe_publish_policy(
+                    event_id=event_id,
+                    anomaly_id=anomaly_id,
+                    anomaly_type=anomaly_type,
+                    severity=severity,
+                    confidence=confidence,
+                    envelope=envelope,
+                    ai_consume_ts_ms=ai_consume_ts_ms,
+                )
+                self._metric_inc("forwarded")
+            except (ValidationError, StorageError) as exc:
+                handle_status = "error"
+                self._metric_inc("publish_failed")
+                self._logger.error("Sentinel adapter tracker error", extra={"error": str(exc)})
+            except Exception as exc:
+                handle_status = "error"
+                self._metric_inc("publish_failed")
+                self._logger.error("Sentinel adapter publish failed", extra={"error": str(exc)}, exc_info=True)
+        finally:
+            try:
+                self._service_metrics.record_service_operation(
+                    "sentinel_handle",
+                    time.monotonic() - handle_start,
+                    status=handle_status,
+                )
+            except Exception:
+                self._logger.debug("Failed to record sentinel handle metric", exc_info=True)
 
     def _is_duplicate(self, event_id: str) -> bool:
         now = time.time()
@@ -307,16 +501,53 @@ class SentinelKafkaAdapter:
         return False
 
     @staticmethod
-    def _map_anomaly_type(analysis: Dict[str, Any]) -> str:
+    def _map_anomaly_type(analysis: Dict[str, Any], *, envelope: Optional[Dict[str, Any]] = None) -> str:
+        # Prefer explicit structured hints first; this avoids depending only on
+        # free-text findings that can be sparse in blob replay scenarios.
+        hint_candidates = (
+            analysis.get("anomaly_type"),
+            analysis.get("threat_type"),
+            analysis.get("attack_type"),
+            analysis.get("verdict"),
+            analysis.get("threat_level"),
+            analysis.get("model_version"),
+        )
+        for hint in hint_candidates:
+            normalized = SentinelKafkaAdapter._normalize_anomaly_hint(hint)
+            if normalized != "anomaly":
+                return normalized
+
+        labels = envelope.get("labels") if isinstance(envelope, dict) else {}
+        if isinstance(labels, dict):
+            scenario_hint = labels.get("scenario")
+            normalized = SentinelKafkaAdapter._normalize_anomaly_hint(scenario_hint)
+            if normalized != "anomaly":
+                return normalized
+
         findings = analysis.get("findings") or []
         if isinstance(findings, list):
-            joined = " ".join(str(f.get("description", "")) for f in findings if isinstance(f, dict)).lower()
-            if "pps" in joined or "bps" in joined or "ddos" in joined:
-                return "ddos"
-            if "malware" in joined or "yara" in joined:
-                return "malware"
-            if "port" in joined and "scan" in joined:
-                return "port_scan"
+            text_parts = []
+            for finding in findings:
+                if not isinstance(finding, dict):
+                    continue
+                text_parts.append(str(finding.get("category", "")))
+                text_parts.append(str(finding.get("description", "")))
+            normalized = SentinelKafkaAdapter._normalize_anomaly_hint(" ".join(text_parts))
+            if normalized != "anomaly":
+                return normalized
+        return "anomaly"
+
+    @staticmethod
+    def _normalize_anomaly_hint(value: Any) -> str:
+        token = str(value or "").strip().lower().replace("-", "_")
+        if not token:
+            return "anomaly"
+        if "ddos" in token or token in {"dos", "syn_flood", "flood"}:
+            return "ddos"
+        if "port" in token and "scan" in token:
+            return "port_scan"
+        if "malware" in token or "yara" in token or "ransom" in token:
+            return "malware"
         return "anomaly"
 
     def _maybe_publish_policy(
@@ -328,6 +559,7 @@ class SentinelKafkaAdapter:
         severity: int,
         confidence: float,
         envelope: Dict[str, Any],
+        ai_consume_ts_ms: int,
     ) -> None:
         if not self._cfg.policy_enabled or self._cfg.mode != "prod":
             return
@@ -342,10 +574,29 @@ class SentinelKafkaAdapter:
         labels = envelope.get("labels") if isinstance(envelope, dict) else None
         if not isinstance(labels, dict):
             labels = {}
+        label_source_event_id = labels.get("source_event_id") or labels.get("trace_id") or ""
+        if label_source_event_id and not network_context.get("source_event_id"):
+            network_context["source_event_id"] = label_source_event_id
+        label_source_ts_ms = _normalize_event_ts_ms(labels.get("source_event_ts_ms"))
+        if label_source_ts_ms > 0:
+            network_context["source_event_ts_ms"] = label_source_ts_ms
+        label_ingest_ts_ms = _normalize_event_ts_ms(labels.get("telemetry_ingest_ts_ms"))
+        if label_ingest_ts_ms > 0:
+            network_context["telemetry_ingest_ts_ms"] = label_ingest_ts_ms
         metadata = {
             "tenant_id": envelope.get("tenant_id"),
             "region": envelope.get("region"),
             "source": envelope.get("source"),
+            "sentinel_event_id": event_id,
+            "source_event_id": network_context.get("source_event_id") or "",
+            "source_event_ts_ms": _normalize_event_ts_ms(network_context.get("source_event_ts_ms")),
+            "telemetry_ingest_ts_ms": _normalize_event_ts_ms(network_context.get("telemetry_ingest_ts_ms")),
+            "trace_id": labels.get("trace_id") or labels.get("source_event_id") or "",
+            "t_sentinel_consume_ms": _normalize_event_ts_ms(labels.get("t_sentinel_consume_ms")),
+            "t_sentinel_analysis_done_ms": _normalize_event_ts_ms(labels.get("t_sentinel_analysis_done_ms")),
+            "t_sentinel_emit_ms": _normalize_event_ts_ms(labels.get("t_sentinel_emit_ms"))
+            or _normalize_event_ts_ms(envelope.get("timestamp")),
+            "t_ai_sentinel_consume_ms": ai_consume_ts_ms,
             "profile_mode": labels.get("profile_mode"),
             "scenario": labels.get("scenario"),
             "sample_count": labels.get("sample_count"),
@@ -368,15 +619,24 @@ class SentinelKafkaAdapter:
         )
 
         if decision.candidate is None:
-            self._metrics["policy_skipped"] += 1
+            self._metric_inc("policy_skipped")
             reason = decision.reason or "unknown"
             if reason in ("severity_below_threshold", "confidence_below_threshold"):
-                self._metrics["policy_skipped_threshold"] += 1
+                self._metric_inc("policy_skipped_threshold")
             if reason == "missing_target":
-                self._metrics["policy_skipped_missing_target"] += 1
+                self._metric_inc("policy_skipped_missing_target")
             self._logger.info(
                 "Sentinel policy skipped",
-                extra={"event_id": event_id, "anomaly_id": anomaly_id, "reason": reason},
+                extra={
+                    "event_id": event_id,
+                    "anomaly_id": anomaly_id,
+                    "reason": reason,
+                    "anomaly_type": anomaly_type,
+                    "severity": severity,
+                    "confidence": confidence,
+                    "min_severity": decision.effective_severity_threshold,
+                    "min_confidence": decision.effective_confidence_threshold,
+                },
             )
             return
 
@@ -385,32 +645,88 @@ class SentinelKafkaAdapter:
         policy_id = self._stable_uuid4(f"{event_id}|{candidate.rule_type}|{candidate.action}|{target}")
         policy_payload = dict(candidate.payload)
         policy_payload["policy_id"] = policy_id
+        if _env_bool("POLICY_STAGE_MARKERS_ENABLED", False):
+            trace_id = (
+                (policy_payload.get("trace") or {}).get("id")
+                or (policy_payload.get("metadata") or {}).get("trace_id")
+                or policy_payload.get("trace_id")
+                or policy_payload.get("qc_reference")
+                or ""
+            )
+            if trace_id:
+                self._logger.info(
+                    "policy stage marker",
+                    extra={
+                        "stage": "t_ai_decision_done",
+                        "policy_id": policy_id,
+                        "trace_id": str(trace_id),
+                        "t_ms": int(time.time() * 1000),
+                    },
+                )
 
-        self._metrics["policy_candidates"] += 1
+        self._metric_inc("policy_candidates")
+        task = {
+            "event_id": event_id,
+            "anomaly_id": anomaly_id,
+            "policy_id": policy_id,
+            "rule_type": candidate.rule_type,
+            "enforcement_action": candidate.action,
+            "policy_payload": policy_payload,
+        }
+        if self._policy_publish_queue is not None:
+            try:
+                self._policy_publish_queue.put_nowait(task)
+                self._metric_inc("policy_enqueued")
+                return
+            except queue.Full:
+                # Preserve correctness over throughput: fallback to synchronous publish.
+                self._metric_inc("policy_queue_overflow_sync")
+
+        self._publish_policy_task(task)
+
+    def _publish_policy_task(self, task: Dict[str, Any]) -> None:
+        publish_start = time.monotonic()
         try:
             self._publisher.publish_policy_violation(
-                policy_id=policy_id,
-                rule_type=candidate.rule_type,
-                enforcement_action=candidate.action,
-                payload=policy_payload,
+                policy_id=task["policy_id"],
+                rule_type=task["rule_type"],
+                enforcement_action=task["enforcement_action"],
+                payload=task["policy_payload"],
             )
-            self._metrics["policy_published"] += 1
+            self._metric_inc("policy_published")
             if self._tracker:
                 self._tracker.record_policy_dispatched(
-                    anomaly_id=anomaly_id,
-                    policy_id=policy_id,
+                    anomaly_id=task["anomaly_id"],
+                    policy_id=task["policy_id"],
                     ttl_seconds=getattr(self._policy_cfg, "ttl_seconds", None),
                     requires_ack=getattr(self._policy_cfg, "requires_ack", None),
                     fast_path=bool(getattr(self._policy_cfg, "canary_scope", False)),
                     timestamp=time.time(),
                 )
         except Exception as exc:  # pragma: no cover - defensive
-            self._metrics["policy_failed"] += 1
+            self._metric_inc("policy_failed")
+            try:
+                self._service_metrics.record_service_operation(
+                    "sentinel_publish_policy",
+                    time.monotonic() - publish_start,
+                    status="error",
+                )
+            except Exception:
+                self._logger.debug("Failed to record sentinel policy publish metric", exc_info=True)
             self._logger.error(
                 "Sentinel policy publish failed",
-                extra={"event_id": event_id, "anomaly_id": anomaly_id, "error": str(exc)},
+                extra={"event_id": task["event_id"], "anomaly_id": task["anomaly_id"], "error": str(exc)},
                 exc_info=True,
             )
+            return
+        try:
+            self._service_metrics.record_service_operation(
+                "sentinel_publish_policy",
+                time.monotonic() - publish_start,
+                status="ok",
+            )
+        except Exception:
+            self._logger.debug("Failed to record sentinel policy publish metric", exc_info=True)
 
     @staticmethod
     def _map_severity(analysis: Dict[str, Any]) -> int:
@@ -441,6 +757,18 @@ class SentinelKafkaAdapter:
         network_context: Dict[str, Any] = {}
         input_part = payload.get("input") if isinstance(payload, dict) else {}
         if isinstance(input_part, dict):
+            source_id = input_part.get("id")
+            if isinstance(source_id, str) and source_id:
+                network_context["source_event_id"] = source_id
+            explicit_source_ts = _normalize_event_ts_ms(input_part.get("source_event_ts_ms"))
+            if explicit_source_ts > 0:
+                network_context["source_event_ts_ms"] = explicit_source_ts
+            explicit_ingest_ts = _normalize_event_ts_ms(input_part.get("telemetry_ingest_ts_ms"))
+            if explicit_ingest_ts > 0:
+                network_context["telemetry_ingest_ts_ms"] = explicit_ingest_ts
+            source_ts = input_part.get("timestamp")
+            if "source_event_ts_ms" not in network_context and isinstance(source_ts, (int, float)) and source_ts > 0:
+                network_context["source_event_ts_ms"] = int(float(source_ts) * 1000.0)
             for key in ("src_ip", "source_ip", "dst_ip", "destination_ip"):
                 value = input_part.get(key)
                 if isinstance(value, str) and value:
@@ -455,6 +783,54 @@ class SentinelKafkaAdapter:
                 network_context.setdefault("src_ip", match.group(0))
                 break
         return network_context
+
+    def _resolve_validator_id(
+        self,
+        *,
+        envelope: Dict[str, Any],
+        payload: Dict[str, Any],
+        network_context: Dict[str, Any],
+    ) -> Optional[str]:
+        """Resolve validator identity from explicit metadata first, then trusted IP mapping."""
+
+        labels = envelope.get("labels") if isinstance(envelope, dict) else {}
+        if not isinstance(labels, dict):
+            labels = {}
+        input_part = payload.get("input") if isinstance(payload, dict) else {}
+        if not isinstance(input_part, dict):
+            input_part = {}
+
+        explicit_keys = (
+            "validator_id",
+            "validator",
+            "node_id",
+            "node",
+            "producer_id",
+        )
+        for source in (labels, input_part, network_context):
+            for key in explicit_keys:
+                value = source.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+
+        for key in ("src_ip", "source_ip", "dst_ip", "destination_ip"):
+            candidate = network_context.get(key) or input_part.get(key)
+            normalized_ip = self._normalize_ip(candidate)
+            if normalized_ip and normalized_ip in self._validator_ip_map:
+                return self._validator_ip_map[normalized_ip]
+        return None
+
+    @staticmethod
+    def _normalize_ip(value: Any) -> str:
+        if not isinstance(value, str):
+            return ""
+        raw = value.strip()
+        if not raw:
+            return ""
+        try:
+            return str(ipaddress.ip_address(raw))
+        except ValueError:
+            return ""
 
     @staticmethod
     def _safe_float(value: Any, default: Optional[float]) -> Optional[float]:

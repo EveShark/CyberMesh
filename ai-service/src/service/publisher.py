@@ -24,6 +24,7 @@ import json
 import threading
 import time
 import ipaddress
+import os
 from typing import Optional, Dict, Any, Callable
 from datetime import datetime, timezone
 
@@ -605,6 +606,23 @@ class MessagePublisher:
         
         # Send via producer (it handles serialization)
         try:
+            trace_id = (
+                (normalized_payload.get("trace") or {}).get("id")
+                or (normalized_payload.get("metadata") or {}).get("trace_id")
+                or normalized_payload.get("trace_id")
+                or normalized_payload.get("qc_reference")
+                or ""
+            )
+            if self._policy_stage_markers_enabled() and trace_id:
+                self.logger.info(
+                    "policy stage marker",
+                    extra={
+                        "stage": "t_ai_producer_send_start",
+                        "policy_id": policy_id,
+                        "trace_id": str(trace_id),
+                        "t_ms": int(time.time() * 1000),
+                    },
+                )
             success = self.producer.send_policy(policy_msg)
             
             # Call delivery handler
@@ -622,6 +640,16 @@ class MessagePublisher:
                     "action": enforcement_action,
                 }
             )
+            if success and self._policy_stage_markers_enabled() and trace_id:
+                self.logger.info(
+                    "policy stage marker",
+                    extra={
+                        "stage": "t_ai_producer_ack",
+                        "policy_id": policy_id,
+                        "trace_id": str(trace_id),
+                        "t_ms": int(time.time() * 1000),
+                    },
+                )
             
             return message_id
             
@@ -642,7 +670,9 @@ class MessagePublisher:
                 }
             )
             raise
-    
+    def _policy_stage_markers_enabled(self) -> bool:
+        return os.getenv("POLICY_STAGE_MARKERS_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+
     def _handle_delivery(
         self,
         message_id: str,

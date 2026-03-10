@@ -20,4 +20,6 @@ message PolicyAckEvent {
   bool fast_path = 12;               // True if policy was evaluated for fast-path
   bytes rule_hash = 13;              // Policy rule hash for idempotency
   bytes producer_id = 14;            // Original backend producer id for traceability
+  int64 applied_at_ms = 15;          // Unix timestamp in milliseconds when apply finished (preferred when set)
+  int64 acked_at_ms = 16;            // Unix timestamp in milliseconds when ACK emitted (preferred when set)
 }

@@ -38,21 +38,56 @@ func computeTxRoot(txs []state.Transaction) types.BlockHash {
 
 // Build deterministically selects transactions from the mempool under limits and produces an AppBlock.
 func (b *Builder) Build(height uint64, parent types.BlockHash, proposer types.ValidatorID, now time.Time) *AppBlock {
+	return b.BuildWithExclusions(height, parent, proposer, now, nil)
+}
+
+// BuildWithExclusions builds a block while excluding specific transaction content hashes.
+// This is used by proposer-side anti-replay hold logic to avoid re-proposing the same tx
+// across rapid view changes before commit cleanup runs.
+func (b *Builder) BuildWithExclusions(height uint64, parent types.BlockHash, proposer types.ValidatorID, now time.Time, exclusions map[[32]byte]struct{}) *AppBlock {
 	count, _, oldest := b.mp.StatsDetailed()
 	maxCount := b.cfg.MaxTxsPerBlock
 	maxBytes := b.cfg.MaxBlockBytes
-	
+
 	backpressureThreshold := int(float64(b.cfg.MempoolCapacity) * b.cfg.BackpressureThreshold)
-	
+
 	if count > backpressureThreshold {
 		maxCount = min(count, b.cfg.MaxTxsBackpressure)
 	}
-	
+
 	if oldest > 0 && now.Unix()-oldest > b.cfg.LatencyThresholdSeconds {
 		maxCount = min(count, b.cfg.MaxTxsLatency)
 	}
-	
-	txs := b.mp.Select(maxCount, maxBytes)
+
+	// Fetch with unlimited count, then apply exclusion and per-block cap locally.
+	// This avoids starvation when top-ranked txs are temporarily excluded.
+	candidates := b.mp.Select(0, maxBytes)
+	txs := make([]state.Transaction, 0, len(candidates))
+	currentBytes := 0
+	for _, tx := range candidates {
+		if tx == nil {
+			continue
+		}
+		env := tx.Envelope()
+		if env == nil {
+			continue
+		}
+		if len(exclusions) > 0 {
+			if _, blocked := exclusions[env.ContentHash]; blocked {
+				continue
+			}
+		}
+		size := len(tx.Payload())
+		if maxBytes > 0 && currentBytes+size > maxBytes {
+			continue
+		}
+		txs = append(txs, tx)
+		currentBytes += size
+		if maxCount > 0 && len(txs) >= maxCount {
+			break
+		}
+	}
+
 	// Prepare roots
 	txRoot := computeTxRoot(txs)
 	var hint types.BlockHash

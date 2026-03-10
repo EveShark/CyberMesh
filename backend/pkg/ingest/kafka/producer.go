@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -282,14 +283,24 @@ func (p *Producer) PublishCommit(ctx context.Context, height uint64, hash [32]by
 	return nil
 }
 
-// PublishPolicy publishes a policy update event to control.policy.v1.
+// PublishPolicy publishes a policy update event to the configured control policy topic.
 func (p *Producer) PublishPolicy(ctx context.Context, evt *pb.PolicyUpdateEvent) error {
 	_, _, err := p.PublishPolicyWithAck(ctx, evt)
 	return err
 }
 
-// PublishPolicyWithAck publishes a policy update and returns Kafka partition/offset.
+// PublishPolicyWithAck publishes a policy update with legacy key selection and returns Kafka partition/offset.
 func (p *Producer) PublishPolicyWithAck(ctx context.Context, evt *pb.PolicyUpdateEvent) (int32, int64, error) {
+	return p.publishPolicyWithKey(ctx, evt, "")
+}
+
+// PublishPolicyWithRoutingKey publishes a policy update using the provided deterministic routing key.
+// An empty routing key falls back to the legacy key selection path.
+func (p *Producer) PublishPolicyWithRoutingKey(ctx context.Context, evt *pb.PolicyUpdateEvent, routingKey string) (int32, int64, error) {
+	return p.publishPolicyWithKey(ctx, evt, routingKey)
+}
+
+func (p *Producer) publishPolicyWithKey(ctx context.Context, evt *pb.PolicyUpdateEvent, routingKey string) (int32, int64, error) {
 	p.mu.RLock()
 	if p.closed {
 		p.mu.RUnlock()
@@ -322,7 +333,9 @@ func (p *Producer) PublishPolicyWithAck(ctx context.Context, evt *pb.PolicyUpdat
 	}
 
 	var key sarama.Encoder
-	if len(evt.RuleHash) > 0 {
+	if routingKey != "" {
+		key = sarama.StringEncoder(routingKey)
+	} else if len(evt.RuleHash) > 0 {
 		key = sarama.ByteEncoder(evt.RuleHash)
 	} else if evt.PolicyId != "" {
 		key = sarama.StringEncoder(evt.PolicyId)
@@ -338,6 +351,19 @@ func (p *Producer) PublishPolicyWithAck(ctx context.Context, evt *pb.PolicyUpdat
 			{Key: []byte("version"), Value: []byte("1")},
 			{Key: []byte("type"), Value: []byte("policy")},
 		},
+	}
+	if routingKey != "" {
+		routingScopeKind := deriveRoutingScopeKind(routingKey)
+		routingScopeBucketed := "false"
+		if routingScopeKind == "cluster" && routingKey != "cluster" {
+			routingScopeBucketed = "true"
+		}
+		kafkaMsg.Headers = append(kafkaMsg.Headers,
+			sarama.RecordHeader{Key: []byte("routing_mode"), Value: []byte("scope_identifier_v1")},
+			sarama.RecordHeader{Key: []byte("scope_identifier"), Value: []byte(routingKey)},
+			sarama.RecordHeader{Key: []byte("routing_scope_kind"), Value: []byte(routingScopeKind)},
+			sarama.RecordHeader{Key: []byte("routing_scope_bucketed"), Value: []byte(routingScopeBucketed)},
+		)
 	}
 
 	start := time.Now()
@@ -562,6 +588,27 @@ func encodeUint64(n uint64) []byte {
 	buf := make([]byte, 8)
 	binary.BigEndian.PutUint64(buf, n)
 	return buf
+}
+
+func deriveRoutingScopeKind(routingKey string) string {
+	switch {
+	case strings.HasPrefix(routingKey, "node:"):
+		return "node"
+	case strings.HasPrefix(routingKey, "namespace:"):
+		return "namespace"
+	case strings.HasPrefix(routingKey, "tenant:"):
+		return "tenant"
+	case strings.HasPrefix(routingKey, "region:"):
+		return "region"
+	case strings.HasPrefix(routingKey, "cluster"):
+		return "cluster"
+	case routingKey == "global":
+		return "global"
+	case routingKey == "":
+		return "unknown"
+	default:
+		return "unknown"
+	}
 }
 
 func (p *Producer) shouldLog(lastNs *int64) bool {

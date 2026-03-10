@@ -38,6 +38,8 @@ type PolicyAckEvent struct {
 	FastPath           bool                   `protobuf:"varint,12,opt,name=fast_path,json=fastPath,proto3" json:"fast_path,omitempty"`                              // True if policy was evaluated for fast-path
 	RuleHash           []byte                 `protobuf:"bytes,13,opt,name=rule_hash,json=ruleHash,proto3" json:"rule_hash,omitempty"`                               // Policy rule hash for idempotency
 	ProducerId         []byte                 `protobuf:"bytes,14,opt,name=producer_id,json=producerId,proto3" json:"producer_id,omitempty"`                         // Original backend producer id for traceability
+	AppliedAtMs        int64                  `protobuf:"varint,15,opt,name=applied_at_ms,json=appliedAtMs,proto3" json:"applied_at_ms,omitempty"`                   // Unix timestamp in milliseconds when apply finished (preferred when set)
+	AckedAtMs          int64                  `protobuf:"varint,16,opt,name=acked_at_ms,json=ackedAtMs,proto3" json:"acked_at_ms,omitempty"`                         // Unix timestamp in milliseconds when ACK emitted (preferred when set)
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
@@ -170,11 +172,25 @@ func (x *PolicyAckEvent) GetProducerId() []byte {
 	return nil
 }
 
+func (x *PolicyAckEvent) GetAppliedAtMs() int64 {
+	if x != nil {
+		return x.AppliedAtMs
+	}
+	return 0
+}
+
+func (x *PolicyAckEvent) GetAckedAtMs() int64 {
+	if x != nil {
+		return x.AckedAtMs
+	}
+	return 0
+}
+
 var File_backend_proto_control_policy_ack_proto protoreflect.FileDescriptor
 
 const file_backend_proto_control_policy_ack_proto_rawDesc = "" +
 	"\n" +
-	"&backend/proto/control_policy_ack.proto\x12\x14cybermesh.control.v1\"\xc0\x03\n" +
+	"&backend/proto/control_policy_ack.proto\x12\x14cybermesh.control.v1\"\x84\x04\n" +
 	"\x0ePolicyAckEvent\x12\x1b\n" +
 	"\tpolicy_id\x18\x01 \x01(\tR\bpolicyId\x12)\n" +
 	"\x10scope_identifier\x18\x02 \x01(\tR\x0fscopeIdentifier\x12\x16\n" +
@@ -193,7 +209,9 @@ const file_backend_proto_control_policy_ack_proto_rawDesc = "" +
 	"\tfast_path\x18\f \x01(\bR\bfastPath\x12\x1b\n" +
 	"\trule_hash\x18\r \x01(\fR\bruleHash\x12\x1f\n" +
 	"\vproducer_id\x18\x0e \x01(\fR\n" +
-	"producerIdB\x12Z\x10backend/proto;pbb\x06proto3"
+	"producerId\x12\"\n" +
+	"\rapplied_at_ms\x18\x0f \x01(\x03R\vappliedAtMs\x12\x1e\n" +
+	"\vacked_at_ms\x18\x10 \x01(\x03R\tackedAtMsB\x12Z\x10backend/proto;pbb\x06proto3"
 
 var (
 	file_backend_proto_control_policy_ack_proto_rawDescOnce sync.Once

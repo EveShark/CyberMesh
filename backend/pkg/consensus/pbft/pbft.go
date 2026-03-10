@@ -2,12 +2,16 @@ package pbft
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
+	"backend/pkg/block"
 	"backend/pkg/consensus/messages"
 	"backend/pkg/consensus/types"
+	"backend/pkg/state"
 )
 
 // Domain separators for consensus messages
@@ -247,6 +251,7 @@ func (hs *HotStuff) onProposalLocked(ctx context.Context, proposal *messages.Pro
 			return nil, fmt.Errorf("block validation failed: %w", err)
 		}
 	}
+	hs.emitPolicyStageForProposal(proposal, "t_replica_proposal_validated", time.Now().UnixMilli())
 
 	// Store proposal
 	if err := hs.storage.StoreProposal(proposal); err != nil {
@@ -306,6 +311,7 @@ func (hs *HotStuff) sendVoteLocked(ctx context.Context, proposal *messages.Propo
 		VoterID:   messages.KeyID(hs.crypto.GetKeyID()),
 		Timestamp: ts,
 	}
+	hs.emitPolicyStageForProposal(proposal, "t_vote_generated", ts.UnixMilli())
 
 	// Sign vote
 	signBytes := vote.SignBytes()
@@ -348,6 +354,7 @@ func (hs *HotStuff) sendVoteLocked(ctx context.Context, proposal *messages.Propo
 			hs.logger.ErrorContext(ctx, "vote callback failed", "error", err)
 		}
 	}
+	hs.emitPolicyStageForProposal(proposal, "t_vote_broadcast", time.Now().UnixMilli())
 
 	// If we're the leader, process our own vote (MUST be called while holding lock from OnProposal)
 	isLeader, _ := hs.rotation.IsLeader(ctx, hs.crypto.GetKeyID(), proposal.View)
@@ -444,6 +451,7 @@ func (hs *HotStuff) onVoteInternal(ctx context.Context, vote *messages.Vote) (ty
 		hs.pendingVotes[vote.BlockHash] = make(map[types.ValidatorID]*messages.Vote)
 	}
 	hs.pendingVotes[vote.BlockHash][types.ValidatorID(vote.VoterID)] = vote
+	hs.emitPolicyStageForStoredProposal(vote.BlockHash, "t_vote_aggregated", time.Now().UnixMilli())
 
 	// DEBUG: Log quorum check with detailed progress
 	voteCount := len(hs.pendingVotes[vote.BlockHash])
@@ -640,6 +648,7 @@ func (hs *HotStuff) checkCommitRule(ctx context.Context, qc types.QC) error {
 	hs.logger.InfoContext(ctx, "checkCommitRule ENTERED",
 		"qc_view", qc.GetView(),
 		"qc_height", qc.GetHeight())
+	hs.emitPolicyStageForStoredProposal(qc.GetBlockHash(), "t_2chain_commit_eval_start", time.Now().UnixMilli())
 
 	// CRITICAL FIX (BUG-015): Single-node mode immediate commit
 	// In single-node mode (1 validator), there's no Byzantine fault risk.
@@ -706,6 +715,7 @@ func (hs *HotStuff) checkCommitRule(ctx context.Context, qc types.QC) error {
 			// Commit the block from lockedQC (parent of current QC's block)
 			hs.logger.InfoContext(ctx, "2-chain rule satisfied - committing lockedQC block",
 				"commit_height", hs.lockedQC.GetHeight())
+			hs.emitPolicyStageForStoredProposal(lockedHash, "t_2chain_commit_satisfied", time.Now().UnixMilli())
 			proposal := hs.storage.GetProposal(lockedHash)
 			if proposal == nil {
 				hs.logger.ErrorContext(ctx, "cannot find proposal for committed block")
@@ -734,6 +744,98 @@ func (hs *HotStuff) checkCommitRule(ctx context.Context, qc types.QC) error {
 	}
 
 	return nil
+}
+
+func (hs *HotStuff) emitPolicyStageForStoredProposal(blockHash types.BlockHash, stage string, tMs int64) {
+	if hs == nil || hs.storage == nil {
+		return
+	}
+	if proposal := hs.storage.GetProposal(blockHash); proposal != nil {
+		hs.emitPolicyStageForProposal(proposal, stage, tMs)
+	}
+}
+
+func (hs *HotStuff) emitPolicyStageForProposal(proposal *messages.Proposal, stage string, tMs int64) {
+	if hs == nil || hs.logger == nil || proposal == nil || proposal.Block == nil || stage == "" {
+		return
+	}
+	blk, ok := proposal.Block.(*block.AppBlock)
+	if !ok || blk == nil {
+		return
+	}
+	for _, tx := range blk.Transactions() {
+		if tx == nil || tx.Type() != state.TxPolicy {
+			continue
+		}
+		policyID, traceID := extractPolicyIdentityFromPayload(tx.Payload())
+		if policyID == "" {
+			continue
+		}
+		hs.logger.InfoContext(context.Background(), "policy stage marker",
+			"stage", stage,
+			"policy_id", policyID,
+			"trace_id", traceID,
+			"t_ms", tMs,
+			"view", proposal.View,
+			"height", proposal.Height,
+			"block_hash", fmt.Sprintf("%x", proposal.BlockHash[:8]),
+		)
+	}
+}
+
+func extractPolicyIdentityFromPayload(payload []byte) (string, string) {
+	if len(payload) == 0 {
+		return "", ""
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(payload, &root); err != nil {
+		return "", ""
+	}
+
+	policyID := strings.TrimSpace(stringFromMap(root, "policy_id"))
+	traceID := strings.TrimSpace(stringFromMap(root, "trace_id"))
+
+	if traceID == "" {
+		if metadata, ok := root["metadata"].(map[string]interface{}); ok {
+			traceID = strings.TrimSpace(stringFromMap(metadata, "trace_id"))
+		}
+	}
+	if traceID == "" {
+		if trace, ok := root["trace"].(map[string]interface{}); ok {
+			traceID = strings.TrimSpace(stringFromMap(trace, "id"))
+		}
+	}
+
+	if wrapped, ok := root["params"].(map[string]interface{}); ok {
+		if policyID == "" {
+			policyID = strings.TrimSpace(stringFromMap(wrapped, "policy_id"))
+		}
+		if traceID == "" {
+			traceID = strings.TrimSpace(stringFromMap(wrapped, "trace_id"))
+		}
+		if traceID == "" {
+			if metadata, ok := wrapped["metadata"].(map[string]interface{}); ok {
+				traceID = strings.TrimSpace(stringFromMap(metadata, "trace_id"))
+			}
+		}
+		if traceID == "" {
+			if trace, ok := wrapped["trace"].(map[string]interface{}); ok {
+				traceID = strings.TrimSpace(stringFromMap(trace, "id"))
+			}
+		}
+	}
+
+	return policyID, traceID
+}
+
+func stringFromMap(m map[string]interface{}, key string) string {
+	if m == nil {
+		return ""
+	}
+	if s, ok := m[key].(string); ok {
+		return s
+	}
+	return ""
 }
 
 // commitBlock finalizes a block

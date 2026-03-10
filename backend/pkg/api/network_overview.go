@@ -60,6 +60,7 @@ func (s *Server) handleNetworkOverview(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) buildNetworkOverview(ctx context.Context, now time.Time) (*NetworkOverviewResponse, error) {
 	status := s.engine.GetStatus()
+	activation := consapi.PrivateGetActivationStatus(s.engine)
 	validators := s.engine.ListValidators()
 
 	var routerStats p2p.RouterStats
@@ -95,22 +96,23 @@ func (s *Server) buildNetworkOverview(ctx context.Context, now time.Time) (*Netw
 
 	overview := &NetworkOverviewResponse{
 		// ConnectedPeers, TotalPeers, and ExpectedPeers all represent remote validators only.
-		ConnectedPeers:   routerStats.PeerCount,
-		TotalPeers:       totalPeers,
-		ExpectedPeers:    remoteValidatorCount,
-		AverageLatencyMs: routerStats.AvgLatencyMs,
-		ConsensusRound:   status.Height,
-		LeaderStability:  computeLeaderStability(status.Metrics.ViewChanges),
-		Phase:            deriveConsensusPhase(status),
-		Leader:           s.resolveLeaderAlias(status.CurrentLeader, validators),
-		LeaderID:         leaderID,
-		Nodes:            nodes,
-		VotingStatus:     buildVotingStatus(validators),
-		Edges:            s.mergeInferredEdges(edges, peerResolver, routerStats.Self, validators, selfID, now),
-		Self:             selfID,
-		InboundRateBps:   routerStats.InboundRateBps,
-		OutboundRateBps:  routerStats.OutboundRateBps,
-		UpdatedAt:        now,
+		ConnectedPeers:      routerStats.PeerCount,
+		TotalPeers:          totalPeers,
+		ExpectedPeers:       remoteValidatorCount,
+		AverageLatencyMs:    routerStats.AvgLatencyMs,
+		AverageMessageGapMs: routerStats.AvgMessageGapMs,
+		ConsensusRound:      status.Height,
+		LeaderStability:     computeLeaderStability(status.Metrics.ViewChanges),
+		Phase:               deriveConsensusPhase(status, activation),
+		Leader:              s.resolveLeaderAlias(status.CurrentLeader, validators),
+		LeaderID:            leaderID,
+		Nodes:               nodes,
+		VotingStatus:        buildVotingStatus(validators),
+		Edges:               s.mergeInferredEdges(edges, peerResolver, routerStats.Self, validators, selfID, now),
+		Self:                selfID,
+		InboundRateBps:      routerStats.InboundRateBps,
+		OutboundRateBps:     routerStats.OutboundRateBps,
+		UpdatedAt:           now,
 	}
 
 	return overview, nil
@@ -130,6 +132,8 @@ func (s *Server) buildNetworkNodes(validators []types.ValidatorInfo, stats p2p.R
 		}
 		peerStat, ok := validatorStats[v.ID]
 		latencyMs := 0.0
+		pingLatencyMs := 0.0
+		messageGapMs := 0.0
 		throughput := uint64(0)
 		lastSeen := v.LastSeen
 		inRate := 0.0
@@ -138,6 +142,8 @@ func (s *Server) buildNetworkNodes(validators []types.ValidatorInfo, stats p2p.R
 				status = peerStat.Status
 			}
 			latencyMs = peerStat.LatencyMs
+			pingLatencyMs = peerStat.PingLatencyMs
+			messageGapMs = peerStat.MessageGapMs
 			throughput = peerStat.BytesIn
 			inRate = peerStat.RateBps
 			if !peerStat.LastSeen.IsZero() {
@@ -158,6 +164,8 @@ func (s *Server) buildNetworkNodes(validators []types.ValidatorInfo, stats p2p.R
 			Name:            alias,
 			Status:          status,
 			Latency:         latencyMs,
+			PingLatencyMs:   pingLatencyMs,
+			MessageGapMs:    messageGapMs,
 			Uptime:          uptime,
 			ThroughputBytes: throughput,
 			LastSeen:        lastSeenPtr,
@@ -353,14 +361,27 @@ func (s *Server) resolveLeaderAlias(id types.ValidatorID, validators []types.Val
 	return encodeValidatorID(id)
 }
 
-func deriveConsensusPhase(status consapi.EngineStatus) string {
+func deriveConsensusPhase(status consapi.EngineStatus, activation consapi.ActivationStatus) string {
 	switch {
 	case !status.Running:
 		return "stopped"
-	case status.Running && status.Metrics.BlocksCommitted == 0:
-		return "initializing"
-	default:
+	case status.Metrics.BlocksCommitted > 0:
 		return "active"
+	case !status.Metrics.LastCommitTime.IsZero():
+		return "active"
+	case status.Metrics.ProposalsReceived > 0:
+		return "active"
+	case status.Metrics.VotesReceived > 0:
+		return "active"
+	case status.Metrics.QCsFormed > 0:
+		return "active"
+	case activation.RequiredReady > 0 &&
+		activation.ReadyValidators >= activation.RequiredReady &&
+		activation.SeenQuorum &&
+		(activation.RequiredPeers == 0 || activation.ConnectedPeers >= activation.RequiredPeers):
+		return "active"
+	default:
+		return "initializing"
 	}
 }
 

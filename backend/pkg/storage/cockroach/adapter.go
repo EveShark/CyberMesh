@@ -1,6 +1,7 @@
 package cockroach
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -8,6 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -121,10 +124,19 @@ func isUniqueViolation(err error, constraint string) bool {
 
 // adapter implements the Adapter interface
 type adapter struct {
-	db          *sql.DB
-	logger      *utils.Logger
-	auditLogger *utils.AuditLogger
-	metrics     *dbMetrics
+	db                *sql.DB
+	logger            *utils.Logger
+	auditLogger       *utils.AuditLogger
+	metrics           *dbMetrics
+	txMismatchSeenMu  sync.Mutex
+	txMismatchSeen    map[[32]byte]time.Time
+	txMismatchSeenTTL time.Duration
+	txMismatchSeenMax int
+	perf              adapterPerformanceConfig
+	txBatchCanary     *batchCanaryState
+	outboxBatchCanary *batchCanaryState
+	batchTuner        *batchTunerState
+	sqlTpl            sqlTemplateCache
 
 	// Prepared statements for queries
 	stmtGetBlock    *sql.Stmt
@@ -156,11 +168,128 @@ type adapter struct {
 	stmtDeleteEvidenceBefore  *sql.Stmt
 }
 
+type sqlTemplateCache struct {
+	txInsert     sync.Map // map[int]string
+	txVerify     sync.Map // map[int]string
+	outboxInsert sync.Map // map[int]string
+	outboxVerify sync.Map // map[int]string
+}
+
+type batchTunerState struct {
+	txCurrent       atomic.Int64
+	outboxCurrent   atomic.Int64
+	txScaleUp       atomic.Uint64
+	txScaleDown     atomic.Uint64
+	outboxScaleUp   atomic.Uint64
+	outboxScaleDown atomic.Uint64
+}
+
+type batchCanaryState struct {
+	mu                  sync.Mutex
+	samples             []bool
+	idx                 int
+	filled              int
+	bad                 int
+	fallbackUntilUnixMs int64
+	fallbackActivations atomic.Uint64
+}
+
+type policyStageMarker struct {
+	policyID string
+	traceID  string
+	txIndex  int
+}
+
+type persistAttemptContextKey struct{}
+
+// WithPersistAttempt attaches persistence attempt metadata to context for stage correlation.
+func WithPersistAttempt(ctx context.Context, attempt int) context.Context {
+	if attempt <= 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, persistAttemptContextKey{}, attempt)
+}
+
+// PersistAttemptFromContext returns persistence attempt metadata if present.
+func PersistAttemptFromContext(ctx context.Context) int {
+	if ctx == nil {
+		return 0
+	}
+	v := ctx.Value(persistAttemptContextKey{})
+	if n, ok := v.(int); ok && n > 0 {
+		return n
+	}
+	return 0
+}
+
+const (
+	txUpsertBatchSize     = 128
+	outboxUpsertBatchSize = 128
+	maxUpsertBatchSize    = 1024
+)
+
+// AdapterPerformanceConfig controls persistence hot-path batching and guardrails.
+type AdapterPerformanceConfig struct {
+	TxBatchEnabled         bool
+	TxBatchEnabledSet      bool
+	TxBatchSize            int
+	TxBatchAdaptive        bool
+	TxBatchAdaptiveSet     bool
+	TxBatchMinSize         int
+	TxBatchScaleStep       int
+	OutboxBatchEnabled     bool
+	OutboxBatchEnabledSet  bool
+	OutboxBatchSize        int
+	OutboxBatchAdaptive    bool
+	OutboxBatchAdaptiveSet bool
+	OutboxBatchMinSize     int
+	OutboxBatchScaleStep   int
+	TxStoreFullPayload     bool
+	TxStoreFullPayloadSet  bool
+	CanaryAutoFallback     bool
+	CanaryAutoFallbackSet  bool
+	CanaryWindowSize       int
+	CanaryMinSamples       int
+	CanaryMaxErrorRate     float64
+	CanaryFallbackCooldown time.Duration
+	PersistTxRetryMax      int
+	PersistTxRetryBaseMS   int
+	PersistTxRetryMaxMS    int
+	TxVerifyUseTx          bool
+	TxVerifyUseTxSet       bool
+	TxVerifyChunkSize      int
+}
+
+type adapterPerformanceConfig struct {
+	txBatchEnabled         bool
+	txBatchSize            int
+	txBatchAdaptive        bool
+	txBatchMinSize         int
+	txBatchScaleStep       int
+	outboxBatchEnabled     bool
+	outboxBatchSize        int
+	outboxBatchAdaptive    bool
+	outboxBatchMinSize     int
+	outboxBatchScaleStep   int
+	txStoreFullPayload     bool
+	canaryAutoFallback     bool
+	canaryWindowSize       int
+	canaryMinSamples       int
+	canaryMaxErrorRate     float64
+	canaryFallbackCooldown time.Duration
+	persistTxRetryMax      int
+	persistTxRetryBase     time.Duration
+	persistTxRetryCap      time.Duration
+	txVerifyUseTx          bool
+	txVerifyChunkSize      int
+}
+
 // AdapterConfig holds configuration for the adapter
 type AdapterConfig struct {
 	DB          *sql.DB
 	Logger      *utils.Logger
 	AuditLogger *utils.AuditLogger
+	Performance AdapterPerformanceConfig
 }
 
 // NewAdapter creates a new CockroachDB adapter
@@ -170,11 +299,18 @@ func NewAdapter(ctx context.Context, cfg *AdapterConfig) (Adapter, error) {
 	}
 
 	a := &adapter{
-		db:          cfg.DB,
-		logger:      cfg.Logger,
-		auditLogger: cfg.AuditLogger,
-		metrics:     newDBMetrics(),
+		db:                cfg.DB,
+		logger:            cfg.Logger,
+		auditLogger:       cfg.AuditLogger,
+		metrics:           newDBMetrics(),
+		perf:              sanitizePerformanceConfig(cfg.Performance),
+		txMismatchSeen:    make(map[[32]byte]time.Time),
+		txMismatchSeenTTL: 6 * time.Hour,
+		txMismatchSeenMax: 100000,
 	}
+	a.txBatchCanary = newBatchCanaryState(a.perf.canaryWindowSize)
+	a.outboxBatchCanary = newBatchCanaryState(a.perf.canaryWindowSize)
+	a.batchTuner = newBatchTunerState(a.perf.txBatchSize, a.perf.outboxBatchSize)
 
 	// Prepare statements
 	if err := a.prepareStatements(ctx); err != nil {
@@ -183,9 +319,302 @@ func NewAdapter(ctx context.Context, cfg *AdapterConfig) (Adapter, error) {
 
 	if a.logger != nil {
 		a.logger.InfoContext(ctx, "CockroachDB adapter initialized")
+		if !a.perf.txStoreFullPayload {
+			a.logger.WarnContext(ctx, "transaction payload persistence is in minimal mode; full tx JSON is not stored in transactions.payload")
+		}
 	}
 
 	return a, nil
+}
+
+func sanitizePerformanceConfig(cfg AdapterPerformanceConfig) adapterPerformanceConfig {
+	perf := adapterPerformanceConfig{
+		txBatchEnabled:         true,
+		txBatchSize:            txUpsertBatchSize,
+		txBatchAdaptive:        true,
+		txBatchMinSize:         32,
+		txBatchScaleStep:       16,
+		outboxBatchEnabled:     true,
+		outboxBatchSize:        outboxUpsertBatchSize,
+		outboxBatchAdaptive:    true,
+		outboxBatchMinSize:     32,
+		outboxBatchScaleStep:   16,
+		txStoreFullPayload:     true,
+		canaryAutoFallback:     true,
+		canaryWindowSize:       50,
+		canaryMinSamples:       20,
+		canaryMaxErrorRate:     0.20,
+		canaryFallbackCooldown: 5 * time.Minute,
+		persistTxRetryMax:      2,
+		persistTxRetryBase:     40 * time.Millisecond,
+		persistTxRetryCap:      500 * time.Millisecond,
+		txVerifyUseTx:          true,
+		txVerifyChunkSize:      maxUpsertBatchSize,
+	}
+
+	if cfg.TxBatchSize > 0 {
+		perf.txBatchSize = cfg.TxBatchSize
+	}
+	if cfg.OutboxBatchSize > 0 {
+		perf.outboxBatchSize = cfg.OutboxBatchSize
+	}
+	if perf.txBatchSize > maxUpsertBatchSize {
+		perf.txBatchSize = maxUpsertBatchSize
+	}
+	if perf.txBatchSize < 1 {
+		perf.txBatchSize = 1
+	}
+	if perf.outboxBatchSize > maxUpsertBatchSize {
+		perf.outboxBatchSize = maxUpsertBatchSize
+	}
+	if perf.outboxBatchSize < 1 {
+		perf.outboxBatchSize = 1
+	}
+	if cfg.TxBatchEnabledSet {
+		perf.txBatchEnabled = cfg.TxBatchEnabled
+	}
+	if cfg.TxBatchAdaptiveSet {
+		perf.txBatchAdaptive = cfg.TxBatchAdaptive
+	}
+	if cfg.OutboxBatchEnabledSet {
+		perf.outboxBatchEnabled = cfg.OutboxBatchEnabled
+	}
+	if cfg.OutboxBatchAdaptiveSet {
+		perf.outboxBatchAdaptive = cfg.OutboxBatchAdaptive
+	}
+	if cfg.TxBatchMinSize > 0 {
+		perf.txBatchMinSize = cfg.TxBatchMinSize
+	}
+	if cfg.TxBatchScaleStep > 0 {
+		perf.txBatchScaleStep = cfg.TxBatchScaleStep
+	}
+	if cfg.OutboxBatchMinSize > 0 {
+		perf.outboxBatchMinSize = cfg.OutboxBatchMinSize
+	}
+	if cfg.OutboxBatchScaleStep > 0 {
+		perf.outboxBatchScaleStep = cfg.OutboxBatchScaleStep
+	}
+	if cfg.TxStoreFullPayloadSet {
+		perf.txStoreFullPayload = cfg.TxStoreFullPayload
+	}
+	if cfg.CanaryWindowSize > 0 {
+		perf.canaryWindowSize = cfg.CanaryWindowSize
+	}
+	if cfg.CanaryMinSamples > 0 {
+		perf.canaryMinSamples = cfg.CanaryMinSamples
+	}
+	if cfg.CanaryMaxErrorRate > 0 {
+		perf.canaryMaxErrorRate = cfg.CanaryMaxErrorRate
+	}
+	if cfg.CanaryFallbackCooldown > 0 {
+		perf.canaryFallbackCooldown = cfg.CanaryFallbackCooldown
+	}
+	if cfg.PersistTxRetryMax > 0 {
+		perf.persistTxRetryMax = cfg.PersistTxRetryMax
+	}
+	if cfg.PersistTxRetryBaseMS > 0 {
+		perf.persistTxRetryBase = time.Duration(cfg.PersistTxRetryBaseMS) * time.Millisecond
+	}
+	if cfg.PersistTxRetryMaxMS > 0 {
+		perf.persistTxRetryCap = time.Duration(cfg.PersistTxRetryMaxMS) * time.Millisecond
+	}
+	if cfg.TxVerifyUseTxSet {
+		perf.txVerifyUseTx = cfg.TxVerifyUseTx
+	}
+	if cfg.TxVerifyChunkSize > 0 {
+		perf.txVerifyChunkSize = cfg.TxVerifyChunkSize
+	}
+	if perf.persistTxRetryMax < 1 {
+		perf.persistTxRetryMax = 1
+	}
+	if perf.persistTxRetryBase <= 0 {
+		perf.persistTxRetryBase = 10 * time.Millisecond
+	}
+	if perf.persistTxRetryCap < perf.persistTxRetryBase {
+		perf.persistTxRetryCap = perf.persistTxRetryBase
+	}
+	if perf.txVerifyChunkSize < 1 {
+		perf.txVerifyChunkSize = 1
+	}
+	if perf.txVerifyChunkSize > maxUpsertBatchSize {
+		perf.txVerifyChunkSize = maxUpsertBatchSize
+	}
+	if perf.canaryWindowSize < 1 {
+		perf.canaryWindowSize = 1
+	}
+	if perf.canaryMinSamples < 1 {
+		perf.canaryMinSamples = 1
+	}
+	if perf.canaryMinSamples > perf.canaryWindowSize {
+		perf.canaryMinSamples = perf.canaryWindowSize
+	}
+	if perf.canaryMaxErrorRate <= 0 || perf.canaryMaxErrorRate > 1 {
+		perf.canaryMaxErrorRate = 0.20
+	}
+	if perf.txBatchMinSize < 1 {
+		perf.txBatchMinSize = 1
+	}
+	if perf.txBatchMinSize > perf.txBatchSize {
+		perf.txBatchMinSize = perf.txBatchSize
+	}
+	if perf.txBatchScaleStep < 1 {
+		perf.txBatchScaleStep = 1
+	}
+	if perf.outboxBatchMinSize < 1 {
+		perf.outboxBatchMinSize = 1
+	}
+	if perf.outboxBatchMinSize > perf.outboxBatchSize {
+		perf.outboxBatchMinSize = perf.outboxBatchSize
+	}
+	if perf.outboxBatchScaleStep < 1 {
+		perf.outboxBatchScaleStep = 1
+	}
+	if cfg.CanaryAutoFallbackSet {
+		perf.canaryAutoFallback = cfg.CanaryAutoFallback
+	}
+	return perf
+}
+
+func newBatchCanaryState(window int) *batchCanaryState {
+	if window < 1 {
+		window = 1
+	}
+	return &batchCanaryState{
+		samples: make([]bool, window),
+	}
+}
+
+func newBatchTunerState(txInitial, outboxInitial int) *batchTunerState {
+	if txInitial < 1 {
+		txInitial = txUpsertBatchSize
+	}
+	if outboxInitial < 1 {
+		outboxInitial = outboxUpsertBatchSize
+	}
+	s := &batchTunerState{}
+	s.txCurrent.Store(int64(txInitial))
+	s.outboxCurrent.Store(int64(outboxInitial))
+	return s
+}
+
+func (b *batchTunerState) txSize(defaultSize int) int {
+	if b == nil {
+		return defaultSize
+	}
+	v := int(b.txCurrent.Load())
+	if v < 1 {
+		return defaultSize
+	}
+	return v
+}
+
+func (b *batchTunerState) outboxSize(defaultSize int) int {
+	if b == nil {
+		return defaultSize
+	}
+	v := int(b.outboxCurrent.Load())
+	if v < 1 {
+		return defaultSize
+	}
+	return v
+}
+
+func (b *batchTunerState) setTxSize(size int) {
+	if b == nil || size < 1 {
+		return
+	}
+	b.txCurrent.Store(int64(size))
+}
+
+func (b *batchTunerState) setOutboxSize(size int) {
+	if b == nil || size < 1 {
+		return
+	}
+	b.outboxCurrent.Store(int64(size))
+}
+
+func (b *batchTunerState) scaleDownTx() {
+	if b != nil {
+		b.txScaleDown.Add(1)
+	}
+}
+
+func (b *batchTunerState) scaleUpTx() {
+	if b != nil {
+		b.txScaleUp.Add(1)
+	}
+}
+
+func (b *batchTunerState) scaleDownOutbox() {
+	if b != nil {
+		b.outboxScaleDown.Add(1)
+	}
+}
+
+func (b *batchTunerState) scaleUpOutbox() {
+	if b != nil {
+		b.outboxScaleUp.Add(1)
+	}
+}
+
+func (b *batchCanaryState) isFallbackActive(now time.Time) bool {
+	if b == nil {
+		return false
+	}
+	return now.UnixMilli() < atomic.LoadInt64(&b.fallbackUntilUnixMs)
+}
+
+func (b *batchCanaryState) fallbackUntilUnixMilli() int64 {
+	if b == nil {
+		return 0
+	}
+	return atomic.LoadInt64(&b.fallbackUntilUnixMs)
+}
+
+func (b *batchCanaryState) activationCount() uint64 {
+	if b == nil {
+		return 0
+	}
+	return b.fallbackActivations.Load()
+}
+
+func (b *batchCanaryState) recordSample(now time.Time, bad bool, minSamples int, maxErrorRate float64, cooldown time.Duration) bool {
+	if b == nil {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.filled == len(b.samples) {
+		if b.samples[b.idx] {
+			b.bad--
+		}
+	} else {
+		b.filled++
+	}
+
+	b.samples[b.idx] = bad
+	if bad {
+		b.bad++
+	}
+	b.idx = (b.idx + 1) % len(b.samples)
+
+	if b.filled < minSamples {
+		return false
+	}
+	rate := float64(b.bad) / float64(b.filled)
+	if rate <= maxErrorRate {
+		return false
+	}
+
+	until := now.Add(cooldown).UnixMilli()
+	previous := atomic.LoadInt64(&b.fallbackUntilUnixMs)
+	if until > previous {
+		atomic.StoreInt64(&b.fallbackUntilUnixMs, until)
+		b.fallbackActivations.Add(1)
+		return true
+	}
+	return false
 }
 
 // prepareStatements prepares SQL statements for reuse
@@ -434,11 +863,53 @@ func (a *adapter) prepareStatements(ctx context.Context) error {
 }
 
 // PersistBlock atomically persists block, transactions, and state snapshot
-func (a *adapter) PersistBlock(ctx context.Context, blk *block.AppBlock, receipts []state.Receipt, stateRoot [32]byte) error {
+func (a *adapter) PersistBlock(ctx context.Context, blk *block.AppBlock, receipts []state.Receipt, stateRoot [32]byte) (retErr error) {
 	stop := a.recordTxn("persist_block")
 	defer stop()
+	persistStart := time.Now()
+	txBodyStart := time.Time{}
+	defer func() {
+		if a.metrics == nil {
+			if a.logger != nil && blk != nil {
+				total := time.Since(persistStart)
+				if total >= 2*time.Second {
+					a.logger.Warn("persist attempt summary",
+						utils.ZapUint64("height", blk.GetHeight()),
+						utils.ZapInt("attempt", PersistAttemptFromContext(ctx)),
+						utils.ZapFloat64("total_ms", float64(total)/float64(time.Millisecond)),
+						utils.ZapString("result", map[bool]string{true: "error", false: "ok"}[retErr != nil]))
+				}
+			}
+			return
+		}
+		a.metrics.observePersistStage("persist_attempt_total", time.Since(persistStart))
+		if !txBodyStart.IsZero() {
+			a.metrics.observePersistStage("tx_body_exec", time.Since(txBodyStart))
+		}
+		if retErr != nil {
+			a.metrics.observePersistFailureClass("persist_attempt_total", retErr)
+		}
+		if a.logger != nil && blk != nil {
+			total := time.Since(persistStart)
+			if total >= 2*time.Second {
+				result := "ok"
+				class := "none"
+				if retErr != nil {
+					result = "error"
+					class = classifyPersistError(retErr)
+				}
+				a.logger.Warn("persist attempt summary",
+					utils.ZapUint64("height", blk.GetHeight()),
+					utils.ZapInt("attempt", PersistAttemptFromContext(ctx)),
+					utils.ZapFloat64("total_ms", float64(total)/float64(time.Millisecond)),
+					utils.ZapString("result", result),
+					utils.ZapString("class", class))
+			}
+		}
+	}()
 	if blk == nil {
-		return fmt.Errorf("%w: block is nil", ErrInvalidData)
+		retErr = fmt.Errorf("%w: block is nil", ErrInvalidData)
+		return retErr
 	}
 
 	// Audit the persistence attempt (without payload)
@@ -451,14 +922,64 @@ func (a *adapter) PersistBlock(ctx context.Context, blk *block.AppBlock, receipt
 		})
 	}
 
+	maxAttempts := a.perf.persistTxRetryMax
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	var txErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			delay := retryBackoff(attempt-1, a.perf.persistTxRetryBase, a.perf.persistTxRetryCap)
+			delay = withRetryJitter(delay)
+			if a.metrics != nil {
+				a.metrics.observePersistStage("persist_internal_retry_delay", delay)
+			}
+			if !waitForContext(ctx, delay) {
+				retErr = fmt.Errorf("persist internal retry canceled: %w", ctx.Err())
+				return retErr
+			}
+		}
+		txErr = a.persistBlockOnce(ctx, blk, receipts, stateRoot, persistStart, &txBodyStart)
+		if txErr == nil {
+			retErr = nil
+			return nil
+		}
+		if !IsRetryable(txErr) {
+			retErr = txErr
+			return retErr
+		}
+		if a.metrics != nil {
+			a.metrics.observePersistFailureClass("persist_internal_retry", txErr)
+			if classifyPersistError(txErr) == "retry_serialization" {
+				a.metrics.observePersistContentionSignal("serialization_retry")
+			}
+		}
+	}
+	retErr = txErr
+	return retErr
+}
+
+func (a *adapter) persistBlockOnce(ctx context.Context, blk *block.AppBlock, receipts []state.Receipt, stateRoot [32]byte, _ time.Time, txBodyStart *time.Time) error {
 	// Start SERIALIZABLE transaction for linearizability
+	beginStart := time.Now()
 	tx, err := a.db.BeginTx(ctx, &sql.TxOptions{
 		Isolation: sql.LevelSerializable,
 	})
+	beginWait := time.Since(beginStart)
+	if a.metrics != nil {
+		a.metrics.observePersistStage("tx_begin_wait", beginWait)
+		if beginWait >= 250*time.Millisecond {
+			a.metrics.observePersistContentionSignal("tx_begin_lock_wait")
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
+	*txBodyStart = time.Now()
 	defer tx.Rollback() // Safe to call even after commit
+	persistAttempt := PersistAttemptFromContext(ctx)
+	policyMarkers := collectPolicyStageMarkers(blk)
+	a.logPolicyStageMarkers(policyMarkers, blk.GetHeight(), "t_db_tx_begin", time.Now().UnixMilli(), persistAttempt)
 
 	// 1. UPSERT block
 	stageStart := time.Now()
@@ -467,6 +988,7 @@ func (a *adapter) PersistBlock(ctx context.Context, blk *block.AppBlock, receipt
 			a.metrics.observePersistStage("upsert_block", time.Since(stageStart))
 			a.metrics.observePersistFailureClass("upsert_block", err)
 		}
+		a.logPolicyStageMarkers(policyMarkers, blk.GetHeight(), "t_db_upsert_block_failed", time.Now().UnixMilli(), persistAttempt)
 		if a.auditLogger != nil {
 			_ = a.auditLogger.Error("block_persist_failed", map[string]interface{}{
 				"height": blk.GetHeight(),
@@ -478,14 +1000,18 @@ func (a *adapter) PersistBlock(ctx context.Context, blk *block.AppBlock, receipt
 	if a.metrics != nil {
 		a.metrics.observePersistStage("upsert_block", time.Since(stageStart))
 	}
+	a.logPolicyStageMarkers(policyMarkers, blk.GetHeight(), "t_db_upsert_block_done", time.Now().UnixMilli(), persistAttempt)
 
 	// 2. UPSERT transactions
 	stageStart = time.Now()
-	if err := a.upsertTransactions(ctx, tx, blk, receipts); err != nil {
+	upsertTransactionsCallStart := time.Now()
+	if err := a.upsertTransactions(ctx, tx, blk, receipts, persistAttempt); err != nil {
 		if a.metrics != nil {
+			a.metrics.observePersistStage("upsert_transactions_call_wall", time.Since(upsertTransactionsCallStart))
 			a.metrics.observePersistStage("upsert_transactions", time.Since(stageStart))
 			a.metrics.observePersistFailureClass("upsert_transactions", err)
 		}
+		a.logPolicyStageMarkers(policyMarkers, blk.GetHeight(), "t_db_upsert_transactions_failed", time.Now().UnixMilli(), persistAttempt)
 		if a.auditLogger != nil {
 			_ = a.auditLogger.Error("transactions_persist_failed", map[string]interface{}{
 				"height": blk.GetHeight(),
@@ -495,8 +1021,10 @@ func (a *adapter) PersistBlock(ctx context.Context, blk *block.AppBlock, receipt
 		return fmt.Errorf("upsert transactions: %w", err)
 	}
 	if a.metrics != nil {
+		a.metrics.observePersistStage("upsert_transactions_call_wall", time.Since(upsertTransactionsCallStart))
 		a.metrics.observePersistStage("upsert_transactions", time.Since(stageStart))
 	}
+	a.logPolicyStageMarkers(policyMarkers, blk.GetHeight(), "t_db_upsert_transactions_done", time.Now().UnixMilli(), persistAttempt)
 
 	// 3. UPSERT state snapshot
 	stageStart = time.Now()
@@ -505,6 +1033,7 @@ func (a *adapter) PersistBlock(ctx context.Context, blk *block.AppBlock, receipt
 			a.metrics.observePersistStage("upsert_snapshot", time.Since(stageStart))
 			a.metrics.observePersistFailureClass("upsert_snapshot", err)
 		}
+		a.logPolicyStageMarkers(policyMarkers, blk.GetHeight(), "t_db_upsert_snapshot_failed", time.Now().UnixMilli(), persistAttempt)
 		if a.auditLogger != nil {
 			_ = a.auditLogger.Error("snapshot_persist_failed", map[string]interface{}{
 				"height": blk.GetHeight(),
@@ -516,6 +1045,7 @@ func (a *adapter) PersistBlock(ctx context.Context, blk *block.AppBlock, receipt
 	if a.metrics != nil {
 		a.metrics.observePersistStage("upsert_snapshot", time.Since(stageStart))
 	}
+	a.logPolicyStageMarkers(policyMarkers, blk.GetHeight(), "t_db_upsert_snapshot_done", time.Now().UnixMilli(), persistAttempt)
 
 	// Commit transaction
 	stageStart = time.Now()
@@ -524,6 +1054,7 @@ func (a *adapter) PersistBlock(ctx context.Context, blk *block.AppBlock, receipt
 			a.metrics.observePersistStage("commit", time.Since(stageStart))
 			a.metrics.observePersistFailureClass("commit", err)
 		}
+		a.logPolicyStageMarkers(policyMarkers, blk.GetHeight(), "t_db_tx_commit_failed", time.Now().UnixMilli(), persistAttempt)
 		if a.auditLogger != nil {
 			_ = a.auditLogger.Error("block_persist_commit_failed", map[string]interface{}{
 				"height": blk.GetHeight(),
@@ -535,6 +1066,7 @@ func (a *adapter) PersistBlock(ctx context.Context, blk *block.AppBlock, receipt
 	if a.metrics != nil {
 		a.metrics.observePersistStage("commit", time.Since(stageStart))
 	}
+	a.logPolicyStageMarkers(policyMarkers, blk.GetHeight(), "t_db_tx_commit_done", time.Now().UnixMilli(), persistAttempt)
 
 	// Success audit
 	if a.auditLogger != nil {
@@ -554,6 +1086,57 @@ func (a *adapter) PersistBlock(ctx context.Context, blk *block.AppBlock, receipt
 	}
 
 	return nil
+}
+
+func retryBackoff(attempt int, base, max time.Duration) time.Duration {
+	if base <= 0 {
+		base = 10 * time.Millisecond
+	}
+	if max < base {
+		max = base
+	}
+	delay := base
+	for i := 0; i < attempt; i++ {
+		if delay >= max/2 {
+			return max
+		}
+		delay *= 2
+	}
+	if delay > max {
+		return max
+	}
+	return delay
+}
+
+func waitForContext(ctx context.Context, delay time.Duration) bool {
+	if delay <= 0 {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+			return true
+		}
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func withRetryJitter(base time.Duration) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	maxJitter := base / 5 // +20% max jitter
+	if maxJitter <= 0 {
+		return base
+	}
+	extra := time.Duration(time.Now().UnixNano() % int64(maxJitter+1))
+	return base + extra
 }
 
 // upsertBlock inserts or verifies existing block
@@ -643,39 +1226,441 @@ func (a *adapter) upsertBlock(ctx context.Context, tx *sql.Tx, blk *block.AppBlo
 	return nil
 }
 
-// upsertTransactions inserts or verifies existing transactions
-func (a *adapter) upsertTransactions(ctx context.Context, tx *sql.Tx, blk *block.AppBlock, receipts []state.Receipt) error {
+type persistedTxRecord struct {
+	txHash       [32]byte
+	blockHeight  uint64
+	txIndex      int
+	txType       string
+	producerID   []byte
+	nonce        []byte
+	contentHash  [32]byte
+	algorithm    string
+	publicKey    []byte
+	signature    []byte
+	payloadJSON  []byte
+	custodyChain []byte
+	status       string
+	errorMsg     string
+	submittedAt  time.Time
+}
+
+type existingTxRecord struct {
+	contentHash [32]byte
+	producerID  []byte
+	nonce       []byte
+	blockHeight uint64
+	txIndex     int
+	algorithm   string
+	publicKey   []byte
+	signature   []byte
+}
+
+type policyOutboxInput struct {
+	blockHeight uint64
+	blockTS     int64
+	txIndex     int
+	txTS        int64
+	payload     []byte
+}
+
+func (a *adapter) txInsertTemplate(rows int) string {
+	if rows < 1 {
+		rows = 1
+	}
+	if cached, ok := a.sqlTpl.txInsert.Load(rows); ok {
+		if s, ok := cached.(string); ok && s != "" {
+			return s
+		}
+	}
+	var q strings.Builder
+	q.Grow(rows * 80)
+	q.WriteString(`
+			INSERT INTO transactions (
+				tx_hash, block_height, tx_index, tx_type, producer_id, nonce, content_hash,
+				algorithm, public_key, signature, payload, custody_chain, status, error_msg,
+				submitted_at, executed_at
+			) VALUES
+	`)
+	for i := 0; i < rows; i++ {
+		if i > 0 {
+			q.WriteString(",")
+		}
+		base := i * 15
+		fmt.Fprintf(&q, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,NOW())",
+			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10, base+11, base+12, base+13, base+14, base+15)
+	}
+	q.WriteString(`
+			ON CONFLICT (tx_hash) DO NOTHING
+			RETURNING tx_hash
+	`)
+	sql := q.String()
+	a.sqlTpl.txInsert.Store(rows, sql)
+	return sql
+}
+
+func (a *adapter) txVerifyTemplate(rows int) string {
+	if rows < 1 {
+		rows = 1
+	}
+	if cached, ok := a.sqlTpl.txVerify.Load(rows); ok {
+		if s, ok := cached.(string); ok && s != "" {
+			return s
+		}
+	}
+	var q strings.Builder
+	q.Grow(rows * 8)
+	q.WriteString(`
+			SELECT tx_hash, content_hash, producer_id, nonce, block_height, tx_index, algorithm, public_key, signature
+			FROM transactions
+			WHERE tx_hash IN (
+	`)
+	for i := 0; i < rows; i++ {
+		if i > 0 {
+			q.WriteString(",")
+		}
+		fmt.Fprintf(&q, "$%d", i+1)
+	}
+	q.WriteString(")")
+	sql := q.String()
+	a.sqlTpl.txVerify.Store(rows, sql)
+	return sql
+}
+
+func (a *adapter) outboxInsertTemplate(rows int) string {
+	if rows < 1 {
+		rows = 1
+	}
+	if cached, ok := a.sqlTpl.outboxInsert.Load(rows); ok {
+		if s, ok := cached.(string); ok && s != "" {
+			return s
+		}
+	}
+	var q strings.Builder
+	q.Grow(rows * 90)
+	q.WriteString(`
+			INSERT INTO control_policy_outbox (
+				block_height, block_ts, tx_index, policy_id, rule_hash, payload, trace_id, ai_event_ts_ms, source_event_id, source_event_ts_ms, status, next_retry_at, created_at, updated_at
+			) VALUES
+	`)
+	for i := 0; i < rows; i++ {
+		if i > 0 {
+			q.WriteString(",")
+		}
+		base := i * 10
+		fmt.Fprintf(&q, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,NULLIF($%d,''),NULLIF($%d,0),'pending',NOW(),NOW(),NOW())",
+			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10)
+	}
+	q.WriteString(`
+			ON CONFLICT (block_height, tx_index) DO NOTHING
+			RETURNING block_height, tx_index
+	`)
+	sql := q.String()
+	a.sqlTpl.outboxInsert.Store(rows, sql)
+	return sql
+}
+
+func (a *adapter) outboxVerifyTemplate(rows int) string {
+	if rows < 1 {
+		rows = 1
+	}
+	if cached, ok := a.sqlTpl.outboxVerify.Load(rows); ok {
+		if s, ok := cached.(string); ok && s != "" {
+			return s
+		}
+	}
+	var q strings.Builder
+	q.Grow(rows * 24)
+	q.WriteString(`
+			SELECT block_height, tx_index, policy_id, rule_hash
+			FROM control_policy_outbox
+			WHERE
+	`)
+	for i := 0; i < rows; i++ {
+		if i > 0 {
+			q.WriteString(" OR ")
+		}
+		base := i * 2
+		fmt.Fprintf(&q, "(block_height = $%d AND tx_index = $%d)", base+1, base+2)
+	}
+	sql := q.String()
+	a.sqlTpl.outboxVerify.Store(rows, sql)
+	return sql
+}
+
+func (a *adapter) marshalStoredTxPayload(stateTx state.Transaction) ([]byte, error) {
+	if a == nil || a.perf.txStoreFullPayload {
+		return json.Marshal(stateTx)
+	}
+	env := stateTx.Envelope()
+	const payloadCap = 256
+	buf := make([]byte, 0, payloadCap)
+	buf = append(buf, []byte(`{"tx_type":"`)...)
+	buf = append(buf, []byte(string(stateTx.Type()))...)
+	buf = append(buf, []byte(`","payload_sha256":"`)...)
+	buf = append(buf, []byte(hex.EncodeToString(env.ContentHash[:]))...)
+	buf = append(buf, []byte(`","ts":`)...)
+	buf = append(buf, []byte(strconv.FormatInt(stateTx.Timestamp(), 10))...)
+	buf = append(buf, []byte(`}`)...)
+	return buf, nil
+}
+
+func (a *adapter) txBatchRuntime() (enabled bool, chunkSize int, mode string) {
+	if a == nil {
+		return true, txUpsertBatchSize, "batch"
+	}
+	if !a.perf.txBatchEnabled {
+		return false, 1, "disabled"
+	}
+	if a.perf.canaryAutoFallback && a.txBatchCanary != nil && a.txBatchCanary.isFallbackActive(time.Now()) {
+		return false, 1, "fallback_single"
+	}
+	size := a.perf.txBatchSize
+	if a.perf.txBatchAdaptive && a.batchTuner != nil {
+		size = a.batchTuner.txSize(a.perf.txBatchSize)
+	}
+	if size < 1 {
+		size = 1
+	}
+	if a.perf.txBatchAdaptive {
+		return true, size, "adaptive_batch"
+	}
+	return true, size, "batch"
+}
+
+func (a *adapter) outboxBatchRuntime() (enabled bool, chunkSize int, mode string) {
+	if a == nil {
+		return true, outboxUpsertBatchSize, "batch"
+	}
+	if !a.perf.outboxBatchEnabled {
+		return false, 1, "disabled"
+	}
+	if a.perf.canaryAutoFallback && a.outboxBatchCanary != nil && a.outboxBatchCanary.isFallbackActive(time.Now()) {
+		return false, 1, "fallback_single"
+	}
+	size := a.perf.outboxBatchSize
+	if a.perf.outboxBatchAdaptive && a.batchTuner != nil {
+		size = a.batchTuner.outboxSize(a.perf.outboxBatchSize)
+	}
+	if size < 1 {
+		size = 1
+	}
+	if a.perf.outboxBatchAdaptive {
+		return true, size, "adaptive_batch"
+	}
+	return true, size, "batch"
+}
+
+func classifyCanaryReason(err error) string {
+	if err == nil {
+		return "none"
+	}
+	switch {
+	case errors.Is(err, ErrIntegrityViolation):
+		return "integrity"
+	case errors.Is(err, ErrInvalidData):
+		return "invalid"
+	case IsRetryable(err):
+		return "retryable"
+	default:
+		return "other"
+	}
+}
+
+func (a *adapter) recordTxBatchCanaryOutcome(err error, usedBatch bool) {
+	if a == nil || a.txBatchCanary == nil || !a.perf.canaryAutoFallback || !usedBatch {
+		return
+	}
+	reason := classifyCanaryReason(err)
+	if a.metrics != nil && reason != "none" {
+		a.metrics.observeTxBatchCanaryBad(reason)
+	}
+	// Security and availability split:
+	// - integrity/invalid errors still fail closed
+	// - only transient retryable errors trigger auto-fallback mode
+	bad := reason == "retryable"
+	activated := a.txBatchCanary.recordSample(
+		time.Now(),
+		bad,
+		a.perf.canaryMinSamples,
+		a.perf.canaryMaxErrorRate,
+		a.perf.canaryFallbackCooldown,
+	)
+	if activated && a.logger != nil {
+		a.logger.Warn("tx upsert switched to safe single-row mode",
+			utils.ZapFloat64("max_error_rate", a.perf.canaryMaxErrorRate),
+			utils.ZapInt("window_size", a.perf.canaryWindowSize),
+			utils.ZapInt("min_samples", a.perf.canaryMinSamples),
+			utils.ZapDuration("cooldown", a.perf.canaryFallbackCooldown))
+	}
+}
+
+func (a *adapter) recordOutboxBatchCanaryOutcome(err error, usedBatch bool) {
+	if a == nil || a.outboxBatchCanary == nil || !a.perf.canaryAutoFallback || !usedBatch {
+		return
+	}
+	reason := classifyCanaryReason(err)
+	if a.metrics != nil && reason != "none" {
+		a.metrics.observeOutboxBatchCanaryBad(reason)
+	}
+	// Security and availability split:
+	// - integrity/invalid errors still fail closed
+	// - only transient retryable errors trigger auto-fallback mode
+	bad := reason == "retryable"
+	activated := a.outboxBatchCanary.recordSample(
+		time.Now(),
+		bad,
+		a.perf.canaryMinSamples,
+		a.perf.canaryMaxErrorRate,
+		a.perf.canaryFallbackCooldown,
+	)
+	if activated && a.logger != nil {
+		a.logger.Warn("outbox upsert switched to safe single-row mode",
+			utils.ZapFloat64("max_error_rate", a.perf.canaryMaxErrorRate),
+			utils.ZapInt("window_size", a.perf.canaryWindowSize),
+			utils.ZapInt("min_samples", a.perf.canaryMinSamples),
+			utils.ZapDuration("cooldown", a.perf.canaryFallbackCooldown))
+	}
+}
+
+func (a *adapter) tuneBatchSizes(txConflicts, txRows int, txErr error, outboxRows int, outboxErr error) {
+	if a == nil || a.batchTuner == nil {
+		return
+	}
+	if a.perf.txBatchAdaptive {
+		current := a.batchTuner.txSize(a.perf.txBatchSize)
+		next := current
+		switch {
+		case txErr != nil && IsRetryable(txErr):
+			next = maxInt(a.perf.txBatchMinSize, current/2)
+		case txRows > 0 && txConflicts*5 > txRows: // >20% conflicts
+			next = maxInt(a.perf.txBatchMinSize, current/2)
+		case txErr == nil && txConflicts*20 < maxInt(txRows, 1): // <5% conflicts
+			next = minInt(a.perf.txBatchSize, current+a.perf.txBatchScaleStep)
+		}
+		if next < current {
+			a.batchTuner.scaleDownTx()
+		}
+		if next > current {
+			a.batchTuner.scaleUpTx()
+		}
+		a.batchTuner.setTxSize(next)
+	}
+	if a.perf.outboxBatchAdaptive {
+		current := a.batchTuner.outboxSize(a.perf.outboxBatchSize)
+		next := current
+		switch {
+		case outboxErr != nil && IsRetryable(outboxErr):
+			next = maxInt(a.perf.outboxBatchMinSize, current/2)
+		case outboxErr == nil && outboxRows > 0:
+			next = minInt(a.perf.outboxBatchSize, current+a.perf.outboxBatchScaleStep)
+		}
+		if next < current {
+			a.batchTuner.scaleDownOutbox()
+		}
+		if next > current {
+			a.batchTuner.scaleUpOutbox()
+		}
+		a.batchTuner.setOutboxSize(next)
+	}
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func (a *adapter) upsertTransactions(ctx context.Context, tx *sql.Tx, blk *block.AppBlock, receipts []state.Receipt, persistAttempt int) (retErr error) {
 	transactions := blk.Transactions()
 	if len(transactions) != len(receipts) {
 		return fmt.Errorf("%w: transaction count mismatch", ErrInvalidData)
 	}
+	if len(transactions) == 0 {
+		return nil
+	}
+	upsertTransactionsStart := time.Now()
+	beforeVerifyStart := upsertTransactionsStart
+	afterVerifyStart := time.Time{}
+	verifyStarted := false
+	verifyCompleted := false
+	defer func() {
+		if a == nil || a.metrics == nil {
+			return
+		}
+		totalDur := time.Since(upsertTransactionsStart)
+		a.metrics.observePersistStage("upsert_transactions_total_inner", totalDur)
+		if verifyCompleted && !afterVerifyStart.IsZero() {
+			a.metrics.observePersistStage("upsert_transactions_after_verify", time.Since(afterVerifyStart))
+		}
+		if !verifyStarted {
+			a.metrics.observePersistDiagnosticSignal("upsert_transactions_verify_skipped")
+		}
+		if retErr == nil {
+			a.metrics.observePersistDiagnosticSignal("upsert_transactions_return_success")
+			a.metrics.observePersistStage("upsert_transactions_return_success", totalDur)
+			return
+		}
+		if errors.Is(retErr, ErrIntegrityViolation) {
+			a.metrics.observePersistDiagnosticSignal("upsert_transactions_return_integrity_error")
+			a.metrics.observePersistStage("upsert_transactions_return_integrity_error", totalDur)
+			return
+		}
+		a.metrics.observePersistDiagnosticSignal("upsert_transactions_return_other_error")
+		a.metrics.observePersistStage("upsert_transactions_return_other_error", totalDur)
+	}()
+	_, txChunkSize, txMode := a.txBatchRuntime()
+	outboxBatchEnabled, outboxChunkSize, outboxMode := a.outboxBatchRuntime()
+	usedTxBatch := txMode == "batch" || txMode == "adaptive_batch"
+	usedOutboxBatch := outboxMode == "batch" || outboxMode == "adaptive_batch"
+	totalConflicts := 0
+	totalPayloadBytes := 0
+	rowCount := len(transactions)
+	policyRowCount := 0
+	var outboxErr error
+	defer func() {
+		if a.metrics != nil {
+			a.metrics.observeTxUpsertStats(rowCount, totalConflicts, totalPayloadBytes)
+			a.metrics.observeTxBatchMode(txMode)
+			a.metrics.observeOutboxBatchMode(outboxMode)
+		}
+		a.tuneBatchSizes(totalConflicts, rowCount, retErr, policyRowCount, outboxErr)
+		a.recordTxBatchCanaryOutcome(retErr, usedTxBatch)
+		a.recordOutboxBatchCanaryOutcome(outboxErr, usedOutboxBatch)
+	}()
 
+	records := make([]persistedTxRecord, 0, len(transactions))
+	policyRows := make([]policyOutboxInput, 0, len(transactions))
+	seenTxHash := make(map[[32]byte]persistedTxRecord, len(transactions))
+	prepareStart := time.Now()
+	blockTS := blk.GetTimestamp().Unix()
 	for i, receipt := range receipts {
 		if i >= len(transactions) {
 			return fmt.Errorf("%w: receipt index out of bounds", ErrInvalidData)
 		}
-
 		stateTx := transactions[i]
 		envelope := stateTx.Envelope()
 
-		// Serialize payload to JSONB
-		payloadJSON, err := json.Marshal(stateTx)
+		payloadJSON, err := a.marshalStoredTxPayload(stateTx)
 		if err != nil {
 			return fmt.Errorf("failed to marshal transaction payload: %w", err)
 		}
 
-		// Serialize custody chain if present (for EvidenceTx)
 		var custodyChainJSON []byte
-		if evidenceTx, ok := stateTx.(*state.EvidenceTx); ok {
-			if len(evidenceTx.CoC) > 0 {
-				custodyChainJSON, err = json.Marshal(evidenceTx.CoC)
-				if err != nil {
-					return fmt.Errorf("failed to marshal custody chain: %w", err)
-				}
+		if evidenceTx, ok := stateTx.(*state.EvidenceTx); ok && len(evidenceTx.CoC) > 0 {
+			custodyChainJSON, err = json.Marshal(evidenceTx.CoC)
+			if err != nil {
+				return fmt.Errorf("failed to marshal custody chain: %w", err)
 			}
 		}
 
-		// Determine status from receipt
 		status := "success"
 		errorMsg := ""
 		if receipt.Error != "" {
@@ -683,7 +1668,6 @@ func (a *adapter) upsertTransactions(ctx context.Context, tx *sql.Tx, blk *block
 			errorMsg = receipt.Error
 		}
 
-		// Compute stable transaction ID from envelope sign-bytes (prevents collisions on identical payloads)
 		contentHash := envelope.ContentHash
 		var domain string
 		switch stateTx.Type() {
@@ -702,103 +1686,500 @@ func (a *adapter) upsertTransactions(ctx context.Context, tx *sql.Tx, blk *block
 		}
 		txHash := state.HashBytes(signBytes)
 
-		// Try INSERT with conflict-avoidance to keep transaction alive
-		res, err := tx.ExecContext(ctx, `
-			INSERT INTO transactions (
-				tx_hash, block_height, tx_index, tx_type, producer_id, nonce, content_hash,
-				algorithm, public_key, signature, payload, custody_chain, status, error_msg,
-				submitted_at, executed_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW())
-			ON CONFLICT (tx_hash) DO NOTHING
-		`,
-			txHash[:],
-			blk.GetHeight(),
-			i,
-			string(stateTx.Type()),
-			envelope.ProducerID,
-			envelope.Nonce,
-			contentHash[:],
-			envelope.Alg,
-			envelope.PubKey,
-			envelope.Signature,
-			payloadJSON,
-			custodyChainJSON,
-			status,
-			errorMsg,
-			time.Unix(stateTx.Timestamp(), 0),
-		)
-
-		if err != nil {
-			return fmt.Errorf("failed to insert transaction at height %d, index %d: %w", blk.GetHeight(), i, err)
+		rec := persistedTxRecord{
+			txHash:       txHash,
+			blockHeight:  blk.GetHeight(),
+			txIndex:      i,
+			txType:       string(stateTx.Type()),
+			producerID:   envelope.ProducerID,
+			nonce:        envelope.Nonce,
+			contentHash:  contentHash,
+			algorithm:    envelope.Alg,
+			publicKey:    envelope.PubKey,
+			signature:    envelope.Signature,
+			payloadJSON:  payloadJSON,
+			custodyChain: custodyChainJSON,
+			status:       status,
+			errorMsg:     errorMsg,
+			submittedAt:  time.Unix(stateTx.Timestamp(), 0),
 		}
-
-		if rows, _ := res.RowsAffected(); rows > 0 {
-			// Insert succeeded; policy transactions must always durable-enqueue outbox within the same DB tx.
-			if stateTx.Type() == state.TxPolicy {
-				policyTx, ok := stateTx.(*state.PolicyTx)
-				if !ok || len(policyTx.Data) == 0 {
-					return fmt.Errorf("%w: policy tx payload missing", ErrInvalidData)
+		totalPayloadBytes += len(payloadJSON) + len(custodyChainJSON)
+		// Fail closed if the same tx_hash appears more than once in a block.
+		// In batch mode, duplicate hashes could otherwise be misclassified as inserted and
+		// skip location verification for the later duplicate row.
+		if prev, exists := seenTxHash[rec.txHash]; exists {
+			sameLocation := prev.blockHeight == rec.blockHeight && prev.txIndex == rec.txIndex
+			sameEnvelope := bytes.Equal(prev.producerID, rec.producerID) &&
+				bytes.Equal(prev.nonce, rec.nonce) &&
+				prev.contentHash == rec.contentHash &&
+				prev.algorithm == rec.algorithm &&
+				bytes.Equal(prev.publicKey, rec.publicKey) &&
+				bytes.Equal(prev.signature, rec.signature)
+			if !sameLocation || !sameEnvelope {
+				if a.auditLogger != nil {
+					_ = a.auditLogger.Security("duplicate_tx_hash_in_block_detected", map[string]interface{}{
+						"height":           blk.GetHeight(),
+						"tx_hash":          fmt.Sprintf("%x", rec.txHash[:]),
+						"prev_tx_index":    prev.txIndex,
+						"current_tx_index": rec.txIndex,
+					})
 				}
-				if err := a.upsertPolicyOutbox(ctx, tx, blk.GetHeight(), blk.GetTimestamp().Unix(), i, policyTx.Data); err != nil {
-					return fmt.Errorf("upsert policy outbox: %w", err)
-				}
+				return fmt.Errorf("%w: duplicate tx_hash in block at height %d indexes %d and %d", ErrIntegrityViolation, blk.GetHeight(), prev.txIndex, rec.txIndex)
 			}
-			continue
+			return fmt.Errorf("%w: duplicate tx_hash in block at height %d index %d", ErrIntegrityViolation, blk.GetHeight(), rec.txIndex)
 		}
-
-		// Conflict occurred (rows == 0), verify idempotency
-		var existingContentHash []byte
-		var existingProducerID []byte
-		var existingNonce []byte
-
-		err = tx.QueryRowContext(ctx, `
-			SELECT content_hash, producer_id, nonce
-			FROM transactions
-			WHERE block_height = $1 AND tx_index = $2
-		`, blk.GetHeight(), i).Scan(&existingContentHash, &existingProducerID, &existingNonce)
-
-		if err != nil {
-			return fmt.Errorf("failed to verify existing transaction: %w", err)
-		}
-
-		// Verify content hash matches
-		if len(existingContentHash) != 32 {
-			return fmt.Errorf("%w: existing tx content_hash invalid length", ErrIntegrityViolation)
-		}
-
-		var existingHash [32]byte
-		copy(existingHash[:], existingContentHash)
-
-		if contentHash != existingHash {
-			if a.auditLogger != nil {
-				_ = a.auditLogger.Security("transaction_hash_mismatch_detected", map[string]interface{}{
-					"height":        blk.GetHeight(),
-					"tx_index":      i,
-					"new_hash":      fmt.Sprintf("%x", contentHash[:]),
-					"existing_hash": fmt.Sprintf("%x", existingHash[:]),
-				})
-			}
-			return fmt.Errorf("%w: transaction content_hash mismatch at height %d, index %d", ErrIntegrityViolation, blk.GetHeight(), i)
-		}
-
-		// Verify producer_id and nonce match (basic check)
-		if len(existingProducerID) == 0 {
-			return fmt.Errorf("%w: existing tx producer_id empty", ErrIntegrityViolation)
-		}
-
-		// Idempotent insert
+		seenTxHash[rec.txHash] = rec
 		if stateTx.Type() == state.TxPolicy {
 			policyTx, ok := stateTx.(*state.PolicyTx)
 			if !ok || len(policyTx.Data) == 0 {
 				return fmt.Errorf("%w: policy tx payload missing", ErrInvalidData)
 			}
-			if err := a.upsertPolicyOutbox(ctx, tx, blk.GetHeight(), blk.GetTimestamp().Unix(), i, policyTx.Data); err != nil {
-				return fmt.Errorf("upsert policy outbox: %w", err)
+			policyRows = append(policyRows, policyOutboxInput{
+				blockHeight: blk.GetHeight(),
+				blockTS:     blockTS,
+				txIndex:     i,
+				txTS:        policyTx.Timestamp(),
+				payload:     policyTx.Data,
+			})
+			policyRowCount++
+		}
+		records = append(records, rec)
+	}
+	if a.metrics != nil {
+		a.metrics.observePersistStage("upsert_transactions_prepare", time.Since(prepareStart))
+	}
+
+	insertTotal := time.Duration(0)
+	verifyTotal := time.Duration(0)
+	conflictListBuildTotal := time.Duration(0)
+	conflictsAll := make([]persistedTxRecord, 0, len(records))
+	for start := 0; start < len(records); start += txChunkSize {
+		end := start + txChunkSize
+		if end > len(records) {
+			end = len(records)
+		}
+		chunk := records[start:end]
+
+		args := make([]interface{}, 0, len(chunk)*15)
+		for _, rec := range chunk {
+			args = append(args,
+				rec.txHash[:],
+				rec.blockHeight,
+				rec.txIndex,
+				rec.txType,
+				rec.producerID,
+				rec.nonce,
+				rec.contentHash[:],
+				rec.algorithm,
+				rec.publicKey,
+				rec.signature,
+				rec.payloadJSON,
+				rec.custodyChain,
+				rec.status,
+				rec.errorMsg,
+				rec.submittedAt,
+			)
+		}
+
+		inserted := make(map[[32]byte]struct{}, len(chunk))
+		insertQueryStart := time.Now()
+		insertRows, err := tx.QueryContext(ctx, a.txInsertTemplate(len(chunk)), args...)
+		insertQueryDur := time.Since(insertQueryStart)
+		if a.metrics != nil {
+			a.metrics.observePersistStage("upsert_transactions_insert_query", insertQueryDur)
+		}
+		if err != nil {
+			return fmt.Errorf("failed to batch insert transactions at height %d: %w", blk.GetHeight(), err)
+		}
+		insertScanStart := time.Now()
+		for insertRows.Next() {
+			var b []byte
+			if scanErr := insertRows.Scan(&b); scanErr != nil {
+				insertRows.Close()
+				if a.metrics != nil {
+					a.metrics.observePersistStage("upsert_transactions_insert_scan", time.Since(insertScanStart))
+				}
+				return fmt.Errorf("failed scanning inserted tx hash: %w", scanErr)
 			}
+			if len(b) != 32 {
+				insertRows.Close()
+				if a.metrics != nil {
+					a.metrics.observePersistStage("upsert_transactions_insert_scan", time.Since(insertScanStart))
+				}
+				return fmt.Errorf("%w: inserted tx hash invalid length", ErrIntegrityViolation)
+			}
+			var h [32]byte
+			copy(h[:], b)
+			inserted[h] = struct{}{}
+		}
+		if err := insertRows.Err(); err != nil {
+			insertRows.Close()
+			if a.metrics != nil {
+				a.metrics.observePersistStage("upsert_transactions_insert_scan", time.Since(insertScanStart))
+			}
+			return fmt.Errorf("failed reading inserted tx hashes: %w", err)
+		}
+		insertRows.Close()
+		insertScanDur := time.Since(insertScanStart)
+		if a.metrics != nil {
+			a.metrics.observePersistStage("upsert_transactions_insert_scan", insertScanDur)
+		}
+		insertTotal += insertQueryDur + insertScanDur
+
+		conflictListBuildStart := time.Now()
+		conflicts := make([]persistedTxRecord, 0, len(chunk))
+		for _, rec := range chunk {
+			if _, ok := inserted[rec.txHash]; !ok {
+				conflicts = append(conflicts, rec)
+			}
+		}
+		conflictListBuildTotal += time.Since(conflictListBuildStart)
+		if len(conflicts) == 0 {
+			continue
+		}
+		totalConflicts += len(conflicts)
+
+		conflictsAll = append(conflictsAll, conflicts...)
+	}
+	if len(conflictsAll) > 0 {
+		if a.metrics != nil {
+			a.metrics.observePersistContentionSignal("verify_conflicts")
+			a.metrics.observePersistDiagnosticSignal("upsert_transactions_verify_called")
+		}
+		verifyStarted = true
+		if a.metrics != nil {
+			a.metrics.observePersistStage("upsert_transactions_before_verify", time.Since(beforeVerifyStart))
+		}
+		verifyStart := time.Now()
+		if err := a.verifyTxConflicts(ctx, tx, blk, conflictsAll); err != nil {
+			return err
+		}
+		verifyTotal += time.Since(verifyStart)
+		afterVerifyStart = time.Now()
+		verifyCompleted = true
+		if a.metrics != nil && verifyTotal >= 500*time.Millisecond {
+			a.metrics.observePersistContentionSignal("verify_conflicts_slow")
+		}
+	}
+	if a.metrics != nil {
+		a.metrics.observePersistStage("upsert_transactions_insert_chunks", insertTotal)
+		a.metrics.observePersistStage("upsert_transactions_conflict_list_build", conflictListBuildTotal)
+		if verifyTotal > 0 {
+			a.metrics.observePersistStage("upsert_transactions_verify_conflicts", verifyTotal)
 		}
 	}
 
+	if len(policyRows) > 0 {
+		outboxStart := time.Now()
+		if outboxBatchEnabled {
+			if err := a.upsertPolicyOutboxBatch(ctx, tx, policyRows, outboxChunkSize, persistAttempt); err != nil {
+				outboxErr = err
+				return fmt.Errorf("upsert policy outbox: %w", err)
+			}
+		} else {
+			for _, row := range policyRows {
+				if err := a.upsertPolicyOutbox(ctx, tx, row.blockHeight, row.blockTS, row.txTS, row.txIndex, row.payload, persistAttempt); err != nil {
+					outboxErr = err
+					return fmt.Errorf("upsert policy outbox: %w", err)
+				}
+			}
+		}
+		if a.metrics != nil {
+			a.metrics.observePersistStage("upsert_transactions_outbox_batch", time.Since(outboxStart))
+		}
+	}
 	return nil
+}
+
+func (a *adapter) verifyTxConflicts(ctx context.Context, tx *sql.Tx, blk *block.AppBlock, conflicts []persistedTxRecord) error {
+	if len(conflicts) == 0 {
+		return nil
+	}
+	verifyTotalStart := time.Now()
+	defer func() {
+		if a != nil && a.metrics != nil {
+			a.metrics.observePersistStage("upsert_transactions_verify_total", time.Since(verifyTotalStart))
+		}
+	}()
+	verifyChunkSize := maxUpsertBatchSize
+	if a != nil && a.perf.txVerifyChunkSize > 0 {
+		verifyChunkSize = a.perf.txVerifyChunkSize
+	}
+	queryRunner := interface {
+		QueryContext(context.Context, string, ...interface{}) (*sql.Rows, error)
+	}(tx)
+	useOutOfTx := false
+	if a != nil && !a.perf.txVerifyUseTx {
+		queryRunner = a.db
+		useOutOfTx = true
+		if a.metrics != nil {
+			a.metrics.observePersistContentionSignal("verify_mode_out_of_tx")
+		}
+	}
+	for start := 0; start < len(conflicts); start += verifyChunkSize {
+		end := start + verifyChunkSize
+		if end > len(conflicts) {
+			end = len(conflicts)
+		}
+		chunk := conflicts[start:end]
+		verifyArgs := make([]interface{}, 0, len(chunk))
+		for _, rec := range chunk {
+			verifyArgs = append(verifyArgs, rec.txHash[:])
+		}
+
+		existing := make(map[[32]byte]existingTxRecord, len(chunk))
+		verifyQueryStart := time.Now()
+		rows, err := queryRunner.QueryContext(ctx, a.txVerifyTemplate(len(chunk)), verifyArgs...)
+		if a.metrics != nil {
+			a.metrics.observePersistStage("upsert_transactions_verify_query", time.Since(verifyQueryStart))
+		}
+		if err != nil {
+			return fmt.Errorf("failed to batch verify existing transactions: %w", err)
+		}
+		verifyScanStart := time.Now()
+		for rows.Next() {
+			var txHashRaw []byte
+			var contentHashRaw []byte
+			var producerID []byte
+			var nonce []byte
+			var blockHeight uint64
+			var txIndex int
+			var algorithm string
+			var publicKey []byte
+			var signature []byte
+			if scanErr := rows.Scan(&txHashRaw, &contentHashRaw, &producerID, &nonce, &blockHeight, &txIndex, &algorithm, &publicKey, &signature); scanErr != nil {
+				rows.Close()
+				if a.metrics != nil {
+					a.metrics.observePersistStage("upsert_transactions_verify_scan", time.Since(verifyScanStart))
+				}
+				return fmt.Errorf("failed scanning existing transaction row: %w", scanErr)
+			}
+			if len(txHashRaw) != 32 || len(contentHashRaw) != 32 {
+				rows.Close()
+				if a.metrics != nil {
+					a.metrics.observePersistStage("upsert_transactions_verify_scan", time.Since(verifyScanStart))
+				}
+				return fmt.Errorf("%w: existing tx hash/content_hash invalid length", ErrIntegrityViolation)
+			}
+			var txHash [32]byte
+			var contentHash [32]byte
+			copy(txHash[:], txHashRaw)
+			copy(contentHash[:], contentHashRaw)
+			existing[txHash] = existingTxRecord{
+				contentHash: contentHash,
+				producerID:  producerID,
+				nonce:       nonce,
+				blockHeight: blockHeight,
+				txIndex:     txIndex,
+				algorithm:   algorithm,
+				publicKey:   publicKey,
+				signature:   signature,
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			if a.metrics != nil {
+				a.metrics.observePersistStage("upsert_transactions_verify_scan", time.Since(verifyScanStart))
+			}
+			return fmt.Errorf("failed reading existing transaction rows: %w", err)
+		}
+		rows.Close()
+		if a.metrics != nil {
+			a.metrics.observePersistStage("upsert_transactions_verify_scan", time.Since(verifyScanStart))
+		}
+
+		verifyCompareStart := time.Now()
+		for _, rec := range chunk {
+			ex, ok := existing[rec.txHash]
+			if !ok && useOutOfTx {
+				// Out-of-transaction verify can miss rows that are only visible inside the active tx.
+				// Recheck once in-tx before failing integrity.
+				recheckStart := time.Now()
+				exInTx, foundInTx, recheckErr := a.recheckTxConflictInTx(ctx, tx, rec.txHash)
+				if a.metrics != nil {
+					a.metrics.observePersistStage("upsert_transactions_verify_recheck_in_tx", time.Since(recheckStart))
+				}
+				if recheckErr != nil {
+					if a.metrics != nil {
+						a.metrics.observePersistDiagnosticSignal("verify_compare_error")
+						a.metrics.observePersistStage("upsert_transactions_verify_compare_error", time.Since(verifyCompareStart))
+						a.metrics.observePersistStage("upsert_transactions_verify_compare_total", time.Since(verifyCompareStart))
+					}
+					return recheckErr
+				}
+				if foundInTx {
+					ex = exInTx
+					ok = true
+					if a.metrics != nil {
+						a.metrics.observePersistContentionSignal("verify_out_of_tx_fallback_hit")
+					}
+				}
+			}
+			if !ok {
+				if useOutOfTx && a.metrics != nil {
+					a.metrics.observePersistContentionSignal("verify_out_of_tx_fallback_miss")
+				}
+				if a.metrics != nil {
+					a.metrics.observePersistDiagnosticSignal("verify_compare_error")
+					a.metrics.observePersistDiagnosticSignal("verify_existing_row_missing")
+					a.metrics.observePersistIntegrityKind("missing_after_conflict")
+					a.metrics.observePersistStage("upsert_transactions_verify_compare_error", time.Since(verifyCompareStart))
+					a.metrics.observePersistStage("upsert_transactions_verify_compare_total", time.Since(verifyCompareStart))
+				}
+				return fmt.Errorf("%w: missing transaction row after tx_hash conflict at height %d, index %d", ErrIntegrityViolation, blk.GetHeight(), rec.txIndex)
+			}
+			if rec.contentHash != ex.contentHash {
+				if a.metrics != nil {
+					a.metrics.observePersistDiagnosticSignal("verify_compare_error")
+					a.metrics.observePersistDiagnosticSignal("verify_content_mismatch")
+					a.metrics.observePersistIntegrityKind("content_hash_mismatch")
+					a.metrics.observePersistStage("upsert_transactions_verify_compare_error", time.Since(verifyCompareStart))
+					a.metrics.observePersistStage("upsert_transactions_verify_compare_total", time.Since(verifyCompareStart))
+				}
+				if a.auditLogger != nil {
+					_ = a.auditLogger.Security("transaction_hash_mismatch_detected", map[string]interface{}{
+						"height":        blk.GetHeight(),
+						"tx_index":      rec.txIndex,
+						"new_hash":      fmt.Sprintf("%x", rec.contentHash[:]),
+						"existing_hash": fmt.Sprintf("%x", ex.contentHash[:]),
+					})
+				}
+				return fmt.Errorf("%w: transaction content_hash mismatch at height %d, index %d", ErrIntegrityViolation, blk.GetHeight(), rec.txIndex)
+			}
+			if len(ex.producerID) == 0 || len(ex.nonce) == 0 {
+				if a.metrics != nil {
+					a.metrics.observePersistDiagnosticSignal("verify_compare_error")
+					a.metrics.observePersistIntegrityKind("producer_nonce_invalid_existing")
+					a.metrics.observePersistStage("upsert_transactions_verify_compare_error", time.Since(verifyCompareStart))
+					a.metrics.observePersistStage("upsert_transactions_verify_compare_total", time.Since(verifyCompareStart))
+				}
+				return fmt.Errorf("%w: existing tx producer_id/nonce invalid", ErrIntegrityViolation)
+			}
+			if !bytes.Equal(ex.producerID, rec.producerID) {
+				if a.metrics != nil {
+					a.metrics.observePersistDiagnosticSignal("verify_compare_error")
+					a.metrics.observePersistIntegrityKind("producer_id_mismatch")
+					a.metrics.observePersistStage("upsert_transactions_verify_compare_error", time.Since(verifyCompareStart))
+					a.metrics.observePersistStage("upsert_transactions_verify_compare_total", time.Since(verifyCompareStart))
+				}
+				return fmt.Errorf("%w: transaction producer_id mismatch at height %d, index %d", ErrIntegrityViolation, blk.GetHeight(), rec.txIndex)
+			}
+			if !bytes.Equal(ex.nonce, rec.nonce) {
+				if a.metrics != nil {
+					a.metrics.observePersistDiagnosticSignal("verify_compare_error")
+					a.metrics.observePersistIntegrityKind("nonce_mismatch")
+					a.metrics.observePersistStage("upsert_transactions_verify_compare_error", time.Since(verifyCompareStart))
+					a.metrics.observePersistStage("upsert_transactions_verify_compare_total", time.Since(verifyCompareStart))
+				}
+				return fmt.Errorf("%w: transaction nonce mismatch at height %d, index %d", ErrIntegrityViolation, blk.GetHeight(), rec.txIndex)
+			}
+			if ex.blockHeight != rec.blockHeight || ex.txIndex != rec.txIndex {
+				locationMismatchStart := time.Now()
+				kind := txLocationMismatchKind(ex.blockHeight != rec.blockHeight, ex.txIndex != rec.txIndex)
+				if a.metrics != nil {
+					a.metrics.observePersistDiagnosticSignal("verify_compare_error")
+					a.metrics.observePersistDiagnosticSignal("verify_location_mismatch_entered")
+					a.metrics.observeTxLocationMismatch("upsert_transactions_verify_conflicts", kind)
+					a.metrics.observePersistIntegrityKind("location_mismatch_" + kind)
+				}
+				if a.auditLogger != nil {
+					auditStart := time.Now()
+					_ = a.auditLogger.Security("transaction_location_mismatch_observed", map[string]interface{}{
+						"tx_hash":               fmt.Sprintf("%x", rec.txHash[:]),
+						"expected_block_height": rec.blockHeight,
+						"expected_tx_index":     rec.txIndex,
+						"existing_block_height": ex.blockHeight,
+						"existing_tx_index":     ex.txIndex,
+						"kind":                  kind,
+					})
+					if a.metrics != nil {
+						a.metrics.observePersistStage("upsert_transactions_verify_location_mismatch_audit", time.Since(auditStart))
+					}
+				}
+				if a.shouldLogTxLocationMismatch(rec.txHash) {
+					if a.metrics != nil {
+						a.metrics.observePersistDiagnosticSignal("verify_forensics_invoked")
+					}
+					a.logTxLocationMismatchForensics(ctx, tx, blk, rec.txHash, rec.blockHeight, rec.txIndex, ex, kind)
+				} else if a.metrics != nil {
+					a.metrics.observePersistDiagnosticSignal("verify_forensics_skipped_dedup")
+				}
+				if a.metrics != nil {
+					a.metrics.observePersistStage("upsert_transactions_verify_location_mismatch", time.Since(locationMismatchStart))
+					a.metrics.observePersistStage("upsert_transactions_verify_compare_error", time.Since(verifyCompareStart))
+					a.metrics.observePersistStage("upsert_transactions_verify_compare_total", time.Since(verifyCompareStart))
+				}
+				return fmt.Errorf("%w: transaction location mismatch at height %d, index %d", ErrIntegrityViolation, blk.GetHeight(), rec.txIndex)
+			}
+			if ex.algorithm != rec.algorithm || !bytes.Equal(ex.publicKey, rec.publicKey) || !bytes.Equal(ex.signature, rec.signature) {
+				if a.metrics != nil {
+					a.metrics.observePersistDiagnosticSignal("verify_compare_error")
+					a.metrics.observePersistDiagnosticSignal("verify_envelope_mismatch")
+					a.metrics.observePersistIntegrityKind("envelope_mismatch")
+					a.metrics.observePersistStage("upsert_transactions_verify_compare_error", time.Since(verifyCompareStart))
+					a.metrics.observePersistStage("upsert_transactions_verify_compare_total", time.Since(verifyCompareStart))
+				}
+				return fmt.Errorf("%w: transaction envelope mismatch at height %d, index %d", ErrIntegrityViolation, blk.GetHeight(), rec.txIndex)
+			}
+		}
+		if a.metrics != nil {
+			a.metrics.observePersistStage("upsert_transactions_verify_compare", time.Since(verifyCompareStart))
+			a.metrics.observePersistStage("upsert_transactions_verify_compare_total", time.Since(verifyCompareStart))
+		}
+	}
+	return nil
+}
+
+func (a *adapter) recheckTxConflictInTx(ctx context.Context, tx *sql.Tx, txHash [32]byte) (existingTxRecord, bool, error) {
+	var zero existingTxRecord
+	if tx == nil {
+		return zero, false, nil
+	}
+	rows, err := tx.QueryContext(ctx, a.txVerifyTemplate(1), txHash[:])
+	if err != nil {
+		return zero, false, fmt.Errorf("failed to recheck existing transaction in tx: %w", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return zero, false, fmt.Errorf("failed reading tx recheck rows: %w", err)
+		}
+		return zero, false, nil
+	}
+
+	var txHashRaw []byte
+	var contentHashRaw []byte
+	var producerID []byte
+	var nonce []byte
+	var blockHeight uint64
+	var txIndex int
+	var algorithm string
+	var publicKey []byte
+	var signature []byte
+	if scanErr := rows.Scan(&txHashRaw, &contentHashRaw, &producerID, &nonce, &blockHeight, &txIndex, &algorithm, &publicKey, &signature); scanErr != nil {
+		return zero, false, fmt.Errorf("failed scanning tx recheck row: %w", scanErr)
+	}
+	if len(txHashRaw) != 32 || len(contentHashRaw) != 32 {
+		return zero, false, fmt.Errorf("%w: existing tx hash/content_hash invalid length", ErrIntegrityViolation)
+	}
+	var txHashOut [32]byte
+	copy(txHashOut[:], txHashRaw)
+	if txHashOut != txHash {
+		return zero, false, fmt.Errorf("%w: tx recheck hash mismatch", ErrIntegrityViolation)
+	}
+	var contentHash [32]byte
+	copy(contentHash[:], contentHashRaw)
+
+	return existingTxRecord{
+		contentHash: contentHash,
+		producerID:  producerID,
+		nonce:       nonce,
+		blockHeight: blockHeight,
+		txIndex:     txIndex,
+		algorithm:   algorithm,
+		publicKey:   publicKey,
+		signature:   signature,
+	}, true, nil
 }
 
 func parsePolicyID(raw []byte) string {
@@ -811,41 +2192,257 @@ func parsePolicyID(raw []byte) string {
 	return strings.TrimSpace(payload.PolicyID)
 }
 
-func parsePolicyTrace(raw []byte) (string, int64) {
-	var payload struct {
-		PolicyID string `json:"policy_id"`
-		QCRef    string `json:"qc_reference"`
-		Metadata struct {
-			TraceID      string `json:"trace_id"`
-			AIEventTsMs  int64  `json:"ai_event_ts_ms"`
-			AIEventTSMs2 int64  `json:"ai_event_timestamp_ms"`
-		} `json:"metadata"`
-		Trace struct {
-			ID        string `json:"id"`
-			AIEventMs int64  `json:"ai_event_ts_ms"`
-		} `json:"trace"`
+func txLocationMismatchKind(heightDiff, indexDiff bool) string {
+	switch {
+	case heightDiff && indexDiff:
+		return "height_and_index"
+	case heightDiff:
+		return "height"
+	case indexDiff:
+		return "index"
+	default:
+		return "unknown"
 	}
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return "", 0
-	}
-	traceID := strings.TrimSpace(payload.Metadata.TraceID)
-	if traceID == "" {
-		traceID = strings.TrimSpace(payload.Trace.ID)
-	}
-	if traceID == "" {
-		traceID = strings.TrimSpace(payload.QCRef)
-	}
-	aiEventTsMs := payload.Metadata.AIEventTsMs
-	if aiEventTsMs <= 0 {
-		aiEventTsMs = payload.Metadata.AIEventTSMs2
-	}
-	if aiEventTsMs <= 0 {
-		aiEventTsMs = payload.Trace.AIEventMs
-	}
-	return traceID, aiEventTsMs
 }
 
-func (a *adapter) upsertPolicyOutbox(ctx context.Context, tx *sql.Tx, blockHeight uint64, blockTS int64, txIndex int, payload []byte) error {
+func (a *adapter) shouldLogTxLocationMismatch(txHash [32]byte) bool {
+	if a == nil {
+		return false
+	}
+	now := time.Now()
+	a.txMismatchSeenMu.Lock()
+	defer a.txMismatchSeenMu.Unlock()
+	a.pruneTxMismatchSeenLocked(now)
+	if _, exists := a.txMismatchSeen[txHash]; exists {
+		return false
+	}
+	a.txMismatchSeen[txHash] = now
+	a.pruneTxMismatchSeenLocked(now)
+	return true
+}
+
+func (a *adapter) pruneTxMismatchSeenLocked(now time.Time) {
+	if a == nil {
+		return
+	}
+	if a.txMismatchSeen == nil {
+		a.txMismatchSeen = make(map[[32]byte]time.Time)
+	}
+	if a.txMismatchSeenTTL > 0 {
+		cutoff := now.Add(-a.txMismatchSeenTTL)
+		for hash, seenAt := range a.txMismatchSeen {
+			if seenAt.Before(cutoff) {
+				delete(a.txMismatchSeen, hash)
+			}
+		}
+	}
+	if a.txMismatchSeenMax <= 0 || len(a.txMismatchSeen) <= a.txMismatchSeenMax {
+		return
+	}
+	drop := len(a.txMismatchSeen) - a.txMismatchSeenMax
+	for hash := range a.txMismatchSeen {
+		delete(a.txMismatchSeen, hash)
+		drop--
+		if drop <= 0 {
+			break
+		}
+	}
+}
+
+func (a *adapter) logTxLocationMismatchForensics(ctx context.Context, tx *sql.Tx, blk *block.AppBlock, txHash [32]byte, incomingHeight uint64, incomingIndex int, ex existingTxRecord, kind string) {
+	if a == nil || a.logger == nil || blk == nil {
+		return
+	}
+	forensicsStart := time.Now()
+	defer func() {
+		if a.metrics != nil {
+			a.metrics.observePersistStage("upsert_transactions_verify_forensics", time.Since(forensicsStart))
+		}
+	}()
+	bh := blk.GetHash()
+	incomingBlockHash := fmt.Sprintf("%x", bh[:])
+	incomingProposer := fmt.Sprintf("%x", blk.Proposer())
+	existingBlockHash, existingProposer := a.loadBlockLocationDetails(ctx, tx, ex.blockHeight)
+	a.logger.Warn("transaction location mismatch forensic",
+		utils.ZapString("stage", "upsert_transactions_verify_conflicts"),
+		utils.ZapString("tx_hash", fmt.Sprintf("%x", txHash[:])),
+		utils.ZapString("mismatch_kind", kind),
+		utils.ZapUint64("incoming_block_height", incomingHeight),
+		utils.ZapInt("incoming_tx_index", incomingIndex),
+		utils.ZapString("incoming_block_hash", incomingBlockHash),
+		utils.ZapString("incoming_block_proposer", incomingProposer),
+		utils.ZapUint64("existing_block_height", ex.blockHeight),
+		utils.ZapInt("existing_tx_index", ex.txIndex),
+		utils.ZapString("existing_block_hash", existingBlockHash),
+		utils.ZapString("existing_block_proposer", existingProposer),
+		utils.ZapInt("persist_attempt", PersistAttemptFromContext(ctx)))
+}
+
+func (a *adapter) loadBlockLocationDetails(ctx context.Context, tx *sql.Tx, height uint64) (string, string) {
+	lookupStart := time.Now()
+	defer func() {
+		if a != nil && a.metrics != nil {
+			a.metrics.observePersistStage("upsert_transactions_verify_forensics_block_lookup", time.Since(lookupStart))
+		}
+	}()
+	if tx == nil {
+		return "", ""
+	}
+	var hashRaw []byte
+	var proposerRaw []byte
+	if err := tx.QueryRowContext(ctx, `SELECT block_hash, proposer_id FROM blocks WHERE height = $1`, height).Scan(&hashRaw, &proposerRaw); err != nil {
+		return "", ""
+	}
+	return fmt.Sprintf("%x", hashRaw), fmt.Sprintf("%x", proposerRaw)
+}
+
+func parsePolicyTrace(raw []byte) (string, int64, string, int64) {
+	var payload map[string]interface{}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return "", 0, "", 0
+	}
+
+	traceID, aiEventTsMs, sourceEventID, sourceEventTsMs := extractTraceFields(payload)
+
+	// Some publishers wrap effective policy payload under "params".
+	if (traceID == "" || aiEventTsMs <= 0 || sourceEventID == "" || sourceEventTsMs <= 0) && payload != nil {
+		if params, ok := payload["params"].(map[string]interface{}); ok {
+			pTraceID, pAiTs, pSourceID, pSourceTs := extractTraceFields(params)
+			if traceID == "" {
+				traceID = pTraceID
+			}
+			if aiEventTsMs <= 0 {
+				aiEventTsMs = pAiTs
+			}
+			if sourceEventID == "" {
+				sourceEventID = pSourceID
+			}
+			if sourceEventTsMs <= 0 {
+				sourceEventTsMs = pSourceTs
+			}
+		}
+	}
+
+	if aiEventTsMs > 0 {
+		if normalized, _, valid := utils.NormalizeUnixMillis(aiEventTsMs); valid {
+			aiEventTsMs = normalized
+		} else {
+			aiEventTsMs = 0
+		}
+	}
+	if sourceEventTsMs > 0 {
+		if normalized, _, valid := utils.NormalizeUnixMillis(sourceEventTsMs); valid {
+			sourceEventTsMs = normalized
+		} else {
+			sourceEventTsMs = 0
+		}
+	}
+	return traceID, aiEventTsMs, sourceEventID, sourceEventTsMs
+}
+
+func extractTraceFields(payload map[string]interface{}) (string, int64, string, int64) {
+	if payload == nil {
+		return "", 0, "", 0
+	}
+	var traceID string
+	topLevelTraceID := extractString(payload, "trace_id")
+	qcRef := extractString(payload, "qc_reference")
+	sourceEventID := extractString(payload, "source_event_id")
+
+	var aiEventTsMs int64
+	var sourceEventTsMs int64
+	if metadata, ok := payload["metadata"].(map[string]interface{}); ok {
+		traceID = extractString(metadata, "trace_id")
+		if sourceEventID == "" {
+			sourceEventID = extractString(metadata, "source_event_id")
+		}
+		if sourceEventID == "" {
+			sourceEventID = extractString(metadata, "telemetry_event_id")
+		}
+		aiEventTsMs = extractInt64(metadata, "ai_event_ts_ms")
+		if aiEventTsMs <= 0 {
+			aiEventTsMs = extractInt64(metadata, "ai_event_timestamp_ms")
+		}
+		sourceEventTsMs = extractInt64(metadata, "source_event_ts_ms")
+		if sourceEventTsMs <= 0 {
+			sourceEventTsMs = extractInt64(metadata, "telemetry_event_ts_ms")
+		}
+	}
+
+	if trace, ok := payload["trace"].(map[string]interface{}); ok {
+		if traceID == "" {
+			traceID = extractString(trace, "id")
+		}
+		if sourceEventID == "" {
+			sourceEventID = extractString(trace, "source_event_id")
+		}
+		if aiEventTsMs <= 0 {
+			aiEventTsMs = extractInt64(trace, "ai_event_ts_ms")
+		}
+		if sourceEventTsMs <= 0 {
+			sourceEventTsMs = extractInt64(trace, "source_event_ts_ms")
+		}
+	}
+	if traceID == "" {
+		traceID = topLevelTraceID
+	}
+	if sourceEventID == "" {
+		sourceEventID = extractString(payload, "telemetry_event_id")
+	}
+	if traceID == "" {
+		traceID = qcRef
+	}
+	return strings.TrimSpace(traceID), aiEventTsMs, strings.TrimSpace(sourceEventID), sourceEventTsMs
+}
+
+func extractString(m map[string]interface{}, key string) string {
+	if m == nil {
+		return ""
+	}
+	v, ok := m[key]
+	if !ok {
+		return ""
+	}
+	s, ok := v.(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(s)
+}
+
+func extractInt64(m map[string]interface{}, key string) int64 {
+	if m == nil {
+		return 0
+	}
+	v, ok := m[key]
+	if !ok || v == nil {
+		return 0
+	}
+	switch n := v.(type) {
+	case int64:
+		return n
+	case int:
+		return int64(n)
+	case float64:
+		if math.IsNaN(n) || math.IsInf(n, 0) {
+			return 0
+		}
+		return int64(n)
+	case json.Number:
+		if i, err := n.Int64(); err == nil {
+			return i
+		}
+		if f, err := n.Float64(); err == nil {
+			if math.IsNaN(f) || math.IsInf(f, 0) {
+				return 0
+			}
+			return int64(f)
+		}
+	}
+	return 0
+}
+
+func (a *adapter) upsertPolicyOutbox(ctx context.Context, tx *sql.Tx, blockHeight uint64, blockTS int64, txTS int64, txIndex int, payload []byte, persistAttempt int) error {
 	if len(payload) == 0 {
 		return fmt.Errorf("%w: empty policy payload", ErrInvalidData)
 	}
@@ -853,26 +2450,313 @@ func (a *adapter) upsertPolicyOutbox(ctx context.Context, tx *sql.Tx, blockHeigh
 	ruleHash := sha256.Sum256(payload)
 	policyID := parsePolicyID(payload)
 	if policyID == "" {
-		// Preserve durability even for malformed payloads; dispatcher will terminal-fail with guardrail reason.
 		policyID = "invalid:" + hex.EncodeToString(ruleHash[:8])
 	}
-	traceID, aiEventTsMs := parsePolicyTrace(payload)
+	traceID, aiEventTsMs, sourceEventID, sourceEventTsMs := parsePolicyTrace(payload)
+	if aiEventTsMs <= 0 && txTS > 0 {
+		aiEventTsMs = txTS * 1000
+	}
 	if traceID == "" {
 		traceID = fmt.Sprintf("trace:%s:%s", policyID, hex.EncodeToString(ruleHash[:8]))
 	}
 
-	_, err := tx.ExecContext(ctx, `
+	res, err := tx.ExecContext(ctx, `
 		INSERT INTO control_policy_outbox (
-			block_height, block_ts, tx_index, policy_id, rule_hash, payload, trace_id, ai_event_ts_ms, status, next_retry_at, created_at, updated_at
+			block_height, block_ts, tx_index, policy_id, rule_hash, payload, trace_id, ai_event_ts_ms, source_event_id, source_event_ts_ms, status, next_retry_at, created_at, updated_at
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, 'pending', NOW(), NOW(), NOW()
+			$1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), NULLIF($10, 0), 'pending', NOW(), NOW(), NOW()
 		)
 		ON CONFLICT (block_height, tx_index) DO NOTHING
-	`, blockHeight, blockTS, txIndex, policyID, ruleHash[:], payload, traceID, aiEventTsMs)
+	`, blockHeight, blockTS, txIndex, policyID, ruleHash[:], payload, traceID, aiEventTsMs, sourceEventID, sourceEventTsMs)
 	if err != nil {
 		return err
 	}
+	if rows, _ := res.RowsAffected(); rows > 0 {
+		a.logPolicyStage(policyID, traceID, "t_outbox_row_created", time.Now().UnixMilli(), blockHeight, txIndex, persistAttempt)
+		return nil
+	}
+	var existingPolicyID string
+	var existingRuleHash []byte
+	err = tx.QueryRowContext(ctx, `
+		SELECT policy_id, rule_hash
+		FROM control_policy_outbox
+		WHERE block_height = $1
+		  AND tx_index = $2
+	`, blockHeight, txIndex).Scan(&existingPolicyID, &existingRuleHash)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("%w: missing outbox row after tx-identity conflict at height %d index %d", ErrIntegrityViolation, blockHeight, txIndex)
+		}
+		return fmt.Errorf("verify existing outbox row: %w", err)
+	}
+	if strings.TrimSpace(existingPolicyID) != policyID {
+		return fmt.Errorf("%w: outbox policy_id mismatch at height %d index %d", ErrIntegrityViolation, blockHeight, txIndex)
+	}
+	if !bytes.Equal(existingRuleHash, ruleHash[:]) {
+		return fmt.Errorf("%w: outbox rule_hash mismatch at height %d index %d", ErrIntegrityViolation, blockHeight, txIndex)
+	}
 	return nil
+}
+
+func (a *adapter) upsertPolicyOutboxBatch(ctx context.Context, tx *sql.Tx, rows []policyOutboxInput, chunkSize int, persistAttempt int) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	if chunkSize < 1 {
+		chunkSize = outboxUpsertBatchSize
+	}
+	if chunkSize > maxUpsertBatchSize {
+		chunkSize = maxUpsertBatchSize
+	}
+	type outboxPrepared struct {
+		blockHeight     uint64
+		blockTS         int64
+		txIndex         int
+		policyID        string
+		ruleHash        [32]byte
+		payload         []byte
+		traceID         string
+		aiEventTsMs     int64
+		sourceEventID   string
+		sourceEventTsMs int64
+	}
+	prepared := make([]outboxPrepared, 0, len(rows))
+	for _, row := range rows {
+		if len(row.payload) == 0 {
+			return fmt.Errorf("%w: empty policy payload", ErrInvalidData)
+		}
+		ruleHash := sha256.Sum256(row.payload)
+		policyID := parsePolicyID(row.payload)
+		if policyID == "" {
+			policyID = "invalid:" + hex.EncodeToString(ruleHash[:8])
+		}
+		traceID, aiEventTsMs, sourceEventID, sourceEventTsMs := parsePolicyTrace(row.payload)
+		if aiEventTsMs <= 0 && row.txTS > 0 {
+			aiEventTsMs = row.txTS * 1000
+		}
+		if traceID == "" {
+			traceID = fmt.Sprintf("trace:%s:%s", policyID, hex.EncodeToString(ruleHash[:8]))
+		}
+		prepared = append(prepared, outboxPrepared{
+			blockHeight:     row.blockHeight,
+			blockTS:         row.blockTS,
+			txIndex:         row.txIndex,
+			policyID:        policyID,
+			ruleHash:        ruleHash,
+			payload:         row.payload,
+			traceID:         traceID,
+			aiEventTsMs:     aiEventTsMs,
+			sourceEventID:   sourceEventID,
+			sourceEventTsMs: sourceEventTsMs,
+		})
+	}
+
+	type outboxKey struct {
+		blockHeight uint64
+		txIndex     int
+	}
+	type existingOutbox struct {
+		policyID string
+		ruleHash []byte
+	}
+	conflictsAll := make([]outboxPrepared, 0, len(prepared))
+
+	for start := 0; start < len(prepared); start += chunkSize {
+		end := start + chunkSize
+		if end > len(prepared) {
+			end = len(prepared)
+		}
+		chunk := prepared[start:end]
+
+		args := make([]interface{}, 0, len(chunk)*10)
+		for _, row := range chunk {
+			args = append(args,
+				row.blockHeight,
+				row.blockTS,
+				row.txIndex,
+				row.policyID,
+				row.ruleHash[:],
+				row.payload,
+				row.traceID,
+				row.aiEventTsMs,
+				row.sourceEventID,
+				row.sourceEventTsMs,
+			)
+		}
+
+		inserted := make(map[outboxKey]struct{}, len(chunk))
+		rowsInserted, err := tx.QueryContext(ctx, a.outboxInsertTemplate(len(chunk)), args...)
+		if err != nil {
+			return err
+		}
+		for rowsInserted.Next() {
+			var h uint64
+			var i int
+			if scanErr := rowsInserted.Scan(&h, &i); scanErr != nil {
+				rowsInserted.Close()
+				return fmt.Errorf("scan inserted outbox rows: %w", scanErr)
+			}
+			inserted[outboxKey{blockHeight: h, txIndex: i}] = struct{}{}
+		}
+		if err := rowsInserted.Err(); err != nil {
+			rowsInserted.Close()
+			return fmt.Errorf("read inserted outbox rows: %w", err)
+		}
+		rowsInserted.Close()
+
+		conflicts := make([]outboxPrepared, 0, len(chunk))
+		nowMs := time.Now().UnixMilli()
+		for _, row := range chunk {
+			key := outboxKey{blockHeight: row.blockHeight, txIndex: row.txIndex}
+			if _, ok := inserted[key]; ok {
+				a.logPolicyStage(row.policyID, row.traceID, "t_outbox_row_created", nowMs, row.blockHeight, row.txIndex, persistAttempt)
+				continue
+			}
+			conflicts = append(conflicts, row)
+		}
+		conflictsAll = append(conflictsAll, conflicts...)
+	}
+	if len(conflictsAll) == 0 {
+		return nil
+	}
+	verifyChunkSize := maxUpsertBatchSize
+	for start := 0; start < len(conflictsAll); start += verifyChunkSize {
+		end := start + verifyChunkSize
+		if end > len(conflictsAll) {
+			end = len(conflictsAll)
+		}
+		chunk := conflictsAll[start:end]
+		verifyArgs := make([]interface{}, 0, len(chunk)*2)
+		for _, row := range chunk {
+			verifyArgs = append(verifyArgs, row.blockHeight, row.txIndex)
+		}
+		existing := make(map[outboxKey]existingOutbox, len(chunk))
+		verifyRows, err := tx.QueryContext(ctx, a.outboxVerifyTemplate(len(chunk)), verifyArgs...)
+		if err != nil {
+			return fmt.Errorf("verify existing outbox row: %w", err)
+		}
+		for verifyRows.Next() {
+			var h uint64
+			var idx int
+			var pid string
+			var rh []byte
+			if scanErr := verifyRows.Scan(&h, &idx, &pid, &rh); scanErr != nil {
+				verifyRows.Close()
+				return fmt.Errorf("scan existing outbox row: %w", scanErr)
+			}
+			existing[outboxKey{blockHeight: h, txIndex: idx}] = existingOutbox{policyID: strings.TrimSpace(pid), ruleHash: rh}
+		}
+		if err := verifyRows.Err(); err != nil {
+			verifyRows.Close()
+			return fmt.Errorf("read existing outbox rows: %w", err)
+		}
+		verifyRows.Close()
+		for _, row := range chunk {
+			key := outboxKey{blockHeight: row.blockHeight, txIndex: row.txIndex}
+			ex, ok := existing[key]
+			if !ok {
+				return fmt.Errorf("%w: missing outbox row after tx-identity conflict at height %d index %d", ErrIntegrityViolation, row.blockHeight, row.txIndex)
+			}
+			if ex.policyID != row.policyID {
+				return fmt.Errorf("%w: outbox policy_id mismatch at height %d index %d", ErrIntegrityViolation, row.blockHeight, row.txIndex)
+			}
+			if !bytes.Equal(ex.ruleHash, row.ruleHash[:]) {
+				return fmt.Errorf("%w: outbox rule_hash mismatch at height %d index %d", ErrIntegrityViolation, row.blockHeight, row.txIndex)
+			}
+		}
+	}
+	return nil
+}
+
+func collectPolicyStageMarkers(blk *block.AppBlock) []policyStageMarker {
+	if blk == nil {
+		return nil
+	}
+	txs := blk.Transactions()
+	markers := make([]policyStageMarker, 0, len(txs))
+	for idx, tx := range txs {
+		if tx == nil || tx.Type() != state.TxPolicy {
+			continue
+		}
+		payload := tx.Payload()
+		if len(payload) == 0 {
+			continue
+		}
+		ruleHash := sha256.Sum256(payload)
+		policyID := parsePolicyID(payload)
+		if policyID == "" {
+			policyID = "invalid:" + hex.EncodeToString(ruleHash[:8])
+		}
+		traceID, _, _, _ := parsePolicyTrace(payload)
+		if traceID == "" {
+			traceID = fmt.Sprintf("trace:%s:%s", policyID, hex.EncodeToString(ruleHash[:8]))
+		}
+		markers = append(markers, policyStageMarker{
+			policyID: policyID,
+			traceID:  traceID,
+			txIndex:  idx,
+		})
+	}
+	return markers
+}
+
+func (a *adapter) logPolicyStageMarkers(markers []policyStageMarker, blockHeight uint64, stage string, tMs int64, persistAttempt int) {
+	if a == nil || a.logger == nil || stage == "" || len(markers) == 0 {
+		return
+	}
+	for _, marker := range markers {
+		a.logPolicyStage(marker.policyID, marker.traceID, stage, tMs, blockHeight, marker.txIndex, persistAttempt)
+	}
+}
+
+func (a *adapter) logPolicyStage(policyID, traceID, stage string, tMs int64, blockHeight uint64, txIndex int, persistAttempt int) {
+	if a == nil || a.logger == nil || stage == "" || policyID == "" {
+		return
+	}
+	if persistAttempt > 0 {
+		a.logger.Info("policy stage marker",
+			utils.ZapString("stage", stage),
+			utils.ZapString("policy_id", policyID),
+			utils.ZapString("trace_id", traceID),
+			utils.ZapInt64("t_ms", tMs),
+			utils.ZapUint64("height", blockHeight),
+			utils.ZapInt("tx_index", txIndex),
+			utils.ZapInt("persist_attempt", persistAttempt),
+		)
+		return
+	}
+	a.logger.Info("policy stage marker",
+		utils.ZapString("stage", stage),
+		utils.ZapString("policy_id", policyID),
+		utils.ZapString("trace_id", traceID),
+		utils.ZapInt64("t_ms", tMs),
+		utils.ZapUint64("height", blockHeight),
+		utils.ZapInt("tx_index", txIndex),
+	)
+}
+
+func (a *adapter) logPolicyStageForPersist(blk *block.AppBlock, stage string, tMs int64) {
+	if blk == nil || stage == "" {
+		return
+	}
+	a.logPolicyStageMarkers(collectPolicyStageMarkers(blk), blk.GetHeight(), stage, tMs, 0)
+}
+
+func (a *adapter) logPolicyStageFromPayload(payload []byte, stage string, tMs int64, blockHeight uint64, txIndex int) {
+	if len(payload) == 0 {
+		return
+	}
+	policyID := parsePolicyID(payload)
+	if policyID == "" {
+		ruleHash := sha256.Sum256(payload)
+		policyID = "invalid:" + hex.EncodeToString(ruleHash[:8])
+	}
+	traceID, _, _, _ := parsePolicyTrace(payload)
+	if traceID == "" {
+		ruleHash := sha256.Sum256(payload)
+		traceID = fmt.Sprintf("trace:%s:%s", policyID, hex.EncodeToString(ruleHash[:8]))
+	}
+	a.logPolicyStage(policyID, traceID, stage, tMs, blockHeight, txIndex, 0)
 }
 
 // upsertSnapshot inserts or verifies state snapshot
@@ -1163,6 +3047,10 @@ func (a *adapter) Ping(ctx context.Context) error {
 
 // Close closes the database connection and prepared statements
 func (a *adapter) Close() error {
+	a.txMismatchSeenMu.Lock()
+	a.txMismatchSeen = nil
+	a.txMismatchSeenMu.Unlock()
+
 	// Close prepared statements
 	if a.stmtGetBlock != nil {
 		a.stmtGetBlock.Close()
@@ -1259,7 +3147,38 @@ func (a *adapter) Metrics() MetricsSnapshot {
 	if a == nil || a.metrics == nil {
 		return MetricsSnapshot{}
 	}
-	return a.metrics.snapshot()
+	snap := a.metrics.snapshot()
+	snap.BatchTxConfiguredSize = a.perf.txBatchSize
+	snap.BatchOutboxConfiguredSize = a.perf.outboxBatchSize
+	snap.TxStoreFullPayload = a.perf.txStoreFullPayload
+	snap.BatchCanaryEnabled = a.perf.canaryAutoFallback
+	snap.TxVerifyUseTx = a.perf.txVerifyUseTx
+	snap.TxVerifyChunkSize = a.perf.txVerifyChunkSize
+	if a.txBatchCanary != nil {
+		snap.BatchFallbackUntilUnixMs = a.txBatchCanary.fallbackUntilUnixMilli()
+		snap.BatchFallbackActivations = a.txBatchCanary.activationCount()
+		snap.BatchFallbackActive = a.txBatchCanary.isFallbackActive(time.Now())
+		snap.TxBatchFallbackUntilUnixMs = snap.BatchFallbackUntilUnixMs
+		snap.TxBatchFallbackActivations = snap.BatchFallbackActivations
+		snap.TxBatchFallbackActive = snap.BatchFallbackActive
+	}
+	if a.outboxBatchCanary != nil {
+		snap.OutboxBatchFallbackUntilUnixMs = a.outboxBatchCanary.fallbackUntilUnixMilli()
+		snap.OutboxBatchFallbackActivations = a.outboxBatchCanary.activationCount()
+		snap.OutboxBatchFallbackActive = a.outboxBatchCanary.isFallbackActive(time.Now())
+	}
+	if a.batchTuner != nil {
+		snap.BatchTxCurrentSize = a.batchTuner.txSize(a.perf.txBatchSize)
+		snap.BatchOutboxCurrentSize = a.batchTuner.outboxSize(a.perf.outboxBatchSize)
+		snap.TxBatchAdaptiveScaleUpTotal = a.batchTuner.txScaleUp.Load()
+		snap.TxBatchAdaptiveScaleDownTotal = a.batchTuner.txScaleDown.Load()
+		snap.OutboxBatchAdaptiveScaleUpTotal = a.batchTuner.outboxScaleUp.Load()
+		snap.OutboxBatchAdaptiveScaleDownTotal = a.batchTuner.outboxScaleDown.Load()
+		// Backward compatibility aggregate.
+		snap.BatchAdaptiveScaleUpTotal = snap.TxBatchAdaptiveScaleUpTotal + snap.OutboxBatchAdaptiveScaleUpTotal
+		snap.BatchAdaptiveScaleDownTotal = snap.TxBatchAdaptiveScaleDownTotal + snap.OutboxBatchAdaptiveScaleDownTotal
+	}
+	return snap
 }
 
 func (a *adapter) recordQuery(label string) func() {
@@ -1284,36 +3203,95 @@ func (a *adapter) recordTxn(label string) func() {
 
 // MetricsSnapshot contains aggregated latency and slow operation counters.
 type MetricsSnapshot struct {
-	QueryBuckets              []utils.HistogramBucket
-	QueryCount                uint64
-	QuerySumMs                float64
-	QueryP95Ms                float64
-	TxnBuckets                []utils.HistogramBucket
-	TxnCount                  uint64
-	TxnSumMs                  float64
-	TxnP95Ms                  float64
-	SlowQueryCount            uint64
-	SlowTransactionCount      uint64
-	SlowQueries               map[string]uint64
-	SlowTransactions          map[string]uint64
-	PersistStageBuckets       map[string][]utils.HistogramBucket
-	PersistStageCount         map[string]uint64
-	PersistStageSumMs         map[string]float64
-	PersistStageP95Ms         map[string]float64
-	PersistFailureClassTotals map[string]uint64
+	QueryBuckets                      []utils.HistogramBucket
+	QueryCount                        uint64
+	QuerySumMs                        float64
+	QueryP95Ms                        float64
+	TxnBuckets                        []utils.HistogramBucket
+	TxnCount                          uint64
+	TxnSumMs                          float64
+	TxnP95Ms                          float64
+	SlowQueryCount                    uint64
+	SlowTransactionCount              uint64
+	SlowQueries                       map[string]uint64
+	SlowTransactions                  map[string]uint64
+	PersistStageBuckets               map[string][]utils.HistogramBucket
+	PersistStageCount                 map[string]uint64
+	PersistStageSumMs                 map[string]float64
+	PersistStageP95Ms                 map[string]float64
+	PersistFailureClassTotals         map[string]uint64
+	PersistIntegrityKindTotals        map[string]uint64
+	PersistContentionSignalTotals     map[string]uint64
+	PersistDiagnosticSignalTotals     map[string]uint64
+	TxUpsertBlocks                    uint64
+	TxUpsertRows                      uint64
+	TxUpsertConflicts                 uint64
+	TxUpsertPayloadBytes              uint64
+	TxUpsertConflictRatio             float64
+	TxLocationMismatchTotal           uint64
+	TxLocationMismatchBySource        map[string]uint64
+	TxLocationMismatchByKind          map[string]uint64
+	TxLocationMismatchByLabel         map[TxLocationMismatchLabel]uint64
+	TxBatchModeTotals                 map[string]uint64
+	OutboxBatchModeTotals             map[string]uint64
+	TxBatchCanaryBadByReason          map[string]uint64
+	OutboxBatchCanaryBadByReason      map[string]uint64
+	BatchFallbackActive               bool
+	BatchFallbackUntilUnixMs          int64
+	BatchFallbackActivations          uint64
+	TxBatchFallbackActive             bool
+	TxBatchFallbackUntilUnixMs        int64
+	TxBatchFallbackActivations        uint64
+	OutboxBatchFallbackActive         bool
+	OutboxBatchFallbackUntilUnixMs    int64
+	OutboxBatchFallbackActivations    uint64
+	BatchTxConfiguredSize             int
+	BatchOutboxConfiguredSize         int
+	BatchTxCurrentSize                int
+	BatchOutboxCurrentSize            int
+	BatchAdaptiveScaleUpTotal         uint64
+	BatchAdaptiveScaleDownTotal       uint64
+	TxBatchAdaptiveScaleUpTotal       uint64
+	TxBatchAdaptiveScaleDownTotal     uint64
+	OutboxBatchAdaptiveScaleUpTotal   uint64
+	OutboxBatchAdaptiveScaleDownTotal uint64
+	TxStoreFullPayload                bool
+	BatchCanaryEnabled                bool
+	TxVerifyUseTx                     bool
+	TxVerifyChunkSize                 int
+}
+
+type TxLocationMismatchLabel struct {
+	Source string
+	Kind   string
 }
 
 type dbMetrics struct {
-	queryLatency          *utils.LatencyHistogram
-	txnLatency            *utils.LatencyHistogram
-	slowQueryThresholdMs  float64
-	slowTxnThresholdMs    float64
-	slowQueryCount        atomic.Uint64
-	slowTxnCount          atomic.Uint64
-	slowQueryLabels       sync.Map
-	slowTxnLabels         sync.Map
-	persistStages         sync.Map
-	persistFailureClasses sync.Map
+	queryLatency                *utils.LatencyHistogram
+	txnLatency                  *utils.LatencyHistogram
+	slowQueryThresholdMs        float64
+	slowTxnThresholdMs          float64
+	slowQueryCount              atomic.Uint64
+	slowTxnCount                atomic.Uint64
+	slowQueryLabels             sync.Map
+	slowTxnLabels               sync.Map
+	persistStages               sync.Map
+	persistFailureClasses       sync.Map
+	persistIntegrityKinds       sync.Map
+	persistContentionSignals    sync.Map
+	persistDiagnosticSignals    sync.Map
+	txUpsertBlocks              atomic.Uint64
+	txUpsertRows                atomic.Uint64
+	txUpsertConflicts           atomic.Uint64
+	txUpsertPayloadBytes        atomic.Uint64
+	txLocationMismatchTotal     atomic.Uint64
+	txLocationMismatchBySource  sync.Map
+	txLocationMismatchByKind    sync.Map
+	txLocationMismatchByLabel   sync.Map
+	txBatchModes                sync.Map
+	outboxBatchModes            sync.Map
+	txBatchCanaryBadReasons     sync.Map
+	outboxBatchCanaryBadReasons sync.Map
 }
 
 func newDBMetrics() *dbMetrics {
@@ -1363,7 +3341,7 @@ func (m *dbMetrics) observePersistStage(label string, d time.Duration) {
 	val, ok := m.persistStages.Load(label)
 	if !ok {
 		created := &stageMetric{
-			hist: utils.NewLatencyHistogram([]float64{1, 5, 20, 50, 100, 250, 500, 1000, 2500, 5000}),
+			hist: utils.NewLatencyHistogram([]float64{1, 5, 20, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 15000}),
 		}
 		actual, loaded := m.persistStages.LoadOrStore(label, created)
 		if loaded {
@@ -1386,6 +3364,96 @@ func (m *dbMetrics) observePersistFailureClass(stage string, err error) {
 	incrementLabel(&m.persistFailureClasses, key)
 }
 
+func (m *dbMetrics) observePersistIntegrityKind(kind string) {
+	if m == nil {
+		return
+	}
+	if kind == "" {
+		kind = "unknown"
+	}
+	incrementLabel(&m.persistIntegrityKinds, kind)
+}
+
+func (m *dbMetrics) observePersistContentionSignal(signal string) {
+	if m == nil {
+		return
+	}
+	if signal == "" {
+		signal = "unknown"
+	}
+	incrementLabel(&m.persistContentionSignals, signal)
+}
+
+func (m *dbMetrics) observePersistDiagnosticSignal(signal string) {
+	if m == nil {
+		return
+	}
+	if signal == "" {
+		signal = "unknown"
+	}
+	incrementLabel(&m.persistDiagnosticSignals, signal)
+}
+
+func (m *dbMetrics) observeTxUpsertStats(rows, conflicts, payloadBytes int) {
+	if m == nil {
+		return
+	}
+	if rows > 0 {
+		m.txUpsertBlocks.Add(1)
+		m.txUpsertRows.Add(uint64(rows))
+	}
+	if conflicts > 0 {
+		m.txUpsertConflicts.Add(uint64(conflicts))
+	}
+	if payloadBytes > 0 {
+		m.txUpsertPayloadBytes.Add(uint64(payloadBytes))
+	}
+}
+
+func (m *dbMetrics) observeTxLocationMismatch(source, kind string) {
+	if m == nil {
+		return
+	}
+	if source == "" {
+		source = "unknown"
+	}
+	if kind == "" {
+		kind = "unknown"
+	}
+	m.txLocationMismatchTotal.Add(1)
+	incrementLabel(&m.txLocationMismatchBySource, source)
+	incrementLabel(&m.txLocationMismatchByKind, kind)
+	incrementLabel(&m.txLocationMismatchByLabel, TxLocationMismatchLabel{Source: source, Kind: kind})
+}
+
+func (m *dbMetrics) observeTxBatchMode(mode string) {
+	if m == nil {
+		return
+	}
+	incrementLabel(&m.txBatchModes, mode)
+}
+
+func (m *dbMetrics) observeOutboxBatchMode(mode string) {
+	if m == nil {
+		return
+	}
+	incrementLabel(&m.outboxBatchModes, mode)
+}
+
+func (m *dbMetrics) observeTxBatchCanaryBad(reason string) {
+	if m == nil {
+		return
+	}
+	incrementLabel(&m.txBatchCanaryBadReasons, reason)
+}
+
+func (m *dbMetrics) observeOutboxBatchCanaryBad(reason string) {
+	if m == nil {
+		return
+	}
+	incrementLabel(&m.outboxBatchCanaryBadReasons, reason)
+}
+
 func (m *dbMetrics) snapshot() MetricsSnapshot {
 	if m == nil {
 		return MetricsSnapshot{}
@@ -1393,27 +3461,69 @@ func (m *dbMetrics) snapshot() MetricsSnapshot {
 	queryBuckets, qCount, qSum := m.queryLatency.Snapshot()
 	txnBuckets, tCount, tSum := m.txnLatency.Snapshot()
 	snapshot := MetricsSnapshot{
-		QueryBuckets:              queryBuckets,
-		QueryCount:                qCount,
-		QuerySumMs:                qSum,
-		QueryP95Ms:                m.queryLatency.Quantile(0.95),
-		TxnBuckets:                txnBuckets,
-		TxnCount:                  tCount,
-		TxnSumMs:                  tSum,
-		TxnP95Ms:                  m.txnLatency.Quantile(0.95),
-		SlowQueryCount:            m.slowQueryCount.Load(),
-		SlowTransactionCount:      m.slowTxnCount.Load(),
-		SlowQueries:               make(map[string]uint64),
-		SlowTransactions:          make(map[string]uint64),
-		PersistStageBuckets:       make(map[string][]utils.HistogramBucket),
-		PersistStageCount:         make(map[string]uint64),
-		PersistStageSumMs:         make(map[string]float64),
-		PersistStageP95Ms:         make(map[string]float64),
-		PersistFailureClassTotals: make(map[string]uint64),
+		QueryBuckets:                  queryBuckets,
+		QueryCount:                    qCount,
+		QuerySumMs:                    qSum,
+		QueryP95Ms:                    m.queryLatency.Quantile(0.95),
+		TxnBuckets:                    txnBuckets,
+		TxnCount:                      tCount,
+		TxnSumMs:                      tSum,
+		TxnP95Ms:                      m.txnLatency.Quantile(0.95),
+		SlowQueryCount:                m.slowQueryCount.Load(),
+		SlowTransactionCount:          m.slowTxnCount.Load(),
+		SlowQueries:                   make(map[string]uint64),
+		SlowTransactions:              make(map[string]uint64),
+		PersistStageBuckets:           make(map[string][]utils.HistogramBucket),
+		PersistStageCount:             make(map[string]uint64),
+		PersistStageSumMs:             make(map[string]float64),
+		PersistStageP95Ms:             make(map[string]float64),
+		PersistFailureClassTotals:     make(map[string]uint64),
+		PersistIntegrityKindTotals:    make(map[string]uint64),
+		PersistContentionSignalTotals: make(map[string]uint64),
+		PersistDiagnosticSignalTotals: make(map[string]uint64),
+		TxUpsertBlocks:                m.txUpsertBlocks.Load(),
+		TxUpsertRows:                  m.txUpsertRows.Load(),
+		TxUpsertConflicts:             m.txUpsertConflicts.Load(),
+		TxUpsertPayloadBytes:          m.txUpsertPayloadBytes.Load(),
+		TxLocationMismatchTotal:       m.txLocationMismatchTotal.Load(),
+		TxLocationMismatchBySource:    make(map[string]uint64),
+		TxLocationMismatchByKind:      make(map[string]uint64),
+		TxLocationMismatchByLabel:     make(map[TxLocationMismatchLabel]uint64),
+		TxBatchModeTotals:             make(map[string]uint64),
+		OutboxBatchModeTotals:         make(map[string]uint64),
+		TxBatchCanaryBadByReason:      make(map[string]uint64),
+		OutboxBatchCanaryBadByReason:  make(map[string]uint64),
+	}
+	if snapshot.TxUpsertRows > 0 {
+		snapshot.TxUpsertConflictRatio = float64(snapshot.TxUpsertConflicts) / float64(snapshot.TxUpsertRows)
 	}
 	m.slowQueryLabels.Range(func(key, value any) bool {
 		if counter, ok := value.(*atomic.Uint64); ok {
 			snapshot.SlowQueries[key.(string)] = counter.Load()
+		}
+		return true
+	})
+	m.txLocationMismatchBySource.Range(func(key, value any) bool {
+		if counter, ok := value.(*atomic.Uint64); ok {
+			if source, ok := key.(string); ok {
+				snapshot.TxLocationMismatchBySource[source] = counter.Load()
+			}
+		}
+		return true
+	})
+	m.txLocationMismatchByKind.Range(func(key, value any) bool {
+		if counter, ok := value.(*atomic.Uint64); ok {
+			if kind, ok := key.(string); ok {
+				snapshot.TxLocationMismatchByKind[kind] = counter.Load()
+			}
+		}
+		return true
+	})
+	m.txLocationMismatchByLabel.Range(func(key, value any) bool {
+		if counter, ok := value.(*atomic.Uint64); ok {
+			if label, ok := key.(TxLocationMismatchLabel); ok {
+				snapshot.TxLocationMismatchByLabel[label] = counter.Load()
+			}
 		}
 		return true
 	})
@@ -1447,12 +3557,74 @@ func (m *dbMetrics) snapshot() MetricsSnapshot {
 		}
 		return true
 	})
+	m.persistIntegrityKinds.Range(func(key, value any) bool {
+		if counter, ok := value.(*atomic.Uint64); ok {
+			if name, ok := key.(string); ok {
+				snapshot.PersistIntegrityKindTotals[name] = counter.Load()
+			}
+		}
+		return true
+	})
+	m.persistContentionSignals.Range(func(key, value any) bool {
+		if counter, ok := value.(*atomic.Uint64); ok {
+			if name, ok := key.(string); ok {
+				snapshot.PersistContentionSignalTotals[name] = counter.Load()
+			}
+		}
+		return true
+	})
+	m.persistDiagnosticSignals.Range(func(key, value any) bool {
+		if counter, ok := value.(*atomic.Uint64); ok {
+			if name, ok := key.(string); ok {
+				snapshot.PersistDiagnosticSignalTotals[name] = counter.Load()
+			}
+		}
+		return true
+	})
+	m.txBatchModes.Range(func(key, value any) bool {
+		if counter, ok := value.(*atomic.Uint64); ok {
+			if name, ok := key.(string); ok {
+				snapshot.TxBatchModeTotals[name] = counter.Load()
+			}
+		}
+		return true
+	})
+	m.outboxBatchModes.Range(func(key, value any) bool {
+		if counter, ok := value.(*atomic.Uint64); ok {
+			if name, ok := key.(string); ok {
+				snapshot.OutboxBatchModeTotals[name] = counter.Load()
+			}
+		}
+		return true
+	})
+	m.txBatchCanaryBadReasons.Range(func(key, value any) bool {
+		if counter, ok := value.(*atomic.Uint64); ok {
+			if name, ok := key.(string); ok {
+				snapshot.TxBatchCanaryBadByReason[name] = counter.Load()
+			}
+		}
+		return true
+	})
+	m.outboxBatchCanaryBadReasons.Range(func(key, value any) bool {
+		if counter, ok := value.(*atomic.Uint64); ok {
+			if name, ok := key.(string); ok {
+				snapshot.OutboxBatchCanaryBadByReason[name] = counter.Load()
+			}
+		}
+		return true
+	})
 	return snapshot
 }
 
 func classifyPersistError(err error) string {
 	if err == nil {
 		return "none"
+	}
+	if errors.Is(err, ErrIntegrityViolation) {
+		return "integrity"
+	}
+	if errors.Is(err, ErrInvalidData) {
+		return "invalid_data"
 	}
 	if state := extractSQLState(err); state != "" {
 		switch state {
@@ -1523,8 +3695,8 @@ func extractSQLState(err error) string {
 	return ""
 }
 
-func incrementLabel(store *sync.Map, label string) {
-	if label == "" {
+func incrementLabel(store *sync.Map, label any) {
+	if label == nil {
 		label = "unknown"
 	}
 	if val, ok := store.Load(label); ok {

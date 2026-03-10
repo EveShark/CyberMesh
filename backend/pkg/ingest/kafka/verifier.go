@@ -340,6 +340,7 @@ func VerifyEvidenceMsg(msg *EvidenceMsg, cfg VerifierConfig, log *utils.Logger) 
 
 // VerifyPolicyMsg verifies signature, content hash, and timestamp of PolicyMsg
 func VerifyPolicyMsg(msg *PolicyMsg, cfg VerifierConfig, log *utils.Logger) (*state.PolicyTx, error) {
+	policyID, traceID := extractPolicyStageIdentityFromParams(msg.Params)
 	// Validate message structure
 	if err := ValidatePolicyMsg(msg); err != nil {
 		return nil, fmt.Errorf("validation failed: %w", err)
@@ -377,6 +378,13 @@ func VerifyPolicyMsg(msg *PolicyMsg, cfg VerifierConfig, log *utils.Logger) (*st
 	if !bytes.Equal(msg.ProducerID, msg.PubKey) {
 		return nil, fmt.Errorf("producer/pubkey mismatch")
 	}
+	if log != nil && policyID != "" {
+		log.Info("policy stage marker",
+			utils.ZapString("stage", "t_signature_domain_ok"),
+			utils.ZapString("policy_id", policyID),
+			utils.ZapString("trace_id", traceID),
+			utils.ZapInt64("t_ms", time.Now().UnixMilli()))
+	}
 
 	if len(cfg.PolicyPubKeyAllowlist) > 0 {
 		keyHex := hex.EncodeToString(msg.PubKey)
@@ -386,6 +394,13 @@ func VerifyPolicyMsg(msg *PolicyMsg, cfg VerifierConfig, log *utils.Logger) (*st
 	}
 	if err := validatePolicyTraceContract(msg.Params, cfg); err != nil {
 		return nil, fmt.Errorf("policy trace contract invalid: %w", err)
+	}
+	if log != nil && policyID != "" {
+		log.Info("policy stage marker",
+			utils.ZapString("stage", "t_trace_contract_ok"),
+			utils.ZapString("policy_id", policyID),
+			utils.ZapString("trace_id", traceID),
+			utils.ZapInt64("t_ms", time.Now().UnixMilli()))
 	}
 
 	// Convert to state.PolicyTx
@@ -406,6 +421,48 @@ func VerifyPolicyMsg(msg *PolicyMsg, cfg VerifierConfig, log *utils.Logger) (*st
 	return tx, nil
 }
 
+func extractPolicyStageIdentityFromParams(params []byte) (string, string) {
+	if len(params) == 0 {
+		return "", ""
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(params, &payload); err != nil {
+		return "", ""
+	}
+	get := func(m map[string]any, key string) string {
+		if m == nil {
+			return ""
+		}
+		if v, ok := m[key].(string); ok {
+			return v
+		}
+		return ""
+	}
+	policyID := get(payload, "policy_id")
+	traceID := get(payload, "trace_id")
+	if meta, ok := payload["metadata"].(map[string]any); ok && traceID == "" {
+		traceID = get(meta, "trace_id")
+	}
+	if tr, ok := payload["trace"].(map[string]any); ok && traceID == "" {
+		traceID = get(tr, "id")
+	}
+	if nested, ok := payload["params"].(map[string]any); ok {
+		if policyID == "" {
+			policyID = get(nested, "policy_id")
+		}
+		if traceID == "" {
+			traceID = get(nested, "trace_id")
+		}
+		if meta, ok := nested["metadata"].(map[string]any); ok && traceID == "" {
+			traceID = get(meta, "trace_id")
+		}
+		if tr, ok := nested["trace"].(map[string]any); ok && traceID == "" {
+			traceID = get(tr, "id")
+		}
+	}
+	return policyID, traceID
+}
+
 func validatePolicyTraceContract(params []byte, cfg VerifierConfig) error {
 	if !cfg.PolicyRequireTrace && !cfg.PolicyRequireQCRef {
 		return nil
@@ -423,30 +480,52 @@ func validatePolicyTraceContract(params []byte, cfg VerifierConfig) error {
 		aiEventTSMs int64
 		traceTSMs   int64
 	)
-
-	if rawQC, ok := payload["qc_reference"].(string); ok {
-		qcReference = rawQC
+	extractNum := func(v any) int64 {
+		switch n := v.(type) {
+		case float64:
+			return int64(n)
+		case int64:
+			return n
+		case int:
+			return int64(n)
+		default:
+			return 0
+		}
 	}
-
-	if metadata, ok := payload["metadata"].(map[string]any); ok {
-		if v, ok := metadata["trace_id"].(string); ok {
+	parseFrom := func(src map[string]any) {
+		if src == nil {
+			return
+		}
+		if rawQC, ok := src["qc_reference"].(string); ok && qcReference == "" {
+			qcReference = rawQC
+		}
+		if metadata, ok := src["metadata"].(map[string]any); ok {
+			if v, ok := metadata["trace_id"].(string); ok && traceID == "" {
+				traceID = v
+			}
+			if aiEventTSMs == 0 {
+				aiEventTSMs = extractNum(metadata["ai_event_ts_ms"])
+			}
+			if aiEventTSMs == 0 {
+				aiEventTSMs = extractNum(metadata["ai_event_timestamp_ms"])
+			}
+		}
+		if trace, ok := src["trace"].(map[string]any); ok {
+			if v, ok := trace["id"].(string); ok && traceIDAlt == "" {
+				traceIDAlt = v
+			}
+			if traceTSMs == 0 {
+				traceTSMs = extractNum(trace["ai_event_ts_ms"])
+			}
+		}
+		if v, ok := src["trace_id"].(string); ok && traceID == "" {
 			traceID = v
 		}
-		if n, ok := metadata["ai_event_ts_ms"].(float64); ok {
-			aiEventTSMs = int64(n)
-		}
-		if n, ok := metadata["ai_event_timestamp_ms"].(float64); ok && aiEventTSMs == 0 {
-			aiEventTSMs = int64(n)
-		}
 	}
 
-	if trace, ok := payload["trace"].(map[string]any); ok {
-		if v, ok := trace["id"].(string); ok {
-			traceIDAlt = v
-		}
-		if n, ok := trace["ai_event_ts_ms"].(float64); ok {
-			traceTSMs = int64(n)
-		}
+	parseFrom(payload)
+	if wrapped, ok := payload["params"].(map[string]any); ok {
+		parseFrom(wrapped)
 	}
 
 	if cfg.PolicyRequireQCRef && qcReference == "" {
@@ -478,6 +557,11 @@ func validatePolicyTraceContract(params []byte, cfg VerifierConfig) error {
 		effectiveEventTS = traceTSMs
 	}
 	if effectiveEventTS > 0 {
+		normalizedTS, _, valid := utils.NormalizeUnixMillis(effectiveEventTS)
+		if !valid {
+			return fmt.Errorf("ai_event_ts_ms invalid or out of allowed range")
+		}
+		effectiveEventTS = normalizedTS
 		maxFutureSkew := cfg.PolicyTraceFutureSkew
 		if maxFutureSkew <= 0 {
 			maxFutureSkew = cfg.MaxTimestampSkew

@@ -238,7 +238,40 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 			fmt.Fprintf(w, "# HELP cockroach_slow_transactions_total Total slow CockroachDB transactions (above threshold).\n")
 			fmt.Fprintf(w, "# TYPE cockroach_slow_transactions_total counter\n")
 			fmt.Fprintf(w, "cockroach_slow_transactions_total %d\n", snap.SlowTransactionCount)
-			for _, stage := range []string{"upsert_block", "upsert_transactions", "upsert_snapshot", "commit"} {
+			for _, stage := range []string{
+				"tx_begin_wait",
+				"tx_body_exec",
+				"persist_attempt_total",
+				"upsert_block",
+				"upsert_transactions",
+				"upsert_transactions_prepare",
+				"upsert_transactions_insert_query",
+				"upsert_transactions_insert_scan",
+				"upsert_transactions_insert_chunks",
+				"upsert_transactions_conflict_list_build",
+				"upsert_transactions_total_inner",
+				"upsert_transactions_before_verify",
+				"upsert_transactions_after_verify",
+				"upsert_transactions_call_wall",
+				"upsert_transactions_return_success",
+				"upsert_transactions_return_integrity_error",
+				"upsert_transactions_return_other_error",
+				"upsert_transactions_verify_total",
+				"upsert_transactions_verify_query",
+				"upsert_transactions_verify_scan",
+				"upsert_transactions_verify_compare",
+				"upsert_transactions_verify_compare_total",
+				"upsert_transactions_verify_compare_error",
+				"upsert_transactions_verify_recheck_in_tx",
+				"upsert_transactions_verify_conflicts",
+				"upsert_transactions_verify_location_mismatch",
+				"upsert_transactions_verify_location_mismatch_audit",
+				"upsert_transactions_verify_forensics",
+				"upsert_transactions_verify_forensics_block_lookup",
+				"upsert_transactions_outbox_batch",
+				"upsert_snapshot",
+				"commit",
+			} {
 				count, ok := snap.PersistStageCount[stage]
 				if !ok || count == 0 {
 					continue
@@ -254,6 +287,9 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 			if len(snap.PersistFailureClassTotals) > 0 {
 				fmt.Fprintf(w, "# HELP cockroach_persist_failures_total Total CockroachDB persist failures by stage/class.\n")
 				fmt.Fprintf(w, "# TYPE cockroach_persist_failures_total counter\n")
+				var retrySerializationTotal uint64
+				var retryDeadlockTotal uint64
+				var retryLockUnavailableTotal uint64
 				for key, count := range snap.PersistFailureClassTotals {
 					stage := key
 					class := "other"
@@ -261,8 +297,201 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 						stage = key[:idx]
 						class = key[idx+1:]
 					}
+					switch class {
+					case "retry_serialization":
+						retrySerializationTotal += count
+					case "retry_deadlock":
+						retryDeadlockTotal += count
+					case "retry_lock_not_available":
+						retryLockUnavailableTotal += count
+					}
 					fmt.Fprintf(w, "cockroach_persist_failures_total{stage=\"%s\",class=\"%s\"} %d\n", stage, class, count)
 				}
+				fmt.Fprintf(w, "# HELP cockroach_tx_serialization_restarts_total Total serialization restart errors observed during persistence.\n")
+				fmt.Fprintf(w, "# TYPE cockroach_tx_serialization_restarts_total counter\n")
+				fmt.Fprintf(w, "cockroach_tx_serialization_restarts_total %d\n", retrySerializationTotal)
+				fmt.Fprintf(w, "# HELP cockroach_tx_deadlock_retries_total Total deadlock retry errors observed during persistence.\n")
+				fmt.Fprintf(w, "# TYPE cockroach_tx_deadlock_retries_total counter\n")
+				fmt.Fprintf(w, "cockroach_tx_deadlock_retries_total %d\n", retryDeadlockTotal)
+				fmt.Fprintf(w, "# HELP cockroach_tx_lock_unavailable_retries_total Total lock-not-available retry errors observed during persistence.\n")
+				fmt.Fprintf(w, "# TYPE cockroach_tx_lock_unavailable_retries_total counter\n")
+				fmt.Fprintf(w, "cockroach_tx_lock_unavailable_retries_total %d\n", retryLockUnavailableTotal)
+			}
+			if len(snap.PersistContentionSignalTotals) > 0 {
+				fmt.Fprintf(w, "# HELP cockroach_persist_contention_signal_total Heuristic contention signals observed during persistence stages.\n")
+				fmt.Fprintf(w, "# TYPE cockroach_persist_contention_signal_total counter\n")
+				for signal, count := range snap.PersistContentionSignalTotals {
+					fmt.Fprintf(w, "cockroach_persist_contention_signal_total{signal=\"%s\"} %d\n", signal, count)
+				}
+			}
+			if len(snap.PersistDiagnosticSignalTotals) > 0 {
+				fmt.Fprintf(w, "# HELP cockroach_persist_diagnostic_signal_total Diagnostic branch-entry and failure-path signals observed during persistence verification.\n")
+				fmt.Fprintf(w, "# TYPE cockroach_persist_diagnostic_signal_total counter\n")
+				for signal, count := range snap.PersistDiagnosticSignalTotals {
+					fmt.Fprintf(w, "cockroach_persist_diagnostic_signal_total{signal=\"%s\"} %d\n", signal, count)
+				}
+			}
+			if len(snap.PersistIntegrityKindTotals) > 0 {
+				fmt.Fprintf(w, "# HELP cockroach_integrity_failure_total Deterministic integrity failure signals by kind observed in persistence verification.\n")
+				fmt.Fprintf(w, "# TYPE cockroach_integrity_failure_total counter\n")
+				for kind, count := range snap.PersistIntegrityKindTotals {
+					fmt.Fprintf(w, "cockroach_integrity_failure_total{kind=\"%s\"} %d\n", kind, count)
+				}
+			}
+			fmt.Fprintf(w, "# HELP cockroach_tx_upsert_blocks_total Blocks handled by transaction upsert.\n")
+			fmt.Fprintf(w, "# TYPE cockroach_tx_upsert_blocks_total counter\n")
+			fmt.Fprintf(w, "cockroach_tx_upsert_blocks_total %d\n", snap.TxUpsertBlocks)
+			fmt.Fprintf(w, "# HELP cockroach_tx_upsert_rows_total Transaction rows handled by upsert.\n")
+			fmt.Fprintf(w, "# TYPE cockroach_tx_upsert_rows_total counter\n")
+			fmt.Fprintf(w, "cockroach_tx_upsert_rows_total %d\n", snap.TxUpsertRows)
+			fmt.Fprintf(w, "# HELP cockroach_tx_upsert_conflicts_total Upsert conflicts that required verification readback.\n")
+			fmt.Fprintf(w, "# TYPE cockroach_tx_upsert_conflicts_total counter\n")
+			fmt.Fprintf(w, "cockroach_tx_upsert_conflicts_total %d\n", snap.TxUpsertConflicts)
+			fmt.Fprintf(w, "# HELP cockroach_tx_upsert_payload_bytes_total Serialized payload bytes processed in transaction upsert.\n")
+			fmt.Fprintf(w, "# TYPE cockroach_tx_upsert_payload_bytes_total counter\n")
+			fmt.Fprintf(w, "cockroach_tx_upsert_payload_bytes_total %d\n", snap.TxUpsertPayloadBytes)
+			fmt.Fprintf(w, "# HELP cockroach_tx_upsert_conflict_ratio Conflict ratio for transaction upsert rows.\n")
+			fmt.Fprintf(w, "# TYPE cockroach_tx_upsert_conflict_ratio gauge\n")
+			fmt.Fprintf(w, "cockroach_tx_upsert_conflict_ratio %.6f\n", snap.TxUpsertConflictRatio)
+			fmt.Fprintf(w, "# HELP cockroach_tx_location_mismatch_total Total transaction location mismatch detections during conflict verification.\n")
+			fmt.Fprintf(w, "# TYPE cockroach_tx_location_mismatch_total counter\n")
+			if len(snap.TxLocationMismatchByLabel) > 0 {
+				for label, count := range snap.TxLocationMismatchByLabel {
+					source := label.Source
+					if source == "" {
+						source = "unknown"
+					}
+					kind := label.Kind
+					if kind == "" {
+						kind = "unknown"
+					}
+					fmt.Fprintf(w, "cockroach_tx_location_mismatch_total{source=\"%s\",kind=\"%s\"} %d\n", source, kind, count)
+				}
+			} else if len(snap.TxLocationMismatchBySource) == 0 {
+				fmt.Fprintf(w, "cockroach_tx_location_mismatch_total %d\n", snap.TxLocationMismatchTotal)
+			} else {
+				for source, count := range snap.TxLocationMismatchBySource {
+					fmt.Fprintf(w, "cockroach_tx_location_mismatch_total{source=\"%s\"} %d\n", source, count)
+				}
+			}
+			if len(snap.TxBatchModeTotals) > 0 {
+				fmt.Fprintf(w, "# HELP cockroach_tx_batch_mode_total Transaction upsert execution mode counts.\n")
+				fmt.Fprintf(w, "# TYPE cockroach_tx_batch_mode_total counter\n")
+				for mode, count := range snap.TxBatchModeTotals {
+					fmt.Fprintf(w, "cockroach_tx_batch_mode_total{mode=\"%s\"} %d\n", mode, count)
+				}
+			}
+			if len(snap.OutboxBatchModeTotals) > 0 {
+				fmt.Fprintf(w, "# HELP cockroach_outbox_batch_mode_total Outbox upsert execution mode counts.\n")
+				fmt.Fprintf(w, "# TYPE cockroach_outbox_batch_mode_total counter\n")
+				for mode, count := range snap.OutboxBatchModeTotals {
+					fmt.Fprintf(w, "cockroach_outbox_batch_mode_total{mode=\"%s\"} %d\n", mode, count)
+				}
+			}
+			fmt.Fprintf(w, "# HELP cockroach_tx_batch_configured_size Configured transaction upsert batch size.\n")
+			fmt.Fprintf(w, "# TYPE cockroach_tx_batch_configured_size gauge\n")
+			fmt.Fprintf(w, "cockroach_tx_batch_configured_size %d\n", snap.BatchTxConfiguredSize)
+			fmt.Fprintf(w, "# HELP cockroach_outbox_batch_configured_size Configured outbox upsert batch size.\n")
+			fmt.Fprintf(w, "# TYPE cockroach_outbox_batch_configured_size gauge\n")
+			fmt.Fprintf(w, "cockroach_outbox_batch_configured_size %d\n", snap.BatchOutboxConfiguredSize)
+			fmt.Fprintf(w, "# HELP cockroach_tx_verify_chunk_size Configured chunk size for transaction conflict verification.\n")
+			fmt.Fprintf(w, "# TYPE cockroach_tx_verify_chunk_size gauge\n")
+			fmt.Fprintf(w, "cockroach_tx_verify_chunk_size %d\n", snap.TxVerifyChunkSize)
+			fmt.Fprintf(w, "# HELP cockroach_tx_verify_mode Conflict verification query execution mode (in_tx=1/out_of_tx=1).\n")
+			fmt.Fprintf(w, "# TYPE cockroach_tx_verify_mode gauge\n")
+			if snap.TxVerifyUseTx {
+				fmt.Fprintf(w, "cockroach_tx_verify_mode{mode=\"in_tx\"} 1\n")
+				fmt.Fprintf(w, "cockroach_tx_verify_mode{mode=\"out_of_tx\"} 0\n")
+			} else {
+				fmt.Fprintf(w, "cockroach_tx_verify_mode{mode=\"in_tx\"} 0\n")
+				fmt.Fprintf(w, "cockroach_tx_verify_mode{mode=\"out_of_tx\"} 1\n")
+			}
+			fmt.Fprintf(w, "# HELP cockroach_tx_batch_canary_enabled Whether transaction upsert canary fallback is enabled (1/0).\n")
+			fmt.Fprintf(w, "# TYPE cockroach_tx_batch_canary_enabled gauge\n")
+			if snap.BatchCanaryEnabled {
+				fmt.Fprintf(w, "cockroach_tx_batch_canary_enabled 1\n")
+			} else {
+				fmt.Fprintf(w, "cockroach_tx_batch_canary_enabled 0\n")
+			}
+			fmt.Fprintf(w, "# HELP cockroach_tx_batch_fallback_active Whether transaction upsert fallback mode is active (1/0).\n")
+			fmt.Fprintf(w, "# TYPE cockroach_tx_batch_fallback_active gauge\n")
+			if snap.TxBatchFallbackActive {
+				fmt.Fprintf(w, "cockroach_tx_batch_fallback_active 1\n")
+			} else {
+				fmt.Fprintf(w, "cockroach_tx_batch_fallback_active 0\n")
+			}
+			fmt.Fprintf(w, "# HELP cockroach_tx_batch_fallback_until_unix_ms Unix milliseconds when fallback mode expires.\n")
+			fmt.Fprintf(w, "# TYPE cockroach_tx_batch_fallback_until_unix_ms gauge\n")
+			fmt.Fprintf(w, "cockroach_tx_batch_fallback_until_unix_ms %d\n", snap.TxBatchFallbackUntilUnixMs)
+			fmt.Fprintf(w, "# HELP cockroach_tx_batch_fallback_activations_total Canary fallback activations.\n")
+			fmt.Fprintf(w, "# TYPE cockroach_tx_batch_fallback_activations_total counter\n")
+			fmt.Fprintf(w, "cockroach_tx_batch_fallback_activations_total %d\n", snap.TxBatchFallbackActivations)
+			fmt.Fprintf(w, "# HELP cockroach_outbox_batch_fallback_active Whether outbox upsert fallback mode is active (1/0).\n")
+			fmt.Fprintf(w, "# TYPE cockroach_outbox_batch_fallback_active gauge\n")
+			if snap.OutboxBatchFallbackActive {
+				fmt.Fprintf(w, "cockroach_outbox_batch_fallback_active 1\n")
+			} else {
+				fmt.Fprintf(w, "cockroach_outbox_batch_fallback_active 0\n")
+			}
+			fmt.Fprintf(w, "# HELP cockroach_outbox_batch_fallback_until_unix_ms Unix milliseconds when outbox fallback mode expires.\n")
+			fmt.Fprintf(w, "# TYPE cockroach_outbox_batch_fallback_until_unix_ms gauge\n")
+			fmt.Fprintf(w, "cockroach_outbox_batch_fallback_until_unix_ms %d\n", snap.OutboxBatchFallbackUntilUnixMs)
+			fmt.Fprintf(w, "# HELP cockroach_outbox_batch_fallback_activations_total Outbox canary fallback activations.\n")
+			fmt.Fprintf(w, "# TYPE cockroach_outbox_batch_fallback_activations_total counter\n")
+			fmt.Fprintf(w, "cockroach_outbox_batch_fallback_activations_total %d\n", snap.OutboxBatchFallbackActivations)
+			if len(snap.TxBatchCanaryBadByReason) > 0 {
+				fmt.Fprintf(w, "# HELP cockroach_tx_batch_canary_bad_total Tx canary samples by reason.\n")
+				fmt.Fprintf(w, "# TYPE cockroach_tx_batch_canary_bad_total counter\n")
+				for reason, count := range snap.TxBatchCanaryBadByReason {
+					fmt.Fprintf(w, "cockroach_tx_batch_canary_bad_total{reason=\"%s\"} %d\n", reason, count)
+				}
+			}
+			if len(snap.OutboxBatchCanaryBadByReason) > 0 {
+				fmt.Fprintf(w, "# HELP cockroach_outbox_batch_canary_bad_total Outbox canary samples by reason.\n")
+				fmt.Fprintf(w, "# TYPE cockroach_outbox_batch_canary_bad_total counter\n")
+				for reason, count := range snap.OutboxBatchCanaryBadByReason {
+					fmt.Fprintf(w, "cockroach_outbox_batch_canary_bad_total{reason=\"%s\"} %d\n", reason, count)
+				}
+			}
+			fmt.Fprintf(w, "# HELP cockroach_tx_batch_current_size Current transaction upsert batch size after adaptive tuning.\n")
+			fmt.Fprintf(w, "# TYPE cockroach_tx_batch_current_size gauge\n")
+			fmt.Fprintf(w, "cockroach_tx_batch_current_size %d\n", snap.BatchTxCurrentSize)
+			fmt.Fprintf(w, "# HELP cockroach_outbox_batch_current_size Current outbox upsert batch size after adaptive tuning.\n")
+			fmt.Fprintf(w, "# TYPE cockroach_outbox_batch_current_size gauge\n")
+			fmt.Fprintf(w, "cockroach_outbox_batch_current_size %d\n", snap.BatchOutboxCurrentSize)
+			fmt.Fprintf(w, "# HELP cockroach_batch_adaptive_scale_up_total Adaptive batch scale-up operations.\n")
+			fmt.Fprintf(w, "# TYPE cockroach_batch_adaptive_scale_up_total counter\n")
+			fmt.Fprintf(w, "cockroach_batch_adaptive_scale_up_total %d\n", snap.BatchAdaptiveScaleUpTotal)
+			fmt.Fprintf(w, "# HELP cockroach_batch_adaptive_scale_down_total Adaptive batch scale-down operations.\n")
+			fmt.Fprintf(w, "# TYPE cockroach_batch_adaptive_scale_down_total counter\n")
+			fmt.Fprintf(w, "cockroach_batch_adaptive_scale_down_total %d\n", snap.BatchAdaptiveScaleDownTotal)
+			fmt.Fprintf(w, "# HELP cockroach_tx_batch_adaptive_scale_up_total Transaction batch adaptive scale-up operations.\n")
+			fmt.Fprintf(w, "# TYPE cockroach_tx_batch_adaptive_scale_up_total counter\n")
+			fmt.Fprintf(w, "cockroach_tx_batch_adaptive_scale_up_total %d\n", snap.TxBatchAdaptiveScaleUpTotal)
+			fmt.Fprintf(w, "# HELP cockroach_tx_batch_adaptive_scale_down_total Transaction batch adaptive scale-down operations.\n")
+			fmt.Fprintf(w, "# TYPE cockroach_tx_batch_adaptive_scale_down_total counter\n")
+			fmt.Fprintf(w, "cockroach_tx_batch_adaptive_scale_down_total %d\n", snap.TxBatchAdaptiveScaleDownTotal)
+			fmt.Fprintf(w, "# HELP cockroach_outbox_batch_adaptive_scale_up_total Outbox batch adaptive scale-up operations.\n")
+			fmt.Fprintf(w, "# TYPE cockroach_outbox_batch_adaptive_scale_up_total counter\n")
+			fmt.Fprintf(w, "cockroach_outbox_batch_adaptive_scale_up_total %d\n", snap.OutboxBatchAdaptiveScaleUpTotal)
+			fmt.Fprintf(w, "# HELP cockroach_outbox_batch_adaptive_scale_down_total Outbox batch adaptive scale-down operations.\n")
+			fmt.Fprintf(w, "# TYPE cockroach_outbox_batch_adaptive_scale_down_total counter\n")
+			fmt.Fprintf(w, "cockroach_outbox_batch_adaptive_scale_down_total %d\n", snap.OutboxBatchAdaptiveScaleDownTotal)
+			fmt.Fprintf(w, "# HELP cockroach_tx_payload_mode Payload persistence mode for transactions (full=1, minimal=0).\n")
+			fmt.Fprintf(w, "# TYPE cockroach_tx_payload_mode gauge\n")
+			if snap.TxStoreFullPayload {
+				fmt.Fprintf(w, "cockroach_tx_payload_mode{mode=\"full\"} 1\n")
+				fmt.Fprintf(w, "cockroach_tx_payload_mode{mode=\"minimal\"} 0\n")
+			} else {
+				fmt.Fprintf(w, "cockroach_tx_payload_mode{mode=\"full\"} 0\n")
+				fmt.Fprintf(w, "cockroach_tx_payload_mode{mode=\"minimal\"} 1\n")
+			}
+			fmt.Fprintf(w, "# HELP cockroach_tx_store_full_payload Whether full transaction payload JSON is persisted (1/0).\n")
+			fmt.Fprintf(w, "# TYPE cockroach_tx_store_full_payload gauge\n")
+			if snap.TxStoreFullPayload {
+				fmt.Fprintf(w, "cockroach_tx_store_full_payload 1\n")
+			} else {
+				fmt.Fprintf(w, "cockroach_tx_store_full_payload 0\n")
 			}
 		}
 	}
@@ -330,6 +559,9 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 
 	if s.kafkaCons != nil {
 		consStats := s.kafkaCons.Stats()
+		fmt.Fprintf(w, "# HELP kafka_consumer_replay_rejected_admit_total Total messages rejected at pre-admit replay guard.\n")
+		fmt.Fprintf(w, "# TYPE kafka_consumer_replay_rejected_admit_total counter\n")
+		fmt.Fprintf(w, "kafka_consumer_replay_rejected_admit_total %d\n", consStats.ReplayRejectedAdmit)
 		if consStats.IngestLatencyCount > 0 {
 			fmt.Fprintf(w, "# HELP kafka_consumer_ingest_latency_seconds Histogram of Kafka consumer ingest latency in seconds.\n")
 			fmt.Fprintf(w, "# TYPE kafka_consumer_ingest_latency_seconds histogram\n")
@@ -350,12 +582,71 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 
 	if s.outboxStats != nil {
 		if commitStats, ok := s.outboxStats.GetCommitPathStats(); ok {
+			writeCommitLatency := func(base, help string, buckets []utils.HistogramBucket, count uint64, sumMs, p95Ms float64) {
+				if count == 0 {
+					return
+				}
+				fmt.Fprintf(w, "# HELP %s %s\n", base, help)
+				fmt.Fprintf(w, "# TYPE %s histogram\n", base)
+				writePrometheusHistogram(w, base, buckets, count, sumMs)
+				fmt.Fprintf(w, "# HELP %s_p95_seconds 95th percentile %s\n", base, strings.TrimSuffix(help, "."))
+				fmt.Fprintf(w, "# TYPE %s_p95_seconds gauge\n", base)
+				fmt.Fprintf(w, "%s_p95_seconds %.6f\n", base, p95Ms/1000.0)
+			}
 			fmt.Fprintf(w, "# HELP control_commit_log_sample_every_n Commit info log sampling interval.\n")
 			fmt.Fprintf(w, "# TYPE control_commit_log_sample_every_n gauge\n")
 			fmt.Fprintf(w, "control_commit_log_sample_every_n %d\n", commitStats.LogSampleEvery)
 			fmt.Fprintf(w, "# HELP control_commit_logs_suppressed_total Total commit-path logs suppressed by sampling/throttling.\n")
 			fmt.Fprintf(w, "# TYPE control_commit_logs_suppressed_total counter\n")
 			fmt.Fprintf(w, "control_commit_logs_suppressed_total %d\n", commitStats.LogsSuppressed)
+			fmt.Fprintf(w, "# HELP control_persist_backfill_pending Current number of pending backfill entries.\n")
+			fmt.Fprintf(w, "# TYPE control_persist_backfill_pending gauge\n")
+			fmt.Fprintf(w, "control_persist_backfill_pending %d\n", commitStats.BackfillPending)
+			fmt.Fprintf(w, "# HELP control_persist_backfill_dropped_total Total pending backfill entries dropped due to cap/eviction.\n")
+			fmt.Fprintf(w, "# TYPE control_persist_backfill_dropped_total counter\n")
+			fmt.Fprintf(w, "control_persist_backfill_dropped_total %d\n", commitStats.BackfillDropped)
+			fmt.Fprintf(w, "# HELP control_tx_replay_rejected_total Total transactions rejected by replay filter.\n")
+			fmt.Fprintf(w, "# TYPE control_tx_replay_rejected_total counter\n")
+			fmt.Fprintf(w, "control_tx_replay_rejected_total{stage=\"admit\"} %d\n", commitStats.ReplayRejectedAdmit)
+			fmt.Fprintf(w, "control_tx_replay_rejected_total{stage=\"build\"} %d\n", commitStats.ReplayRejectedBuild)
+			fmt.Fprintf(w, "# HELP control_tx_replay_filter_size Current number of committed tx identities tracked by replay filter.\n")
+			fmt.Fprintf(w, "# TYPE control_tx_replay_filter_size gauge\n")
+			fmt.Fprintf(w, "control_tx_replay_filter_size %d\n", commitStats.ReplayFilterSize)
+			fmt.Fprintf(w, "# HELP control_tx_replay_filter_evictions_total Total replay filter evictions due to cap.\n")
+			fmt.Fprintf(w, "# TYPE control_tx_replay_filter_evictions_total counter\n")
+			fmt.Fprintf(w, "control_tx_replay_filter_evictions_total %d\n", commitStats.ReplayFilterEvictions)
+			fmt.Fprintf(w, "# HELP control_persist_enqueue_total Total persistence enqueue attempts by source and role.\n")
+			fmt.Fprintf(w, "# TYPE control_persist_enqueue_total counter\n")
+			fmt.Fprintf(w, "control_persist_enqueue_total{source=\"commit\",role=\"proposer\"} %d\n", commitStats.PersistEnqueueCommitProposer)
+			fmt.Fprintf(w, "control_persist_enqueue_total{source=\"commit\",role=\"non_proposer\"} %d\n", commitStats.PersistEnqueueCommitNonProposer)
+			fmt.Fprintf(w, "control_persist_enqueue_total{source=\"backfill\",role=\"proposer\"} %d\n", commitStats.PersistEnqueueBackfillProposer)
+			fmt.Fprintf(w, "control_persist_enqueue_total{source=\"backfill\",role=\"non_proposer\"} %d\n", commitStats.PersistEnqueueBackfillNonProposer)
+			fmt.Fprintf(w, "# HELP control_persist_enqueue_dropped_non_proposer_total Total persistence enqueue requests dropped by proposer-only safety guard.\n")
+			fmt.Fprintf(w, "# TYPE control_persist_enqueue_dropped_non_proposer_total counter\n")
+			fmt.Fprintf(w, "control_persist_enqueue_dropped_non_proposer_total %d\n", commitStats.PersistEnqueueDroppedNonProposer)
+			fmt.Fprintf(w, "# HELP control_persist_enqueue_errors_total Total persistence enqueue errors.\n")
+			fmt.Fprintf(w, "# TYPE control_persist_enqueue_errors_total counter\n")
+			fmt.Fprintf(w, "control_persist_enqueue_errors_total %d\n", commitStats.PersistEnqueueErrors)
+			fmt.Fprintf(w, "# HELP control_persist_execute_total Total persistence execution attempts by role and decision.\n")
+			fmt.Fprintf(w, "# TYPE control_persist_execute_total counter\n")
+			fmt.Fprintf(w, "control_persist_execute_total{role=\"proposer\",decision=\"allowed\"} %d\n", commitStats.PersistExecuteProposer)
+			fmt.Fprintf(w, "control_persist_execute_total{role=\"non_proposer\",decision=\"allowed\"} %d\n", commitStats.PersistExecuteNonProposer)
+			fmt.Fprintf(w, "control_persist_execute_total{role=\"non_proposer\",decision=\"dropped_non_owner\"} %d\n", commitStats.PersistExecuteDroppedNonOwner)
+			fmt.Fprintf(w, "# HELP control_apply_block_runs_total Total ApplyBlock executions observed by the wiring layer.\n")
+			fmt.Fprintf(w, "# TYPE control_apply_block_runs_total counter\n")
+			fmt.Fprintf(w, "control_apply_block_runs_total %d\n", commitStats.ApplyBlockRuns)
+			fmt.Fprintf(w, "# HELP control_apply_block_txs_total Total transactions processed by ApplyBlock, partitioned by transaction type.\n")
+			fmt.Fprintf(w, "# TYPE control_apply_block_txs_total counter\n")
+			fmt.Fprintf(w, "control_apply_block_txs_total{type=\"event\"} %d\n", commitStats.ApplyBlockEventTxs)
+			fmt.Fprintf(w, "control_apply_block_txs_total{type=\"evidence\"} %d\n", commitStats.ApplyBlockEvidenceTxs)
+			fmt.Fprintf(w, "control_apply_block_txs_total{type=\"policy\"} %d\n", commitStats.ApplyBlockPolicyTxs)
+			writeCommitLatency("control_apply_block_total_seconds", "Histogram of ApplyBlock total latency in seconds.", commitStats.ApplyBlockTotalBuckets, commitStats.ApplyBlockTotalCount, commitStats.ApplyBlockTotalSumMs, commitStats.ApplyBlockTotalP95Ms)
+			writeCommitLatency("control_apply_block_validate_seconds", "Histogram of ApplyBlock validation latency in seconds.", commitStats.ApplyBlockValidateBuckets, commitStats.ApplyBlockValidateCount, commitStats.ApplyBlockValidateSumMs, commitStats.ApplyBlockValidateP95Ms)
+			writeCommitLatency("control_apply_block_nonce_check_seconds", "Histogram of ApplyBlock nonce-check latency in seconds.", commitStats.ApplyBlockNonceCheckBuckets, commitStats.ApplyBlockNonceCheckCount, commitStats.ApplyBlockNonceCheckSumMs, commitStats.ApplyBlockNonceCheckP95Ms)
+			writeCommitLatency("control_apply_block_reducer_event_seconds", "Histogram of ApplyBlock event reducer latency in seconds.", commitStats.ApplyBlockReducerEventBuckets, commitStats.ApplyBlockReducerEventCount, commitStats.ApplyBlockReducerEventSumMs, commitStats.ApplyBlockReducerEventP95Ms)
+			writeCommitLatency("control_apply_block_reducer_evidence_seconds", "Histogram of ApplyBlock evidence reducer latency in seconds.", commitStats.ApplyBlockReducerEvidenceBuckets, commitStats.ApplyBlockReducerEvidenceCount, commitStats.ApplyBlockReducerEvidenceSumMs, commitStats.ApplyBlockReducerEvidenceP95Ms)
+			writeCommitLatency("control_apply_block_reducer_policy_seconds", "Histogram of ApplyBlock policy reducer latency in seconds.", commitStats.ApplyBlockReducerPolicyBuckets, commitStats.ApplyBlockReducerPolicyCount, commitStats.ApplyBlockReducerPolicySumMs, commitStats.ApplyBlockReducerPolicyP95Ms)
+			writeCommitLatency("control_apply_block_commit_state_seconds", "Histogram of ApplyBlock state-commit latency in seconds.", commitStats.ApplyBlockCommitStateBuckets, commitStats.ApplyBlockCommitStateCount, commitStats.ApplyBlockCommitStateSumMs, commitStats.ApplyBlockCommitStateP95Ms)
 		}
 
 		if ackStats, ok := s.outboxStats.GetPolicyAckConsumerStats(); ok {
@@ -394,6 +685,33 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 			fmt.Fprintf(w, "# HELP control_policy_causal_skew_corrections_total Total causal latency corrections due to clock skew.\n")
 			fmt.Fprintf(w, "# TYPE control_policy_causal_skew_corrections_total counter\n")
 			fmt.Fprintf(w, "control_policy_causal_skew_corrections_total %d\n", causal.SkewCorrectionsTotal)
+			fmt.Fprintf(w, "# HELP control_policy_ack_correlation_exact_total Total ACK correlations matched via policy_id+rule_hash+trace_id.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_ack_correlation_exact_total counter\n")
+			fmt.Fprintf(w, "control_policy_ack_correlation_exact_total %d\n", causal.CorrelationExact)
+			fmt.Fprintf(w, "# HELP control_policy_ack_correlation_fallback_hash_total Total ACK correlations matched via policy_id+rule_hash fallback.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_ack_correlation_fallback_hash_total counter\n")
+			fmt.Fprintf(w, "control_policy_ack_correlation_fallback_hash_total %d\n", causal.CorrelationFallbackHash)
+			fmt.Fprintf(w, "# HELP control_policy_ack_correlation_fallback_trace_total Total ACK correlations matched via policy_id+trace_id fallback.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_ack_correlation_fallback_trace_total counter\n")
+			fmt.Fprintf(w, "control_policy_ack_correlation_fallback_trace_total %d\n", causal.CorrelationFallbackTrace)
+			fmt.Fprintf(w, "# HELP control_policy_ack_correlation_no_match_total Total ACK events with no outbox correlation match.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_ack_correlation_no_match_total counter\n")
+			fmt.Fprintf(w, "control_policy_ack_correlation_no_match_total %d\n", causal.CorrelationNoMatch)
+			fmt.Fprintf(w, "# HELP control_policy_ack_correlation_errors_total Total ACK correlation query errors.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_ack_correlation_errors_total counter\n")
+			fmt.Fprintf(w, "control_policy_ack_correlation_errors_total %d\n", causal.CorrelationErrors)
+			fmt.Fprintf(w, "# HELP control_policy_ack_ai_event_unit_corrections_total Total AI-event timestamp unit corrections during ACK causal computation.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_ack_ai_event_unit_corrections_total counter\n")
+			fmt.Fprintf(w, "control_policy_ack_ai_event_unit_corrections_total %d\n", causal.AIEventUnitCorrections)
+			fmt.Fprintf(w, "# HELP control_policy_ack_ai_event_invalid_total Total invalid AI-event timestamps skipped during ACK causal computation.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_ack_ai_event_invalid_total counter\n")
+			fmt.Fprintf(w, "control_policy_ack_ai_event_invalid_total %d\n", causal.AIEventInvalidTotal)
+			fmt.Fprintf(w, "# HELP control_policy_ack_source_event_unit_corrections_total Total source-event timestamp unit corrections during ACK causal computation.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_ack_source_event_unit_corrections_total counter\n")
+			fmt.Fprintf(w, "control_policy_ack_source_event_unit_corrections_total %d\n", causal.SourceEventUnitCorrections)
+			fmt.Fprintf(w, "# HELP control_policy_ack_source_event_invalid_total Total invalid source-event timestamps skipped during ACK causal computation.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_ack_source_event_invalid_total counter\n")
+			fmt.Fprintf(w, "control_policy_ack_source_event_invalid_total %d\n", causal.SourceEventInvalidTotal)
 			if causal.AIToAckCount > 0 {
 				fmt.Fprintf(w, "# HELP control_policy_causal_ai_to_ack_latency_seconds Histogram of corrected AI-to-ACK causal latency in seconds.\n")
 				fmt.Fprintf(w, "# TYPE control_policy_causal_ai_to_ack_latency_seconds histogram\n")
@@ -401,6 +719,14 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 				fmt.Fprintf(w, "# HELP control_policy_causal_ai_to_ack_latency_p95_seconds 95th percentile corrected AI-to-ACK latency in seconds.\n")
 				fmt.Fprintf(w, "# TYPE control_policy_causal_ai_to_ack_latency_p95_seconds gauge\n")
 				fmt.Fprintf(w, "control_policy_causal_ai_to_ack_latency_p95_seconds %.6f\n", causal.AIToAckP95Ms/1000.0)
+			}
+			if causal.SourceToAckCount > 0 {
+				fmt.Fprintf(w, "# HELP control_policy_causal_source_to_ack_latency_seconds Histogram of corrected source-event-to-ACK causal latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_causal_source_to_ack_latency_seconds histogram\n")
+				writePrometheusHistogram(w, "control_policy_causal_source_to_ack_latency_seconds", causal.SourceToAckBuckets, causal.SourceToAckCount, causal.SourceToAckSumMs)
+				fmt.Fprintf(w, "# HELP control_policy_causal_source_to_ack_latency_p95_seconds 95th percentile corrected source-event-to-ACK latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_causal_source_to_ack_latency_p95_seconds gauge\n")
+				fmt.Fprintf(w, "control_policy_causal_source_to_ack_latency_p95_seconds %.6f\n", causal.SourceToAckP95Ms/1000.0)
 			}
 			if causal.PublishToAckCount > 0 {
 				fmt.Fprintf(w, "# HELP control_policy_causal_publish_to_ack_latency_seconds Histogram of corrected publish-to-ACK causal latency in seconds.\n")
@@ -471,6 +797,77 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 			fmt.Fprintf(w, "# HELP control_policy_outbox_skew_corrections_total Total outbox causal latency corrections due to clock skew.\n")
 			fmt.Fprintf(w, "# TYPE control_policy_outbox_skew_corrections_total counter\n")
 			fmt.Fprintf(w, "control_policy_outbox_skew_corrections_total %d\n", outbox.SkewCorrectionsTotal)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_ai_event_unit_corrections_total Total AI-event timestamp unit corrections in outbox causal computation.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_ai_event_unit_corrections_total counter\n")
+			fmt.Fprintf(w, "control_policy_outbox_ai_event_unit_corrections_total %d\n", outbox.AIEventUnitCorrections)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_ai_event_invalid_total Total invalid AI-event timestamps skipped in outbox causal computation.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_ai_event_invalid_total counter\n")
+			fmt.Fprintf(w, "control_policy_outbox_ai_event_invalid_total %d\n", outbox.AIEventInvalidTotal)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_source_event_unit_corrections_total Total source-event timestamp unit corrections in outbox causal computation.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_source_event_unit_corrections_total counter\n")
+			fmt.Fprintf(w, "control_policy_outbox_source_event_unit_corrections_total %d\n", outbox.SourceEventUnitCorrections)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_source_event_invalid_total Total invalid source-event timestamps skipped in outbox causal computation.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_source_event_invalid_total counter\n")
+			fmt.Fprintf(w, "control_policy_outbox_source_event_invalid_total %d\n", outbox.SourceEventInvalidTotal)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_publish_scope_fallback_total Total policy publish scope derivations that fell back to global routing.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_publish_scope_fallback_total counter\n")
+			fmt.Fprintf(w, "control_policy_outbox_publish_scope_fallback_total %d\n", outbox.PublishScopeFallbacks)
+			if len(outbox.PublishScopeResultTotals) > 0 {
+				fmt.Fprintf(w, "# HELP control_policy_outbox_publish_scope_total Policy outbox publish attempts grouped by scope kind and result.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_outbox_publish_scope_total counter\n")
+				for key, count := range outbox.PublishScopeResultTotals {
+					scopeKind := key
+					result := "unknown"
+					if idx := strings.Index(key, ":"); idx > 0 && idx < len(key)-1 {
+						scopeKind = key[:idx]
+						result = key[idx+1:]
+					}
+					fmt.Fprintf(w, "control_policy_outbox_publish_scope_total{scope_kind=\"%s\",result=\"%s\"} %d\n", scopeKind, result, count)
+				}
+			}
+			if len(outbox.PublishScopeRouteTotals) > 0 {
+				fmt.Fprintf(w, "# HELP control_policy_outbox_publish_scope_route_total Policy outbox publish attempts grouped by routing scope kind, bucketed flag, and result.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_outbox_publish_scope_route_total counter\n")
+				for key, count := range outbox.PublishScopeRouteTotals {
+					parts := strings.SplitN(key, ":", 3)
+					if len(parts) != 3 {
+						continue
+					}
+					scopeKind := sanitizeLabelValue(parts[0])
+					bucketed := sanitizeLabelValue(parts[1])
+					result := sanitizeLabelValue(parts[2])
+					fmt.Fprintf(w, "control_policy_outbox_publish_scope_route_total{scope_kind=\"%s\",bucketed=\"%s\",result=\"%s\"} %d\n", scopeKind, bucketed, result, count)
+				}
+			}
+			if len(outbox.PublishResultTotals) > 0 {
+				fmt.Fprintf(w, "# HELP control_policy_outbox_publish_total Policy outbox publish attempts grouped by topic and result.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_outbox_publish_total counter\n")
+				for key, count := range outbox.PublishResultTotals {
+					topic := key
+					result := "unknown"
+					if idx := strings.LastIndex(key, ":"); idx > 0 && idx < len(key)-1 {
+						topic = key[:idx]
+						result = key[idx+1:]
+					}
+					fmt.Fprintf(w, "control_policy_outbox_publish_total{topic=\"%s\",result=\"%s\"} %d\n", topic, result, count)
+				}
+			}
+			if len(outbox.PublishPartitionTotals) > 0 {
+				fmt.Fprintf(w, "# HELP control_policy_outbox_publish_partition_total Policy outbox publish attempts grouped by topic, partition, and result.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_outbox_publish_partition_total counter\n")
+				for key, count := range outbox.PublishPartitionTotals {
+					topic := "unknown"
+					partition := "unknown"
+					result := "unknown"
+					parts := strings.SplitN(key, ":", 3)
+					if len(parts) == 3 {
+						topic = parts[0]
+						partition = parts[1]
+						result = parts[2]
+					}
+					fmt.Fprintf(w, "control_policy_outbox_publish_partition_total{topic=\"%s\",partition=\"%s\",result=\"%s\"} %d\n", topic, partition, result, count)
+				}
+			}
 			if outbox.PublishLatencyCount > 0 {
 				fmt.Fprintf(w, "# HELP control_policy_outbox_publish_latency_seconds Histogram of durable outbox publish latency in seconds.\n")
 				fmt.Fprintf(w, "# TYPE control_policy_outbox_publish_latency_seconds histogram\n")
@@ -494,6 +891,14 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 				fmt.Fprintf(w, "# HELP control_policy_outbox_mark_latency_p95_seconds 95th percentile outbox state-mark latency in seconds.\n")
 				fmt.Fprintf(w, "# TYPE control_policy_outbox_mark_latency_p95_seconds gauge\n")
 				fmt.Fprintf(w, "control_policy_outbox_mark_latency_p95_seconds %.6f\n", outbox.MarkLatencyP95Ms/1000.0)
+			}
+			if outbox.SourceToPublishCount > 0 {
+				fmt.Fprintf(w, "# HELP control_policy_causal_source_to_publish_latency_seconds Histogram of corrected source-event-to-publish causal latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_causal_source_to_publish_latency_seconds histogram\n")
+				writePrometheusHistogram(w, "control_policy_causal_source_to_publish_latency_seconds", outbox.SourceToPublishBuckets, outbox.SourceToPublishCount, outbox.SourceToPublishSumMs)
+				fmt.Fprintf(w, "# HELP control_policy_causal_source_to_publish_latency_p95_seconds 95th percentile corrected source-event-to-publish latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_causal_source_to_publish_latency_p95_seconds gauge\n")
+				fmt.Fprintf(w, "control_policy_causal_source_to_publish_latency_p95_seconds %.6f\n", outbox.SourceToPublishP95Ms/1000.0)
 			}
 			if outbox.TickLatencyCount > 0 {
 				fmt.Fprintf(w, "# HELP control_policy_outbox_tick_latency_seconds Histogram of dispatcher tick duration in seconds.\n")
@@ -651,26 +1056,48 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 
 	routeSnapshots := s.snapshotRouteMetrics()
 	if len(routeSnapshots) > 0 {
-		fmt.Fprintf(w, "# HELP api_route_requests_total Total HTTP requests per method/path.\n")
+		fmt.Fprintf(w, "# HELP api_route_requests_total Total HTTP requests per method/path/status class.\n")
 		fmt.Fprintf(w, "# TYPE api_route_requests_total counter\n")
-		fmt.Fprintf(w, "# HELP api_route_request_errors_total Total error responses per method/path.\n")
+		fmt.Fprintf(w, "# HELP api_route_request_errors_total Total error responses per method/path/status class.\n")
 		fmt.Fprintf(w, "# TYPE api_route_request_errors_total counter\n")
-		fmt.Fprintf(w, "# HELP api_route_request_duration_seconds_sum Total request duration in seconds per method/path.\n")
-		fmt.Fprintf(w, "# TYPE api_route_request_duration_seconds_sum counter\n")
-		fmt.Fprintf(w, "# HELP api_route_response_bytes_total Total response bytes per method/path.\n")
+		fmt.Fprintf(w, "# HELP api_route_request_duration_seconds Histogram of request latency in seconds per method/path/status class.\n")
+		fmt.Fprintf(w, "# TYPE api_route_request_duration_seconds histogram\n")
+		fmt.Fprintf(w, "# HELP api_route_request_duration_p95_seconds 95th percentile request latency in seconds per method/path/status class.\n")
+		fmt.Fprintf(w, "# TYPE api_route_request_duration_p95_seconds gauge\n")
+		fmt.Fprintf(w, "# HELP api_route_request_duration_p99_seconds 99th percentile request latency in seconds per method/path/status class.\n")
+		fmt.Fprintf(w, "# TYPE api_route_request_duration_p99_seconds gauge\n")
+		fmt.Fprintf(w, "# HELP api_route_response_bytes_total Total response bytes per method/path/status class.\n")
 		fmt.Fprintf(w, "# TYPE api_route_response_bytes_total counter\n")
-		fmt.Fprintf(w, "# HELP api_route_cache_hits_total Cache hits observed per method/path.\n")
+		fmt.Fprintf(w, "# HELP api_route_cache_hits_total Cache hits observed per method/path/status class.\n")
 		fmt.Fprintf(w, "# TYPE api_route_cache_hits_total counter\n")
-		fmt.Fprintf(w, "# HELP api_route_cache_misses_total Cache misses observed per method/path.\n")
+		fmt.Fprintf(w, "# HELP api_route_cache_misses_total Cache misses observed per method/path/status class.\n")
 		fmt.Fprintf(w, "# TYPE api_route_cache_misses_total counter\n")
 		for _, snap := range routeSnapshots {
-			labels := fmt.Sprintf("method=\"%s\",path=\"%s\"", sanitizeLabelValue(snap.method), sanitizeLabelValue(snap.path))
+			labels := fmt.Sprintf("method=\"%s\",path=\"%s\",status_class=\"%s\"", sanitizeLabelValue(snap.method), sanitizeLabelValue(snap.path), sanitizeLabelValue(snap.statusClass))
 			fmt.Fprintf(w, "api_route_requests_total{%s} %d\n", labels, snap.requests)
 			fmt.Fprintf(w, "api_route_request_errors_total{%s} %d\n", labels, snap.errors)
-			fmt.Fprintf(w, "api_route_request_duration_seconds_sum{%s} %.6f\n", labels, float64(snap.latencyMicros)/1_000_000.0)
+			writePrometheusHistogramWithLabels(w, "api_route_request_duration_seconds", labels, snap.latencyBuckets, snap.latencyCount, snap.latencySumMs)
+			fmt.Fprintf(w, "api_route_request_duration_p95_seconds{%s} %.6f\n", labels, snap.latencyP95Ms/1000.0)
+			fmt.Fprintf(w, "api_route_request_duration_p99_seconds{%s} %.6f\n", labels, snap.latencyP99Ms/1000.0)
 			fmt.Fprintf(w, "api_route_response_bytes_total{%s} %d\n", labels, snap.bytes)
 			fmt.Fprintf(w, "api_route_cache_hits_total{%s} %d\n", labels, snap.cacheHits)
 			fmt.Fprintf(w, "api_route_cache_misses_total{%s} %d\n", labels, snap.cacheMisses)
+		}
+	}
+
+	dashboardSnapshots := s.snapshotDashboardSectionMetrics()
+	if len(dashboardSnapshots) > 0 {
+		fmt.Fprintf(w, "# HELP api_dashboard_section_duration_seconds Histogram of dashboard overview section build latency in seconds.\n")
+		fmt.Fprintf(w, "# TYPE api_dashboard_section_duration_seconds histogram\n")
+		fmt.Fprintf(w, "# HELP api_dashboard_section_duration_p95_seconds 95th percentile dashboard overview section build latency in seconds.\n")
+		fmt.Fprintf(w, "# TYPE api_dashboard_section_duration_p95_seconds gauge\n")
+		fmt.Fprintf(w, "# HELP api_dashboard_section_duration_p99_seconds 99th percentile dashboard overview section build latency in seconds.\n")
+		fmt.Fprintf(w, "# TYPE api_dashboard_section_duration_p99_seconds gauge\n")
+		for _, snap := range dashboardSnapshots {
+			labels := fmt.Sprintf("section=\"%s\"", sanitizeLabelValue(snap.section))
+			writePrometheusHistogramWithLabels(w, "api_dashboard_section_duration_seconds", labels, snap.buckets, snap.count, snap.sumMs)
+			fmt.Fprintf(w, "api_dashboard_section_duration_p95_seconds{%s} %.6f\n", labels, snap.p95Ms/1000.0)
+			fmt.Fprintf(w, "api_dashboard_section_duration_p99_seconds{%s} %.6f\n", labels, snap.p99Ms/1000.0)
 		}
 	}
 
@@ -871,6 +1298,10 @@ func convertToInt64(v interface{}) int64 {
 }
 
 func writePrometheusHistogram(w io.Writer, name string, buckets []utils.HistogramBucket, count uint64, sumMs float64) {
+	writePrometheusHistogramWithLabels(w, name, "", buckets, count, sumMs)
+}
+
+func writePrometheusHistogramWithLabels(w io.Writer, name, labels string, buckets []utils.HistogramBucket, count uint64, sumMs float64) {
 	var cumulative uint64
 	for _, bucket := range buckets {
 		cumulative += bucket.Count
@@ -878,8 +1309,17 @@ func writePrometheusHistogram(w io.Writer, name string, buckets []utils.Histogra
 		if !math.IsInf(bucket.UpperBound, 1) {
 			le = fmt.Sprintf("%.6f", bucket.UpperBound/1000.0)
 		}
-		fmt.Fprintf(w, "%s_bucket{le=\"%s\"} %d\n", name, le, cumulative)
+		if labels == "" {
+			fmt.Fprintf(w, "%s_bucket{le=\"%s\"} %d\n", name, le, cumulative)
+		} else {
+			fmt.Fprintf(w, "%s_bucket{%s,le=\"%s\"} %d\n", name, labels, le, cumulative)
+		}
 	}
-	fmt.Fprintf(w, "%s_sum %.6f\n", name, sumMs/1000.0)
-	fmt.Fprintf(w, "%s_count %d\n", name, count)
+	if labels == "" {
+		fmt.Fprintf(w, "%s_sum %.6f\n", name, sumMs/1000.0)
+		fmt.Fprintf(w, "%s_count %d\n", name, count)
+	} else {
+		fmt.Fprintf(w, "%s_sum{%s} %.6f\n", name, labels, sumMs/1000.0)
+		fmt.Fprintf(w, "%s_count{%s} %d\n", name, labels, count)
+	}
 }

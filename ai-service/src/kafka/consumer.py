@@ -10,7 +10,8 @@ Topics:
 - control.evidence.v1
 """
 import os
-from confluent_kafka import Consumer, Producer, KafkaException, KafkaError as ConfluentKafkaError
+from collections import deque
+from confluent_kafka import Consumer, Producer, KafkaException, KafkaError as ConfluentKafkaError, TopicPartition
 import threading
 import time
 from typing import Callable, Dict, Optional, List
@@ -132,6 +133,12 @@ class AIConsumer:
         self._commits_processed = 0
         self._tracker_updates = 0
         self._tracker_errors = 0
+        self._messages_by_topic: Dict[str, int] = {}
+        self._last_poll_ts: Optional[float] = None
+        self._last_message_ts: Optional[float] = None
+        self._last_error: Optional[str] = None
+        self._recent_poison_limit = max(10, int(os.getenv("AI_CONSUMER_POISON_HISTORY_LIMIT", "200")))
+        self._recent_poison = deque(maxlen=self._recent_poison_limit)
     
     def _build_config(self, settings: Settings) -> dict:
         """Build confluent-kafka Consumer configuration."""
@@ -220,6 +227,7 @@ class AIConsumer:
         """Main consumer loop"""
         while self._running:
             try:
+                self._last_poll_ts = time.time()
                 # Poll for messages (timeout in seconds)
                 msg = self.consumer.poll(timeout=1.0)
                 
@@ -235,6 +243,7 @@ class AIConsumer:
                 
                 # Process message
                 self._messages_received += 1
+                self._last_message_ts = time.time()
                 self._process_message(msg.topic(), msg.value())
                 
                 # Manual commit if auto-commit disabled
@@ -242,11 +251,13 @@ class AIConsumer:
                     self.consumer.commit(message=msg, asynchronous=False)
                 
             except KafkaException as e:
+                self._last_error = str(e)
                 if self.logger:
                     self.logger.error(f"Kafka consumer error: {e}")
                 time.sleep(1)
                 
             except Exception as e:
+                self._last_error = str(e)
                 if self.logger:
                     self.logger.error(f"Consumer loop error: {e}", exc_info=True)
                 time.sleep(1)
@@ -287,6 +298,7 @@ class AIConsumer:
                     self.logger.warning(f"No handler registered for topic: {topic}")
             
             self._messages_processed += 1
+            self._messages_by_topic[topic] = self._messages_by_topic.get(topic, 0) + 1
             
         except ContractError as e:
             # Identify timestamp skew via structured error type in the cause chain
@@ -473,7 +485,97 @@ class AIConsumer:
             "commits_processed": self._commits_processed,
             "tracker_updates": self._tracker_updates,
             "tracker_errors": self._tracker_errors,
+            "messages_by_topic": dict(self._messages_by_topic),
         }
+
+    def get_runtime_status(self) -> dict:
+        """Best-effort runtime status for operational debugging."""
+        assignment = []
+        try:
+            assigned = self.consumer.assignment() or []
+            for tp in assigned:
+                assignment.append({
+                    "topic": tp.topic,
+                    "partition": tp.partition,
+                })
+        except Exception as exc:
+            assignment = [{"error": str(exc)}]
+
+        thread_alive = bool(self._thread and self._thread.is_alive())
+        return {
+            "running": self._running,
+            "thread_alive": thread_alive,
+            "auto_commit_enabled": self._auto_commit_enabled,
+            "topics": list(self.topic_list),
+            "assignments": assignment,
+            "last_poll_ts": self._last_poll_ts,
+            "last_message_ts": self._last_message_ts,
+            "last_error": self._last_error,
+            "metrics": self.get_metrics(),
+        }
+
+    def get_offsets(self, topic: Optional[str] = None) -> dict:
+        """Best-effort consumer offsets and lag for assigned partitions."""
+        offsets = []
+        errors = []
+        try:
+            assigned = self.consumer.assignment() or []
+            if topic:
+                assigned = [tp for tp in assigned if tp.topic == topic]
+            if not assigned:
+                return {"offsets": [], "errors": []}
+
+            positions = {}
+            committed = {}
+            try:
+                for tp in self.consumer.position(assigned):
+                    positions[(tp.topic, tp.partition)] = tp.offset
+            except Exception as exc:
+                errors.append(f"position: {exc}")
+
+            try:
+                committed_tps = [TopicPartition(tp.topic, tp.partition) for tp in assigned]
+                for tp in self.consumer.committed(committed_tps, timeout=5.0):
+                    committed[(tp.topic, tp.partition)] = tp.offset
+            except Exception as exc:
+                errors.append(f"committed: {exc}")
+
+            for tp in assigned:
+                key = (tp.topic, tp.partition)
+                low = None
+                high = None
+                lag = None
+                try:
+                    low, high = self.consumer.get_watermark_offsets(tp, timeout=1.0, cached=False)
+                    current = positions.get(key)
+                    if current is not None and current >= 0 and high is not None:
+                        lag = max(0, high - current)
+                except Exception as exc:
+                    errors.append(f"watermark {tp.topic}[{tp.partition}]: {exc}")
+
+                offsets.append({
+                    "topic": tp.topic,
+                    "partition": tp.partition,
+                    "position": positions.get(key),
+                    "committed": committed.get(key),
+                    "low_watermark": low,
+                    "high_watermark": high,
+                    "lag": lag,
+                })
+        except Exception as exc:
+            errors.append(str(exc))
+
+        return {"offsets": offsets, "errors": errors}
+
+    def get_recent_poison_messages(self, limit: int = 50) -> List[dict]:
+        if limit <= 0:
+            return []
+        if limit > self._recent_poison_limit:
+            limit = self._recent_poison_limit
+        items = list(self._recent_poison)
+        if len(items) <= limit:
+            return items
+        return items[-limit:]
 
     def _ensure_dlq_producer(self):
         if self._dlq_producer is not None:
@@ -502,13 +604,14 @@ class AIConsumer:
     def _send_to_dlq(self, original_topic: str, data: bytes, reason: str, error: str):
         self._ensure_dlq_producer()
         dlq_topic = self.config.kafka_topics.dlq
+        message_hash = hashlib.sha256(data or b'').hexdigest()
         payload = {
             "original_topic": original_topic,
             "reason": reason,
             "error": error,
             "timestamp": int(time.time()),
             "node_id": getattr(self.config, "node_id", "unknown"),
-            "message_hash": hashlib.sha256(data or b'').hexdigest(),
+            "message_hash": message_hash,
             "data_size": len(data or b''),
         }
         encoded = json.dumps(payload, separators=(",", ":")).encode()
@@ -516,6 +619,15 @@ class AIConsumer:
         try:
             self._dlq_producer.produce(dlq_topic, value=encoded, key=key)
             self._dlq_producer.flush(5)
+            self._recent_poison.append({
+                "topic": original_topic,
+                "dlq_topic": dlq_topic,
+                "reason": reason,
+                "error": error,
+                "message_hash": message_hash,
+                "timestamp": payload["timestamp"],
+                "data_size": payload["data_size"],
+            })
         except Exception as ex:
             if self.logger:
                 self.logger.error(f"Failed to send DLQ message: {ex}")

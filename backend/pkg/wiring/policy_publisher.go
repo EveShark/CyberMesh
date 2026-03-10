@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"backend/pkg/control/policyoutbox"
 	"backend/pkg/ingest/kafka"
 	"backend/pkg/utils"
 	pb "backend/proto"
@@ -25,31 +26,35 @@ import (
 type policyProducer interface {
 	PublishPolicy(ctx context.Context, evt *pb.PolicyUpdateEvent) error
 	PublishPolicyWithAck(ctx context.Context, evt *pb.PolicyUpdateEvent) (int32, int64, error)
+	PublishPolicyWithRoutingKey(ctx context.Context, evt *pb.PolicyUpdateEvent, routingKey string) (int32, int64, error)
 	PublishDLQ(ctx context.Context, topic string, key sarama.Encoder, payload []byte, headers []sarama.RecordHeader) (int32, int64, error)
 }
 
 type policyPublisher struct {
-	producer      policyProducer
-	logger        *utils.Logger
-	audit         *utils.AuditLogger
-	enabled       bool
-	topic         string
-	gatewayNS     string
-	maxTTL        time.Duration
-	maxCIDRPrefix int
-	maxPerBlock   int
-	blockDuration time.Duration
-	rateLimiter   *policyRateLimiter
-	dlqTopic      string
-	dlqEnabled    bool
-	guardrailMu   sync.Mutex
-	guardrailHits map[string]uint64
-	publishMu     sync.Mutex
-	publishedAt   map[string]time.Time
-	dedupeWindow  time.Duration
-	maxCacheSize  int
-	dlqSuccesses  atomic.Uint64
-	dlqFailures   atomic.Uint64
+	producer            policyProducer
+	logger              *utils.Logger
+	audit               *utils.AuditLogger
+	enabled             bool
+	topic               string
+	gatewayNS           string
+	maxTTL              time.Duration
+	maxCIDRPrefix       int
+	maxPerBlock         int
+	blockDuration       time.Duration
+	rateLimiter         *policyRateLimiter
+	dlqTopic            string
+	dlqEnabled          bool
+	guardrailMu         sync.Mutex
+	guardrailHits       map[string]uint64
+	publishMu           sync.Mutex
+	publishedAt         map[string]time.Time
+	dedupeWindow        time.Duration
+	maxCacheSize        int
+	scopeRouting        bool
+	clusterShardingMode string
+	clusterShardBuckets int
+	dlqSuccesses        atomic.Uint64
+	dlqFailures         atomic.Uint64
 }
 
 const minIPv6Prefix = 64
@@ -96,6 +101,26 @@ func newPolicyPublisher(producer *kafka.Producer, cfgMgr *utils.ConfigManager, t
 	if maxCacheSize <= 0 {
 		maxCacheSize = 10000
 	}
+	scopeRouting := cfgMgr.GetBool("CONTROL_POLICY_SCOPE_ROUTING_ENABLED", false)
+	rawClusterShardingMode := strings.TrimSpace(cfgMgr.GetString("CONTROL_POLICY_CLUSTER_SHARDING_MODE", policyoutbox.ClusterShardingOff))
+	normalizedRouting, unknownMode := policyoutbox.NormalizeRoutingOptions(policyoutbox.RoutingOptions{
+		ClusterShardingMode: rawClusterShardingMode,
+		ClusterShardBuckets: cfgMgr.GetInt("CONTROL_POLICY_CLUSTER_SHARD_BUCKETS", 1),
+	})
+	clusterShardingMode := normalizedRouting.ClusterShardingMode
+	clusterShardBuckets := normalizedRouting.ClusterShardBuckets
+	if unknownMode {
+		if logger != nil {
+			logger.Warn("Unsupported CONTROL_POLICY_CLUSTER_SHARDING_MODE; disabling cluster sharding",
+				utils.ZapString("mode", rawClusterShardingMode))
+		}
+		if audit != nil {
+			_ = audit.Warn("policy_cluster_sharding_mode_invalid", map[string]interface{}{
+				"component": "publisher",
+				"mode":      rawClusterShardingMode,
+			})
+		}
+	}
 
 	dlqTopic := strings.TrimSpace(cfgMgr.GetString("CONTROL_POLICY_DLQ_TOPIC", ""))
 	dlqEnabled := cfgMgr.GetBool("POLICY_DLQ_ENABLED", dlqTopic != "")
@@ -107,22 +132,25 @@ func newPolicyPublisher(producer *kafka.Producer, cfgMgr *utils.ConfigManager, t
 	}
 
 	pp := &policyPublisher{
-		producer:      producer,
-		logger:        logger,
-		audit:         audit,
-		enabled:       enabled,
-		topic:         topic,
-		maxTTL:        maxTTL,
-		maxCIDRPrefix: maxCIDR,
-		maxPerBlock:   maxPerBlock,
-		blockDuration: blockDuration,
-		rateLimiter:   newPolicyRateLimiter(maxPerMinute),
-		dlqTopic:      dlqTopic,
-		dlqEnabled:    dlqEnabled,
-		guardrailHits: make(map[string]uint64),
-		publishedAt:   make(map[string]time.Time),
-		dedupeWindow:  dedupeWindow,
-		maxCacheSize:  maxCacheSize,
+		producer:            producer,
+		logger:              logger,
+		audit:               audit,
+		enabled:             enabled,
+		topic:               topic,
+		maxTTL:              maxTTL,
+		maxCIDRPrefix:       maxCIDR,
+		maxPerBlock:         maxPerBlock,
+		blockDuration:       blockDuration,
+		rateLimiter:         newPolicyRateLimiter(maxPerMinute),
+		dlqTopic:            dlqTopic,
+		dlqEnabled:          dlqEnabled,
+		guardrailHits:       make(map[string]uint64),
+		publishedAt:         make(map[string]time.Time),
+		dedupeWindow:        dedupeWindow,
+		maxCacheSize:        maxCacheSize,
+		scopeRouting:        scopeRouting,
+		clusterShardingMode: clusterShardingMode,
+		clusterShardBuckets: clusterShardBuckets,
 	}
 
 	// Optional: when set, any policy payload that targets this namespace is treated as a
@@ -237,7 +265,15 @@ func (p *policyPublisher) PublishFromOutbox(ctx context.Context, height uint64, 
 		return policyID, 0, 0, err
 	}
 
-	partition, offset, err := p.producer.PublishPolicyWithAck(ctx, evt)
+	routingKey := ""
+	if p.scopeRouting {
+		_, routingKey, _ = policyoutbox.DeriveScopeIdentifierWithOptions(raw, policyoutbox.RoutingOptions{
+			ClusterShardingMode: p.clusterShardingMode,
+			ClusterShardBuckets: p.clusterShardBuckets,
+		})
+	}
+
+	partition, offset, err := p.producer.PublishPolicyWithRoutingKey(ctx, evt, routingKey)
 	if err != nil {
 		p.guardrailReject(ctx, policyID, height, "policy_publish_failed", err, raw)
 		return policyID, partition, offset, err

@@ -2,8 +2,12 @@ package messages
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -307,10 +311,74 @@ func (v *Validator) ValidateQC(ctx context.Context, qc *QC) error {
 
 	// Verify all signatures cryptographically
 	if err := v.encoder.VerifyQC(ctx, qc); err != nil {
+		if v.logger != nil {
+			signerIDs := make([]string, 0, len(qc.Signatures))
+			signerMeta := make([]string, 0, len(qc.Signatures))
+			for _, sig := range qc.Signatures {
+				signerIDs = append(signerIDs, fmt.Sprintf("%x", sig.KeyID[:8]))
+				if info, ierr := v.validatorSet.GetValidator(sig.KeyID); ierr == nil && info != nil {
+					pubPrefix := ""
+					if len(info.PublicKey) > 0 {
+						pubPrefix = fmt.Sprintf("%x", info.PublicKey[:minInt(8, len(info.PublicKey))])
+					}
+					signerMeta = append(signerMeta,
+						fmt.Sprintf("%x:active=%t:pub=%s", sig.KeyID[:8], v.validatorSet.IsActiveInView(sig.KeyID, qc.View), pubPrefix))
+				}
+			}
+			sort.Strings(signerIDs)
+			sort.Strings(signerMeta)
+			v.logger.WarnContext(ctx, "qc verify failed forensic",
+				"view", qc.View,
+				"sig_count", len(qc.Signatures),
+				"required_quorum", requiredQuorum,
+				"validator_count", totalValidators,
+				"block_hash", fmt.Sprintf("%x", qc.BlockHash[:8]),
+				"signer_ids", strings.Join(signerIDs, ","),
+				"signer_meta", strings.Join(signerMeta, ","),
+				"validator_set_hash_env", validatorSetHashFromEnv(),
+				"error", err)
+		}
 		return fmt.Errorf("QC signature verification failed: %w", err)
 	}
 
 	return nil
+}
+
+func validatorSetHashFromEnv() string {
+	nodesRaw := strings.TrimSpace(os.Getenv("CONSENSUS_NODES"))
+	if nodesRaw == "" {
+		return ""
+	}
+	parts := strings.Split(nodesRaw, ",")
+	pairs := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if _, err := strconv.Atoi(p); err != nil {
+			continue
+		}
+		k := fmt.Sprintf("VALIDATOR_%s_PUBKEY_HEX", p)
+		v := strings.TrimSpace(os.Getenv(k))
+		if v == "" {
+			continue
+		}
+		pairs = append(pairs, p+":"+strings.ToLower(v))
+	}
+	if len(pairs) == 0 {
+		return ""
+	}
+	sort.Strings(pairs)
+	sum := sha256.Sum256([]byte(strings.Join(pairs, "|")))
+	return hex.EncodeToString(sum[:8])
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // ValidateViewChange validates a view change message

@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"backend/pkg/control/policytrace"
 	"backend/pkg/utils"
 )
 
@@ -31,6 +32,7 @@ type Dispatcher struct {
 	logger *utils.Logger
 	audit  *utils.AuditLogger
 	holder string
+	trace  *policytrace.Collector
 
 	stopCh chan struct{}
 	doneCh chan struct{}
@@ -51,6 +53,10 @@ type Dispatcher struct {
 	throttledLogs        uint64
 	ticksTotal           uint64
 	skewCorrections      uint64
+	aiEventUnitFixes     uint64
+	aiEventInvalid       uint64
+	sourceEventUnitFixes uint64
+	sourceEventInvalid   uint64
 	leaseHeld            uint32
 	lastLeaseEpoch       int64
 	publishLatency       *utils.LatencyHistogram
@@ -58,13 +64,20 @@ type Dispatcher struct {
 	markLatency          *utils.LatencyHistogram
 	tickLatency          *utils.LatencyHistogram
 	aiToPublishLatency   *utils.LatencyHistogram
+	sourceToPublish      *utils.LatencyHistogram
 	commitToPublish      *utils.LatencyHistogram
 	lastLeaseErrLogAt    int64
 	lastClaimErrLogAt    int64
 	lastMarkErrLogAt     int64
+	scopeMu              sync.Mutex
+	publishScopeTotals   map[string]uint64
+	publishScopeRoutes   map[string]uint64
+	publishScopeFallback uint64
+	publishResultTotals  map[string]uint64
+	publishPartitions    map[string]uint64
 }
 
-func NewDispatcher(cfg Config, store storeOps, pub Publisher, logger *utils.Logger, audit *utils.AuditLogger, holderID string) (*Dispatcher, error) {
+func NewDispatcher(cfg Config, store storeOps, pub Publisher, logger *utils.Logger, audit *utils.AuditLogger, holderID string, trace *policytrace.Collector) (*Dispatcher, error) {
 	if store == nil {
 		return nil, fmt.Errorf("policy outbox: store required")
 	}
@@ -79,7 +92,26 @@ func NewDispatcher(cfg Config, store storeOps, pub Publisher, logger *utils.Logg
 		cfg.LeaseKey = "control.policy.dispatcher"
 	}
 	if cfg.PolicyTopic == "" {
-		cfg.PolicyTopic = "control.policy.v1"
+		cfg.PolicyTopic = "control.policy.v2"
+	}
+	rawShardingMode := strings.TrimSpace(cfg.ClusterShardingMode)
+	normalizedRouting, unknownMode := NormalizeRoutingOptions(RoutingOptions{
+		ClusterShardingMode: cfg.ClusterShardingMode,
+		ClusterShardBuckets: cfg.ClusterShardBuckets,
+	})
+	cfg.ClusterShardingMode = normalizedRouting.ClusterShardingMode
+	cfg.ClusterShardBuckets = normalizedRouting.ClusterShardBuckets
+	if unknownMode {
+		if logger != nil {
+			logger.Warn("Policy outbox dispatcher received unsupported CONTROL_POLICY_CLUSTER_SHARDING_MODE; disabling cluster sharding",
+				utils.ZapString("mode", rawShardingMode))
+		}
+		if audit != nil {
+			_ = audit.Warn("policy_cluster_sharding_mode_invalid", map[string]interface{}{
+				"component": "dispatcher",
+				"mode":      rawShardingMode,
+			})
+		}
 	}
 	if cfg.LeaseTTL <= 0 {
 		cfg.LeaseTTL = 10 * time.Second
@@ -144,6 +176,7 @@ func NewDispatcher(cfg Config, store storeOps, pub Publisher, logger *utils.Logg
 		logger: logger,
 		audit:  audit,
 		holder: holderID,
+		trace:  trace,
 		stopCh: make(chan struct{}),
 		doneCh: make(chan struct{}),
 		publishLatency: utils.NewLatencyHistogram([]float64{
@@ -161,10 +194,17 @@ func NewDispatcher(cfg Config, store storeOps, pub Publisher, logger *utils.Logg
 		aiToPublishLatency: utils.NewLatencyHistogram([]float64{
 			10, 25, 50, 100, 250, 500, 1000, 2000, 5000, 10000, 30000,
 		}),
+		sourceToPublish: utils.NewLatencyHistogram([]float64{
+			10, 25, 50, 100, 250, 500, 1000, 2000, 5000, 10000, 30000,
+		}),
 		commitToPublish: utils.NewLatencyHistogram([]float64{
 			10, 25, 50, 100, 250, 500, 1000, 2000, 5000, 10000, 30000,
 		}),
-		currentBatchSize: uint64(cfg.BatchSize),
+		currentBatchSize:    uint64(cfg.BatchSize),
+		publishScopeTotals:  make(map[string]uint64),
+		publishScopeRoutes:  make(map[string]uint64),
+		publishResultTotals: make(map[string]uint64),
+		publishPartitions:   make(map[string]uint64),
 	}, nil
 }
 
@@ -256,6 +296,10 @@ func (d *Dispatcher) tick(ctx context.Context) {
 			return
 		}
 		atomic.AddUint64(&d.rowsClaimedTotal, uint64(len(rows)))
+		nowMs := time.Now().UnixMilli()
+		for _, row := range rows {
+			d.recordStageMarker("t_outbox_claimed", row, nowMs, nil, nil)
+		}
 		d.processBatch(ctx, rows, deadline)
 		if len(rows) < batchSize {
 			return
@@ -316,9 +360,6 @@ func (d *Dispatcher) processBatch(ctx context.Context, rows []Row, deadline time
 	}
 
 	for _, row := range rows {
-		if d.cfg.DrainMaxDuration > 0 && time.Now().After(deadline) {
-			break
-		}
 		select {
 		case publishQ <- row:
 		default:
@@ -345,6 +386,7 @@ type markTask struct {
 	row         Row
 	partition   int32
 	offset      int64
+	publishAck  int64
 	retries     int
 	nextRetryAt time.Time
 	errMsg      string
@@ -352,23 +394,37 @@ type markTask struct {
 }
 
 func (d *Dispatcher) publishRow(ctx context.Context, row Row, deadline time.Time) (markTask, bool) {
-	if d.cfg.DrainMaxDuration > 0 && time.Now().After(deadline) {
-		return markTask{}, false
-	}
 	opCtx := ctx
 	cancel := func() {}
 	if d.cfg.DrainMaxDuration > 0 {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return markTask{}, false
-		}
-		opCtx, cancel = context.WithTimeout(ctx, remaining)
+		opCtx, cancel = context.WithTimeout(ctx, d.timeoutFromDeadline(deadline))
 	}
 	defer cancel()
 
 	start := time.Now()
+	d.recordStageMarker("t_control_publish_start", row, start.UnixMilli(), nil, nil)
+	scopeKind, scopeIdentifier, scopeFallback := "legacy", "", false
+	scopeBucketed := false
+	if d.cfg.ScopeRoutingEnabled {
+		scopeKind, scopeIdentifier, scopeFallback = DeriveScopeIdentifierWithOptions(row.Payload, RoutingOptions{
+			ClusterShardingMode: d.cfg.ClusterShardingMode,
+			ClusterShardBuckets: d.cfg.ClusterShardBuckets,
+		})
+		scopeBucketed = scopeKind == "cluster" && scopeIdentifier != "cluster"
+	}
+	if d.logger != nil && row.PolicyID != "" {
+		d.logger.Info("policy publish scope derived",
+			utils.ZapString("policy_id", row.PolicyID),
+			utils.ZapString("trace_id", row.TraceID),
+			utils.ZapString("scope_kind", scopeKind),
+			utils.ZapString("scope_identifier", scopeIdentifier),
+			utils.ZapBool("scope_bucketed", scopeBucketed),
+			utils.ZapBool("scope_fallback", scopeFallback))
+	}
 	_, partition, offset, err := d.pub.PublishFromOutbox(opCtx, row.BlockHeight, row.BlockTS, row.Payload)
 	if err != nil {
+		d.observePublishScope(scopeKind, "error", scopeBucketed, scopeFallback)
+		d.observePublishResult(d.cfg.PolicyTopic, "error", nil)
 		nextRetries := row.Retries + 1
 		if nextRetries >= d.cfg.MaxRetries {
 			return markTask{
@@ -393,24 +449,115 @@ func (d *Dispatcher) publishRow(ctx context.Context, row Row, deadline time.Time
 			pubStart:    start,
 		}, true
 	}
+	d.observePublishScope(scopeKind, "success", scopeBucketed, scopeFallback)
+	d.observePublishResult(d.cfg.PolicyTopic, "success", &partition)
+	publishAck := time.Now().UnixMilli()
 	return markTask{
-		kind:      markTaskPublished,
-		row:       row,
-		partition: partition,
-		offset:    offset,
-		pubStart:  start,
+		kind:       markTaskPublished,
+		row:        row,
+		partition:  partition,
+		offset:     offset,
+		publishAck: publishAck,
+		pubStart:   start,
 	}, true
+}
+
+func (d *Dispatcher) observePublishScope(scopeKind, result string, bucketed bool, fallback bool) {
+	if d == nil {
+		return
+	}
+	if scopeKind == "" {
+		scopeKind = "unknown"
+	}
+	if result == "" {
+		result = "unknown"
+	}
+	key := scopeKind + ":" + result
+	bucketedLabel := "false"
+	if bucketed {
+		bucketedLabel = "true"
+	}
+	routeKey := scopeKind + ":" + bucketedLabel + ":" + result
+	d.scopeMu.Lock()
+	d.publishScopeTotals[key]++
+	d.publishScopeRoutes[routeKey]++
+	if fallback {
+		d.publishScopeFallback++
+	}
+	d.scopeMu.Unlock()
+}
+
+func (d *Dispatcher) observePublishResult(topic, result string, partition *int32) {
+	if d == nil {
+		return
+	}
+	if topic == "" {
+		topic = "unknown"
+	}
+	if result == "" {
+		result = "unknown"
+	}
+	partitionLabel := "unknown"
+	if partition != nil {
+		partitionLabel = fmt.Sprintf("%d", *partition)
+	}
+	resultKey := topic + ":" + result
+	partitionKey := topic + ":" + partitionLabel + ":" + result
+	d.scopeMu.Lock()
+	d.publishResultTotals[resultKey]++
+	d.publishPartitions[partitionKey]++
+	d.scopeMu.Unlock()
+}
+
+func (d *Dispatcher) recordStageMarker(stage string, row Row, tsMs int64, partition *int32, offset *int64) {
+	if d == nil || row.PolicyID == "" {
+		return
+	}
+	if d.logger != nil {
+		if partition != nil && offset != nil {
+			d.logger.Info("policy stage marker",
+				utils.ZapString("stage", stage),
+				utils.ZapString("policy_id", row.PolicyID),
+				utils.ZapString("trace_id", row.TraceID),
+				utils.ZapInt64("t_ms", tsMs),
+				utils.ZapString("outbox_id", row.ID),
+				utils.ZapUint64("height", row.BlockHeight),
+				utils.ZapInt32("partition", *partition),
+				utils.ZapInt64("offset", *offset))
+		} else {
+			d.logger.Info("policy stage marker",
+				utils.ZapString("stage", stage),
+				utils.ZapString("policy_id", row.PolicyID),
+				utils.ZapString("trace_id", row.TraceID),
+				utils.ZapInt64("t_ms", tsMs),
+				utils.ZapString("outbox_id", row.ID),
+				utils.ZapUint64("height", row.BlockHeight))
+		}
+	}
+	if d.trace != nil {
+		marker := policytrace.Marker{
+			Stage:       stage,
+			PolicyID:    row.PolicyID,
+			TraceID:     row.TraceID,
+			TimestampMs: tsMs,
+			Height:      row.BlockHeight,
+			OutboxID:    row.ID,
+		}
+		if partition != nil {
+			marker.Partition = *partition
+		}
+		if offset != nil {
+			marker.Offset = *offset
+		}
+		d.trace.Record(marker)
+	}
 }
 
 func (d *Dispatcher) handleMarkTask(ctx context.Context, task markTask, deadline time.Time) {
 	opCtx := ctx
 	cancel := func() {}
 	if d.cfg.DrainMaxDuration > 0 {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return
-		}
-		opCtx, cancel = context.WithTimeout(ctx, remaining)
+		opCtx, cancel = context.WithTimeout(ctx, d.timeoutFromDeadline(deadline))
 	}
 	defer cancel()
 
@@ -431,6 +578,13 @@ func (d *Dispatcher) handleMarkTask(ctx context.Context, task markTask, deadline
 			}
 			return
 		}
+		ackMs := task.publishAck
+		if ackMs <= 0 {
+			ackMs = markStart.UnixMilli()
+		}
+		markDoneMs := time.Now().UnixMilli()
+		d.recordStageMarker("t_control_publish_ack", task.row, ackMs, &task.partition, &task.offset)
+		d.recordStageMarker("t_outbox_mark_published_done", task.row, markDoneMs, &task.partition, &task.offset)
 		d.publishLatency.Observe(float64(time.Since(task.pubStart).Milliseconds()))
 		if task.row.BlockTS > 0 {
 			commitLatency := time.Now().UnixMilli() - (task.row.BlockTS * 1000)
@@ -441,12 +595,36 @@ func (d *Dispatcher) handleMarkTask(ctx context.Context, task markTask, deadline
 			d.commitToPublish.Observe(float64(commitLatency))
 		}
 		if task.row.AIEventTsMs > 0 {
-			aiLatency := time.Now().UnixMilli() - task.row.AIEventTsMs
-			if aiLatency < 0 {
-				aiLatency = 0
-				atomic.AddUint64(&d.skewCorrections, 1)
+			aiTSMs, corrected, valid := utils.NormalizeUnixMillis(task.row.AIEventTsMs)
+			if !valid {
+				atomic.AddUint64(&d.aiEventInvalid, 1)
+			} else {
+				if corrected {
+					atomic.AddUint64(&d.aiEventUnitFixes, 1)
+				}
+				aiLatency := time.Now().UnixMilli() - aiTSMs
+				if aiLatency < 0 {
+					aiLatency = 0
+					atomic.AddUint64(&d.skewCorrections, 1)
+				}
+				d.aiToPublishLatency.Observe(float64(aiLatency))
 			}
-			d.aiToPublishLatency.Observe(float64(aiLatency))
+		}
+		if task.row.SourceEventTsMs > 0 {
+			sourceTSMs, corrected, valid := utils.NormalizeUnixMillis(task.row.SourceEventTsMs)
+			if !valid {
+				atomic.AddUint64(&d.sourceEventInvalid, 1)
+			} else {
+				if corrected {
+					atomic.AddUint64(&d.sourceEventUnitFixes, 1)
+				}
+				sourceLatency := time.Now().UnixMilli() - sourceTSMs
+				if sourceLatency < 0 {
+					sourceLatency = 0
+					atomic.AddUint64(&d.skewCorrections, 1)
+				}
+				d.sourceToPublish.Observe(float64(sourceLatency))
+			}
 		}
 		atomic.AddUint64(&d.publishedTotal, 1)
 	case markTaskRetry:
@@ -487,50 +665,83 @@ func (d *Dispatcher) Stats() DispatcherStats {
 	markBuckets, markCount, markSumMs := d.markLatency.Snapshot()
 	tickBuckets, tickCount, tickSumMs := d.tickLatency.Snapshot()
 	aiPubBuckets, aiPubCount, aiPubSumMs := d.aiToPublishLatency.Snapshot()
+	sourcePubBuckets, sourcePubCount, sourcePubSumMs := d.sourceToPublish.Snapshot()
 	commitPubBuckets, commitPubCount, commitPubSumMs := d.commitToPublish.Snapshot()
+	d.scopeMu.Lock()
+	scopeTotals := make(map[string]uint64, len(d.publishScopeTotals))
+	for key, count := range d.publishScopeTotals {
+		scopeTotals[key] = count
+	}
+	scopeRouteTotals := make(map[string]uint64, len(d.publishScopeRoutes))
+	for key, count := range d.publishScopeRoutes {
+		scopeRouteTotals[key] = count
+	}
+	scopeFallbacks := d.publishScopeFallback
+	resultTotals := make(map[string]uint64, len(d.publishResultTotals))
+	for key, count := range d.publishResultTotals {
+		resultTotals[key] = count
+	}
+	partitionTotals := make(map[string]uint64, len(d.publishPartitions))
+	for key, count := range d.publishPartitions {
+		partitionTotals[key] = count
+	}
+	d.scopeMu.Unlock()
 	return DispatcherStats{
-		LeaseAcquireAttempts:   atomic.LoadUint64(&d.leaseAcquireAttempts),
-		LeaseAcquireSuccesses:  atomic.LoadUint64(&d.leaseAcquireSuccess),
-		LeaseAcquireErrors:     atomic.LoadUint64(&d.leaseAcquireErrors),
-		LeaseHeld:              atomic.LoadUint32(&d.leaseHeld) == 1,
-		LastLeaseEpoch:         atomic.LoadInt64(&d.lastLeaseEpoch),
-		TicksTotal:             atomic.LoadUint64(&d.ticksTotal),
-		RowsClaimedTotal:       atomic.LoadUint64(&d.rowsClaimedTotal),
-		CurrentBatchSize:       int(atomic.LoadUint64(&d.currentBatchSize)),
-		BatchScaleUpTotal:      atomic.LoadUint64(&d.batchScaleUpTotal),
-		BatchScaleDownTotal:    atomic.LoadUint64(&d.batchScaleDownTotal),
-		PublishQueueWaits:      atomic.LoadUint64(&d.publishQueueWaits),
-		MarkQueueWaits:         atomic.LoadUint64(&d.markQueueWaits),
-		PublishedTotal:         atomic.LoadUint64(&d.publishedTotal),
-		RetryTotal:             atomic.LoadUint64(&d.retryTotal),
-		TerminalFailedTotal:    atomic.LoadUint64(&d.terminalTotal),
-		FencedUpdateFailures:   atomic.LoadUint64(&d.fencedFailures),
-		ThrottledLogsTotal:     atomic.LoadUint64(&d.throttledLogs),
-		PublishLatencyBuckets:  pubBuckets,
-		PublishLatencyCount:    pubCount,
-		PublishLatencySumMs:    pubSumMs,
-		PublishLatencyP95Ms:    d.publishLatency.Quantile(0.95),
-		ClaimLatencyBuckets:    claimBuckets,
-		ClaimLatencyCount:      claimCount,
-		ClaimLatencySumMs:      claimSumMs,
-		ClaimLatencyP95Ms:      d.claimLatency.Quantile(0.95),
-		MarkLatencyBuckets:     markBuckets,
-		MarkLatencyCount:       markCount,
-		MarkLatencySumMs:       markSumMs,
-		MarkLatencyP95Ms:       d.markLatency.Quantile(0.95),
-		TickLatencyBuckets:     tickBuckets,
-		TickLatencyCount:       tickCount,
-		TickLatencySumMs:       tickSumMs,
-		TickLatencyP95Ms:       d.tickLatency.Quantile(0.95),
-		AIToPublishBuckets:     aiPubBuckets,
-		AIToPublishCount:       aiPubCount,
-		AIToPublishSumMs:       aiPubSumMs,
-		AIToPublishP95Ms:       d.aiToPublishLatency.Quantile(0.95),
-		CommitToPublishBuckets: commitPubBuckets,
-		CommitToPublishCount:   commitPubCount,
-		CommitToPublishSumMs:   commitPubSumMs,
-		CommitToPublishP95Ms:   d.commitToPublish.Quantile(0.95),
-		SkewCorrectionsTotal:   atomic.LoadUint64(&d.skewCorrections),
+		LeaseAcquireAttempts:       atomic.LoadUint64(&d.leaseAcquireAttempts),
+		LeaseAcquireSuccesses:      atomic.LoadUint64(&d.leaseAcquireSuccess),
+		LeaseAcquireErrors:         atomic.LoadUint64(&d.leaseAcquireErrors),
+		LeaseHeld:                  atomic.LoadUint32(&d.leaseHeld) == 1,
+		LastLeaseEpoch:             atomic.LoadInt64(&d.lastLeaseEpoch),
+		TicksTotal:                 atomic.LoadUint64(&d.ticksTotal),
+		RowsClaimedTotal:           atomic.LoadUint64(&d.rowsClaimedTotal),
+		CurrentBatchSize:           int(atomic.LoadUint64(&d.currentBatchSize)),
+		BatchScaleUpTotal:          atomic.LoadUint64(&d.batchScaleUpTotal),
+		BatchScaleDownTotal:        atomic.LoadUint64(&d.batchScaleDownTotal),
+		PublishQueueWaits:          atomic.LoadUint64(&d.publishQueueWaits),
+		MarkQueueWaits:             atomic.LoadUint64(&d.markQueueWaits),
+		PublishedTotal:             atomic.LoadUint64(&d.publishedTotal),
+		RetryTotal:                 atomic.LoadUint64(&d.retryTotal),
+		TerminalFailedTotal:        atomic.LoadUint64(&d.terminalTotal),
+		FencedUpdateFailures:       atomic.LoadUint64(&d.fencedFailures),
+		ThrottledLogsTotal:         atomic.LoadUint64(&d.throttledLogs),
+		PublishLatencyBuckets:      pubBuckets,
+		PublishLatencyCount:        pubCount,
+		PublishLatencySumMs:        pubSumMs,
+		PublishLatencyP95Ms:        d.publishLatency.Quantile(0.95),
+		ClaimLatencyBuckets:        claimBuckets,
+		ClaimLatencyCount:          claimCount,
+		ClaimLatencySumMs:          claimSumMs,
+		ClaimLatencyP95Ms:          d.claimLatency.Quantile(0.95),
+		MarkLatencyBuckets:         markBuckets,
+		MarkLatencyCount:           markCount,
+		MarkLatencySumMs:           markSumMs,
+		MarkLatencyP95Ms:           d.markLatency.Quantile(0.95),
+		TickLatencyBuckets:         tickBuckets,
+		TickLatencyCount:           tickCount,
+		TickLatencySumMs:           tickSumMs,
+		TickLatencyP95Ms:           d.tickLatency.Quantile(0.95),
+		AIToPublishBuckets:         aiPubBuckets,
+		AIToPublishCount:           aiPubCount,
+		AIToPublishSumMs:           aiPubSumMs,
+		AIToPublishP95Ms:           d.aiToPublishLatency.Quantile(0.95),
+		SourceToPublishBuckets:     sourcePubBuckets,
+		SourceToPublishCount:       sourcePubCount,
+		SourceToPublishSumMs:       sourcePubSumMs,
+		SourceToPublishP95Ms:       d.sourceToPublish.Quantile(0.95),
+		CommitToPublishBuckets:     commitPubBuckets,
+		CommitToPublishCount:       commitPubCount,
+		CommitToPublishSumMs:       commitPubSumMs,
+		CommitToPublishP95Ms:       d.commitToPublish.Quantile(0.95),
+		SkewCorrectionsTotal:       atomic.LoadUint64(&d.skewCorrections),
+		AIEventUnitCorrections:     atomic.LoadUint64(&d.aiEventUnitFixes),
+		AIEventInvalidTotal:        atomic.LoadUint64(&d.aiEventInvalid),
+		SourceEventUnitCorrections: atomic.LoadUint64(&d.sourceEventUnitFixes),
+		SourceEventInvalidTotal:    atomic.LoadUint64(&d.sourceEventInvalid),
+		PublishScopeResultTotals:   scopeTotals,
+		PublishScopeRouteTotals:    scopeRouteTotals,
+		PublishScopeFallbacks:      scopeFallbacks,
+		PublishResultTotals:        resultTotals,
+		PublishPartitionTotals:     partitionTotals,
 	}
 }
 
@@ -568,6 +779,27 @@ func (d *Dispatcher) jitterDuration(base time.Duration) time.Duration {
 		return base
 	}
 	return out
+}
+
+func (d *Dispatcher) timeoutFromDeadline(deadline time.Time) time.Duration {
+	fallback := d.cfg.RetryInitialBack
+	if fallback <= 0 {
+		fallback = 250 * time.Millisecond
+	}
+	if fallback < 100*time.Millisecond {
+		fallback = 100 * time.Millisecond
+	}
+	if fallback > 2*time.Second {
+		fallback = 2 * time.Second
+	}
+	if deadline.IsZero() {
+		return fallback
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return fallback
+	}
+	return remaining
 }
 
 func (d *Dispatcher) adjustBatchSize(current, claimed int, claimMs float64) {

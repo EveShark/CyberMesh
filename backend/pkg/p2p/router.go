@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -107,6 +108,7 @@ type RouterStats struct {
 	BytesReceived   uint64
 	BytesSent       uint64
 	AvgLatencyMs    float64
+	AvgMessageGapMs float64
 	Timestamp       time.Time
 	History         []RouterTrendSample
 	Peers           []RouterPeerStats
@@ -118,25 +120,28 @@ type RouterStats struct {
 
 // RouterTrendSample captures a historical snapshot of router telemetry.
 type RouterTrendSample struct {
-	Timestamp     time.Time
-	PeerCount     int
-	InboundPeers  int
-	OutboundPeers int
-	AvgLatencyMs  float64
-	BytesReceived uint64
-	BytesSent     uint64
+	Timestamp       time.Time
+	PeerCount       int
+	InboundPeers    int
+	OutboundPeers   int
+	AvgLatencyMs    float64
+	AvgMessageGapMs float64
+	BytesReceived   uint64
+	BytesSent       uint64
 }
 
 // RouterPeerStats captures per-peer transport metrics for diagnostics.
 type RouterPeerStats struct {
-	ID        peer.ID
-	LatencyMs float64
-	BytesIn   uint64
-	BytesOut  uint64
-	LastSeen  time.Time
-	Status    string
-	Labels    map[string]string
-	RateBps   float64
+	ID            peer.ID
+	LatencyMs     float64
+	PingLatencyMs float64
+	MessageGapMs  float64
+	BytesIn       uint64
+	BytesOut      uint64
+	LastSeen      time.Time
+	Status        string
+	Labels        map[string]string
+	RateBps       float64
 }
 
 // RouterEdge represents an adjacency between the local node and a peer.
@@ -440,7 +445,7 @@ func NewRouter(parent context.Context, nodeCfg *config.NodeConfig, secCfg *confi
 	}
 
 	if r.state != nil {
-		r.state.ResetPeersSeen()
+		r.state.Start()
 	}
 
 	// Create semaphore for bounded handler concurrency
@@ -496,7 +501,8 @@ func NewRouter(parent context.Context, nodeCfg *config.NodeConfig, secCfg *confi
 		log.Warn("bootstrap dialing issues", utils.ZapError(err))
 	}
 
-	// ---- Discovery loop: find peers periodically ----
+	// ---- Recovery/discovery loops ----
+	go r.bootstrapRecoveryLoop()
 	go r.discoveryLoop(rendezvous)
 
 	// Audit router initialization
@@ -1015,6 +1021,9 @@ func derivePeerStatus(ps PeerState, now time.Time) string {
 	if ps.Quarantined {
 		return "critical"
 	}
+	if !ps.Connected {
+		return "offline"
+	}
 	if ps.LastSeen.IsZero() {
 		return "unknown"
 	}
@@ -1085,6 +1094,8 @@ func (r *Router) GetNetworkStats() RouterStats {
 		peers := make([]RouterPeerStats, 0, len(snapshot))
 		var latencySum float64
 		var latencyCount int
+		var gapSum float64
+		var gapCount int
 		for pid, ps := range snapshot {
 			out.BytesReceived += ps.BytesIn
 			peerMetric := RouterPeerStats{
@@ -1095,14 +1106,21 @@ func (r *Router) GetNetworkStats() RouterStats {
 				Labels:   ps.Labels,
 				Status:   derivePeerStatus(ps, sampleTime),
 			}
-			if ps.LatencyEMA > 0 {
-				peerMetric.LatencyMs = ps.LatencyEMA * 1000
-				latencySum += ps.LatencyEMA
+			if ps.PingRTTEMA > 0 {
+				peerMetric.PingLatencyMs = ps.PingRTTEMA * 1000
+				peerMetric.LatencyMs = peerMetric.PingLatencyMs
+				latencySum += ps.PingRTTEMA
 				latencyCount++
 			} else if rtt, ok := r.getPeerLatency(pid); ok && rtt > 0 {
-				peerMetric.LatencyMs = rtt.Seconds() * 1000
+				peerMetric.PingLatencyMs = rtt.Seconds() * 1000
+				peerMetric.LatencyMs = peerMetric.PingLatencyMs
 				latencySum += rtt.Seconds()
 				latencyCount++
+			}
+			if ps.MessageGapEMA > 0 {
+				peerMetric.MessageGapMs = ps.MessageGapEMA * 1000
+				gapSum += ps.MessageGapEMA
+				gapCount++
 			}
 			if elapsed > 0 {
 				if prev, ok := r.peerRateSnapshots[pid]; ok {
@@ -1118,6 +1136,9 @@ func (r *Router) GetNetworkStats() RouterStats {
 		}
 		if latencyCount > 0 {
 			out.AvgLatencyMs = (latencySum / float64(latencyCount)) * 1000
+		}
+		if gapCount > 0 {
+			out.AvgMessageGapMs = (gapSum / float64(gapCount)) * 1000
 		}
 		out.Peers = peers
 	}
@@ -1206,13 +1227,14 @@ func (r *Router) recordTrend(sample RouterStats) {
 		return
 	}
 	entry := RouterTrendSample{
-		Timestamp:     sample.Timestamp,
-		PeerCount:     sample.PeerCount,
-		InboundPeers:  sample.InboundPeers,
-		OutboundPeers: sample.OutboundPeers,
-		AvgLatencyMs:  sample.AvgLatencyMs,
-		BytesReceived: sample.BytesReceived,
-		BytesSent:     sample.BytesSent,
+		Timestamp:       sample.Timestamp,
+		PeerCount:       sample.PeerCount,
+		InboundPeers:    sample.InboundPeers,
+		OutboundPeers:   sample.OutboundPeers,
+		AvgLatencyMs:    sample.AvgLatencyMs,
+		AvgMessageGapMs: sample.AvgMessageGapMs,
+		BytesReceived:   sample.BytesReceived,
+		BytesSent:       sample.BytesSent,
 	}
 	r.trendMu.Lock()
 	defer r.trendMu.Unlock()
@@ -1249,7 +1271,11 @@ func (r *Router) GetConnectedPeerCount() int {
 	if r.state == nil {
 		return 0
 	}
-	return r.state.GetConnectedPeerCount()
+	self := peer.ID("")
+	if r.Host != nil {
+		self = r.Host.ID()
+	}
+	return r.state.GetConnectedPeerCountExcluding(self)
 }
 
 // GetActivePeerCount returns the number of recently active peers
@@ -1259,7 +1285,11 @@ func (r *Router) GetActivePeerCount(since time.Duration) int {
 		return 0
 	}
 	r.refreshConnectionActivity()
-	return r.state.GetActivePeerCount(since)
+	self := peer.ID("")
+	if r.Host != nil {
+		self = r.Host.ID()
+	}
+	return r.state.GetActivePeerCountExcluding(self, since)
 }
 
 func (r *Router) refreshConnectionActivity() {
@@ -1284,7 +1314,11 @@ func (r *Router) GetPeersSeenSinceStartup() int {
 	if r.state == nil {
 		return 0
 	}
-	return r.state.GetPeersSeenSinceStartup()
+	self := peer.ID("")
+	if r.Host != nil {
+		self = r.Host.ID()
+	}
+	return r.state.GetPeersSeenSinceStartupExcluding(self)
 }
 
 // PeerHash returns a deterministic fingerprint over the currently known peers (including self).
@@ -1324,6 +1358,9 @@ func (r *Router) GetPeerCount() int {
 // Close shuts everything down.
 func (r *Router) Close() error {
 	r.cancel()
+	if r.state != nil {
+		r.state.Stop()
+	}
 	if r.DHT != nil {
 		_ = r.DHT.Close()
 	}
@@ -1353,7 +1390,7 @@ func (r *Router) consume(topic string, sub *pubsub.Subscription) {
 			utils.ZapString("from", from.String()),
 			utils.ZapInt("bytes", len(msg.Data)))
 		// Update peer activity in state
-		if r.state != nil {
+		if r.state != nil && (r.Host == nil || from != r.Host.ID()) {
 			r.state.OnMessage(topic, from, len(msg.Data))
 		}
 		// Dispatch to handlers
@@ -1401,6 +1438,9 @@ func (r *Router) dialBootstrapPeers() error {
 	}
 
 	var errs []string
+	attempted := 0
+	succeeded := 0
+	selfSkipped := 0
 	for _, addr := range addrs {
 		addr = strings.TrimSpace(addr)
 		if addr == "" {
@@ -1421,17 +1461,25 @@ func (r *Router) dialBootstrapPeers() error {
 				errs = append(errs, fmt.Sprintf("%s: failed to extract peer info: %v", addr, err))
 				continue
 			}
+			if peerInfo.ID == r.Host.ID() {
+				selfSkipped++
+				continue
+			}
 
 			// Attempt connection
+			attempted++
 			ctx, cancel := context.WithTimeout(r.ctx, 10*time.Second)
 			err = r.Host.Connect(ctx, *peerInfo)
 			cancel()
 
 			if err != nil {
-				r.log.Debug("bootstrap connection failed",
+				errs = append(errs, fmt.Sprintf("peer %s: %v", peerInfo.ID.String(), err))
+				r.log.Warn("bootstrap connection failed",
 					utils.ZapString("peer", peerInfo.ID.String()),
 					utils.ZapError(err))
 			} else {
+				succeeded++
+				r.protectPeerConnection(peerInfo.ID, "bootstrap-peer")
 				r.log.Info("bootstrap connection successful",
 					utils.ZapString("peer", peerInfo.ID.String()))
 			}
@@ -1441,8 +1489,12 @@ func (r *Router) dialBootstrapPeers() error {
 		// Handle host:port format
 		host, port, err := utils.SplitHostPortLoose(addr)
 		if err != nil {
-			host = addr
-			port = ""
+			errs = append(errs, fmt.Sprintf("%s: invalid host:port bootstrap address: %v", addr, err))
+			continue
+		}
+		if strings.TrimSpace(port) == "" {
+			errs = append(errs, fmt.Sprintf("%s: bootstrap host:port requires explicit port", addr))
+			continue
 		}
 		if net.ParseIP(host) == nil {
 			// DNS resolution
@@ -1456,16 +1508,54 @@ func (r *Router) dialBootstrapPeers() error {
 				utils.ZapAny("ips", ips),
 				utils.ZapString("port", port))
 		}
+		errs = append(errs, fmt.Sprintf("%s: host:port bootstrap entries are unsupported for dialing; use /dns4/%s/tcp/%s/p2p/<peerID>", addr, host, port))
 	}
 
+	if attempted > 0 && succeeded == 0 && len(errs) > 0 {
+		return fmt.Errorf("bootstrap connectivity failed (attempted=%d, succeeded=%d): %s", attempted, succeeded, strings.Join(errs, "; "))
+	}
+	if attempted == 0 {
+		if len(errs) > 0 {
+			return fmt.Errorf("bootstrap dialing skipped: %s", strings.Join(errs, "; "))
+		}
+		if selfSkipped > 0 {
+			return fmt.Errorf("bootstrap dialing skipped: only self bootstrap peers configured (self_entries=%d)", selfSkipped)
+		}
+		return fmt.Errorf("bootstrap dialing skipped: no usable bootstrap peers configured")
+	}
 	if len(errs) > 0 {
-		return fmt.Errorf("bootstrap resolution issues: %s", strings.Join(errs, "; "))
+		r.log.Warn("bootstrap dialing completed with partial failures",
+			utils.ZapInt("attempted", attempted),
+			utils.ZapInt("succeeded", succeeded),
+			utils.ZapInt("failed", len(errs)))
 	}
 	return nil
 }
 
+func (r *Router) discoveryInterval() time.Duration {
+	if r == nil || r.configMgr == nil {
+		return 15 * time.Second
+	}
+	return r.configMgr.GetDuration("P2P_DISCOVERY_INTERVAL", 15*time.Second)
+}
+
+func (r *Router) bootstrapRecoveryLoop() {
+	interval := r.discoveryInterval()
+	t := time.NewTicker(interval)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-r.ctx.Done():
+			return
+		case <-t.C:
+			r.ensureBootstrapConnectivity()
+		}
+	}
+}
+
 func (r *Router) discoveryLoop(rendezvous string) {
-	interval := r.configMgr.GetDuration("P2P_DISCOVERY_INTERVAL", 15*time.Second)
+	interval := r.discoveryInterval()
 	t := time.NewTicker(interval)
 	defer t.Stop()
 
@@ -1488,10 +1578,207 @@ func (r *Router) discoveryLoop(rendezvous string) {
 					continue
 				}
 				// best-effort dial
-				_ = r.Host.Connect(r.ctx, p)
+				if err := r.Host.Connect(r.ctx, p); err == nil {
+					r.protectPeerConnection(p.ID, "discovered-peer")
+				}
 			}
 		}
 	}
+}
+
+func (r *Router) ensureBootstrapConnectivity() {
+	if r == nil || r.Host == nil || r.configMgr == nil {
+		return
+	}
+	targetPeers := r.bootstrapConnectivityTarget()
+	if targetPeers <= 0 {
+		return
+	}
+	connected, scoped, scopeKnown := r.connectedBootstrapScopedPeerCount()
+	if connected >= targetPeers {
+		return
+	}
+
+	if err := r.dialBootstrapPeers(); err != nil {
+		r.log.Warn("bootstrap redial attempt failed",
+			utils.ZapInt("connected_peers", connected),
+			utils.ZapBool("scoped_peer_count", scopeKnown),
+			utils.ZapInt("configured_bootstrap_targets", scoped),
+			utils.ZapInt("target_peers", targetPeers),
+			utils.ZapError(err))
+		return
+	}
+
+	updated, updatedScoped, updatedScopeKnown := r.connectedBootstrapScopedPeerCount()
+	if updated < targetPeers {
+		r.log.Warn("bootstrap redial completed below min peer target",
+			utils.ZapInt("connected_peers", updated),
+			utils.ZapBool("scoped_peer_count", updatedScopeKnown),
+			utils.ZapInt("configured_bootstrap_targets", updatedScoped),
+			utils.ZapInt("target_peers", targetPeers))
+	}
+}
+
+func (r *Router) connectedBootstrapScopedPeerCount() (connected int, scoped int, scopeKnown bool) {
+	if r == nil || r.Host == nil {
+		return 0, 0, false
+	}
+	peers := r.Host.Network().Peers()
+	targets := r.bootstrapTargetPeerIDs()
+	if len(targets) == 0 {
+		// Fallback for legacy/misconfigured environments where bootstrap peer IDs are not derivable.
+		return len(peers), 0, false
+	}
+	n := 0
+	for _, pid := range peers {
+		if _, ok := targets[pid]; ok {
+			n++
+		}
+	}
+	return n, len(targets), true
+}
+
+func (r *Router) bootstrapTargetPeerIDs() map[peer.ID]struct{} {
+	ids := make(map[peer.ID]struct{})
+	if r == nil {
+		return ids
+	}
+	var addrs []string
+	if len(r.opts.BootstrapAddrs) > 0 {
+		addrs = r.opts.BootstrapAddrs
+	} else if r.nodeCfg != nil && r.nodeCfg.MeshConfig != nil {
+		addrs = r.nodeCfg.MeshConfig.BootstrapNodes
+	} else if r.configMgr != nil {
+		addrs = r.configMgr.GetStringSlice("P2P_BOOTSTRAP_PEERS", []string{})
+	}
+	for _, raw := range addrs {
+		addr := strings.TrimSpace(raw)
+		if addr == "" || !strings.HasPrefix(addr, "/") {
+			continue
+		}
+		maddr, err := multiaddr.NewMultiaddr(addr)
+		if err != nil {
+			continue
+		}
+		pi, err := peer.AddrInfoFromP2pAddr(maddr)
+		if err != nil || pi.ID == "" || (r.Host != nil && pi.ID == r.Host.ID()) {
+			continue
+		}
+		ids[pi.ID] = struct{}{}
+	}
+	if r.configMgr != nil {
+		for pid := range parsePeerIDs(r.configMgr.GetStringSlice("TRUSTED_P2P_PEERS", []string{})) {
+			if r.Host != nil && pid == r.Host.ID() {
+				continue
+			}
+			ids[pid] = struct{}{}
+		}
+	}
+	return ids
+}
+
+func (r *Router) bootstrapRedialMinPeers() int {
+	if r == nil || r.configMgr == nil {
+		return 0
+	}
+	explicit := strings.TrimSpace(r.configMgr.GetString("P2P_BOOTSTRAP_REDIAL_MIN_PEERS", ""))
+	if explicit != "" {
+		n, err := strconv.Atoi(explicit)
+		if err == nil {
+			if n < 0 {
+				return 0
+			}
+			return n
+		}
+		r.log.Warn("invalid P2P_BOOTSTRAP_REDIAL_MIN_PEERS, deriving from CONSENSUS_NODES",
+			utils.ZapString("value", explicit),
+			utils.ZapError(err))
+	}
+	return computeBootstrapRedialMinPeers(-1, r.configMgr.GetString("CONSENSUS_NODES", ""))
+}
+
+func (r *Router) bootstrapConnectivityTarget() int {
+	if r == nil || r.configMgr == nil {
+		return 0
+	}
+	targets := len(r.bootstrapTargetPeerIDs())
+	if targets == 0 {
+		return r.bootstrapRedialMinPeers()
+	}
+	return computeBootstrapConnectivityTarget(targets, r.configMgr.GetString("CONSENSUS_NODES", ""))
+}
+
+func computeBootstrapRedialMinPeers(explicit int, consensusNodesRaw string) int {
+	if explicit >= 0 {
+		return explicit
+	}
+
+	nodes := 0
+	for _, part := range strings.Split(consensusNodesRaw, ",") {
+		if strings.TrimSpace(part) != "" {
+			nodes++
+		}
+	}
+	if nodes <= 1 {
+		return 0
+	}
+
+	// PBFT/HotStuff quorum floor: require enough peers to satisfy 2f+1 with local node included.
+	f := (nodes - 1) / 3
+	requiredReady := 2*f + 1
+	if requiredReady < 1 {
+		requiredReady = 1
+	}
+	requiredPeers := requiredReady - 1
+	if requiredPeers < 1 {
+		requiredPeers = 1
+	}
+	if requiredPeers > nodes-1 {
+		requiredPeers = nodes - 1
+	}
+	return requiredPeers
+}
+
+func computeExpectedValidatorPeerCount(consensusNodesRaw string) int {
+	nodes := 0
+	for _, part := range strings.Split(consensusNodesRaw, ",") {
+		if strings.TrimSpace(part) != "" {
+			nodes++
+		}
+	}
+	if nodes <= 1 {
+		return 0
+	}
+	return nodes - 1
+}
+
+func computeBootstrapConnectivityTarget(configuredTargets int, consensusNodesRaw string) int {
+	if configuredTargets <= 0 {
+		return computeBootstrapRedialMinPeers(-1, consensusNodesRaw)
+	}
+	expectedPeers := computeExpectedValidatorPeerCount(consensusNodesRaw)
+	if expectedPeers <= 0 {
+		return configuredTargets
+	}
+	if configuredTargets < expectedPeers {
+		return configuredTargets
+	}
+	return expectedPeers
+}
+
+func (r *Router) protectPeerConnection(pid peer.ID, tag string) {
+	if r == nil || r.Host == nil || pid == "" || pid == r.Host.ID() {
+		return
+	}
+	if _, ok := r.bootstrapTargetPeerIDs()[pid]; !ok {
+		return
+	}
+	cm := r.Host.ConnManager()
+	if cm == nil {
+		return
+	}
+	cm.TagPeer(pid, "validator", 1000)
+	cm.Protect(pid, tag)
 }
 
 // --- identity / helpers ---
@@ -1559,6 +1846,7 @@ func (n *netNotifiee) Connected(net network.Network, c network.Conn) {
 		"remote":    c.RemoteMultiaddr().String(),
 	}
 	n.r.state.OnConnect(c.RemotePeer(), labels)
+	n.r.protectPeerConnection(c.RemotePeer(), "validator-peer")
 }
 func (n *netNotifiee) Disconnected(net network.Network, c network.Conn) {
 	if n.r == nil || n.r.state == nil {

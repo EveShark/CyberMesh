@@ -58,6 +58,7 @@ func (s *Server) handleConsensusOverview(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) buildConsensusOverview(ctx context.Context, now time.Time) (*ConsensusOverviewResponse, error) {
 	status := s.engine.GetStatus()
+	activation := consapi.PrivateGetActivationStatus(s.engine)
 	validators := s.engine.ListValidators()
 
 	activePeers := 0
@@ -82,7 +83,7 @@ func (s *Server) buildConsensusOverview(ctx context.Context, now time.Time) (*Co
 		Leader:          s.resolveLeaderAlias(status.CurrentLeader, validators),
 		LeaderID:        encodeValidatorID(status.CurrentLeader),
 		Term:            status.View,
-		Phase:           deriveConsensusPhase(status),
+		Phase:           deriveConsensusPhase(status, activation),
 		ActivePeers:     activePeers,
 		QuorumSize:      computeQuorumSize(len(validators)),
 		Proposals:       proposals,
@@ -404,6 +405,7 @@ func computeQuorumSize(total int) int {
 type aiSuspiciousNodesResponse struct {
 	Nodes []struct {
 		ID             string   `json:"id"`
+		EntityType     string   `json:"entity_type"`
 		Status         string   `json:"status"`
 		Uptime         float64  `json:"uptime"`
 		SuspicionScore float64  `json:"suspicion_score"`
@@ -417,7 +419,7 @@ func (s *Server) fetchAISuspiciousNodes(ctx context.Context) ([]SuspiciousNodeDT
 		return nil, nil
 	}
 
-	endpoint := strings.TrimRight(s.aiBaseURL, "/") + "/detections/suspicious-nodes?limit=25"
+	endpoint := strings.TrimRight(s.aiBaseURL, "/") + "/detections/suspicious-nodes?limit=25&entity_type=validator"
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -452,6 +454,7 @@ func (s *Server) fetchAISuspiciousNodes(ctx context.Context) ([]SuspiciousNodeDT
 	for _, node := range payload.Nodes {
 		dto := SuspiciousNodeDTO{
 			ID:             node.ID,
+			EntityType:     node.EntityType,
 			Status:         node.Status,
 			Uptime:         clampFloat(node.Uptime, 0, 100),
 			SuspicionScore: clampFloat(node.SuspicionScore, 0, 100),

@@ -3,11 +3,13 @@ package mempool
 import (
 	"container/heap"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"sort"
 	"sync"
 	"time"
 
+	"backend/pkg/control/policytrace"
 	"backend/pkg/state"
 	"backend/pkg/utils"
 )
@@ -36,6 +38,12 @@ type entry struct {
 	Confidence float64
 	Ts         int64
 	Size       int
+}
+
+// ProducerNonce identifies a tx by producer_id + nonce envelope identity.
+type ProducerNonce struct {
+	ProducerID []byte
+	Nonce      []byte
 }
 
 // priority ordering: higher severity, higher confidence, earlier ts, lexicographic hash
@@ -96,6 +104,7 @@ type producerState struct {
 type Mempool struct {
 	mu        sync.RWMutex
 	log       *utils.Logger
+	trace     *policytrace.Collector
 	cfg       Config
 	entries   map[string]*entry         // hexdigest(hash) -> entry
 	total     int                       // bytes
@@ -109,6 +118,60 @@ func (m *Mempool) ProducerCount() int {
 	return len(m.prod)
 }
 
+// HasPolicyTx returns true when at least one policy transaction is pending.
+func (m *Mempool) HasPolicyTx() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, e := range m.entries {
+		if e != nil && e.Tx != nil && e.Tx.Type() == state.TxPolicy {
+			return true
+		}
+	}
+	return false
+}
+
+func extractPolicyStageIdentityFromPayload(payload []byte) (string, string) {
+	if len(payload) == 0 {
+		return "", ""
+	}
+	var root map[string]any
+	if err := json.Unmarshal(payload, &root); err != nil {
+		return "", ""
+	}
+	get := func(m map[string]any, key string) string {
+		if m == nil {
+			return ""
+		}
+		if s, ok := m[key].(string); ok {
+			return s
+		}
+		return ""
+	}
+	policyID := get(root, "policy_id")
+	traceID := get(root, "trace_id")
+	if metadata, ok := root["metadata"].(map[string]any); ok && traceID == "" {
+		traceID = get(metadata, "trace_id")
+	}
+	if trace, ok := root["trace"].(map[string]any); ok && traceID == "" {
+		traceID = get(trace, "id")
+	}
+	if nested, ok := root["params"].(map[string]any); ok {
+		if policyID == "" {
+			policyID = get(nested, "policy_id")
+		}
+		if traceID == "" {
+			traceID = get(nested, "trace_id")
+		}
+		if metadata, ok := nested["metadata"].(map[string]any); ok && traceID == "" {
+			traceID = get(metadata, "trace_id")
+		}
+		if trace, ok := nested["trace"].(map[string]any); ok && traceID == "" {
+			traceID = get(trace, "id")
+		}
+	}
+	return policyID, traceID
+}
+
 func New(cfg Config, log *utils.Logger) *Mempool {
 	h := make(minHeap, 0)
 	heap.Init(&h)
@@ -119,6 +182,15 @@ func New(cfg Config, log *utils.Logger) *Mempool {
 		evictHeap: h,
 		prod:      make(map[string]*producerState),
 	}
+}
+
+func (m *Mempool) SetTraceCollector(trace *policytrace.Collector) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.trace = trace
+	m.mu.Unlock()
 }
 
 // cleanup producer nonce entries that expired
@@ -174,6 +246,26 @@ func (m *Mempool) Add(tx state.Transaction, meta AdmissionMeta, now time.Time) e
 	m.cleanupNonces(now, ps)
 	if _, used := ps.nonces[nonce]; used {
 		return ErrInvalidTx
+	}
+	if tx.Type() == state.TxPolicy {
+		policyID, traceID := extractPolicyStageIdentityFromPayload(tx.Payload())
+		if policyID != "" {
+			if m.log != nil {
+				m.log.Info("policy stage marker",
+					utils.ZapString("stage", "t_nonce_idempotency_ok"),
+					utils.ZapString("policy_id", policyID),
+					utils.ZapString("trace_id", traceID),
+					utils.ZapInt64("t_ms", now.UnixMilli()))
+			}
+			if m.trace != nil {
+				m.trace.Record(policytrace.Marker{
+					Stage:       "t_nonce_idempotency_ok",
+					PolicyID:    policyID,
+					TraceID:     traceID,
+					TimestampMs: now.UnixMilli(),
+				})
+			}
+		}
 	}
 	// Rate limiting
 	if m.cfg.RatePerSecond > 0 && !ps.bucket.allow(now) {
@@ -266,6 +358,45 @@ func (m *Mempool) Remove(hashes ...[32]byte) {
 		}
 	}
 	// rebuild eviction heap to drop stale pointers (costly but safe and deterministic)
+	m.evictHeap = make(minHeap, 0, len(m.entries))
+	for _, e := range m.entries {
+		heap.Push(&m.evictHeap, e)
+	}
+}
+
+// RemoveByProducerNonces removes all mempool entries matching any producer_id+nonce pair.
+func (m *Mempool) RemoveByProducerNonces(keys []ProducerNonce) {
+	if len(keys) == 0 {
+		return
+	}
+	set := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		if len(k.ProducerID) == 0 || len(k.Nonce) == 0 {
+			continue
+		}
+		id := hex.EncodeToString(k.ProducerID) + ":" + hex.EncodeToString(k.Nonce)
+		set[id] = struct{}{}
+	}
+	if len(set) == 0 {
+		return
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	removed := false
+	for key, e := range m.entries {
+		id := hex.EncodeToString(e.ProducerID) + ":" + hex.EncodeToString(e.Nonce)
+		if _, ok := set[id]; ok {
+			delete(m.entries, key)
+			m.total -= e.Size
+			removed = true
+		}
+	}
+	if !removed {
+		return
+	}
+	// Rebuild eviction heap to drop stale pointers.
 	m.evictHeap = make(minHeap, 0, len(m.entries))
 	for _, e := range m.entries {
 		heap.Push(&m.evictHeap, e)

@@ -17,6 +17,7 @@ type LatencyHistogram struct {
 	counts []uint64
 	sum    float64
 	total  uint64
+	max    float64
 	mu     sync.Mutex
 }
 
@@ -45,6 +46,9 @@ func (h *LatencyHistogram) Observe(value float64) {
 	h.mu.Lock()
 	h.total++
 	h.sum += value
+	if h.total == 1 || value > h.max {
+		h.max = value
+	}
 	for i, bound := range h.bounds {
 		if value <= bound {
 			h.counts[i]++
@@ -89,6 +93,12 @@ func (h *LatencyHistogram) Quantile(q float64) float64 {
 		cumulative += count
 		bound := h.bounds[i]
 		if cumulative >= target {
+			if math.IsInf(bound, 1) {
+				// Prometheus-style +Inf overflow buckets do not have a finite upper
+				// bound to interpolate against. Return the highest observed value
+				// so percentile gauges remain finite and actionable.
+				return h.max
+			}
 			if count == 0 {
 				return bound
 			}

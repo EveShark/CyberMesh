@@ -82,6 +82,8 @@ def _decode_feature_proto(payload: bytes) -> Dict:
         "feature_coverage": float(msg.feature_coverage or 0.0),
         "source_type": msg.source_type or "",
         "source_id": msg.source_id or "",
+        "source_event_ts_ms": int(getattr(msg, "source_event_ts_ms", 0) or 0),
+        "telemetry_ingest_ts_ms": int(getattr(msg, "telemetry_ingest_ts_ms", 0) or 0),
     }
     feature_names = FlowFeatureExtractor.FEATURE_COLUMNS
     skip = {"src_port", "dst_port", "protocol"}
@@ -142,6 +144,8 @@ class KafkaTelemetrySource(TelemetrySource):
         self._seen_flows: "OrderedDict[str, float]" = OrderedDict()
         self.logger = get_logger(__name__)
         self._buffer: List[Dict] = []
+        self._prefetched_messages = []
+        self._last_fetch_stats: Dict[str, object] = {}
 
         self._feature_names = FlowFeatureExtractor.FEATURE_COLUMNS
         self._consumer = Consumer(self._build_consumer_config(consumer_group))
@@ -157,30 +161,38 @@ class KafkaTelemetrySource(TelemetrySource):
             },
         )
 
-    def get_network_flows(self, limit: int = 100) -> List[Dict]:
+    def get_network_flows(self, limit: int = 100, *, wait_policy: Optional[str] = None) -> List[Dict]:
         limit = max(1, int(limit))
+        fetch_started = time.perf_counter()
         flows: List[Dict] = []
-        max_empty_polls = int(os.getenv("TELEMETRY_MAX_EMPTY_POLLS", "5"))
+        wait_cfg = self._resolve_wait_policy(wait_policy)
+        max_empty_polls = wait_cfg["max_empty_polls"]
+        poll_timeout = wait_cfg["poll_timeout"]
+        assign_timeout = wait_cfg["assign_timeout_sec"]
         empty_polls = 0
+        rejected_count = 0
+        coverage_reject_count = 0
+        duplicate_count = 0
+        accepted_count = 0
+        assignment_polls = 0
+        poll_count = 0
+        reason = "success"
         seek_latest = os.getenv("TELEMETRY_SEEK_LATEST", "false").lower() in ("1", "true", "yes", "on")
         seek_ts_ms = os.getenv("TELEMETRY_SEEK_TIMESTAMP_MS")
+        assignment_wait_ms = 0.0
         # Ensure assignments are established before applying any seek.
         # If we seek-to-latest before the assignment exists, the first seek may happen
         # *after* new messages arrive and skip them (common in E2E tests).
         if not getattr(self, "_assigned", False):
-            assign_timeout = float(os.getenv("TELEMETRY_ASSIGN_TIMEOUT_SEC", "8.0"))
-            deadline = time.time() + max(0.5, assign_timeout)
-            assignment = []
-            while time.time() < deadline and not assignment:
-                try:
-                    self._consumer.poll(0.2)
-                    assignment = self._consumer.assignment() or []
-                except Exception:
-                    assignment = []
-                if not assignment:
-                    time.sleep(0.05)
-            if assignment:
+            assignment_wait_ms, assignment_polls, poll_count, assigned = self._prime_assignment(
+                timeout_sec=assign_timeout,
+                poll_count=poll_count,
+                assignment_polls=assignment_polls,
+            )
+            if assigned:
                 self._assigned = True
+            elif assign_timeout > 0:
+                reason = "no_assignment"
 
         if seek_ts_ms:
             try:
@@ -205,25 +217,40 @@ class KafkaTelemetrySource(TelemetrySource):
             flows.append(self._buffer.pop(0))
 
         while len(flows) < limit:
+            if self._prefetched_messages:
+                msg = self._prefetched_messages.pop(0)
+            else:
+                msg = None
             if not self._consumer.assignment():
                 if seek_ts_ms:
                     try:
                         self._apply_seek_timestamp(seek_ts_ms)
                     except Exception:
                         pass
-                self._consumer.poll(0.1)
+                if msg is None:
+                    self._consumer.poll(0.1)
+                    poll_count += 1
+                    assignment_polls += 1
                 if not self._consumer.assignment():
                     empty_polls += 1
                     if empty_polls >= max_empty_polls:
+                        if reason == "success":
+                            reason = "no_assignment"
                         break
                     continue
-            msg = self._consumer.poll(self.poll_timeout)
+            if msg is None:
+                msg = self._consumer.poll(poll_timeout)
+                poll_count += 1
             if msg is None:
                 empty_polls += 1
                 if empty_polls >= max_empty_polls:
+                    if reason == "success":
+                        reason = "empty_topic_window"
                     break
                 continue
-            for msg in self._drain_messages(msg):
+            drained_messages, drain_polls = self._drain_messages(msg)
+            poll_count += drain_polls
+            for msg in drained_messages:
                 if msg.error():
                     if msg.error().code() == KafkaError._PARTITION_EOF:
                         continue
@@ -242,25 +269,75 @@ class KafkaTelemetrySource(TelemetrySource):
                     if self.feature_mask_enabled:
                         flow = _apply_feature_mask(flow, self._feature_names, flow.get("feature_mask", ""))
                     if not _meets_coverage(flow, self.min_feature_coverage):
+                        coverage_reject_count += 1
                         raise ValueError("feature coverage below threshold")
                     if self._is_duplicate(flow):
-                        self.logger.debug("telemetry duplicate skipped", extra={"flow_id": flow.get("flow_id", "")})
+                        duplicate_count += 1
                         self._commit_processed(message=msg, processed=True)
                         continue
                 except Exception as exc:
-                    self.logger.debug("telemetry rejected", extra={"error": str(exc)})
+                    rejected_count += 1
                     self._emit_dlq("TELEMETRY_INVALID", str(exc), payload)
                     self._commit_processed(message=msg, processed=True)
                     continue
 
                 flows.append(flow)
+                accepted_count += 1
                 self._commit_processed(message=msg, processed=True)
                 if len(flows) >= limit:
                     break
 
         self._commit_processed(force=True)
         self._flush_dlq(force=True)
+        if not flows:
+            if rejected_count > 0 and duplicate_count == 0:
+                reason = "all_rejected"
+            elif duplicate_count > 0 and rejected_count == 0:
+                reason = "all_duplicates"
+            elif rejected_count > 0 or duplicate_count > 0:
+                reason = "mixed_filtered"
+            elif reason == "success":
+                reason = "empty_topic_window"
+        total_duration_ms = (time.perf_counter() - fetch_started) * 1000
+        self._last_fetch_stats = {
+            "wait_policy": wait_cfg["policy_name"],
+            "limit": limit,
+            "accepted_count": accepted_count,
+            "rejected_count": rejected_count,
+            "coverage_reject_count": coverage_reject_count,
+            "duplicate_count": duplicate_count,
+            "empty_polls": empty_polls,
+            "assignment_polls": assignment_polls,
+            "poll_count": poll_count,
+            "assignment_wait_ms": round(assignment_wait_ms, 2),
+            "poll_timeout_sec": poll_timeout,
+            "max_empty_polls": max_empty_polls,
+            "assign_timeout_sec": assign_timeout,
+            "total_duration_ms": round(total_duration_ms, 2),
+            "reason": reason,
+        }
+        if not flows:
+            self.logger.info("Kafka telemetry fetch yielded no flows", extra=self._last_fetch_stats)
         return flows
+
+    def get_last_fetch_stats(self) -> Dict:
+        return dict(self._last_fetch_stats)
+
+    def prime_assignment(self, timeout_sec: Optional[float] = None) -> Dict[str, object]:
+        effective_timeout = timeout_sec
+        if effective_timeout is None:
+            effective_timeout = max(0.0, float(os.getenv("TELEMETRY_STARTUP_ASSIGN_TIMEOUT_SEC", "2.0")))
+        assignment_wait_ms, assignment_polls, poll_count, assigned = self._prime_assignment(
+            timeout_sec=float(effective_timeout),
+            poll_count=0,
+            assignment_polls=0,
+        )
+        return {
+            "assigned": bool(assigned),
+            "assignment_wait_ms": round(assignment_wait_ms, 2),
+            "assignment_polls": int(assignment_polls),
+            "poll_count": int(poll_count),
+        }
 
     def get_files(self, limit: int = 50) -> List[Dict]:
         return []
@@ -355,21 +432,65 @@ class KafkaTelemetrySource(TelemetrySource):
         except KafkaException as exc:
             self.logger.warning("Kafka commit failed", extra={"error": str(exc)})
 
-    def _drain_messages(self, first_msg) -> List:
+    def _drain_messages(self, first_msg) -> tuple[List, int]:
         batch = [first_msg]
         if self.poll_drain_max_messages <= 1 or self.poll_drain_max_ms <= 0:
-            return batch
+            return batch, 0
 
         deadline = time.monotonic() + (float(self.poll_drain_max_ms) / 1000.0)
+        poll_count = 0
         while len(batch) < self.poll_drain_max_messages:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             msg = self._consumer.poll(min(remaining, 0.05))
+            poll_count += 1
             if msg is None:
                 break
             batch.append(msg)
-        return batch
+        return batch, poll_count
+
+    def _resolve_wait_policy(self, wait_policy: Optional[str]) -> Dict[str, object]:
+        policy_name = (wait_policy or os.getenv("TELEMETRY_WAIT_POLICY", "bounded_wait")).strip().lower()
+        if policy_name == "non_blocking":
+            return {
+                "policy_name": policy_name,
+                "assign_timeout_sec": max(0.0, float(os.getenv("TELEMETRY_NON_BLOCKING_ASSIGN_TIMEOUT_SEC", "0.5"))),
+                "max_empty_polls": max(1, int(os.getenv("TELEMETRY_NON_BLOCKING_MAX_EMPTY_POLLS", "1"))),
+                "poll_timeout": max(0.05, float(os.getenv("TELEMETRY_NON_BLOCKING_POLL_TIMEOUT_SEC", "0.2"))),
+            }
+        if policy_name == "streaming_batch":
+            return {
+                "policy_name": policy_name,
+                "assign_timeout_sec": max(0.0, float(os.getenv("TELEMETRY_STREAMING_ASSIGN_TIMEOUT_SEC", "2.0"))),
+                "max_empty_polls": max(1, int(os.getenv("TELEMETRY_STREAMING_MAX_EMPTY_POLLS", "3"))),
+                "poll_timeout": max(0.05, float(os.getenv("TELEMETRY_STREAMING_POLL_TIMEOUT_SEC", "0.5"))),
+            }
+        return {
+            "policy_name": "bounded_wait",
+            "assign_timeout_sec": max(0.0, float(os.getenv("TELEMETRY_ASSIGN_TIMEOUT_SEC", "8.0"))),
+            "max_empty_polls": max(1, int(os.getenv("TELEMETRY_MAX_EMPTY_POLLS", "5"))),
+            "poll_timeout": self.poll_timeout,
+        }
+
+    def _prime_assignment(self, *, timeout_sec: float, poll_count: int, assignment_polls: int) -> tuple[float, int, int, bool]:
+        deadline = time.time() + max(0.0, timeout_sec)
+        assignment = self._consumer.assignment() or []
+        assign_started = time.perf_counter()
+        while time.time() < deadline and not assignment:
+            try:
+                msg = self._consumer.poll(0.2)
+                poll_count += 1
+                assignment_polls += 1
+                if msg is not None and not msg.error():
+                    self._prefetched_messages.append(msg)
+                assignment = self._consumer.assignment() or []
+            except Exception:
+                assignment = []
+            if not assignment:
+                time.sleep(0.05)
+        assignment_wait_ms = (time.perf_counter() - assign_started) * 1000
+        return assignment_wait_ms, assignment_polls, poll_count, bool(assignment)
 
     def _build_consumer_config(self, consumer_group: Optional[str]) -> dict:
         consumer_cfg = self.settings.kafka_consumer

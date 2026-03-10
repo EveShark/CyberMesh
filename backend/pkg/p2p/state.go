@@ -22,9 +22,13 @@ type State struct {
 	cfg       *config.NodeConfig
 	configMgr *utils.ConfigManager
 
-	mu    sync.RWMutex
-	peers map[peer.ID]*PeerState
-	seen  map[peer.ID]time.Time
+	mu        sync.RWMutex
+	peers     map[peer.ID]*PeerState
+	seen      map[peer.ID]time.Time
+	started   bool
+	stopped   bool
+	startOnce sync.Once
+	stopOnce  sync.Once
 
 	// Configuration (loaded from configMgr, no hardcoded values)
 	heartbeatInterval time.Duration
@@ -53,16 +57,18 @@ type Metrics interface {
 
 // PeerState holds rolling health/reputation for a peer.
 type PeerState struct {
-	ID           peer.ID
-	LastSeen     time.Time
-	LastDecay    time.Time
-	BytesIn      uint64
-	MsgIn        uint64
-	Score        float64
-	Quarantined  bool
-	QuarantineAt time.Time
-	Labels       map[string]string
-	LatencyEMA   float64
+	ID            peer.ID
+	LastSeen      time.Time
+	LastDecay     time.Time
+	BytesIn       uint64
+	MsgIn         uint64
+	Score         float64
+	Connected     bool
+	Quarantined   bool
+	QuarantineAt  time.Time
+	Labels        map[string]string
+	MessageGapEMA float64
+	PingRTTEMA    float64
 }
 
 // NewState constructs a State with parameters from configuration (no hardcoding).
@@ -115,21 +121,38 @@ func NewState(parentCtx context.Context, log *utils.Logger, cfg *config.NodeConf
 
 // Start begins background maintenance loops (decay, liveness).
 func (s *State) Start() {
-	s.ResetPeersSeen()
-	s.wg.Add(1)
-	go s.decayLoop()
+	if s == nil {
+		return
+	}
+	s.startOnce.Do(func() {
+		s.ResetPeersSeen()
+		s.mu.Lock()
+		s.started = true
+		s.mu.Unlock()
 
-	s.wg.Add(1)
-	go s.livenessLoop()
+		s.wg.Add(1)
+		go s.decayLoop()
 
-	s.log.Info("P2P state manager background loops started")
+		s.wg.Add(1)
+		go s.livenessLoop()
+
+		s.log.Info("P2P state manager background loops started")
+	})
 }
 
 // Stop gracefully shuts down background loops
 func (s *State) Stop() {
-	s.cancel()
-	s.wg.Wait()
-	s.log.Info("P2P state manager stopped")
+	if s == nil {
+		return
+	}
+	s.stopOnce.Do(func() {
+		s.cancel()
+		s.wg.Wait()
+		s.mu.Lock()
+		s.stopped = true
+		s.mu.Unlock()
+		s.log.Info("P2P state manager stopped")
+	})
 }
 
 // OnConnect marks a peer connected (called by router via notifiee).
@@ -137,11 +160,12 @@ func (s *State) OnConnect(pid peer.ID, labels map[string]string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ps := s.ensure(pid)
+	ps.Connected = true
 	ps.LastSeen = time.Now()
 	ps.LastDecay = time.Now()
 	s.seen[pid] = ps.LastSeen
 	if labels != nil {
-		ps.Labels = labels
+		ps.Labels = cloneLabels(labels)
 	}
 	// small boost for successful handshake
 	ps.Score += 0.2
@@ -156,6 +180,9 @@ func (s *State) OnConnect(pid peer.ID, labels map[string]string) {
 func (s *State) OnDisconnect(pid peer.ID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if ps, ok := s.peers[pid]; ok {
+		ps.Connected = false
+	}
 	s.observeCounts()
 
 	s.log.Debug("peer disconnected", utils.ZapString("peer_id", pid.String()))
@@ -170,13 +197,14 @@ func (s *State) OnMessage(topic string, from peer.ID, n int) {
 	if !ps.LastSeen.IsZero() {
 		interval := now.Sub(ps.LastSeen).Seconds()
 		if interval >= 0 {
-			if ps.LatencyEMA == 0 {
-				ps.LatencyEMA = interval
+			if ps.MessageGapEMA == 0 {
+				ps.MessageGapEMA = interval
 			} else {
-				ps.LatencyEMA = ps.LatencyEMA*0.9 + interval*0.1
+				ps.MessageGapEMA = ps.MessageGapEMA*0.9 + interval*0.1
 			}
 		}
 	}
+	ps.Connected = true
 	ps.LastSeen = now
 	ps.MsgIn++
 	ps.BytesIn += uint64(n)
@@ -227,17 +255,12 @@ func (s *State) Penalize(pid peer.ID, severity float64, reason string) {
 // IsQuarantined returns whether a peer is isolated.
 func (s *State) IsQuarantined(pid peer.ID) bool {
 	s.mu.RLock()
+	defer s.mu.RUnlock()
 	ps, ok := s.peers[pid]
-	s.mu.RUnlock()
-
 	if !ok {
 		return false
 	}
-
-	// Check quarantine status atomically
-	isQuarantined := ps.Quarantined && time.Since(ps.QuarantineAt) < s.quarantineTTL
-
-	return isQuarantined
+	return s.isQuarantinedLocked(ps, time.Now())
 }
 
 // ScoreFor exposes current score to router (for GossipSub AppSpecificScore).
@@ -256,7 +279,9 @@ func (s *State) Snapshot() map[peer.ID]PeerState {
 	defer s.mu.RUnlock()
 	out := make(map[peer.ID]PeerState, len(s.peers))
 	for id, ps := range s.peers {
-		out[id] = *ps
+		snap := *ps
+		snap.Labels = cloneLabels(ps.Labels)
+		out[id] = snap
 	}
 	return out
 }
@@ -270,11 +295,21 @@ func (s *State) GetPeerCount() int {
 
 // GetConnectedPeerCount returns the number of non-quarantined peers.
 func (s *State) GetConnectedPeerCount() int {
+	return s.GetConnectedPeerCountExcluding("")
+}
+
+// GetConnectedPeerCountExcluding returns the number of connected, non-quarantined peers,
+// excluding the provided peer ID when present.
+func (s *State) GetConnectedPeerCountExcluding(excluded peer.ID) int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	now := time.Now()
 	count := 0
-	for _, ps := range s.peers {
-		if !ps.Quarantined {
+	for id, ps := range s.peers {
+		if excluded != "" && id == excluded {
+			continue
+		}
+		if ps.Connected && !s.isQuarantinedLocked(ps, now) {
 			count++
 		}
 	}
@@ -288,12 +323,13 @@ func (s *State) TouchPeer(pid peer.ID, ts time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ps, ok := s.peers[pid]
-	if !ok || ps.Quarantined {
+	if !ok || s.isQuarantinedLocked(ps, time.Now()) {
 		return
 	}
 	if ts.IsZero() {
 		ts = time.Now()
 	}
+	ps.Connected = true
 	ps.LastSeen = ts
 	s.seen[pid] = ts
 }
@@ -304,28 +340,38 @@ func (s *State) RecordLatencySample(pid peer.ID, latency time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ps := s.ensure(pid)
-	if !ps.Quarantined {
+	if !s.isQuarantinedLocked(ps, now) {
+		ps.Connected = true
 		ps.LastSeen = now
 		s.seen[pid] = now
 	}
 	if latency > 0 {
 		seconds := latency.Seconds()
-		if ps.LatencyEMA == 0 {
-			ps.LatencyEMA = seconds
+		if ps.PingRTTEMA == 0 {
+			ps.PingRTTEMA = seconds
 		} else {
-			ps.LatencyEMA = ps.LatencyEMA*0.8 + seconds*0.2
+			ps.PingRTTEMA = ps.PingRTTEMA*0.8 + seconds*0.2
 		}
 	}
 }
 
 // GetActivePeerCount returns the number of recently active peers.
 func (s *State) GetActivePeerCount(since time.Duration) int {
+	return s.GetActivePeerCountExcluding("", since)
+}
+
+// GetActivePeerCountExcluding returns the number of recently active peers, excluding the
+// provided peer ID when present.
+func (s *State) GetActivePeerCountExcluding(excluded peer.ID, since time.Duration) int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	now := time.Now()
 	count := 0
-	for _, ps := range s.peers {
-		if !ps.Quarantined && now.Sub(ps.LastSeen) < since {
+	for id, ps := range s.peers {
+		if excluded != "" && id == excluded {
+			continue
+		}
+		if ps.Connected && !s.isQuarantinedLocked(ps, now) && now.Sub(ps.LastSeen) < since {
 			count++
 		}
 	}
@@ -335,14 +381,24 @@ func (s *State) GetActivePeerCount(since time.Duration) int {
 // GetPeersSeenSinceStartup returns the count of peers that have exchanged at least one message
 // with this node since the latest startup/reset.
 func (s *State) GetPeersSeenSinceStartup() int {
+	return s.GetPeersSeenSinceStartupExcluding("")
+}
+
+// GetPeersSeenSinceStartupExcluding returns the number of peers observed since startup,
+// excluding the provided peer ID when present.
+func (s *State) GetPeersSeenSinceStartupExcluding(excluded peer.ID) int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	now := time.Now()
 	count := 0
 	for pid, ts := range s.seen {
+		if excluded != "" && pid == excluded {
+			continue
+		}
 		if ts.Before(s.startup) {
 			continue
 		}
-		if ps, ok := s.peers[pid]; ok && !ps.Quarantined {
+		if ps, ok := s.peers[pid]; ok && !s.isQuarantinedLocked(ps, now) {
 			count++
 		}
 	}
@@ -361,9 +417,10 @@ func (s *State) ResetPeersSeen() {
 func (s *State) GetQuarantinedCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	now := time.Now()
 	count := 0
 	for _, ps := range s.peers {
-		if ps.Quarantined {
+		if s.isQuarantinedLocked(ps, now) {
 			count++
 		}
 	}
@@ -471,6 +528,9 @@ func (s *State) checkLiveness() {
 	quarantineThreshold := s.configMgr.GetFloat64("P2P_QUARANTINE_THRESHOLD", -5.0)
 
 	for _, ps := range s.peers {
+		if !ps.Connected {
+			continue
+		}
 		if now.Sub(ps.LastSeen) > s.livenessTimeout {
 			// gentle penalty for being silent
 			oldScore := ps.Score
@@ -516,13 +576,16 @@ func (s *State) observeCounts() {
 	if s.metrics == nil {
 		return
 	}
+	now := time.Now()
 	active := 0
 	quarantined := 0
 	for _, ps := range s.peers {
-		if !ps.Quarantined {
-			active++
-		} else {
+		if s.isQuarantinedLocked(ps, now) {
 			quarantined++
+			continue
+		}
+		if ps.Connected {
+			active++
 		}
 	}
 	s.metrics.SetGauge("p2p_active_peers", float64(active), nil)
@@ -534,10 +597,11 @@ func (s *State) observeCounts() {
 func (s *State) evictLowestScorePeer() {
 	var lowestID peer.ID
 	lowestScore := math.MaxFloat64
+	now := time.Now()
 
 	for id, ps := range s.peers {
 		// Don't evict quarantined peers (let them expire naturally)
-		if ps.Quarantined {
+		if s.isQuarantinedLocked(ps, now) {
 			continue
 		}
 		if ps.Score < lowestScore {
@@ -553,6 +617,27 @@ func (s *State) evictLowestScorePeer() {
 			utils.ZapFloat64("score", lowestScore),
 			utils.ZapInt("peer_count", len(s.peers)))
 	}
+}
+
+func (s *State) isQuarantinedLocked(ps *PeerState, now time.Time) bool {
+	if ps == nil || !ps.Quarantined {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	return now.Sub(ps.QuarantineAt) < s.quarantineTTL
+}
+
+func cloneLabels(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return map[string]string{}
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 func clamp(v, lo, hi float64) float64 {

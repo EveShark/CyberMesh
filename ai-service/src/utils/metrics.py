@@ -79,8 +79,16 @@ class MetricsCollector:
         
         self.kafka_publish_latency_seconds = Histogram(
             'ai_kafka_publish_latency_seconds',
-            'Kafka message publish latency',
+            'Kafka message end-to-end publish latency including retries and backoff',
             ['topic'],
+            buckets=[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0],
+            registry=self.registry
+        )
+
+        self.kafka_publish_attempt_latency_seconds = Histogram(
+            'ai_kafka_publish_attempt_latency_seconds',
+            'Kafka single publish attempt latency excluding retry backoff sleep',
+            ['topic', 'status'],
             buckets=[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0],
             registry=self.registry
         )
@@ -89,6 +97,21 @@ class MetricsCollector:
             'ai_kafka_retries_total',
             'Kafka publish retry attempts',
             ['topic', 'reason'],
+            registry=self.registry
+        )
+
+        self.service_operations = Counter(
+            'ai_service_operations_total',
+            'AI service operation executions by operation and status',
+            ['operation', 'status'],
+            registry=self.registry
+        )
+
+        self.service_operation_latency_seconds = Histogram(
+            'ai_service_operation_latency_seconds',
+            'AI service local operation latency',
+            ['operation', 'status'],
+            buckets=[0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
             registry=self.registry
         )
         
@@ -140,12 +163,21 @@ class MetricsCollector:
         self.pipeline_latency_seconds.labels(pipeline_type=pipeline_type).observe(latency_seconds)
     
     def record_kafka_publish_latency(self, topic: str, latency_seconds: float):
-        """Record Kafka publish latency."""
+        """Record end-to-end Kafka publish latency including retries/backoff."""
         self.kafka_publish_latency_seconds.labels(topic=topic).observe(latency_seconds)
+
+    def record_kafka_publish_attempt_latency(self, topic: str, latency_seconds: float, status: str):
+        """Record one Kafka publish attempt latency."""
+        self.kafka_publish_attempt_latency_seconds.labels(topic=topic, status=status).observe(latency_seconds)
     
     def record_kafka_retry(self, topic: str, reason: str):
         """Record a Kafka publish retry."""
         self.kafka_retries.labels(topic=topic, reason=reason).inc()
+
+    def record_service_operation(self, operation: str, latency_seconds: float, status: str = "ok"):
+        """Record an AI service local operation latency and outcome."""
+        self.service_operations.labels(operation=operation, status=status).inc()
+        self.service_operation_latency_seconds.labels(operation=operation, status=status).observe(latency_seconds)
     
     def record_dlq_message(self, topic: str, reason: str):
         """Record a message sent to DLQ."""

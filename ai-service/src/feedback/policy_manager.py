@@ -68,6 +68,20 @@ class PolicyManager:
     REDIS_PREFIX = "policy"
     REDIS_ACTIVE = f"{REDIS_PREFIX}:active"
     REDIS_HISTORY = f"{REDIS_PREFIX}:history"
+    APPLY_ACTIONS = {
+        "apply",
+        "add",
+        "update",
+        "enable",
+        "drop",
+        "reject",
+        "rate_limit",
+    }
+    REVERT_ACTIONS = {
+        "revert",
+        "remove",
+        "disable",
+    }
     
     def __init__(self, storage: RedisStorage):
         """
@@ -123,10 +137,12 @@ class PolicyManager:
                 )
                 return False
             
+            action = (event.action or "").strip().lower()
+
             # Handle action
-            if event.action == "apply":
+            if action in self.APPLY_ACTIONS:
                 return self._apply_policy(event, current_height)
-            elif event.action == "revert":
+            elif action in self.REVERT_ACTIONS:
                 return self._revert_policy(event)
             else:
                 self.logger.error(f"Unknown policy action: {event.action}")
@@ -158,6 +174,8 @@ class PolicyManager:
             success = self._apply_rate_limit_policy(event.rule_data)
         elif event.rule_type == "calibration":
             success = self._apply_calibration_policy(event.rule_data)
+        elif event.rule_type == "block":
+            success = self._apply_block_policy(event.rule_data)
         else:
             self.logger.error(f"Unknown rule type: {event.rule_type}")
             return False
@@ -212,6 +230,8 @@ class PolicyManager:
             success = self._apply_rate_limit_policy(record.rule_data)
         elif record.rule_type == "calibration":
             success = self._apply_calibration_policy(record.rule_data)
+        elif record.rule_type == "block":
+            success = self._apply_block_policy(record.rule_data)
         else:
             self.logger.error(f"Unknown rule type: {record.rule_type}")
             return False
@@ -359,6 +379,19 @@ class PolicyManager:
         except Exception as e:
             self.logger.error(f"Failed to apply calibration policy: {e}")
             return False
+
+    def _apply_block_policy(self, rule_data: Dict[str, Any]) -> bool:
+        """
+        Accept block policies for lifecycle consistency.
+
+        Enforcement happens in backend/enforcement-agent; feedback manager keeps
+        these as auditable policy records and does not mutate local detection
+        thresholds based on block control payloads.
+        """
+        if not isinstance(rule_data, dict):
+            self.logger.error("Block policy rule_data must be a JSON object")
+            return False
+        return True
     
     def _persist_overrides(self):
         """Persist overrides to Redis."""

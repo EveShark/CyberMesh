@@ -15,8 +15,10 @@ import (
 	"backend/pkg/config"
 	"backend/pkg/consensus/api"
 	"backend/pkg/consensus/messages"
+	ctypes "backend/pkg/consensus/types"
 	"backend/pkg/control/policyack"
 	"backend/pkg/control/policyoutbox"
+	"backend/pkg/control/policytrace"
 	"backend/pkg/ingest/kafka"
 	"backend/pkg/mempool"
 	"backend/pkg/p2p"
@@ -29,6 +31,9 @@ import (
 type Config struct {
 	BuildInterval       time.Duration
 	ProposalCooldown    time.Duration
+	BacklogCooldown     time.Duration
+	PolicyFastCooldown  time.Duration
+	BacklogTxThreshold  int
 	MinMempoolTxs       int
 	TimestampSkew       time.Duration
 	GenesisHash         [32]byte
@@ -65,6 +70,7 @@ type Service struct {
 	builder *block.Builder
 	store   state.StateStore
 	log     *utils.Logger
+	audit   *utils.AuditLogger
 	metrics *Metrics
 	memMon  *utils.MemoryMonitor
 
@@ -72,15 +78,31 @@ type Service struct {
 	persistWorker *PersistenceWorker
 
 	// Kafka (optional)
-	kafkaConsumer              *kafka.Consumer
-	kafkaProducer              *kafka.Producer
-	policyPublisher            *policyPublisher
-	policyPublishOnCommit      bool
-	policyPublishOnPersistence bool
-	policyCommitProposerOnly   bool
-	policyOutboxDispatcher     *policyoutbox.Dispatcher
-	policyOutboxStore          *policyoutbox.Store
-	policyAckCons              *policyack.Consumer
+	kafkaConsumer               *kafka.Consumer
+	kafkaProducer               *kafka.Producer
+	policyPublisher             *policyPublisher
+	policyPublishOnCommit       bool
+	policyPublishOnPersistence  bool
+	policyCommitProposerOnly    bool
+	persistCommitProposerOnly   bool
+	persistBackfillEnabled      bool
+	persistBackfillLagThreshold uint64
+	persistBackfillStaleAfter   time.Duration
+	persistBackfillPollInterval time.Duration
+	persistBackfillMaxPerCycle  int
+	persistBackfillPendingMax   int
+	replayFilterEnabled         bool
+	replayFilterTTL             time.Duration
+	replayFilterMax             int
+	replayRefreshEnabled        bool
+	replayRefreshLeaderOnly     bool
+	replayRefreshInterval       time.Duration
+	replayRefreshHeightWindow   uint64
+	replayRefreshMaxHeightsTick int
+	policyOutboxDispatcher      *policyoutbox.Dispatcher
+	policyOutboxStore           *policyoutbox.Store
+	policyAckCons               *policyack.Consumer
+	policyTraceCollector        *policytrace.Collector
 
 	// API server (optional)
 	apiServer *apiserver.Server
@@ -97,6 +119,9 @@ type Service struct {
 	lastProposedHeight   uint64   // Last height we proposed (for cooldown logging)
 	lastProposalTime     time.Time
 	proposalCooldown     time.Duration
+	backlogCooldown      time.Duration
+	policyFastCooldown   time.Duration
+	backlogTxThreshold   int
 	blockTimeout         time.Duration
 	stopCh               chan struct{}
 	commitLogEveryN      uint64
@@ -105,27 +130,82 @@ type Service struct {
 	commitLogsSuppressed uint64
 	lastPersistNilWarnNs int64
 
+	// Proposed tx hold prevents immediate tx re-proposal before commit cleanup.
+	proposedTxHold         map[[32]byte]time.Time
+	proposalTxHoldDuration time.Duration
+
 	// Genesis coordination
 	startTime          time.Time     // Service start time for genesis delay calculation
 	genesisGracePeriod time.Duration // Grace period before first proposal
+
+	// Proposer wakeup path: event-driven trigger with ticker fallback.
+	proposeTriggerCh       chan struct{}
+	proposeTriggerDropped  uint64
+	proposeTriggerLogEvery uint64
+
+	persistBackfillMu      sync.RWMutex
+	persistBackfillPending map[uint64]pendingPersistenceEntry
+	persistBackfillDropped uint64
+
+	replayFilterMu        sync.RWMutex
+	replayCommittedTx     map[[32]byte]time.Time
+	replayRefreshNext     uint64
+	replayRejectedAdmit   uint64
+	replayRejectedBuild   uint64
+	replayFilterEvictions uint64
+
+	persistEnqueueCommitProposer      uint64
+	persistEnqueueCommitNonProposer   uint64
+	persistEnqueueBackfillProposer    uint64
+	persistEnqueueBackfillNonProposer uint64
+	persistEnqueueDroppedNonProposer  uint64
+	persistEnqueueErrors              uint64
+	persistExecuteProposer            uint64
+	persistExecuteNonProposer         uint64
+	persistExecuteDroppedNonOwner     uint64
+	applyBlockObserverCleanup         func()
+
+	// test hook for persistence writer ownership decision.
+	persistStatusFn func() (ctypes.ValidatorID, bool)
 }
 
 func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, builder *block.Builder, store state.StateStore, log *utils.Logger) (*Service, error) {
+	var initOK bool
 	s := &Service{
-		cfg:              cfg,
-		eng:              eng,
-		mp:               mp,
-		builder:          builder,
-		memMon:           utils.NewMemoryMonitor(log),
-		store:            store,
-		log:              log,
-		metrics:          &Metrics{},
-		lastParent:       cfg.GenesisHash, // Initialize with genesis instead of zero
-		stopCh:           make(chan struct{}),
-		blockTimeout:     cfg.BlockTimeout,
-		proposalCooldown: cfg.ProposalCooldown,
+		cfg:                cfg,
+		eng:                eng,
+		mp:                 mp,
+		builder:            builder,
+		memMon:             utils.NewMemoryMonitor(log),
+		store:              store,
+		log:                log,
+		audit:              cfg.AuditLogger,
+		metrics:            NewMetrics(),
+		lastParent:         cfg.GenesisHash, // Initialize with genesis instead of zero
+		stopCh:             make(chan struct{}),
+		blockTimeout:       cfg.BlockTimeout,
+		proposalCooldown:   cfg.ProposalCooldown,
+		backlogCooldown:    cfg.BacklogCooldown,
+		policyFastCooldown: cfg.PolicyFastCooldown,
+		backlogTxThreshold: cfg.BacklogTxThreshold,
 		// startTime will be set in Start() after genesis completes
-		genesisGracePeriod: cfg.GenesisGracePeriod,
+		genesisGracePeriod:     cfg.GenesisGracePeriod,
+		proposedTxHold:         make(map[[32]byte]time.Time),
+		proposeTriggerCh:       make(chan struct{}, 1),
+		proposeTriggerLogEvery: 100,
+		persistBackfillPending: make(map[uint64]pendingPersistenceEntry),
+		replayCommittedTx:      make(map[[32]byte]time.Time),
+		policyTraceCollector:   policytrace.NewCollector(4096, 64),
+	}
+	defer func() {
+		if !initOK && s.applyBlockObserverCleanup != nil {
+			s.applyBlockObserverCleanup()
+			s.applyBlockObserverCleanup = nil
+		}
+	}()
+	s.applyBlockObserverCleanup = state.SetApplyBlockObserver(s.metrics.RecordApplyBlockMetrics)
+	if mp != nil {
+		mp.SetTraceCollector(s.policyTraceCollector)
 	}
 	if s.blockTimeout <= 0 {
 		s.blockTimeout = 5 * time.Second
@@ -143,6 +223,21 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 		}
 		s.proposalCooldown = cooldown
 	}
+	if s.backlogCooldown < 0 {
+		s.backlogCooldown = 0
+	}
+	if s.policyFastCooldown < 0 {
+		s.policyFastCooldown = 0
+	}
+	if s.backlogTxThreshold < 0 {
+		s.backlogTxThreshold = 0
+	}
+	if s.backlogCooldown > 0 && s.backlogCooldown > s.proposalCooldown {
+		s.backlogCooldown = s.proposalCooldown
+	}
+	if s.policyFastCooldown > 0 && s.policyFastCooldown > s.proposalCooldown {
+		s.policyFastCooldown = s.proposalCooldown
+	}
 	if s.genesisGracePeriod < 0 {
 		s.genesisGracePeriod = 0
 	}
@@ -150,6 +245,7 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 		// Keep conservative default for multi-node startup unless explicitly tuned by env.
 		s.genesisGracePeriod = 60 * time.Second
 	}
+	s.proposalTxHoldDuration = 10 * time.Second
 	s.commitLogEveryN = 20
 	s.commitWarnThrottle = 10 * time.Second
 	if cfg.ConfigManager != nil {
@@ -159,6 +255,9 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 		if throttle := cfg.ConfigManager.GetDuration("CONTROL_COMMIT_WARN_LOG_THROTTLE", 10*time.Second); throttle > 0 {
 			s.commitWarnThrottle = throttle
 		}
+		if hold := cfg.ConfigManager.GetDuration("PROPOSER_TX_HOLD_DURATION", 10*time.Second); hold > 0 {
+			s.proposalTxHoldDuration = hold
+		}
 	}
 
 	// Control-plane policy publish source selection.
@@ -167,6 +266,21 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 	s.policyPublishOnCommit = true
 	s.policyPublishOnPersistence = true
 	s.policyCommitProposerOnly = false
+	s.persistCommitProposerOnly = false
+	s.persistBackfillEnabled = true
+	s.persistBackfillLagThreshold = 1
+	s.persistBackfillStaleAfter = 15 * time.Second
+	s.persistBackfillPollInterval = 5 * time.Second
+	s.persistBackfillMaxPerCycle = 4
+	s.persistBackfillPendingMax = 2048
+	s.replayFilterEnabled = true
+	s.replayFilterTTL = 30 * time.Minute
+	s.replayFilterMax = 200000
+	s.replayRefreshEnabled = true
+	s.replayRefreshLeaderOnly = true
+	s.replayRefreshInterval = 30 * time.Second
+	s.replayRefreshHeightWindow = 512
+	s.replayRefreshMaxHeightsTick = 32
 	if cfg.ConfigManager != nil {
 		source := strings.ToLower(strings.TrimSpace(cfg.ConfigManager.GetString("CONTROL_POLICY_PUBLISH_SOURCE", "both")))
 		switch source {
@@ -214,6 +328,84 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 				utils.ZapBool("publish_on_commit", s.policyPublishOnCommit),
 				utils.ZapBool("publish_on_persistence", s.policyPublishOnPersistence),
 				utils.ZapBool("commit_writer_proposer_only", s.policyCommitProposerOnly))
+		}
+
+		// Persistence writer mode controls how many validators enqueue full block persistence
+		// for a committed block.
+		// Supported values:
+		// - "all": any validator that commits may persist (legacy behavior)
+		// - "proposer": only the committed block proposer persists (single writer)
+		persistWriterMode := strings.ToLower(strings.TrimSpace(cfg.ConfigManager.GetString("PERSIST_COMMIT_WRITER_MODE", "proposer")))
+		switch persistWriterMode {
+		case "all":
+			s.persistCommitProposerOnly = false
+		case "proposer", "":
+			s.persistCommitProposerOnly = true
+		default:
+			s.persistCommitProposerOnly = true
+			if log != nil {
+				log.Warn("Invalid PERSIST_COMMIT_WRITER_MODE; defaulting to proposer (fail-closed)",
+					utils.ZapString("value", persistWriterMode))
+			}
+		}
+		s.persistBackfillEnabled = cfg.ConfigManager.GetBool("PERSIST_BACKFILL_ENABLED", true)
+		s.persistBackfillLagThreshold = uint64(cfg.ConfigManager.GetInt("PERSIST_BACKFILL_LAG_THRESHOLD", 1))
+		s.persistBackfillStaleAfter = cfg.ConfigManager.GetDuration("PERSIST_BACKFILL_STALE_AFTER", 15*time.Second)
+		if s.persistBackfillStaleAfter <= 0 {
+			s.persistBackfillStaleAfter = 15 * time.Second
+		}
+		s.persistBackfillPollInterval = cfg.ConfigManager.GetDuration("PERSIST_BACKFILL_POLL_INTERVAL", 5*time.Second)
+		if s.persistBackfillPollInterval <= 0 {
+			s.persistBackfillPollInterval = 5 * time.Second
+		}
+		s.persistBackfillMaxPerCycle = cfg.ConfigManager.GetInt("PERSIST_BACKFILL_MAX_PER_CYCLE", 4)
+		if s.persistBackfillMaxPerCycle <= 0 {
+			s.persistBackfillMaxPerCycle = 4
+		}
+		s.persistBackfillPendingMax = cfg.ConfigManager.GetInt("PERSIST_BACKFILL_PENDING_MAX", 2048)
+		if s.persistBackfillPendingMax <= 0 {
+			s.persistBackfillPendingMax = 2048
+		}
+		s.replayFilterEnabled = cfg.ConfigManager.GetBool("TX_REPLAY_FILTER_ENABLED", true)
+		s.replayFilterTTL = cfg.ConfigManager.GetDuration("TX_REPLAY_FILTER_TTL", 30*time.Minute)
+		if s.replayFilterTTL <= 0 {
+			s.replayFilterTTL = 30 * time.Minute
+		}
+		s.replayFilterMax = cfg.ConfigManager.GetInt("TX_REPLAY_FILTER_MAX", 200000)
+		if s.replayFilterMax <= 0 {
+			s.replayFilterMax = 200000
+		}
+		s.replayRefreshEnabled = cfg.ConfigManager.GetBool("TX_REPLAY_REFRESH_ENABLED", true)
+		s.replayRefreshLeaderOnly = cfg.ConfigManager.GetBool("TX_REPLAY_REFRESH_LEADER_ONLY", true)
+		s.replayRefreshInterval = cfg.ConfigManager.GetDuration("TX_REPLAY_REFRESH_INTERVAL", 30*time.Second)
+		if s.replayRefreshInterval <= 0 {
+			s.replayRefreshInterval = 30 * time.Second
+		}
+		s.replayRefreshHeightWindow = uint64(cfg.ConfigManager.GetInt("TX_REPLAY_REFRESH_HEIGHT_WINDOW", 512))
+		if s.replayRefreshHeightWindow == 0 {
+			s.replayRefreshHeightWindow = 512
+		}
+		s.replayRefreshMaxHeightsTick = cfg.ConfigManager.GetInt("TX_REPLAY_REFRESH_MAX_HEIGHTS_PER_TICK", 32)
+		if s.replayRefreshMaxHeightsTick <= 0 {
+			s.replayRefreshMaxHeightsTick = 32
+		}
+		if log != nil {
+			log.Info("Configured persistence writer mode",
+				utils.ZapBool("persist_writer_proposer_only", s.persistCommitProposerOnly),
+				utils.ZapBool("persist_backfill_enabled", s.persistBackfillEnabled),
+				utils.ZapDuration("persist_backfill_stale_after", s.persistBackfillStaleAfter),
+				utils.ZapDuration("persist_backfill_poll_interval", s.persistBackfillPollInterval),
+				utils.ZapUint64("persist_backfill_lag_threshold", s.persistBackfillLagThreshold),
+				utils.ZapInt("persist_backfill_max_per_cycle", s.persistBackfillMaxPerCycle),
+				utils.ZapInt("persist_backfill_pending_max", s.persistBackfillPendingMax),
+				utils.ZapBool("tx_replay_filter_enabled", s.replayFilterEnabled),
+				utils.ZapDuration("tx_replay_filter_ttl", s.replayFilterTTL),
+				utils.ZapInt("tx_replay_filter_max", s.replayFilterMax),
+				utils.ZapBool("tx_replay_refresh_enabled", s.replayRefreshEnabled),
+				utils.ZapBool("tx_replay_refresh_leader_only", s.replayRefreshLeaderOnly),
+				utils.ZapDuration("tx_replay_refresh_interval", s.replayRefreshInterval),
+				utils.ZapUint64("tx_replay_refresh_height_window", s.replayRefreshHeightWindow),
+				utils.ZapInt("tx_replay_refresh_max_heights_per_tick", s.replayRefreshMaxHeightsTick))
 		}
 	}
 
@@ -334,30 +526,33 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 						}
 
 						outboxCfg := policyoutbox.Config{
-							Enabled:          true,
-							LeaseKey:         strings.TrimSpace(cfg.ConfigManager.GetString("CONTROL_POLICY_OUTBOX_LEASE_KEY", "control.policy.dispatcher")),
-							PolicyTopic:      cfg.KafkaProducerCfg.Topics.Policy,
-							LeaseTTL:         cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_LEASE_TTL", 10*time.Second),
-							ReclaimAfter:     cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_RECLAIM_AFTER", 30*time.Second),
-							PollInterval:     cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_POLL_INTERVAL", 500*time.Millisecond),
-							DrainMaxDuration: cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_DRAIN_MAX_DURATION", 2*time.Second),
-							BatchSize:        cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_BATCH_SIZE", 100),
-							BatchSizeMin:     cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_BATCH_SIZE_MIN", 25),
-							BatchSizeMax:     cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_BATCH_SIZE_MAX", 400),
-							AdaptiveBatch:    cfg.ConfigManager.GetBool("CONTROL_POLICY_OUTBOX_ADAPTIVE_BATCH", true),
-							MaxInFlight:      cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_MAX_IN_FLIGHT", 8),
-							MarkWorkers:      cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_MARK_WORKERS", 4),
-							InternalQueue:    cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_INTERNAL_QUEUE_SIZE", 256),
-							DrainMaxBatches:  cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_DRAIN_BATCHES", 4),
-							MaxRetries:       cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_MAX_RETRIES", 8),
-							RetryInitialBack: cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_RETRY_INITIAL", 250*time.Millisecond),
-							RetryMaxBack:     cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_RETRY_MAX", 30*time.Second),
-							RetryJitterRatio: cfg.ConfigManager.GetFloat64("CONTROL_POLICY_OUTBOX_RETRY_JITTER_RATIO", 0.2),
-							LogThrottle:      cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_LOG_THROTTLE", 5*time.Second),
+							Enabled:             true,
+							LeaseKey:            strings.TrimSpace(cfg.ConfigManager.GetString("CONTROL_POLICY_OUTBOX_LEASE_KEY", "control.policy.dispatcher")),
+							PolicyTopic:         cfg.KafkaProducerCfg.Topics.Policy,
+							ScopeRoutingEnabled: cfg.ConfigManager.GetBool("CONTROL_POLICY_SCOPE_ROUTING_ENABLED", false),
+							ClusterShardingMode: strings.ToLower(strings.TrimSpace(cfg.ConfigManager.GetString("CONTROL_POLICY_CLUSTER_SHARDING_MODE", "off"))),
+							ClusterShardBuckets: cfg.ConfigManager.GetInt("CONTROL_POLICY_CLUSTER_SHARD_BUCKETS", 1),
+							LeaseTTL:            cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_LEASE_TTL", 10*time.Second),
+							ReclaimAfter:        cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_RECLAIM_AFTER", 30*time.Second),
+							PollInterval:        cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_POLL_INTERVAL", 500*time.Millisecond),
+							DrainMaxDuration:    cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_DRAIN_MAX_DURATION", 2*time.Second),
+							BatchSize:           cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_BATCH_SIZE", 100),
+							BatchSizeMin:        cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_BATCH_SIZE_MIN", 25),
+							BatchSizeMax:        cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_BATCH_SIZE_MAX", 400),
+							AdaptiveBatch:       cfg.ConfigManager.GetBool("CONTROL_POLICY_OUTBOX_ADAPTIVE_BATCH", true),
+							MaxInFlight:         cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_MAX_IN_FLIGHT", 8),
+							MarkWorkers:         cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_MARK_WORKERS", 4),
+							InternalQueue:       cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_INTERNAL_QUEUE_SIZE", 256),
+							DrainMaxBatches:     cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_DRAIN_BATCHES", 4),
+							MaxRetries:          cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_MAX_RETRIES", 8),
+							RetryInitialBack:    cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_RETRY_INITIAL", 250*time.Millisecond),
+							RetryMaxBack:        cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_RETRY_MAX", 30*time.Second),
+							RetryJitterRatio:    cfg.ConfigManager.GetFloat64("CONTROL_POLICY_OUTBOX_RETRY_JITTER_RATIO", 0.2),
+							LogThrottle:         cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_LOG_THROTTLE", 5*time.Second),
 						}
 
 						holderID := strings.TrimSpace(cfg.ConfigManager.GetString("NODE_ID", "backend-node"))
-						dispatcher, err := policyoutbox.NewDispatcher(outboxCfg, outboxStore, pp, log, cfg.AuditLogger, holderID)
+						dispatcher, err := policyoutbox.NewDispatcher(outboxCfg, outboxStore, pp, log, cfg.AuditLogger, holderID, s.policyTraceCollector)
 						if err != nil {
 							kafkaProducer.Close()
 							return nil, fmt.Errorf("failed to initialize policy outbox dispatcher: %w", err)
@@ -408,6 +603,10 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 			return nil, fmt.Errorf("failed to create persistence worker: %w", err)
 		}
 		s.persistWorker = worker
+		if eng != nil {
+			status := eng.GetStatus()
+			s.persistWorker.SetWriterPolicy(s.persistCommitProposerOnly, status.NodeID)
+		}
 		// Wire persistence into consensus engine now that worker exists
 		if eng != nil {
 			eng.AttachPersistence(worker)
@@ -435,7 +634,18 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 			}
 			return nil, fmt.Errorf("failed to create Kafka consumer: %w", err)
 		}
+		kafkaConsumer.SetTraceCollector(s.policyTraceCollector)
+		kafkaConsumer.SetPreAdmitHook(func(topic string, tx state.Transaction) error {
+			if s.shouldRejectReplayOnAdmit(tx, time.Now()) {
+				return kafka.ErrReplayRejected
+			}
+			return nil
+		})
 		s.kafkaConsumer = kafkaConsumer
+		s.kafkaConsumer.SetPostAdmitHook(func(topic string, _ state.Transaction) {
+			// Wake proposer promptly after new mempool admissions.
+			s.notifyProposeTrigger("kafka_admit")
+		})
 
 		// Best-effort topic validation: warn if topics missing or have no partitions
 		if len(cfg.KafkaConsumerCfg.Topics) > 0 {
@@ -556,12 +766,13 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 			}
 
 			ac, err := policyack.New(context.Background(), cg, policyack.Options{
-				Config: ackCfg,
-				Store:  store,
-				Trust:  trust,
-				Logger: log,
-				Audit:  cfg.AuditLogger,
-				DLQ:    dlq,
+				Config:         ackCfg,
+				Store:          store,
+				Trust:          trust,
+				Logger:         log,
+				Audit:          cfg.AuditLogger,
+				DLQ:            dlq,
+				TraceCollector: s.policyTraceCollector,
 			})
 			if err != nil {
 				if dlq != nil {
@@ -601,6 +812,7 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 			KafkaProd:     s.kafkaProducer,
 			KafkaCons:     s.kafkaConsumer,
 			OutboxStats:   s,
+			TraceStats:    s,
 			NodeAliases:   cfg.APIConfig.NodeAliasMap,
 			NodeAliasList: cfg.APIConfig.NodeAliasList,
 		}
@@ -676,6 +888,7 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 		s.eng.SetPeerObserver(cfg.P2PRouter)
 	}
 
+	initOK = true
 	return s, nil
 }
 
@@ -770,6 +983,8 @@ func (s *Service) Start(ctx context.Context) error {
 
 	// Proposer loop
 	go s.runProposer(ctx)
+	go s.runPersistenceBackfill(ctx)
+	go s.runReplayFilterRefresh(ctx)
 
 	return nil
 }
@@ -779,6 +994,10 @@ func (s *Service) Stop() {
 
 	// Signal stop to all goroutines
 	close(s.stopCh)
+	if s.applyBlockObserverCleanup != nil {
+		s.applyBlockObserverCleanup()
+		s.applyBlockObserverCleanup = nil
+	}
 
 	// Stop API server first (stop accepting new requests)
 	if s.apiServer != nil {
@@ -884,9 +1103,66 @@ func (s *Service) GetCommitPathStats() (apiserver.CommitPathStats, bool) {
 	if s == nil {
 		return apiserver.CommitPathStats{}, false
 	}
+	metricsSnap := s.metrics.GetSnapshot()
+	s.persistBackfillMu.RLock()
+	backfillPending := len(s.persistBackfillPending)
+	s.persistBackfillMu.RUnlock()
+	if s.persistWorker != nil {
+		pExec, npExec, droppedExec := s.persistWorker.GetExecutionStats()
+		atomic.StoreUint64(&s.persistExecuteProposer, pExec)
+		atomic.StoreUint64(&s.persistExecuteNonProposer, npExec)
+		atomic.StoreUint64(&s.persistExecuteDroppedNonOwner, droppedExec)
+	}
 	return apiserver.CommitPathStats{
-		LogSampleEvery: s.commitLogEveryN,
-		LogsSuppressed: atomic.LoadUint64(&s.commitLogsSuppressed),
+		LogSampleEvery:                    s.commitLogEveryN,
+		LogsSuppressed:                    atomic.LoadUint64(&s.commitLogsSuppressed),
+		BackfillPending:                   uint64(backfillPending),
+		BackfillDropped:                   atomic.LoadUint64(&s.persistBackfillDropped),
+		ReplayRejectedAdmit:               atomic.LoadUint64(&s.replayRejectedAdmit),
+		ReplayRejectedBuild:               atomic.LoadUint64(&s.replayRejectedBuild),
+		ReplayFilterSize:                  uint64(s.replayFilterSize()),
+		ReplayFilterEvictions:             atomic.LoadUint64(&s.replayFilterEvictions),
+		PersistEnqueueCommitProposer:      atomic.LoadUint64(&s.persistEnqueueCommitProposer),
+		PersistEnqueueCommitNonProposer:   atomic.LoadUint64(&s.persistEnqueueCommitNonProposer),
+		PersistEnqueueBackfillProposer:    atomic.LoadUint64(&s.persistEnqueueBackfillProposer),
+		PersistEnqueueBackfillNonProposer: atomic.LoadUint64(&s.persistEnqueueBackfillNonProposer),
+		PersistEnqueueDroppedNonProposer:  atomic.LoadUint64(&s.persistEnqueueDroppedNonProposer),
+		PersistEnqueueErrors:              atomic.LoadUint64(&s.persistEnqueueErrors),
+		PersistExecuteProposer:            atomic.LoadUint64(&s.persistExecuteProposer),
+		PersistExecuteNonProposer:         atomic.LoadUint64(&s.persistExecuteNonProposer),
+		PersistExecuteDroppedNonOwner:     atomic.LoadUint64(&s.persistExecuteDroppedNonOwner),
+		ApplyBlockRuns:                    metricsSnap.ApplyBlockRuns,
+		ApplyBlockEventTxs:                metricsSnap.ApplyBlockEventTxs,
+		ApplyBlockEvidenceTxs:             metricsSnap.ApplyBlockEvidenceTxs,
+		ApplyBlockPolicyTxs:               metricsSnap.ApplyBlockPolicyTxs,
+		ApplyBlockTotalBuckets:            metricsSnap.ApplyBlockTotalBuckets,
+		ApplyBlockTotalCount:              metricsSnap.ApplyBlockTotalCount,
+		ApplyBlockTotalSumMs:              metricsSnap.ApplyBlockTotalSumMs,
+		ApplyBlockTotalP95Ms:              metricsSnap.ApplyBlockTotalP95Ms,
+		ApplyBlockValidateBuckets:         metricsSnap.ApplyBlockValidateBuckets,
+		ApplyBlockValidateCount:           metricsSnap.ApplyBlockValidateCount,
+		ApplyBlockValidateSumMs:           metricsSnap.ApplyBlockValidateSumMs,
+		ApplyBlockValidateP95Ms:           metricsSnap.ApplyBlockValidateP95Ms,
+		ApplyBlockNonceCheckBuckets:       metricsSnap.ApplyBlockNonceCheckBuckets,
+		ApplyBlockNonceCheckCount:         metricsSnap.ApplyBlockNonceCheckCount,
+		ApplyBlockNonceCheckSumMs:         metricsSnap.ApplyBlockNonceCheckSumMs,
+		ApplyBlockNonceCheckP95Ms:         metricsSnap.ApplyBlockNonceCheckP95Ms,
+		ApplyBlockReducerEventBuckets:     metricsSnap.ApplyBlockReducerEventBuckets,
+		ApplyBlockReducerEventCount:       metricsSnap.ApplyBlockReducerEventCount,
+		ApplyBlockReducerEventSumMs:       metricsSnap.ApplyBlockReducerEventSumMs,
+		ApplyBlockReducerEventP95Ms:       metricsSnap.ApplyBlockReducerEventP95Ms,
+		ApplyBlockReducerEvidenceBuckets:  metricsSnap.ApplyBlockReducerEvidenceBuckets,
+		ApplyBlockReducerEvidenceCount:    metricsSnap.ApplyBlockReducerEvidenceCount,
+		ApplyBlockReducerEvidenceSumMs:    metricsSnap.ApplyBlockReducerEvidenceSumMs,
+		ApplyBlockReducerEvidenceP95Ms:    metricsSnap.ApplyBlockReducerEvidenceP95Ms,
+		ApplyBlockReducerPolicyBuckets:    metricsSnap.ApplyBlockReducerPolicyBuckets,
+		ApplyBlockReducerPolicyCount:      metricsSnap.ApplyBlockReducerPolicyCount,
+		ApplyBlockReducerPolicySumMs:      metricsSnap.ApplyBlockReducerPolicySumMs,
+		ApplyBlockReducerPolicyP95Ms:      metricsSnap.ApplyBlockReducerPolicyP95Ms,
+		ApplyBlockCommitStateBuckets:      metricsSnap.ApplyBlockCommitStateBuckets,
+		ApplyBlockCommitStateCount:        metricsSnap.ApplyBlockCommitStateCount,
+		ApplyBlockCommitStateSumMs:        metricsSnap.ApplyBlockCommitStateSumMs,
+		ApplyBlockCommitStateP95Ms:        metricsSnap.ApplyBlockCommitStateP95Ms,
 	}, true
 }
 
@@ -923,16 +1199,39 @@ func (s *Service) GetPolicyAckCausalStats() (apiserver.PolicyAckCausalStats, boo
 	}
 	stats := cons.CausalStats()
 	return apiserver.PolicyAckCausalStats{
-		SkewCorrectionsTotal: stats.SkewCorrectionsTotal,
-		AIToAckBuckets:       stats.AIToAckBuckets,
-		AIToAckCount:         stats.AIToAckCount,
-		AIToAckSumMs:         stats.AIToAckSumMs,
-		AIToAckP95Ms:         stats.AIToAckP95Ms,
-		PublishToAckBuckets:  stats.PublishToAckBuckets,
-		PublishToAckCount:    stats.PublishToAckCount,
-		PublishToAckSumMs:    stats.PublishToAckSumMs,
-		PublishToAckP95Ms:    stats.PublishToAckP95Ms,
+		SkewCorrectionsTotal:       stats.SkewCorrectionsTotal,
+		CorrelationExact:           stats.CorrelationExact,
+		CorrelationFallbackHash:    stats.CorrelationFallbackHash,
+		CorrelationFallbackTrace:   stats.CorrelationFallbackTrace,
+		CorrelationNoMatch:         stats.CorrelationNoMatch,
+		CorrelationErrors:          stats.CorrelationErrors,
+		AIEventUnitCorrections:     stats.AIEventUnitCorrections,
+		AIEventInvalidTotal:        stats.AIEventInvalidTotal,
+		SourceEventUnitCorrections: stats.SourceEventUnitCorrections,
+		SourceEventInvalidTotal:    stats.SourceEventInvalidTotal,
+		AIToAckBuckets:             stats.AIToAckBuckets,
+		AIToAckCount:               stats.AIToAckCount,
+		AIToAckSumMs:               stats.AIToAckSumMs,
+		AIToAckP95Ms:               stats.AIToAckP95Ms,
+		SourceToAckBuckets:         stats.SourceToAckBuckets,
+		SourceToAckCount:           stats.SourceToAckCount,
+		SourceToAckSumMs:           stats.SourceToAckSumMs,
+		SourceToAckP95Ms:           stats.SourceToAckP95Ms,
+		PublishToAckBuckets:        stats.PublishToAckBuckets,
+		PublishToAckCount:          stats.PublishToAckCount,
+		PublishToAckSumMs:          stats.PublishToAckSumMs,
+		PublishToAckP95Ms:          stats.PublishToAckP95Ms,
 	}, true
+}
+
+func (s *Service) GetPolicyRuntimeTrace(policyID string) []policytrace.Marker {
+	s.mu.Lock()
+	collector := s.policyTraceCollector
+	s.mu.Unlock()
+	if collector == nil {
+		return nil
+	}
+	return collector.GetPolicy(policyID)
 }
 
 func (s *Service) shouldLogCommitInfo() bool {

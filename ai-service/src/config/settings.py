@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass, field
+from typing import Dict
 from .security import SecurityConfig, load_security_config
 from .kafka import (
     KafkaTopicsConfig,
@@ -116,6 +117,7 @@ class PolicyPublishingConfig:
 
     enabled: bool = False
     severity_threshold: int = 8
+    severity_threshold_overrides: dict[str, int] = field(default_factory=dict)
     confidence_threshold: float = 0.9
     ttl_seconds: int = 900
     scope: str = "cluster"  # cluster|namespace|node
@@ -134,6 +136,13 @@ class PolicyPublishingConfig:
     def validate(self):
         if not (1 <= self.severity_threshold <= 10):
             raise ValueError("severity_threshold must be between 1 and 10")
+        for anomaly_type, threshold in self.severity_threshold_overrides.items():
+            if not anomaly_type or not isinstance(anomaly_type, str):
+                raise ValueError("severity_threshold_overrides keys must be non-empty strings")
+            if not (1 <= int(threshold) <= 10):
+                raise ValueError(
+                    f"severity_threshold_overrides[{anomaly_type}] must be between 1 and 10"
+                )
         if not (0.0 <= self.confidence_threshold <= 1.0):
             raise ValueError("confidence_threshold must be within [0, 1]")
         if self.ttl_seconds <= 0:
@@ -343,6 +352,7 @@ class Settings:
 
     # Policy publishing
     policy_publishing: PolicyPublishingConfig = field(default_factory=PolicyPublishingConfig)
+    sentinel_validator_ip_map: Dict[str, str] = field(default_factory=dict)
     
     
 # Legacy Settings class (keep for backward compatibility during migration)

@@ -2,11 +2,39 @@ package wiring
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
+	"sync/atomic"
 	"time"
 
+	"backend/pkg/block"
+	"backend/pkg/control/policytrace"
+	"backend/pkg/state"
 	"backend/pkg/utils"
+	"go.uber.org/zap"
 )
+
+func effectiveProposalCooldown(
+	base time.Duration,
+	backlogFast time.Duration,
+	policyFast time.Duration,
+	txCount int,
+	backlogThreshold int,
+	hasPolicy bool,
+) time.Duration {
+	effective := base
+	if effective <= 0 {
+		return effective
+	}
+	if backlogFast > 0 && txCount >= backlogThreshold && backlogThreshold > 0 && backlogFast < effective {
+		effective = backlogFast
+	}
+	if policyFast > 0 && hasPolicy && policyFast < effective {
+		effective = policyFast
+	}
+	return effective
+}
 
 func (s *Service) runProposer(ctx context.Context) {
 	defer func() {
@@ -29,8 +57,26 @@ func (s *Service) runProposer(ctx context.Context) {
 			return
 		case <-s.stopCh:
 			return
+		case <-s.proposeTriggerCh:
+			s.tryPropose(ctx)
 		case <-t.C:
 			s.tryPropose(ctx)
+		}
+	}
+}
+
+func (s *Service) notifyProposeTrigger(source string) {
+	if s == nil || s.proposeTriggerCh == nil {
+		return
+	}
+	select {
+	case s.proposeTriggerCh <- struct{}{}:
+	default:
+		dropped := atomic.AddUint64(&s.proposeTriggerDropped, 1)
+		if s.log != nil && s.proposeTriggerLogEvery > 0 && dropped%s.proposeTriggerLogEvery == 0 {
+			s.log.Debug("proposer trigger dropped (channel full)",
+				utils.ZapString("source", source),
+				utils.ZapUint64("dropped", dropped))
 		}
 	}
 }
@@ -69,11 +115,22 @@ func (s *Service) tryPropose(ctx context.Context) {
 		return
 	}
 
+	txCount, _ := s.mp.Stats()
+	hasPolicy := s.mp.HasPolicyTx()
+
 	s.mu.Lock()
 	lastView := s.lastProposedView
 	lastHeight := s.lastProposedHeight
 	lastTime := s.lastProposalTime
 	s.mu.Unlock()
+	effectiveCooldown := effectiveProposalCooldown(
+		cooldownWindow,
+		s.backlogCooldown,
+		s.policyFastCooldown,
+		txCount,
+		s.backlogTxThreshold,
+		hasPolicy,
+	)
 
 	s.log.DebugContext(ctx, "tryPropose state",
 		utils.ZapUint64("current_view", currentView),
@@ -81,23 +138,30 @@ func (s *Service) tryPropose(ctx context.Context) {
 		utils.ZapUint64("last_view", lastView),
 		utils.ZapUint64("last_height", lastHeight),
 		utils.ZapDuration("block_timeout", blockTimeout),
+		utils.ZapDuration("effective_cooldown", effectiveCooldown),
+		utils.ZapInt("mempool_txs", txCount),
+		utils.ZapBool("has_policy_tx", hasPolicy),
 		utils.ZapTime("last_proposal_time", lastTime))
 
 	if lastView == currentView && !lastTime.IsZero() {
 		elapsed := time.Since(lastTime)
-		if elapsed < cooldownWindow {
-			cooldown := cooldownWindow - elapsed
+		if elapsed < effectiveCooldown {
+			cooldown := effectiveCooldown - elapsed
 			if isLeader, err := s.eng.IsLeader(ctx); err == nil && isLeader {
 				s.log.DebugContext(ctx, "skipping proposal: leader cooldown active",
 					utils.ZapUint64("view", currentView),
 					utils.ZapUint64("height", currentHeight),
 					utils.ZapUint64("last_height", lastHeight),
+					utils.ZapDuration("configured_cooldown", cooldownWindow),
+					utils.ZapDuration("effective_cooldown", effectiveCooldown),
 					utils.ZapDuration("cooldown_remaining", cooldown))
 			} else {
 				s.log.DebugContext(ctx, "skipping proposal: cooldown active",
 					utils.ZapUint64("view", currentView),
 					utils.ZapUint64("height", currentHeight),
 					utils.ZapUint64("last_height", lastHeight),
+					utils.ZapDuration("configured_cooldown", cooldownWindow),
+					utils.ZapDuration("effective_cooldown", effectiveCooldown),
 					utils.ZapDuration("cooldown_remaining", cooldown),
 					utils.ZapBool("leader_status_unknown", err != nil))
 			}
@@ -256,14 +320,29 @@ func (s *Service) tryPropose(ctx context.Context) {
 	s.log.InfoContext(ctx, "[PROPOSER] building block",
 		utils.ZapUint64("height", height),
 		utils.ZapString("parent_hash", fmt.Sprintf("%x", parent[:8])))
-	blk := s.builder.Build(height, parent, s.eng.GetStatus().NodeID, time.Now())
+	exclusions := s.snapshotProposedTxExclusions(time.Now())
+	blk := s.builder.BuildWithExclusions(height, parent, s.eng.GetStatus().NodeID, time.Now(), exclusions)
 	if blk == nil || blk.GetTransactionCount() == 0 {
-		s.log.InfoContext(ctx, "[PROPOSER] block builder returned nil or empty - skipping")
+		s.log.InfoContext(ctx, "[PROPOSER] block builder returned nil or empty - skipping",
+			utils.ZapInt("excluded_tx_count", len(exclusions)))
+		return
+	}
+	blk, replayRejected := s.filterCommittedTxFromBlock(blk, time.Now())
+	if replayRejected > 0 {
+		s.log.InfoContext(ctx, "[PROPOSER] replay filter removed already-committed txs from proposal",
+			utils.ZapInt("removed", replayRejected),
+			utils.ZapUint64("height", height))
+	}
+	if blk == nil || blk.GetTransactionCount() == 0 {
+		s.log.InfoContext(ctx, "[PROPOSER] replay-filtered block is empty - skipping",
+			utils.ZapInt("removed", replayRejected),
+			utils.ZapUint64("height", height))
 		return
 	}
 
 	s.log.InfoContext(ctx, "[PROPOSER] block built successfully",
 		utils.ZapInt("tx_count", blk.GetTransactionCount()))
+	s.logPolicyStageForBlock("t_leader_selected", blk, currentView, height, 0)
 
 	// Submit block with retry
 	s.metrics.IncrementProposalsAttempted()
@@ -278,6 +357,7 @@ func (s *Service) tryPropose(ctx context.Context) {
 	s.log.InfoContext(ctx, "[PROPOSER] submitting block to consensus engine",
 		utils.ZapUint64("height", height),
 		utils.ZapInt("tx_count", blk.GetTransactionCount()))
+	s.logPolicyStageForBlock("t_propose_start", blk, currentView, height, 0)
 	const maxRetries = 3
 	backoff := 50 * time.Millisecond
 	for attempt := 0; attempt < maxRetries; attempt++ {
@@ -301,9 +381,11 @@ func (s *Service) tryPropose(ctx context.Context) {
 		}
 		// Success
 		now := time.Now()
+		s.logPolicyStageForBlock("t_proposal_broadcast", blk, currentView, height, 0)
 		s.log.InfoContext(ctx, "[PROPOSER] block submission SUCCESS",
 			utils.ZapUint64("height", height),
 			utils.ZapDuration("elapsed", now.Sub(start)))
+		s.recordProposedTxHold(blk, now)
 		s.mu.Lock()
 		// Update last proposal metadata with the success timestamp only; committed parent updates happen in onCommit.
 		s.lastProposalTime = now
@@ -314,5 +396,149 @@ func (s *Service) tryPropose(ctx context.Context) {
 			utils.ZapUint64("height", height),
 			utils.ZapInt("tx_count", blk.GetTransactionCount()))
 		return
+	}
+}
+
+func (s *Service) logPolicyStageForBlock(stage string, blk *block.AppBlock, view uint64, height uint64, qcTsMs int64) {
+	if s == nil || s.log == nil || blk == nil {
+		return
+	}
+	nowMs := time.Now().UnixMilli()
+	stageTsMs := nowMs
+	if stage == "t_qc_formed" && qcTsMs > 0 {
+		stageTsMs = qcTsMs
+	}
+	for _, tx := range blk.Transactions() {
+		if tx == nil || tx.Type() != state.TxPolicy {
+			continue
+		}
+		policyID, traceID := extractPolicyIdentityFromPayload(tx.Payload())
+		if policyID == "" {
+			continue
+		}
+		zf := []zap.Field{
+			utils.ZapString("stage", stage),
+			utils.ZapString("policy_id", policyID),
+			utils.ZapString("trace_id", traceID),
+			utils.ZapInt64("t_ms", stageTsMs),
+			utils.ZapUint64("height", height),
+			utils.ZapUint64("view", view),
+		}
+		if qcTsMs > 0 {
+			zf = append(zf, utils.ZapInt64("qc_ts_ms", qcTsMs))
+		}
+		s.log.Info("policy stage marker", zf...)
+		if s.policyTraceCollector != nil {
+			s.policyTraceCollector.Record(policytrace.Marker{
+				Stage:       stage,
+				PolicyID:    policyID,
+				TraceID:     traceID,
+				TimestampMs: stageTsMs,
+				Height:      height,
+				View:        view,
+				QCTsMs:      qcTsMs,
+			})
+		}
+	}
+}
+
+func extractPolicyIdentityFromPayload(payload []byte) (string, string) {
+	if len(payload) == 0 {
+		return "", ""
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(payload, &root); err != nil {
+		return "", ""
+	}
+	policyID := strings.TrimSpace(stringFromMap(root, "policy_id"))
+	traceID := strings.TrimSpace(stringFromMap(root, "trace_id"))
+	if traceID == "" {
+		if metadata, ok := root["metadata"].(map[string]interface{}); ok {
+			traceID = strings.TrimSpace(stringFromMap(metadata, "trace_id"))
+		}
+	}
+	if traceID == "" {
+		if trace, ok := root["trace"].(map[string]interface{}); ok {
+			traceID = strings.TrimSpace(stringFromMap(trace, "id"))
+		}
+	}
+	if wrapped, ok := root["params"].(map[string]interface{}); ok {
+		if policyID == "" {
+			policyID = strings.TrimSpace(stringFromMap(wrapped, "policy_id"))
+		}
+		if traceID == "" {
+			traceID = strings.TrimSpace(stringFromMap(wrapped, "trace_id"))
+		}
+		if traceID == "" {
+			if metadata, ok := wrapped["metadata"].(map[string]interface{}); ok {
+				traceID = strings.TrimSpace(stringFromMap(metadata, "trace_id"))
+			}
+		}
+		if traceID == "" {
+			if trace, ok := wrapped["trace"].(map[string]interface{}); ok {
+				traceID = strings.TrimSpace(stringFromMap(trace, "id"))
+			}
+		}
+	}
+	return policyID, traceID
+}
+
+func stringFromMap(m map[string]interface{}, key string) string {
+	if m == nil {
+		return ""
+	}
+	if s, ok := m[key].(string); ok {
+		return s
+	}
+	return ""
+}
+
+func (s *Service) snapshotProposedTxExclusions(now time.Time) map[[32]byte]struct{} {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.proposedTxHold) == 0 {
+		return nil
+	}
+	for hash, until := range s.proposedTxHold {
+		if now.After(until) {
+			delete(s.proposedTxHold, hash)
+		}
+	}
+	if len(s.proposedTxHold) == 0 {
+		return nil
+	}
+	out := make(map[[32]byte]struct{}, len(s.proposedTxHold))
+	for hash := range s.proposedTxHold {
+		out[hash] = struct{}{}
+	}
+	return out
+}
+
+func (s *Service) recordProposedTxHold(blk *block.AppBlock, now time.Time) {
+	if s == nil || blk == nil || s.proposalTxHoldDuration <= 0 {
+		return
+	}
+	until := now.Add(s.proposalTxHoldDuration)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, tx := range blk.Transactions() {
+		if tx == nil || tx.Envelope() == nil {
+			continue
+		}
+		s.proposedTxHold[tx.Envelope().ContentHash] = until
+	}
+}
+
+func (s *Service) clearProposedTxHold(hashes ...[32]byte) {
+	if s == nil || len(hashes) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, hash := range hashes {
+		delete(s.proposedTxHold, hash)
 	}
 }

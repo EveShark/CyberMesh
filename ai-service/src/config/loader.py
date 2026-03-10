@@ -5,6 +5,7 @@ Loads and validates all configuration from environment variables.
 Security-first: Fail fast on missing/invalid config in production.
 """
 import os
+import ipaddress
 from pathlib import Path
 from typing import Optional
 from .settings import Settings
@@ -103,6 +104,7 @@ def load_settings(env_file: Optional[str] = None) -> Settings:
         detection_interval=max(0.05, _get_float_env("DETECTION_INTERVAL", 5.0)),
         min_confidence=_get_float_env("MIN_CONFIDENCE", 0.85),
         policy_publishing=policy_publishing,
+        sentinel_validator_ip_map=_load_sentinel_validator_ip_map(),
     )
     
     # Final validation
@@ -242,6 +244,7 @@ def _load_policy_publishing() -> "PolicyPublishingConfig":
     config = PolicyPublishingConfig(
         enabled=_get_bool_env("POLICY_PUBLISHING_ENABLED", False),
         severity_threshold=_get_int_env("POLICY_PUBLISHING_SEVERITY_THRESHOLD", 8),
+        severity_threshold_overrides=_load_policy_severity_overrides(),
         confidence_threshold=_get_float_env("POLICY_PUBLISHING_CONFIDENCE_THRESHOLD", 0.9),
         ttl_seconds=_get_int_env("POLICY_PUBLISHING_TTL_SECONDS", 15 * 60),
         scope=_get_env("POLICY_PUBLISHING_SCOPE", "cluster"),
@@ -257,8 +260,66 @@ def _load_policy_publishing() -> "PolicyPublishingConfig":
         cidr_max_prefix_len=_get_int_env("POLICY_PUBLISHING_CIDR_MAX_PREFIX", 24),
         max_targets=_get_int_env("POLICY_PUBLISHING_MAX_TARGETS", 32),
     )
-
     return config
+
+
+def _load_sentinel_validator_ip_map() -> dict[str, str]:
+    """Load optional validator identity mapping for Sentinel events.
+
+    Format:
+        SENTINEL_VALIDATOR_IP_MAP=10.0.0.5=validator-1,10.0.0.6=validator-2
+
+    Invalid entries are rejected eagerly to avoid ambiguous identity attribution.
+    """
+
+    raw = os.getenv("SENTINEL_VALIDATOR_IP_MAP", "").strip()
+    if not raw:
+        return {}
+
+    mapping: dict[str, str] = {}
+    for item in raw.split(","):
+        token = item.strip()
+        if not token:
+            continue
+        if "=" not in token:
+            raise ConfigError(
+                "Invalid SENTINEL_VALIDATOR_IP_MAP entry: expected ip=validator_id"
+            )
+        ip_raw, validator_raw = token.split("=", 1)
+        ip_value = ip_raw.strip()
+        validator_id = validator_raw.strip()
+        if not validator_id:
+            raise ConfigError(
+                "Invalid SENTINEL_VALIDATOR_IP_MAP entry: validator_id must be non-empty"
+            )
+        try:
+            normalized_ip = str(ipaddress.ip_address(ip_value))
+        except ValueError as exc:
+            raise ConfigError(
+                f"Invalid SENTINEL_VALIDATOR_IP_MAP IP address: {ip_value}"
+            ) from exc
+        mapping[normalized_ip] = validator_id
+    return mapping
+
+
+def _load_policy_severity_overrides() -> dict[str, int]:
+    """Load per-anomaly severity threshold overrides from environment."""
+    prefix = "POLICY_PUBLISHING_SEVERITY_THRESHOLD_"
+    overrides: dict[str, int] = {}
+    for key, raw in os.environ.items():
+        if not key.startswith(prefix):
+            continue
+        anomaly_key = key[len(prefix):].strip().lower().replace("-", "_")
+        if not anomaly_key:
+            continue
+        try:
+            threshold = int(raw)
+        except ValueError as exc:
+            raise ConfigError(f"Invalid integer value for {key}: {raw}") from exc
+        if threshold < 1 or threshold > 10:
+            raise ConfigError(f"{key} out of range: {threshold} (expected 1..10)")
+        overrides[anomaly_key] = threshold
+    return overrides
 
 
 def _validate_key_path(path: str, is_production: bool):

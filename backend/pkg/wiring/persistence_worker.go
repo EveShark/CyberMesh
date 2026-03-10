@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"backend/pkg/block"
+	ctypes "backend/pkg/consensus/types"
 	"backend/pkg/ingest/kafka"
 	"backend/pkg/state"
 	"backend/pkg/storage/cockroach"
@@ -24,6 +27,11 @@ type PersistenceTask struct {
 	Receipts  []state.Receipt
 	StateRoot [32]byte
 	Attempt   int
+}
+
+type persistenceTaskKey struct {
+	Height uint64
+	Hash   [32]byte
 }
 
 // PersistenceSuccessCallback is called after successful block persistence
@@ -53,14 +61,25 @@ type PersistenceWorker struct {
 		Security(event string, fields map[string]interface{}) error
 	}
 
-	queue      chan *PersistenceTask
-	stopCh     chan struct{}
-	wg         sync.WaitGroup
-	mu         sync.RWMutex
-	running    bool
-	taskCount  uint64                     // Total tasks received
-	errorCount uint64                     // Total errors
-	onSuccess  PersistenceSuccessCallback // Callback after successful persistence
+	queue           chan *PersistenceTask
+	stopCh          chan struct{}
+	wg              sync.WaitGroup
+	mu              sync.RWMutex
+	running         bool
+	taskCount       uint64                     // Total tasks received
+	errorCount      uint64                     // Total errors
+	deduped         uint64                     // Duplicate enqueue requests coalesced
+	onSuccess       PersistenceSuccessCallback // Callback after successful persistence
+	inflight        map[persistenceTaskKey]struct{}
+	enqueueInFlight atomic.Int64
+
+	writerMu                    sync.RWMutex
+	writerProposerOnly          bool
+	writerNodeID                ctypes.ValidatorID
+	writerPolicyConfigured      bool
+	executeProposer             atomic.Uint64
+	executeNonProposer          atomic.Uint64
+	executeDroppedNonOwnerTotal atomic.Uint64
 }
 
 // NewPersistenceWorker creates a new async persistence worker
@@ -103,6 +122,7 @@ func NewPersistenceWorker(cfg PersistenceWorkerConfig, adapter cockroach.Adapter
 		stopCh:      make(chan struct{}),
 		running:     false,
 		onSuccess:   cfg.OnSuccess, // Store callback
+		inflight:    make(map[persistenceTaskKey]struct{}),
 	}
 
 	return pw, nil
@@ -171,12 +191,23 @@ func (pw *PersistenceWorker) Stop() error {
 
 // Enqueue adds a persistence task to the queue (non-blocking with timeout)
 func (pw *PersistenceWorker) Enqueue(ctx context.Context, task *PersistenceTask) error {
-	pw.mu.RLock()
+	pw.mu.Lock()
 	if !pw.running {
-		pw.mu.RUnlock()
+		pw.mu.Unlock()
 		return errors.New("persistence: worker not running")
 	}
-	pw.mu.RUnlock()
+	key, hasKey := task.persistenceKey()
+	if hasKey {
+		if _, exists := pw.inflight[key]; exists {
+			pw.deduped++
+			pw.mu.Unlock()
+			return nil
+		}
+		pw.inflight[key] = struct{}{}
+	}
+	pw.enqueueInFlight.Add(1)
+	pw.mu.Unlock()
+	defer pw.enqueueInFlight.Add(-1)
 
 	// Try to enqueue with context timeout
 	select {
@@ -184,8 +215,14 @@ func (pw *PersistenceWorker) Enqueue(ctx context.Context, task *PersistenceTask)
 		pw.incrementTaskCount()
 		return nil
 	case <-ctx.Done():
+		if hasKey {
+			pw.releaseInflightKey(key)
+		}
 		return fmt.Errorf("persistence: enqueue timeout: %w", ctx.Err())
 	case <-pw.stopCh:
+		if hasKey {
+			pw.releaseInflightKey(key)
+		}
 		return errors.New("persistence: worker stopped")
 	}
 }
@@ -222,6 +259,10 @@ func (pw *PersistenceWorker) workerLoop(ctx context.Context, workerID int) {
 					pw.processTask(ctx, task)
 					drained++
 				default:
+					if pw.enqueueInFlight.Load() > 0 {
+						time.Sleep(1 * time.Millisecond)
+						continue
+					}
 					if pw.logger != nil {
 						pw.logger.InfoContext(ctx, "persistence worker drained queue",
 							utils.ZapInt("worker_id", workerID),
@@ -243,6 +284,33 @@ func (pw *PersistenceWorker) processTask(ctx context.Context, task *PersistenceT
 	if task == nil {
 		return
 	}
+	if key, ok := task.persistenceKey(); ok {
+		defer pw.releaseInflightKey(key)
+	}
+	allowed, role, reason := pw.shouldExecuteTask(task)
+	if !allowed {
+		pw.executeDroppedNonOwnerTotal.Add(1)
+		if pw.auditLogger != nil && task.Block != nil {
+			_ = pw.auditLogger.Security("persistence_worker_dropped_non_owner_task", map[string]interface{}{
+				"height": task.Block.GetHeight(),
+				"role":   role,
+				"reason": reason,
+			})
+		}
+		if pw.logger != nil && task.Block != nil {
+			pw.logger.WarnContext(ctx, "dropping persistence task due to writer ownership guard",
+				utils.ZapUint64("height", task.Block.GetHeight()),
+				utils.ZapString("role", role),
+				utils.ZapString("reason", reason))
+		}
+		return
+	}
+	switch role {
+	case "proposer":
+		pw.executeProposer.Add(1)
+	case "non_proposer":
+		pw.executeNonProposer.Add(1)
+	}
 
 	backoff := time.Duration(pw.cfg.RetryBackoffMS) * time.Millisecond
 	maxBackoff := time.Duration(pw.cfg.MaxBackoffMS) * time.Millisecond
@@ -250,6 +318,7 @@ func (pw *PersistenceWorker) processTask(ctx context.Context, task *PersistenceT
 	for attempt := task.Attempt; attempt < pw.cfg.RetryMax; attempt++ {
 		// Create timeout context for this attempt
 		attemptCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		attemptCtx = cockroach.WithPersistAttempt(attemptCtx, attempt+1)
 
 		err := pw.adapter.PersistBlock(attemptCtx, task.Block, task.Receipts, task.StateRoot)
 		cancel()
@@ -330,8 +399,8 @@ func (pw *PersistenceWorker) processTask(ctx context.Context, task *PersistenceT
 			return
 		}
 
-		// Check if error is integrity violation (fail-closed, no retry)
-		if errors.Is(err, cockroach.ErrIntegrityViolation) {
+		// Fail closed on deterministic integrity/data violations.
+		if errors.Is(err, cockroach.ErrIntegrityViolation) || errors.Is(err, cockroach.ErrInvalidData) {
 			pw.incrementErrorCount()
 			if pw.auditLogger != nil {
 				bh := task.Block.GetHash()
@@ -351,18 +420,36 @@ func (pw *PersistenceWorker) processTask(ctx context.Context, task *PersistenceT
 			return
 		}
 
+		// Retry only transient Cockroach/network errors.
+		if !cockroach.IsRetryable(err) {
+			pw.incrementErrorCount()
+			if pw.logger != nil {
+				pw.logger.ErrorContext(ctx, "non-retryable persistence failure",
+					utils.ZapError(err),
+					utils.ZapUint64("height", task.Block.GetHeight()),
+					utils.ZapInt("attempt", attempt+1))
+			}
+			return
+		}
+
 		// Transient error, retry with backoff
 		if attempt < pw.cfg.RetryMax-1 {
 			if pw.logger != nil {
+				retryDelay := withRetryJitter(backoff)
 				pw.logger.WarnContext(ctx, "persistence failed, retrying",
 					utils.ZapError(err),
 					utils.ZapUint64("height", task.Block.GetHeight()),
 					utils.ZapInt("attempt", attempt+1),
-					utils.ZapDuration("backoff", backoff))
+					utils.ZapDuration("backoff", retryDelay))
+				if !waitForRetry(ctx, pw.stopCh, retryDelay) {
+					return
+				}
+			} else {
+				retryDelay := withRetryJitter(backoff)
+				if !waitForRetry(ctx, pw.stopCh, retryDelay) {
+					return
+				}
 			}
-
-			// Sleep with backoff
-			time.Sleep(backoff)
 
 			// Exponential backoff
 			backoff *= 2
@@ -410,15 +497,98 @@ func (pw *PersistenceWorker) incrementErrorCount() {
 func (pw *PersistenceWorker) GetStats() map[string]interface{} {
 	pw.mu.RLock()
 	defer pw.mu.RUnlock()
+	pw.writerMu.RLock()
+	writerProposerOnly := pw.writerProposerOnly
+	writerPolicyConfigured := pw.writerPolicyConfigured
+	pw.writerMu.RUnlock()
 
 	return map[string]interface{}{
-		"running":     pw.running,
-		"queue_size":  len(pw.queue),
-		"queue_cap":   cap(pw.queue),
-		"task_count":  pw.taskCount,
-		"error_count": pw.errorCount,
-		"workers":     pw.cfg.WorkerCount,
+		"running":                     pw.running,
+		"queue_size":                  len(pw.queue),
+		"queue_cap":                   cap(pw.queue),
+		"task_count":                  pw.taskCount,
+		"error_count":                 pw.errorCount,
+		"deduped":                     pw.deduped,
+		"workers":                     pw.cfg.WorkerCount,
+		"execute_proposer":            pw.executeProposer.Load(),
+		"execute_non_proposer":        pw.executeNonProposer.Load(),
+		"execute_dropped_non_owner":   pw.executeDroppedNonOwnerTotal.Load(),
+		"writer_policy_proposer_only": writerProposerOnly,
+		"writer_policy_is_configured": writerPolicyConfigured,
 	}
+}
+
+func (pw *PersistenceWorker) SetWriterPolicy(proposerOnly bool, nodeID ctypes.ValidatorID) {
+	if pw == nil {
+		return
+	}
+	pw.writerMu.Lock()
+	pw.writerProposerOnly = proposerOnly
+	pw.writerNodeID = nodeID
+	pw.writerPolicyConfigured = true
+	pw.writerMu.Unlock()
+}
+
+func (pw *PersistenceWorker) GetExecutionStats() (uint64, uint64, uint64) {
+	if pw == nil {
+		return 0, 0, 0
+	}
+	return pw.executeProposer.Load(), pw.executeNonProposer.Load(), pw.executeDroppedNonOwnerTotal.Load()
+}
+
+func (pw *PersistenceWorker) shouldExecuteTask(task *PersistenceTask) (bool, string, string) {
+	if pw == nil || task == nil || task.Block == nil {
+		return false, "unknown", "invalid_task"
+	}
+	pw.writerMu.RLock()
+	proposerOnly := pw.writerProposerOnly
+	localNodeID := pw.writerNodeID
+	policyConfigured := pw.writerPolicyConfigured
+	pw.writerMu.RUnlock()
+	proposer := task.Block.Proposer()
+	isProposer := localNodeID == proposer
+	role := "non_proposer"
+	if isProposer {
+		role = "proposer"
+	}
+	if isZeroValidatorID(proposer) {
+		return false, "unknown", "missing_proposer_id"
+	}
+	if !proposerOnly {
+		return true, role, ""
+	}
+	if !policyConfigured {
+		return false, role, "writer_policy_unset"
+	}
+	if !isProposer {
+		return false, role, "non_proposer_guard"
+	}
+	return true, "proposer", ""
+}
+
+func isZeroValidatorID(v ctypes.ValidatorID) bool {
+	for _, b := range v {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func (pw *PersistenceWorker) releaseInflightKey(key persistenceTaskKey) {
+	pw.mu.Lock()
+	delete(pw.inflight, key)
+	pw.mu.Unlock()
+}
+
+func (t *PersistenceTask) persistenceKey() (persistenceTaskKey, bool) {
+	if t == nil || t.Block == nil {
+		return persistenceTaskKey{}, false
+	}
+	return persistenceTaskKey{
+		Height: t.Block.GetHeight(),
+		Hash:   t.Block.GetHash(),
+	}, true
 }
 
 // extractAnomalyIDs extracts anomaly IDs from EventTx transactions in a block
@@ -553,6 +723,43 @@ func isValidUUIDv4(id string) bool {
 		return false
 	}
 	return u.Version() == 4
+}
+
+func withRetryJitter(backoff time.Duration) time.Duration {
+	if backoff <= 0 {
+		return 0
+	}
+	maxJitter := backoff / 5 // up to +20%
+	if maxJitter <= 0 {
+		return backoff
+	}
+	jitter := time.Duration(rand.Int63n(int64(maxJitter) + 1))
+	return backoff + jitter
+}
+
+func waitForRetry(ctx context.Context, stopCh <-chan struct{}, delay time.Duration) bool {
+	if delay <= 0 {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-stopCh:
+			return false
+		default:
+			return true
+		}
+	}
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-stopCh:
+		return false
+	}
 }
 
 // resolveAnomalyID attempts to obtain the anomaly UUID from the decoded message.

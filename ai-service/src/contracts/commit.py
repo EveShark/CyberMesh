@@ -8,6 +8,7 @@ AI consumer: src/kafka/consumer.py
 Security: Ed25519 signature verification from trusted backend validators
 """
 import json
+import os
 import uuid
 from pathlib import Path
 from typing import Dict, Optional, Sequence
@@ -128,6 +129,34 @@ class CommitEvent:
     
     # Class-level trust store (shared across all instances)
     _trust_store: Optional[BackendValidatorTrustStore] = None
+
+    @staticmethod
+    def _timestamp_skew_seconds() -> int:
+        """
+        Resolve timestamp skew tolerance for trusted internal commit topic.
+
+        Order:
+        1. CONTROL_COMMITS_TIMESTAMP_SKEW_SECONDS
+        2. AI_INTERNAL_CONTROL_TIMESTAMP_SKEW_SECONDS
+        3. LIMITS_TIMESTAMP_SKEW_SECONDS
+        4. hard default 60
+        """
+        for key in (
+            "CONTROL_COMMITS_TIMESTAMP_SKEW_SECONDS",
+            "AI_INTERNAL_CONTROL_TIMESTAMP_SKEW_SECONDS",
+            "LIMITS_TIMESTAMP_SKEW_SECONDS",
+        ):
+            raw = os.getenv(key, "").strip()
+            if not raw:
+                continue
+            try:
+                value = int(raw)
+            except ValueError as exc:
+                raise ContractError(f"Invalid {key}: {raw}") from exc
+            if value <= 0:
+                raise ContractError(f"{key} must be positive, got: {raw}")
+            return value
+        return 60
     
     @classmethod
     def initialize_trust_store(cls, keys_dir: Optional[Path] = None):
@@ -292,7 +321,7 @@ class CommitEvent:
                 )
             
             # Timestamp
-            validate_timestamp(timestamp)
+            validate_timestamp(timestamp, max_skew_seconds=self._timestamp_skew_seconds())
             
             # Cryptographic fields
             if len(producer_id) != 32:

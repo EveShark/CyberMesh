@@ -2,17 +2,25 @@ package kafka
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
+	"backend/pkg/control/policytrace"
 	"backend/pkg/mempool"
 	"backend/pkg/state"
 	"backend/pkg/utils"
 
 	"github.com/IBM/sarama"
+)
+
+var (
+	// ErrReplayRejected indicates replay filter rejected admission before mempool.Add.
+	ErrReplayRejected = errors.New("kafka: replay admission rejected")
 )
 
 // Consumer handles consuming messages from Kafka ai.* topics and submitting to mempool
@@ -33,26 +41,32 @@ type Consumer struct {
 	closed bool
 
 	// Stats
-	messagesConsumed   uint64
-	messagesVerified   uint64
-	messagesAdmitted   uint64
-	messagesFailed     uint64
-	messagesRetried    uint64
-	transientFailures  uint64
-	groupID            string
-	partitionOffsets   map[string]int64
-	partitionLag       map[string]int64
-	partitionHighwater map[string]int64
-	topicPartitions    map[string]int
-	assignedParts      int
-	lastMessageUnix    int64
-	ingestLatencyHist  *utils.LatencyHistogram
-	processLatencyHist *utils.LatencyHistogram
+	messagesConsumed    uint64
+	messagesVerified    uint64
+	messagesAdmitted    uint64
+	messagesFailed      uint64
+	messagesRetried     uint64
+	transientFailures   uint64
+	replayRejectedAdmit uint64
+	groupID             string
+	partitionOffsets    map[string]int64
+	partitionLag        map[string]int64
+	partitionHighwater  map[string]int64
+	topicPartitions     map[string]int
+	assignedParts       int
+	lastMessageUnix     int64
+	ingestLatencyHist   *utils.LatencyHistogram
+	processLatencyHist  *utils.LatencyHistogram
 
 	// Retry/backoff policy
 	retryMax         int
 	retryBackoffBase time.Duration
 	retryBackoffMax  time.Duration
+
+	// Optional callback invoked after successful mempool admission.
+	onPreAdmit func(topic string, tx state.Transaction) error
+	onAdmitted func(topic string, tx state.Transaction)
+	trace      *policytrace.Collector
 }
 
 // ConsumerConfig holds configuration for creating a consumer
@@ -431,8 +445,8 @@ func isPermanentErr(err error) bool {
 	if errors.Is(err, mempool.ErrRateLimited) || errors.Is(err, mempool.ErrMempoolFull) {
 		return false
 	}
-	// Duplicates and invalid tx are safe to skip
-	if errors.Is(err, mempool.ErrDuplicate) || errors.Is(err, mempool.ErrInvalidTx) {
+	// Replay-rejected, duplicates and invalid tx are safe to skip.
+	if errors.Is(err, ErrReplayRejected) || errors.Is(err, mempool.ErrDuplicate) || errors.Is(err, mempool.ErrInvalidTx) {
 		return true
 	}
 	// Default to permanent to avoid infinite retries on unknown errors
@@ -528,6 +542,24 @@ func (c *Consumer) processMessage(ctx context.Context, session sarama.ConsumerGr
 		c.logger.Info("[DEBUG] Calling mempool.Add()")
 	}
 	now := time.Now()
+	if err := c.emitPreAdmit(message.Topic, tx); err != nil {
+		if errors.Is(err, ErrReplayRejected) {
+			c.incrementReplayRejectedAdmit()
+		}
+		if c.audit != nil {
+			_ = c.audit.Warn("pre_admit_rejected", map[string]interface{}{
+				"error":  err.Error(),
+				"topic":  message.Topic,
+				"offset": message.Offset,
+			})
+		}
+		if c.logger != nil {
+			c.logger.WarnContext(ctx, "Pre-admit hook rejected transaction",
+				utils.ZapError(err),
+				utils.ZapString("topic", message.Topic))
+		}
+		return err
+	}
 	if err := c.mempool.Add(tx, meta, now); err != nil {
 		if c.logger != nil {
 			c.logger.Info("[DEBUG] mempool.Add() returned ERROR",
@@ -552,12 +584,120 @@ func (c *Consumer) processMessage(ctx context.Context, session sarama.ConsumerGr
 		return err
 	}
 
+	if message.Topic == "ai.policy.v1" {
+		if ptx, ok := tx.(*state.PolicyTx); ok {
+			policyID, traceID := extractPolicyStageIdentity(ptx.Data)
+			if policyID != "" {
+				c.recordPolicyStage("t_mempool_enqueued", policyID, traceID, now.UnixMilli())
+			}
+		}
+	}
+	c.emitAdmitted(message.Topic, tx)
+
 	if c.logger != nil {
 		c.logger.Info("[DEBUG] mempool.Add() SUCCESS - message fully processed")
 	}
 
 	// Success
 	return nil
+}
+
+// SetPreAdmitHook installs a callback invoked before mempool admission.
+func (c *Consumer) SetPreAdmitHook(hook func(topic string, tx state.Transaction) error) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.onPreAdmit = hook
+	c.mu.Unlock()
+}
+
+// SetPostAdmitHook installs a callback invoked after successful mempool admission.
+func (c *Consumer) SetPostAdmitHook(hook func(topic string, tx state.Transaction)) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.onAdmitted = hook
+	c.mu.Unlock()
+}
+
+func (c *Consumer) SetTraceCollector(trace *policytrace.Collector) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.trace = trace
+	c.mu.Unlock()
+}
+
+func (c *Consumer) recordPolicyStage(stage, policyID, traceID string, tsMs int64) {
+	if c == nil || stage == "" || policyID == "" || tsMs <= 0 {
+		return
+	}
+	if c.logger != nil {
+		c.logger.Info("policy stage marker",
+			utils.ZapString("stage", stage),
+			utils.ZapString("policy_id", policyID),
+			utils.ZapString("trace_id", traceID),
+			utils.ZapInt64("t_ms", tsMs))
+	}
+	c.mu.RLock()
+	trace := c.trace
+	c.mu.RUnlock()
+	if trace != nil {
+		trace.Record(policytrace.Marker{
+			Stage:       stage,
+			PolicyID:    policyID,
+			TraceID:     traceID,
+			TimestampMs: tsMs,
+		})
+	}
+}
+
+func (c *Consumer) emitPreAdmit(topic string, tx state.Transaction) (err error) {
+	if c == nil {
+		return nil
+	}
+	c.mu.RLock()
+	hook := c.onPreAdmit
+	c.mu.RUnlock()
+	if hook == nil {
+		return nil
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			panicErr := fmt.Errorf("pre-admit hook panic: %v", r)
+			if c.logger != nil {
+				c.logger.Warn("pre-admit hook panicked",
+					utils.ZapString("topic", topic),
+					utils.ZapString("panic", fmt.Sprintf("%v", r)))
+			}
+			// Fail closed: if guard hook panics, reject admission.
+			err = panicErr
+		}
+	}()
+	return hook(topic, tx)
+}
+
+func (c *Consumer) emitAdmitted(topic string, tx state.Transaction) {
+	if c == nil {
+		return
+	}
+	c.mu.RLock()
+	hook := c.onAdmitted
+	c.mu.RUnlock()
+	if hook == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil && c.logger != nil {
+			c.logger.Warn("post-admit hook panicked",
+				utils.ZapString("topic", topic),
+				utils.ZapString("panic", fmt.Sprintf("%v", r)))
+		}
+	}()
+	hook(topic, tx)
 }
 
 // processAnomalyMessage decodes and verifies ai.anomalies.v1 message
@@ -668,6 +808,7 @@ func (c *Consumer) processEvidenceMessage(message *sarama.ConsumerMessage) (stat
 
 // processPolicyMessage decodes and verifies ai.policy.v1 message
 func (c *Consumer) processPolicyMessage(message *sarama.ConsumerMessage) (state.Transaction, mempool.AdmissionMeta, error) {
+	consumeMs := time.Now().UnixMilli()
 	msg, err := DecodePolicyMsg(message.Value)
 	if err != nil {
 		if c.logger != nil {
@@ -676,6 +817,12 @@ func (c *Consumer) processPolicyMessage(message *sarama.ConsumerMessage) (state.
 				utils.ZapInt64("offset", message.Offset))
 		}
 		return nil, mempool.AdmissionMeta{}, fmt.Errorf("decode failed: %w", err)
+	}
+	policyID, traceID := extractPolicyStageIdentity(msg.Params)
+	if policyID != "" {
+		c.recordPolicyStage("t_policy_handler_enter", policyID, traceID, consumeMs)
+		c.recordPolicyStage("t_decode_done", policyID, traceID, time.Now().UnixMilli())
+		c.recordPolicyStage("t_backend_consume", policyID, traceID, consumeMs)
 	}
 
 	tx, err := VerifyPolicyMsg(msg, c.verifierCfg, c.logger)
@@ -694,6 +841,9 @@ func (c *Consumer) processPolicyMessage(message *sarama.ConsumerMessage) (state.
 		}
 		return nil, mempool.AdmissionMeta{}, fmt.Errorf("verification failed: %w", err)
 	}
+	if policyID != "" {
+		c.recordPolicyStage("t_backend_verified_done", policyID, traceID, time.Now().UnixMilli())
+	}
 
 	// Policy has high priority
 	meta := mempool.AdmissionMeta{
@@ -702,6 +852,54 @@ func (c *Consumer) processPolicyMessage(message *sarama.ConsumerMessage) (state.
 	}
 
 	return tx, meta, nil
+}
+
+func extractPolicyStageIdentity(payload []byte) (string, string) {
+	if len(payload) == 0 {
+		return "", ""
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(payload, &root); err != nil {
+		return "", ""
+	}
+	policyID := strings.TrimSpace(asString(root["policy_id"]))
+	traceID := strings.TrimSpace(asString(root["trace_id"]))
+	if traceID == "" {
+		if metadata, ok := root["metadata"].(map[string]interface{}); ok {
+			traceID = strings.TrimSpace(asString(metadata["trace_id"]))
+		}
+	}
+	if traceID == "" {
+		if trace, ok := root["trace"].(map[string]interface{}); ok {
+			traceID = strings.TrimSpace(asString(trace["id"]))
+		}
+	}
+	if nested, ok := root["params"].(map[string]interface{}); ok {
+		if policyID == "" {
+			policyID = strings.TrimSpace(asString(nested["policy_id"]))
+		}
+		if traceID == "" {
+			traceID = strings.TrimSpace(asString(nested["trace_id"]))
+		}
+		if traceID == "" {
+			if metadata, ok := nested["metadata"].(map[string]interface{}); ok {
+				traceID = strings.TrimSpace(asString(metadata["trace_id"]))
+			}
+		}
+		if traceID == "" {
+			if trace, ok := nested["trace"].(map[string]interface{}); ok {
+				traceID = strings.TrimSpace(asString(trace["id"]))
+			}
+		}
+	}
+	return policyID, traceID
+}
+
+func asString(v interface{}) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
 }
 
 // routeToDLQ sends failed messages to Dead Letter Queue
@@ -785,6 +983,12 @@ func (c *Consumer) incrementTransientFailure() {
 	c.mu.Unlock()
 }
 
+func (c *Consumer) incrementReplayRejectedAdmit() {
+	c.mu.Lock()
+	c.replayRejectedAdmit++
+	c.mu.Unlock()
+}
+
 func (c *Consumer) observeIngestLatency(d time.Duration) {
 	if c.ingestLatencyHist == nil {
 		return
@@ -815,6 +1019,7 @@ func (c *Consumer) Stats() ConsumerStats {
 	stats.MessagesFailed = c.messagesFailed
 	stats.MessagesRetried = c.messagesRetried
 	stats.TransientFailures = c.transientFailures
+	stats.ReplayRejectedAdmit = c.replayRejectedAdmit
 	stats.LastMessageUnix = c.lastMessageUnix
 	c.mu.RUnlock()
 	buckets, total, sum := c.ingestLatencyHist.Snapshot()
@@ -906,6 +1111,7 @@ type ConsumerStats struct {
 	MessagesFailed        uint64
 	MessagesRetried       uint64
 	TransientFailures     uint64
+	ReplayRejectedAdmit   uint64
 	LastMessageUnix       int64
 	IngestLatencyBuckets  []utils.HistogramBucket
 	IngestLatencyP95Ms    float64

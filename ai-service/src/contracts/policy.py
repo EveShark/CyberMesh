@@ -10,6 +10,7 @@ Security: Ed25519 signature verification + policy validation
 import hashlib
 import ipaddress
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -77,6 +78,34 @@ class PolicyUpdateEvent:
     
     # Class-level trust store (shared with CommitEvent)
     _trust_store: Optional[BackendValidatorTrustStore] = None
+
+    @staticmethod
+    def _timestamp_skew_seconds() -> int:
+        """
+        Resolve timestamp skew tolerance for trusted internal control.policy topic.
+
+        Order:
+        1. CONTROL_POLICY_TIMESTAMP_SKEW_SECONDS
+        2. AI_INTERNAL_CONTROL_TIMESTAMP_SKEW_SECONDS
+        3. LIMITS_TIMESTAMP_SKEW_SECONDS
+        4. hard default 60
+        """
+        for key in (
+            "CONTROL_POLICY_TIMESTAMP_SKEW_SECONDS",
+            "AI_INTERNAL_CONTROL_TIMESTAMP_SKEW_SECONDS",
+            "LIMITS_TIMESTAMP_SKEW_SECONDS",
+        ):
+            raw = os.getenv(key, "").strip()
+            if not raw:
+                continue
+            try:
+                value = int(raw)
+            except ValueError as exc:
+                raise ContractError(f"Invalid {key}: {raw}") from exc
+            if value <= 0:
+                raise ContractError(f"{key} must be positive, got: {raw}")
+            return value
+        return 60
     
     @classmethod
     def initialize_trust_store(cls, keys_dir: Optional[Path] = None):
@@ -208,7 +237,7 @@ class PolicyUpdateEvent:
                 raise ContractError(f"Invalid rollback_policy_id length: {len(rollback_policy_id)}")
             
             # Timestamp
-            validate_timestamp(timestamp)
+            validate_timestamp(timestamp, max_skew_seconds=self._timestamp_skew_seconds())
             
             # Heights
             if effective_height < 0:

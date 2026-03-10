@@ -70,7 +70,7 @@ class PostgresTelemetrySource(TelemetrySource):
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def get_network_flows(self, limit: int = 100) -> List[Dict]:
+    def get_network_flows(self, limit: int = 100, *, wait_policy: Optional[str] = None) -> List[Dict]:
         """Return recent network flows with optional prefetching."""
 
         limit = max(1, int(limit))

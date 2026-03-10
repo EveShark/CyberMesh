@@ -34,7 +34,7 @@ func IsRetryable(err error) bool {
 		case "57P01", "57P02", "57P03": // admin_shutdown, crash_shutdown, cannot_connect_now
 			return true
 		default:
-			return true
+			return false
 		}
 	}
 
@@ -45,19 +45,27 @@ func IsRetryable(err error) bool {
 		case "40001", "40P01", "55P03", "53300", "57P01", "57P02", "57P03":
 			return true
 		default:
-			return true
+			return false
 		}
 	}
 
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+	// Do not retry caller cancellation; treat local deadline as retryable once (worker is bounded).
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
 
 	var netErr net.Error
 	if errors.As(err, &netErr) {
-		return netErr.Timeout() || netErr.Temporary()
+		if netErr.Timeout() {
+			return true
+		}
+		// Temporary() is deprecated in newer Go; keep backward-compatible check.
+		return netErr.Temporary()
 	}
 
-	// Default to retryable; PersistenceWorker has bounded retries.
-	return true
+	// Default fail-closed for retry classification: unknown errors are non-retryable.
+	return false
 }

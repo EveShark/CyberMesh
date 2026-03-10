@@ -2,15 +2,28 @@ package wiring
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"backend/pkg/block"
 	"backend/pkg/consensus/api"
 	ctypes "backend/pkg/consensus/types"
+	"backend/pkg/mempool"
 	"backend/pkg/state"
 	"backend/pkg/utils"
 )
+
+var errPersistEnqueueNonProposer = errors.New("persistence enqueue dropped on non-proposer in proposer-only mode")
+
+type persistWriterDecision struct {
+	allowed  bool
+	role     string
+	reason   string
+	local    ctypes.ValidatorID
+	proposer ctypes.ValidatorID
+}
 
 func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 	logCommitInfo := s.shouldLogCommitInfo()
@@ -81,6 +94,7 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 		s.log.Error("apply block failed", utils.ZapError(err), utils.ZapUint64("version", version))
 		return err
 	}
+	s.logPolicyStageForBlock("t_state_apply_done", ab, 0, ab.GetHeight(), 0)
 
 	// Update metrics
 	s.metrics.IncrementBlocksCommitted()
@@ -98,10 +112,24 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 
 	// Remove committed txs from mempool
 	hashes := make([][32]byte, 0, len(receipts))
+	identityKeys := make([]mempool.ProducerNonce, 0, len(ab.Transactions()))
 	for _, r := range receipts {
 		hashes = append(hashes, r.ContentHash)
 	}
+	for _, tx := range ab.Transactions() {
+		if tx == nil || tx.Envelope() == nil {
+			continue
+		}
+		env := tx.Envelope()
+		identityKeys = append(identityKeys, mempool.ProducerNonce{
+			ProducerID: env.ProducerID,
+			Nonce:      env.Nonce,
+		})
+	}
+	s.rememberCommittedTransactions(ab, time.Now())
 	s.mp.Remove(hashes...)
+	s.mp.RemoveByProducerNonces(identityKeys)
+	s.clearProposedTxHold(hashes...)
 
 	// Audit with state root
 	if logCommitInfo {
@@ -111,6 +139,14 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 			utils.ZapString("state_root", fmt.Sprintf("%x", root[:8])),
 			utils.ZapUint64("version", version))
 	}
+	qcTsMs := int64(0)
+	qcView := uint64(0)
+	if qc != nil {
+		qcTsMs = qc.GetTimestamp().UnixMilli()
+		qcView = qc.GetView()
+	}
+	s.logPolicyStageForBlock("t_qc_formed", ab, qcView, ab.GetHeight(), qcTsMs)
+	s.logPolicyStageForBlock("t_commit", ab, qcView, ab.GetHeight(), qcTsMs)
 
 	// Prune old state versions to prevent memory growth
 	if memStore, ok := s.store.(*state.MemStore); ok {
@@ -121,27 +157,39 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 	mempoolTxs, _ := s.mp.Stats()
 	producerCount := s.mp.ProducerCount()
 	s.memMon.Check(mempoolTxs, producerCount, 0, 0, 0, 0)
+	if mempoolTxs > 0 {
+		// If backlog remains, wake proposer instead of waiting for next ticker tick.
+		s.notifyProposeTrigger("post_commit_backlog")
+	}
 
 	// Enqueue async persistence if enabled
 	if s.persistWorker != nil {
-		if logCommitInfo {
-			s.log.InfoContext(ctx, "enqueueing persistence task",
-				utils.ZapUint64("height", ab.GetHeight()))
-		}
-
 		task := &PersistenceTask{
 			Block:     ab,
 			Receipts:  receipts,
 			StateRoot: root,
 			Attempt:   0,
 		}
-		if err := s.persistWorker.Enqueue(ctx, task); err != nil {
-			// Log error but don't fail consensus (async persistence)
-			s.log.WarnContext(ctx, "failed to enqueue persistence task",
-				utils.ZapError(err),
-				utils.ZapUint64("height", ab.GetHeight()))
-		} else if logCommitInfo {
-			s.log.InfoContext(ctx, "persistence task enqueued successfully")
+		decision := s.persistWriterDecisionForBlock(ab)
+		s.recordPersistEnqueueAttempt("commit", decision.role == "proposer")
+		if s.shouldPersistOnCommit(ab) {
+			if logCommitInfo {
+				s.log.InfoContext(ctx, "enqueueing persistence task",
+					utils.ZapUint64("height", ab.GetHeight()))
+			}
+			if err := s.enqueuePersistenceTask(ctx, task, "commit"); err != nil {
+				// Log error but don't fail consensus (async persistence)
+				s.log.WarnContext(ctx, "failed to enqueue persistence task",
+					utils.ZapError(err),
+					utils.ZapUint64("height", ab.GetHeight()))
+				if !errors.Is(err, errPersistEnqueueNonProposer) {
+					s.rememberPendingPersistence(task)
+				}
+			} else if logCommitInfo {
+				s.log.InfoContext(ctx, "persistence task enqueued successfully")
+			}
+		} else {
+			s.rememberPendingPersistence(task)
 		}
 
 	} else {
@@ -151,6 +199,55 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 	}
 
 	return nil
+}
+
+func (s *Service) enqueuePersistenceTask(ctx context.Context, task *PersistenceTask, source string) error {
+	if s == nil || s.persistWorker == nil || task == nil || task.Block == nil {
+		return fmt.Errorf("persistence enqueue unavailable")
+	}
+	decision := s.persistWriterDecisionForBlock(task.Block)
+	if !decision.allowed {
+		atomic.AddUint64(&s.persistEnqueueDroppedNonProposer, 1)
+		if s.log != nil {
+			s.log.Warn("dropping non-proposer persistence enqueue in proposer-only mode",
+				utils.ZapString("source", source),
+				utils.ZapUint64("height", task.Block.GetHeight()),
+				utils.ZapString("reason", decision.reason))
+		}
+		if s.audit != nil {
+			_ = s.audit.Security("persistence_enqueue_dropped_non_proposer", map[string]interface{}{
+				"height": task.Block.GetHeight(),
+				"source": source,
+				"reason": decision.reason,
+			})
+		}
+		return errPersistEnqueueNonProposer
+	}
+	if err := s.persistWorker.Enqueue(ctx, task); err != nil {
+		atomic.AddUint64(&s.persistEnqueueErrors, 1)
+		return err
+	}
+	return nil
+}
+
+func (s *Service) recordPersistEnqueueAttempt(source string, proposer bool) {
+	if s == nil {
+		return
+	}
+	switch source {
+	case "commit":
+		if proposer {
+			atomic.AddUint64(&s.persistEnqueueCommitProposer, 1)
+		} else {
+			atomic.AddUint64(&s.persistEnqueueCommitNonProposer, 1)
+		}
+	case "backfill":
+		if proposer {
+			atomic.AddUint64(&s.persistEnqueueBackfillProposer, 1)
+		} else {
+			atomic.AddUint64(&s.persistEnqueueBackfillNonProposer, 1)
+		}
+	}
 }
 
 func shouldPublishPolicyFromCommit(commitEnabled bool, proposerOnly bool, localNodeID ctypes.ValidatorID, proposerID ctypes.ValidatorID) bool {
@@ -174,6 +271,123 @@ func (s *Service) shouldPublishPolicyOnCommit(ab *block.AppBlock) bool {
 			utils.ZapUint64("height", ab.GetHeight()))
 	}
 	return allowed
+}
+
+func shouldPersistFromCommit(proposerOnly bool, localNodeID ctypes.ValidatorID, proposerID ctypes.ValidatorID) bool {
+	return decidePersistFromCommit(proposerOnly, localNodeID, proposerID).allowed
+}
+
+func (s *Service) shouldPersistOnCommit(ab *block.AppBlock) bool {
+	if s == nil || ab == nil || s.persistWorker == nil {
+		return false
+	}
+	decision := s.persistWriterDecisionForBlock(ab)
+	if !decision.allowed && s.persistCommitProposerOnly {
+		if s.log != nil {
+			s.log.Debug("Skipping full block persistence on non-proposer validator",
+				utils.ZapUint64("height", ab.GetHeight()),
+				utils.ZapString("reason", decision.reason))
+		}
+	}
+	if s.audit != nil {
+		mode := "all"
+		if s.persistCommitProposerOnly {
+			mode = "proposer"
+		}
+		_ = s.audit.Info("persist_writer_decision", map[string]interface{}{
+			"height":       ab.GetHeight(),
+			"source":       "commit",
+			"local_node":   fmt.Sprintf("%x", decision.local[:8]),
+			"proposer":     fmt.Sprintf("%x", decision.proposer[:8]),
+			"mode":         mode,
+			"role":         decision.role,
+			"reason":       decision.reason,
+			"will_persist": decision.allowed,
+		})
+	}
+	return decision.allowed
+}
+
+func decidePersistFromCommit(proposerOnly bool, localNodeID ctypes.ValidatorID, proposerID ctypes.ValidatorID) persistWriterDecision {
+	if isZeroValidatorID(proposerID) {
+		return persistWriterDecision{
+			allowed:  false,
+			role:     "unknown",
+			reason:   "missing_proposer_id",
+			local:    localNodeID,
+			proposer: proposerID,
+		}
+	}
+	isProposer := localNodeID == proposerID
+	role := "non_proposer"
+	if isProposer {
+		role = "proposer"
+	}
+	if !proposerOnly {
+		return persistWriterDecision{
+			allowed:  true,
+			role:     role,
+			reason:   "writer_mode_all",
+			local:    localNodeID,
+			proposer: proposerID,
+		}
+	}
+	if !isProposer {
+		return persistWriterDecision{
+			allowed:  false,
+			role:     role,
+			reason:   "non_proposer_guard",
+			local:    localNodeID,
+			proposer: proposerID,
+		}
+	}
+	return persistWriterDecision{
+		allowed:  true,
+		role:     "proposer",
+		reason:   "owner_proposer",
+		local:    localNodeID,
+		proposer: proposerID,
+	}
+}
+
+func (s *Service) persistWriterDecisionForBlock(ab *block.AppBlock) persistWriterDecision {
+	if ab == nil {
+		return persistWriterDecision{allowed: false, role: "unknown", reason: "nil_block"}
+	}
+	if s == nil {
+		return persistWriterDecision{allowed: false, role: "unknown", reason: "nil_service", proposer: ab.Proposer()}
+	}
+	if s.persistStatusFn != nil {
+		if nodeID, ok := s.persistStatusFn(); ok {
+			return decidePersistFromCommit(s.persistCommitProposerOnly, nodeID, ab.Proposer())
+		}
+		return persistWriterDecision{allowed: false, role: "unknown", reason: "engine_unavailable", proposer: ab.Proposer()}
+	}
+	if s.eng == nil {
+		return persistWriterDecision{allowed: false, role: "unknown", reason: "engine_unavailable", proposer: ab.Proposer()}
+	}
+	status := s.eng.GetStatus()
+	return decidePersistFromCommit(s.persistCommitProposerOnly, status.NodeID, ab.Proposer())
+}
+
+func (s *Service) persistCommittedMetadataOnly(ctx context.Context, ab *block.AppBlock) error {
+	if s == nil || ab == nil || s.persistWorker == nil {
+		return nil
+	}
+
+	adapter := s.persistWorker.GetAdapter()
+	if adapter == nil {
+		return fmt.Errorf("persistence adapter not configured")
+	}
+
+	bh := ab.GetHash()
+	metaCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	if err := adapter.SaveCommittedBlock(metaCtx, ab.GetHeight(), bh[:], nil); err != nil {
+		return fmt.Errorf("save committed block metadata: %w", err)
+	}
+	return nil
 }
 
 func (s *Service) logCommitPolicySummary(ab *block.AppBlock, policyCount int, publishEnabled bool, willPublish bool) {

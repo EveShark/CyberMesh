@@ -33,6 +33,7 @@ func (s *Server) collectAIMetrics(ctx context.Context) (*AIMetricsResponse, erro
 		Message:  payload.Message,
 		Engines:  mapAiEngineMetrics(payload.Engines),
 		Variants: mapAiVariantMetrics(payload.Variants),
+		Sentinel: mapAiSentinelMetrics(payload.Sentinel),
 	}
 
 	if payload.DetectionLoop != nil {
@@ -49,6 +50,7 @@ func (s *Server) collectAIMetrics(ctx context.Context) (*AIMetricsResponse, erro
 			Healthy:                   payload.DetectionLoop.Healthy,
 			AvgLatencyMs:              payload.DetectionLoop.AvgLatencyMs,
 			LastLatencyMs:             payload.DetectionLoop.LastLatencyMs,
+			ConfiguredIntervalSeconds: payload.DetectionLoop.ConfiguredIntervalSeconds,
 			SecondsSinceLastDetection: payload.DetectionLoop.SecondsSinceLastDetection,
 			SecondsSinceLastIteration: payload.DetectionLoop.SecondsSinceLastIteration,
 			CacheAgeSeconds:           payload.DetectionLoop.CacheAgeSeconds,
@@ -170,11 +172,12 @@ func (s *Server) handleAISuspiciousNodes(w http.ResponseWriter, r *http.Request)
 		}
 	}
 	limit = clampIntValue(limit, 1, 50)
+	entityType := strings.TrimSpace(r.URL.Query().Get("entity_type"))
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
 	defer cancel()
 
-	payload, err := s.fetchAISuspiciousNodesDetailed(ctx, limit)
+	payload, err := s.fetchAISuspiciousNodesDetailed(ctx, limit, entityType)
 	if err != nil {
 		writeErrorResponse(w, r, "AI_SERVICE_UNAVAILABLE", "failed to fetch suspicious nodes", http.StatusBadGateway)
 		return
@@ -220,9 +223,15 @@ func (s *Server) fetchAIDetectionHistory(ctx context.Context, limit int, since, 
 	return &payload, nil
 }
 
-func (s *Server) fetchAISuspiciousNodesDetailed(ctx context.Context, limit int) (*AiSuspiciousNodesResponse, error) {
+func (s *Server) fetchAISuspiciousNodesDetailed(ctx context.Context, limit int, entityType string) (*AiSuspiciousNodesResponse, error) {
 	resp, err := s.performAIRequest(ctx, http.MethodGet, "/detections/suspicious-nodes", url.Values{
 		"limit": {strconv.Itoa(limit)},
+		"entity_type": func() []string {
+			if entityType == "" {
+				return nil
+			}
+			return []string{entityType}
+		}(),
 	})
 	if err != nil {
 		return nil, err
@@ -348,6 +357,36 @@ func mapAiVariantMetrics(payload []aiDetectionVariantEntry) []AiVariantMetric {
 		})
 	}
 	return variants
+}
+
+func mapAiSentinelMetrics(payload *aiDetectionSentinelEntry) *AiSentinelMetric {
+	if payload == nil {
+		return nil
+	}
+
+	var lastDetectionTime *float64
+	if payload.LastDetectionTime != nil {
+		v := *payload.LastDetectionTime
+		lastDetectionTime = &v
+	}
+
+	var lastHistoryEventTime *float64
+	if payload.LastHistoryEventTime != nil {
+		v := *payload.LastHistoryEventTime
+		lastHistoryEventTime = &v
+	}
+
+	return &AiSentinelMetric{
+		Status:               payload.Status,
+		EventsTotal:          payload.EventsTotal,
+		DetectionsTotal:      payload.DetectionsTotal,
+		PublishRatio:         payload.PublishRatio,
+		LastDetectionTime:    lastDetectionTime,
+		LastHistoryEventTime: lastHistoryEventTime,
+		TopThreatType:        payload.TopThreatType,
+		LastEntityID:         payload.LastEntityID,
+		LastEntityType:       payload.LastEntityType,
+	}
 }
 
 func mapAIDetectionLoopCounters(metrics map[string]interface{}) *AiDetectionLoopCounters {

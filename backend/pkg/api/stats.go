@@ -40,6 +40,18 @@ type aiDetectionVariantEntry struct {
 	LastUpdated         *float64 `json:"last_updated"`
 }
 
+type aiDetectionSentinelEntry struct {
+	Status               string   `json:"status"`
+	EventsTotal          int64    `json:"events_total"`
+	DetectionsTotal      int64    `json:"detections_total"`
+	PublishRatio         float64  `json:"publish_ratio"`
+	LastDetectionTime    *float64 `json:"last_detection_time"`
+	LastHistoryEventTime *float64 `json:"last_history_event_time"`
+	TopThreatType        string   `json:"top_threat_type"`
+	LastEntityID         string   `json:"last_entity_id"`
+	LastEntityType       string   `json:"last_entity_type"`
+}
+
 type aiDetectionStatsPayload struct {
 	Status        string `json:"status"`
 	State         string `json:"state"`
@@ -53,6 +65,7 @@ type aiDetectionStatsPayload struct {
 		Healthy                   bool     `json:"healthy"`
 		AvgLatencyMs              float64  `json:"avg_latency_ms"`
 		LastLatencyMs             float64  `json:"last_latency_ms"`
+		ConfiguredIntervalSeconds *float64 `json:"configured_interval_seconds"`
 		SecondsSinceLastDetection *float64 `json:"seconds_since_last_detection"`
 		SecondsSinceLastIteration *float64 `json:"seconds_since_last_iteration"`
 		CacheAgeSeconds           *float64 `json:"cache_age_seconds"`
@@ -69,6 +82,7 @@ type aiDetectionStatsPayload struct {
 	} `json:"derived"`
 	Engines  []aiDetectionEngineEntry  `json:"engines"`
 	Variants []aiDetectionVariantEntry `json:"variants"`
+	Sentinel *aiDetectionSentinelEntry `json:"sentinel"`
 }
 
 // handleStats handles GET /stats
@@ -215,6 +229,7 @@ func (s *Server) getNetworkStats(ctx context.Context) *NetworkStats {
 		stats.BytesReceived = report.BytesReceived
 		stats.BytesSent = report.BytesSent
 		stats.AvgLatencyMs = report.AvgLatencyMs
+		stats.AvgMessageGapMs = report.AvgMessageGapMs
 		if report.InboundRateBps > 0 {
 			stats.InboundThroughputBps = report.InboundRateBps
 		} else {
@@ -232,13 +247,14 @@ func (s *Server) getNetworkStats(ctx context.Context) *NetworkStats {
 			samples := make([]NetworkTrendSample, len(report.History))
 			for i, sample := range report.History {
 				samples[i] = NetworkTrendSample{
-					Timestamp:     sample.Timestamp,
-					PeerCount:     sample.PeerCount,
-					InboundPeers:  sample.InboundPeers,
-					OutboundPeers: sample.OutboundPeers,
-					AvgLatencyMs:  sample.AvgLatencyMs,
-					BytesReceived: sample.BytesReceived,
-					BytesSent:     sample.BytesSent,
+					Timestamp:       sample.Timestamp,
+					PeerCount:       sample.PeerCount,
+					InboundPeers:    sample.InboundPeers,
+					OutboundPeers:   sample.OutboundPeers,
+					AvgLatencyMs:    sample.AvgLatencyMs,
+					AvgMessageGapMs: sample.AvgMessageGapMs,
+					BytesReceived:   sample.BytesReceived,
+					BytesSent:       sample.BytesSent,
 				}
 			}
 			stats.History = samples
@@ -531,10 +547,12 @@ func sanitizeStatsResponse(resp *StatsResponse) {
 	}
 	if resp.Network != nil {
 		resp.Network.AvgLatencyMs = sanitizeFloat(resp.Network.AvgLatencyMs)
+		resp.Network.AvgMessageGapMs = sanitizeFloat(resp.Network.AvgMessageGapMs)
 		resp.Network.InboundThroughputBps = sanitizeFloat(resp.Network.InboundThroughputBps)
 		resp.Network.OutboundThroughputBps = sanitizeFloat(resp.Network.OutboundThroughputBps)
 		for i := range resp.Network.History {
 			resp.Network.History[i].AvgLatencyMs = sanitizeFloat(resp.Network.History[i].AvgLatencyMs)
+			resp.Network.History[i].AvgMessageGapMs = sanitizeFloat(resp.Network.History[i].AvgMessageGapMs)
 		}
 	}
 	if resp.Kafka != nil {

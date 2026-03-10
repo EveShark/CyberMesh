@@ -18,6 +18,7 @@ class DecisionOutcome:
     should_publish: bool
     reason: Optional[str]
     effective_confidence_threshold: float
+    effective_severity_threshold: int
 
 
 @dataclass
@@ -36,20 +37,41 @@ class PolicyDecisionEngine:
         self._state: Dict[str, _DecisionState] = {}
 
     def evaluate(self, context: "PolicyContext") -> DecisionOutcome:
+        effective_severity_threshold = self._effective_severity_threshold(context)
         if not self._config.enabled:
-            return DecisionOutcome(False, "disabled", self._config.confidence_threshold)
+            return DecisionOutcome(
+                False,
+                "disabled",
+                self._config.confidence_threshold,
+                effective_severity_threshold,
+            )
 
-        if context.severity < self._config.severity_threshold:
-            return DecisionOutcome(False, "severity_below_threshold", self._config.confidence_threshold)
+        if context.severity < effective_severity_threshold:
+            return DecisionOutcome(
+                False,
+                "severity_below_threshold",
+                self._config.confidence_threshold,
+                effective_severity_threshold,
+            )
 
         if self._env_bool("POLICY_PUBLISHING_BENIGN_BLOCK_ENABLED", False):
             profile = str(context.metadata.get("profile_mode") or "").strip().lower()
             if profile in {"benign", "baseline"}:
-                return DecisionOutcome(False, "benign_profile_blocked", self._config.confidence_threshold)
+                return DecisionOutcome(
+                    False,
+                    "benign_profile_blocked",
+                    self._config.confidence_threshold,
+                    effective_severity_threshold,
+                )
 
         effective_threshold = self._effective_threshold(context)
         if context.confidence < effective_threshold:
-            return DecisionOutcome(False, "confidence_below_threshold", effective_threshold)
+            return DecisionOutcome(
+                False,
+                "confidence_below_threshold",
+                effective_threshold,
+                effective_severity_threshold,
+            )
 
         score = self._event_score(context)
         state_key = self._state_key(context)
@@ -76,7 +98,24 @@ class PolicyDecisionEngine:
             st.last_publish = should_publish
             self._state[state_key] = st
 
-        return DecisionOutcome(should_publish, reason, effective_threshold)
+        return DecisionOutcome(
+            should_publish,
+            reason,
+            effective_threshold,
+            effective_severity_threshold,
+        )
+
+    def _effective_severity_threshold(self, context: "PolicyContext") -> int:
+        anomaly_key = self._normalize_anomaly_type(context.anomaly_type)
+        overrides = getattr(self._config, "severity_threshold_overrides", {}) or {}
+        configured = overrides.get(anomaly_key)
+        if configured is not None:
+            return max(1, min(10, int(configured)))
+
+        env_key = f"POLICY_PUBLISHING_SEVERITY_THRESHOLD_{anomaly_key.upper()}"
+        if env_key in os.environ:
+            return self._env_int(env_key, self._config.severity_threshold, 1, 10)
+        return max(1, min(10, int(self._config.severity_threshold)))
 
     def _effective_threshold(self, context: "PolicyContext") -> float:
         anomaly_key = self._normalize_anomaly_type(context.anomaly_type)
@@ -125,7 +164,12 @@ class PolicyDecisionEngine:
             conf_weight = 1.0
             sev_weight = 0.0
             total = 1.0
-        return ((conf_weight * confidence) + (sev_weight * severity_score)) / total
+        blended = ((conf_weight * confidence) + (sev_weight * severity_score)) / total
+        if self._env_bool("POLICY_PUBLISHING_SCORE_FLOOR_TO_CONFIDENCE", True):
+            # Prevent contradictory suppressions where confidence has already
+            # passed class thresholds but blended scoring drops below hysteresis.
+            return max(blended, confidence)
+        return blended
 
     def _class_threshold(self, anomaly_key: str, default: float) -> float:
         env_key = f"POLICY_PUBLISHING_THRESHOLD_{anomaly_key.upper()}"

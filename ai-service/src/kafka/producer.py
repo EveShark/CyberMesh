@@ -18,6 +18,7 @@ from ..contracts import AnomalyMessage, EvidenceMessage, PolicyMessage
 from ..utils.errors import KafkaError
 from ..utils.circuit_breaker import CircuitBreaker
 from ..utils.backoff import ExponentialBackoff
+from ..utils.metrics import get_metrics_collector
 from ..config.settings import Settings
 
 
@@ -40,11 +41,9 @@ class AIProducer:
     def __init__(self, config: Settings, circuit_breaker: CircuitBreaker):
         self.config = config
         self.circuit_breaker = circuit_breaker
-        self.backoff = ExponentialBackoff(
-            base_delay=1.0,
-            max_delay=60.0,
-            max_attempts=5,
-        )
+        self._backoff_base_delay = 1.0
+        self._backoff_max_delay = 60.0
+        self._backoff_max_attempts = 5
         
         # Topics from settings
         self.topics = config.kafka_topics
@@ -57,6 +56,7 @@ class AIProducer:
         self.policy_sync_flush = os.getenv("AI_PRODUCER_POLICY_SYNC_FLUSH", "true").lower() in ("1", "true", "yes", "on")
         self.flush_interval_ms = max(1, int(os.getenv("AI_PRODUCER_FLUSH_INTERVAL_MS", "50")))
         self._last_flush_at = time.monotonic()
+        self._metrics_collector = get_metrics_collector()
         
         # Metrics
         self._messages_sent = 0
@@ -66,6 +66,13 @@ class AIProducer:
         
         # Track in-flight messages for error handling
         self._delivery_errors = []
+
+    def _new_backoff(self) -> ExponentialBackoff:
+        return ExponentialBackoff(
+            base_delay=self._backoff_base_delay,
+            max_delay=self._backoff_max_delay,
+            max_attempts=self._backoff_max_attempts,
+        )
     
     def _build_config(self, settings: Settings) -> dict:
         """Build confluent-kafka Producer configuration."""
@@ -160,8 +167,10 @@ class AIProducer:
         data = msg.to_bytes()
         
         last_error = None
-        
+        start = time.monotonic()
+        backoff = self._new_backoff()
         while True:
+            attempt_start = time.monotonic()
             try:
                 # CircuitBreaker.call() wraps the operation
                 def _send():
@@ -181,14 +190,26 @@ class AIProducer:
                     if self._delivery_errors:
                         error = self._delivery_errors.pop(0)
                         raise KafkaError(f"Delivery failed: {error}")
-                
+                self._metrics_collector.record_kafka_publish_attempt_latency(
+                    topic,
+                    time.monotonic() - attempt_start,
+                    "success",
+                )
+                self._metrics_collector.record_message_published(msg_type, "success", len(data))
+                self._metrics_collector.record_kafka_publish_latency(topic, time.monotonic() - start)
                 return True
                 
             except Exception as e:
                 last_error = e
+                self._metrics_collector.record_kafka_publish_attempt_latency(
+                    topic,
+                    time.monotonic() - attempt_start,
+                    "error",
+                )
+                self._metrics_collector.record_kafka_retry(topic, type(e).__name__)
                 
                 try:
-                    delay = self.backoff.next_delay()
+                    delay = backoff.next_delay()
                     time.sleep(delay)
                 except Exception:
                     # Max attempts reached
@@ -197,6 +218,8 @@ class AIProducer:
         # Permanent failure - send to DLQ
         with self._lock:
             self._messages_failed += 1
+        self._metrics_collector.record_message_published(msg_type, "failed", len(data))
+        self._metrics_collector.record_kafka_publish_latency(topic, time.monotonic() - start)
         self._send_to_dlq(data, msg_type, str(last_error))
         raise KafkaError(f"Failed to send after max retries: {last_error}")
     
@@ -232,6 +255,7 @@ class AIProducer:
                 callback=lambda err, msg: None  # Ignore DLQ errors
             )
             self.producer.flush(timeout=5)
+            self._metrics_collector.record_dlq_message(dlq_topic, reason=msg_type)
             
         except Exception as e:
             # DLQ send failed, just log

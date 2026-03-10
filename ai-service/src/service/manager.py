@@ -161,8 +161,11 @@ class ServiceManager:
         # Detection history (for API exposure)
 
         self._history_staleness_seconds = int(os.getenv("DETECTION_HISTORY_STALE_SECONDS", "900"))
+        self._activity_stale_seconds = int(os.getenv("DETECTION_ACTIVITY_STALE_SECONDS", "180"))
         self._history_lock = threading.Lock()
         self._detection_history = deque(maxlen=500)
+        self._detection_source_metrics_lock = threading.Lock()
+        self._detection_source_metrics = {}
 
         # Aggregated engine analytics
         self._engine_metrics_lock = threading.RLock()
@@ -360,6 +363,21 @@ class ServiceManager:
                 if self.feedback_service:
                     self.logger.info("Starting feedback service")
                     self.feedback_service.start()
+
+                telemetry_source = getattr(self.detection_pipeline, "telemetry_source", None)
+                if telemetry_source is None:
+                    telemetry_source = getattr(self.detection_pipeline, "telemetry", None)
+                if telemetry_source is not None and hasattr(telemetry_source, "prime_assignment"):
+                    self.logger.info("Priming telemetry consumer assignment before detection loop start")
+                    try:
+                        assignment_status = telemetry_source.prime_assignment()
+                        self.logger.info("Telemetry consumer prime complete", extra=assignment_status)
+                    except Exception as exc:
+                        self.logger.warning(
+                            "Telemetry consumer prime failed",
+                            extra={"error": str(exc)},
+                            exc_info=True,
+                        )
                 
                 # Start detection loop (Phase 8)
                 if self.detection_loop:
@@ -762,10 +780,11 @@ class ServiceManager:
 
                 metrics_copy = dict(snapshot.get("metrics", {}))
                 issues_copy = list(snapshot.get("issues", []))
+                aggregate_metrics = self._build_aggregate_detection_metrics(loop_metrics=metrics_copy)
 
                 cache_entry = {
                     "running": snapshot.get("running", False),
-                    "metrics": metrics_copy,
+                    "metrics": aggregate_metrics,
                     "last_updated": snapshot.get("last_updated"),
                 }
                 self._cached_detection_metrics = cache_entry
@@ -777,11 +796,12 @@ class ServiceManager:
                     "blocking": snapshot.get("blocking", False),
                     "issues": issues_copy,
                     "message": snapshot.get("message", ""),
-                    "metrics": metrics_copy,
+                    "metrics": aggregate_metrics,
                     "last_updated": snapshot.get("last_updated"),
                     "history_staleness_seconds": None,
                     "seconds_since_last_iteration": snapshot.get("seconds_since_last_iteration"),
-                    "seconds_since_last_detection": snapshot.get("seconds_since_last_detection"),
+                    "seconds_since_last_detection": self._seconds_since_detection(aggregate_metrics) or snapshot.get("seconds_since_last_detection"),
+                    "sources": self._get_detection_source_metrics(),
                 }
 
                 history_issue, history_staleness = self._evaluate_history_health(metrics_copy)
@@ -795,6 +815,8 @@ class ServiceManager:
                         snapshot_copy["message"] = f"{snapshot_copy['message']}; {history_issue}"
                     else:
                         snapshot_copy["message"] = history_issue
+
+                self._reconcile_recent_detection_activity(snapshot_copy)
 
                 self._cached_detection_snapshot = snapshot_copy
 
@@ -829,6 +851,7 @@ class ServiceManager:
                     "history_staleness_seconds": self._cached_detection_snapshot.get("history_staleness_seconds"),
                     "seconds_since_last_iteration": self._cached_detection_snapshot.get("seconds_since_last_iteration"),
                     "seconds_since_last_detection": self._cached_detection_snapshot.get("seconds_since_last_detection"),
+                    "sources": self._get_detection_source_metrics(),
                 }
                 health["detection_loop"] = cached_snapshot
                 self._last_loop_status = cached_snapshot["status"]
@@ -849,6 +872,7 @@ class ServiceManager:
     def get_detection_metrics(self) -> Dict[str, Any]:
         """Return latest detection loop metrics snapshot."""
         with self._state_lock:
+            aggregate_metrics = self._build_aggregate_detection_metrics()
             return {
                 "running": self._cached_detection_snapshot.get("running", False),
                 "status": self._cached_detection_snapshot.get("status", "unknown"),
@@ -856,11 +880,12 @@ class ServiceManager:
                 "blocking": self._cached_detection_snapshot.get("blocking", False),
                 "issues": list(self._cached_detection_snapshot.get("issues", [])),
                 "message": self._cached_detection_snapshot.get("message", ""),
-                "metrics": dict(self._cached_detection_metrics.get("metrics", {})),
+                "metrics": aggregate_metrics,
                 "last_updated": self._cached_detection_snapshot.get("last_updated"),
                 "history_staleness_seconds": self._cached_detection_snapshot.get("history_staleness_seconds"),
                 "seconds_since_last_iteration": self._cached_detection_snapshot.get("seconds_since_last_iteration"),
                 "seconds_since_last_detection": self._cached_detection_snapshot.get("seconds_since_last_detection"),
+                "sources": self._get_detection_source_metrics(),
             }
 
     def _evaluate_history_health(self, loop_metrics: Dict[str, Any]) -> Tuple[Optional[str], Optional[float]]:
@@ -889,6 +914,59 @@ class ServiceManager:
             return (message, staleness)
 
         return (None, staleness)
+
+    def _seconds_since_detection(self, metrics: Dict[str, Any]) -> Optional[float]:
+        candidate = metrics.get("last_detection_time")
+        try:
+            if candidate is None:
+                return None
+            return max(0.0, time.time() - float(candidate))
+        except (TypeError, ValueError):
+            return None
+
+    def _reconcile_recent_detection_activity(self, snapshot: Dict[str, Any]) -> None:
+        if not snapshot.get("running", False):
+            return
+
+        activity_age = snapshot.get("seconds_since_last_detection")
+        if not isinstance(activity_age, (int, float)):
+            return
+        if activity_age > max(1, self._activity_stale_seconds):
+            return
+
+        stale_prefixes = (
+            "no detections recorded yet",
+            "detection history empty",
+        )
+        stale_substrings = (
+            "since last iteration",
+            "since last detection",
+        )
+
+        original_issues = list(snapshot.get("issues", []))
+        filtered_issues = []
+        removed_issue = False
+        for issue in original_issues:
+            issue_text = str(issue)
+            if issue_text.startswith(stale_prefixes) or any(token in issue_text for token in stale_substrings):
+                removed_issue = True
+                continue
+            filtered_issues.append(issue_text)
+
+        if not removed_issue:
+            return
+
+        snapshot["issues"] = filtered_issues
+        snapshot["message"] = "; ".join(filtered_issues)
+        if not filtered_issues:
+            snapshot["blocking"] = False
+            snapshot["status"] = "ok"
+            snapshot["healthy"] = True
+            return
+
+        snapshot["blocking"] = False
+        snapshot["status"] = "degraded"
+        snapshot["healthy"] = False
 
     def get_handler_metrics(self) -> Dict[str, Any]:
         """
@@ -919,6 +997,55 @@ class ServiceManager:
             raise ServiceError("Publisher not initialized")
         
         return self.publisher.get_metrics()
+
+    def get_kafka_consumer_status(self) -> Dict[str, Any]:
+        """Return Kafka consumer runtime status for ops endpoints."""
+        if not self.consumer:
+            return {"available": False, "reason": "consumer_not_initialized"}
+        status = self.consumer.get_runtime_status()
+        status["available"] = True
+        return status
+
+    def get_kafka_consumer_offsets(self, topic: Optional[str] = None) -> Dict[str, Any]:
+        """Return assigned partition offsets/lag for ops endpoints."""
+        if not self.consumer:
+            return {"available": False, "reason": "consumer_not_initialized", "offsets": [], "errors": []}
+        data = self.consumer.get_offsets(topic=topic)
+        data["available"] = True
+        if topic:
+            data["topic_filter"] = topic
+        return data
+
+    def get_recent_poison_messages(self, limit: int = 50) -> Dict[str, Any]:
+        """Return recent poison/DLQ records captured by the consumer."""
+        if not self.consumer:
+            return {"available": False, "reason": "consumer_not_initialized", "messages": []}
+        messages = self.consumer.get_recent_poison_messages(limit=limit)
+        return {
+            "available": True,
+            "count": len(messages),
+            "messages": messages,
+        }
+
+    def get_policy_emitter_status(self) -> Dict[str, Any]:
+        """Return policy emitter runtime health/metrics."""
+        status: Dict[str, Any] = {
+            "available": False,
+            "state": self.state.value,
+        }
+        if self.producer is None:
+            status["reason"] = "producer_not_initialized"
+            return status
+
+        status["available"] = True
+        status["producer_metrics"] = self.producer.get_metrics()
+        status["pending_deliveries"] = self.publisher.get_pending_count() if self.publisher else None
+        status["publisher_metrics"] = self.publisher.get_metrics() if self.publisher else {}
+        status["circuit_breaker"] = None
+        if self.circuit_breaker:
+            cb_state = self.circuit_breaker.state
+            status["circuit_breaker"] = cb_state.value if hasattr(cb_state, "value") else str(cb_state)
+        return status
     
     def _initialize_ml_pipeline(self, settings: Settings) -> None:
         """
@@ -1348,6 +1475,7 @@ class ServiceManager:
             publisher=self.publisher,
             logger=self.logger,
             tracker=tracker,
+            event_recorder=self.record_detection_event,
         )
 
     def record_engine_metrics(self, engines: List[Dict[str, Any]], variants: List[Dict[str, Any]]) -> None:
@@ -1503,6 +1631,77 @@ class ServiceManager:
         items.sort(key=lambda item: item.get("total", 0), reverse=True)
         return items[:limit]
 
+    def get_sentinel_metrics_summary(self) -> Dict[str, Any]:
+        """Return a client-friendly Sentinel pipeline summary."""
+
+        source_metrics = self._get_detection_source_metrics().get("sentinel", self._new_detection_source_metrics())
+        events_total = int(source_metrics.get("events_total", 0) or 0)
+        detections_total = int(source_metrics.get("detections_total", 0) or 0)
+        publish_ratio = float(detections_total) / events_total if events_total > 0 else 0.0
+        last_detection_time = source_metrics.get("last_detection_time")
+        last_entity_id = source_metrics.get("last_entity_id")
+        last_entity_type = source_metrics.get("last_entity_type")
+
+        threat_counts: Dict[str, int] = {}
+        latest_history_ts = None
+        with self._history_lock:
+            events = list(self._detection_history)
+
+        for event in events:
+            if event.get("source") != "sentinel":
+                continue
+            threat_type = str(event.get("threat_type") or "unknown")
+            threat_counts[threat_type] = threat_counts.get(threat_type, 0) + 1
+            timestamp = event.get("timestamp")
+            try:
+                ts_value = float(timestamp)
+            except (TypeError, ValueError):
+                continue
+            if latest_history_ts is None or ts_value > latest_history_ts:
+                latest_history_ts = ts_value
+
+        top_threat_type = None
+        if threat_counts:
+            top_threat_type = sorted(
+                threat_counts.items(),
+                key=lambda item: (-item[1], item[0]),
+            )[0][0]
+
+        if events_total <= 0 and detections_total <= 0:
+            status = "idle"
+        elif detections_total > 0:
+            status = "active"
+        else:
+            status = "observing"
+
+        return {
+            "status": status,
+            "events_total": events_total,
+            "detections_total": detections_total,
+            "publish_ratio": publish_ratio,
+            "last_detection_time": last_detection_time,
+            "last_history_event_time": latest_history_ts,
+            "top_threat_type": top_threat_type,
+            "last_entity_id": last_entity_id,
+            "last_entity_type": last_entity_type,
+        }
+
+    def get_detection_interval_seconds(self) -> Optional[float]:
+        """Return configured detection interval for UI display."""
+
+        if self.detection_loop is not None:
+            try:
+                return float(getattr(self.detection_loop, "_interval"))
+            except Exception:
+                pass
+
+        if self.settings is not None:
+            try:
+                return float(getattr(self.settings, "detection_interval"))
+            except Exception:
+                return None
+        return None
+
     def _is_engine_ready(self, engine: str) -> bool:
         if not self.detection_pipeline:
             return False
@@ -1558,6 +1757,13 @@ class ServiceManager:
 
         with self._history_lock:
             self._detection_history.append(event)
+        self._record_detection_source_event(
+            source=source,
+            timestamp=event["timestamp"],
+            should_publish=bool(should_publish),
+            validator_id=validator_id,
+            metadata=event["metadata"],
+        )
 
     def get_detection_history(
         self,
@@ -1619,10 +1825,15 @@ class ServiceManager:
             return now
         return ts
 
-    def get_ai_suspicious_nodes(self, limit: int = 10) -> list:
-        """Compute AI-driven suspicious validator scores."""
+    def get_ai_suspicious_nodes(self, limit: int = 10, entity_type: Optional[str] = None) -> list:
+        """Compute AI-driven suspicious entities from recent detection history."""
 
         limit = max(1, min(limit, 50))
+        requested_entity_type = None
+        if entity_type:
+            requested_entity_type = str(entity_type).strip().lower()
+            if requested_entity_type in ("all", "*"):
+                requested_entity_type = None
         now = time.time()
 
         with self._history_lock:
@@ -1633,8 +1844,8 @@ class ServiceManager:
             if not event.get("should_publish"):
                 continue
 
-            validator_id = event.get("validator_id")
-            if not validator_id:
+            resolved_entity_id, resolved_entity_type = self._resolve_suspicious_entity(event)
+            if not resolved_entity_id:
                 continue
 
             age_seconds = now - event["timestamp"]
@@ -1646,8 +1857,9 @@ class ServiceManager:
             score = (severity_component + confidence_component) * decay
 
             entry = aggregates.setdefault(
-                validator_id,
+                resolved_entity_id,
                 {
+                    "entity_type": resolved_entity_type,
                     "score": 0.0,
                     "event_count": 0,
                     "last_seen": event["timestamp"],
@@ -1665,7 +1877,9 @@ class ServiceManager:
             entry["threat_types"].add(event.get("threat_type", "unknown"))
 
         results = []
-        for validator_id, data in aggregates.items():
+        for entity_id, data in aggregates.items():
+            if requested_entity_type and str(data.get("entity_type", "")).lower() != requested_entity_type:
+                continue
             suspicion = min(100.0, round(data["score"], 2))
 
             if suspicion < 20.0:
@@ -1688,7 +1902,8 @@ class ServiceManager:
 
             results.append(
                 {
-                    "id": validator_id,
+                    "id": entity_id,
+                    "entity_type": data.get("entity_type", "validator"),
                     "status": status,
                     "uptime": max(0.0, 100.0 - suspicion),
                     "suspicion_score": suspicion,
@@ -1701,6 +1916,105 @@ class ServiceManager:
 
         results.sort(key=lambda item: item["suspicion_score"], reverse=True)
         return results[:limit]
+
+    def _new_detection_source_metrics(self) -> Dict[str, Any]:
+        return {
+            "events_total": 0,
+            "detections_total": 0,
+            "last_detection_time": None,
+            "last_validator_id": None,
+            "last_entity_id": None,
+            "last_entity_type": None,
+        }
+
+    def _record_detection_source_event(
+        self,
+        *,
+        source: str,
+        timestamp: float,
+        should_publish: bool,
+        validator_id: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> None:
+        source_key = str(source or "unknown")[:64]
+        entity_id, entity_type = self._resolve_suspicious_entity({
+            "validator_id": validator_id,
+            "metadata": metadata or {},
+        })
+        with self._detection_source_metrics_lock:
+            entry = self._detection_source_metrics.setdefault(source_key, self._new_detection_source_metrics())
+            entry["events_total"] += 1
+            if should_publish:
+                entry["detections_total"] += 1
+                entry["last_detection_time"] = timestamp
+            if validator_id:
+                entry["last_validator_id"] = validator_id
+            if entity_id:
+                entry["last_entity_id"] = entity_id
+                entry["last_entity_type"] = entity_type
+
+    def _get_detection_source_metrics(self) -> Dict[str, Dict[str, Any]]:
+        with self._detection_source_metrics_lock:
+            return {
+                source: dict(metrics)
+                for source, metrics in self._detection_source_metrics.items()
+            }
+
+    def _build_aggregate_detection_metrics(self, loop_metrics: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        loop_metrics = dict(loop_metrics if loop_metrics is not None else self._cached_detection_metrics.get("metrics", {}))
+        source_metrics = self._get_detection_source_metrics()
+        publisher_metrics = self.publisher.get_metrics() if self.publisher else {}
+
+        aggregate = dict(loop_metrics)
+        aggregate["detections_total"] = int(
+            sum(int(metrics.get("detections_total", 0) or 0) for metrics in source_metrics.values())
+        )
+        aggregate["detections_published"] = int(
+            publisher_metrics.get("anomalies_sent", loop_metrics.get("detections_published", 0) or 0) or 0
+        )
+        aggregate["events_total"] = int(
+            sum(int(metrics.get("events_total", 0) or 0) for metrics in source_metrics.values())
+        )
+        aggregate["sources"] = source_metrics
+
+        latest_detection = None
+        for metrics in source_metrics.values():
+            ts = metrics.get("last_detection_time")
+            if ts is None:
+                continue
+            try:
+                ts_val = float(ts)
+            except (TypeError, ValueError):
+                continue
+            if latest_detection is None or ts_val > latest_detection:
+                latest_detection = ts_val
+        if latest_detection is not None:
+            aggregate["last_detection_time"] = latest_detection
+
+        return aggregate
+
+    def _resolve_suspicious_entity(self, event: Dict[str, Any]) -> Tuple[Optional[str], str]:
+        validator_id = event.get("validator_id")
+        if isinstance(validator_id, bytes):
+            validator_id = validator_id.hex()
+        if validator_id:
+            return (str(validator_id), "validator")
+
+        metadata = event.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            return (None, "unknown")
+
+        for key in ("src_ip", "source_ip"):
+            candidate = metadata.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return (f"network:{candidate.strip()}", "network_source")
+
+        for key in ("dst_ip", "destination_ip"):
+            candidate = metadata.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return (f"target:{candidate.strip()}", "network_target")
+
+        return (None, "unknown")
 
     # ------------------------------------------------------------------
     # Internal helpers

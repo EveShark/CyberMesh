@@ -16,6 +16,7 @@ import (
 	"backend/pkg/config"
 	consapi "backend/pkg/consensus/api"
 	"backend/pkg/control/policyoutbox"
+	"backend/pkg/control/policytrace"
 	"backend/pkg/ingest/kafka"
 	"backend/pkg/mempool"
 	"backend/pkg/p2p"
@@ -36,9 +37,60 @@ type PolicyOutboxStatsProvider interface {
 	GetPolicyAckCausalStats() (PolicyAckCausalStats, bool)
 }
 
+type PolicyRuntimeTraceProvider interface {
+	GetPolicyRuntimeTrace(policyID string) []policytrace.Marker
+}
+
 type CommitPathStats struct {
-	LogSampleEvery uint64
-	LogsSuppressed uint64
+	LogSampleEvery                    uint64
+	LogsSuppressed                    uint64
+	BackfillPending                   uint64
+	BackfillDropped                   uint64
+	ReplayRejectedAdmit               uint64
+	ReplayRejectedBuild               uint64
+	ReplayFilterSize                  uint64
+	ReplayFilterEvictions             uint64
+	PersistEnqueueCommitProposer      uint64
+	PersistEnqueueCommitNonProposer   uint64
+	PersistEnqueueBackfillProposer    uint64
+	PersistEnqueueBackfillNonProposer uint64
+	PersistEnqueueDroppedNonProposer  uint64
+	PersistEnqueueErrors              uint64
+	PersistExecuteProposer            uint64
+	PersistExecuteNonProposer         uint64
+	PersistExecuteDroppedNonOwner     uint64
+	ApplyBlockRuns                    uint64
+	ApplyBlockEventTxs                uint64
+	ApplyBlockEvidenceTxs             uint64
+	ApplyBlockPolicyTxs               uint64
+	ApplyBlockTotalBuckets            []utils.HistogramBucket
+	ApplyBlockTotalCount              uint64
+	ApplyBlockTotalSumMs              float64
+	ApplyBlockTotalP95Ms              float64
+	ApplyBlockValidateBuckets         []utils.HistogramBucket
+	ApplyBlockValidateCount           uint64
+	ApplyBlockValidateSumMs           float64
+	ApplyBlockValidateP95Ms           float64
+	ApplyBlockNonceCheckBuckets       []utils.HistogramBucket
+	ApplyBlockNonceCheckCount         uint64
+	ApplyBlockNonceCheckSumMs         float64
+	ApplyBlockNonceCheckP95Ms         float64
+	ApplyBlockReducerEventBuckets     []utils.HistogramBucket
+	ApplyBlockReducerEventCount       uint64
+	ApplyBlockReducerEventSumMs       float64
+	ApplyBlockReducerEventP95Ms       float64
+	ApplyBlockReducerEvidenceBuckets  []utils.HistogramBucket
+	ApplyBlockReducerEvidenceCount    uint64
+	ApplyBlockReducerEvidenceSumMs    float64
+	ApplyBlockReducerEvidenceP95Ms    float64
+	ApplyBlockReducerPolicyBuckets    []utils.HistogramBucket
+	ApplyBlockReducerPolicyCount      uint64
+	ApplyBlockReducerPolicySumMs      float64
+	ApplyBlockReducerPolicyP95Ms      float64
+	ApplyBlockCommitStateBuckets      []utils.HistogramBucket
+	ApplyBlockCommitStateCount        uint64
+	ApplyBlockCommitStateSumMs        float64
+	ApplyBlockCommitStateP95Ms        float64
 }
 
 type PolicyAckConsumerStats struct {
@@ -55,15 +107,28 @@ type PolicyAckConsumerStats struct {
 }
 
 type PolicyAckCausalStats struct {
-	SkewCorrectionsTotal uint64
-	AIToAckBuckets       []utils.HistogramBucket
-	AIToAckCount         uint64
-	AIToAckSumMs         float64
-	AIToAckP95Ms         float64
-	PublishToAckBuckets  []utils.HistogramBucket
-	PublishToAckCount    uint64
-	PublishToAckSumMs    float64
-	PublishToAckP95Ms    float64
+	SkewCorrectionsTotal       uint64
+	CorrelationExact           uint64
+	CorrelationFallbackHash    uint64
+	CorrelationFallbackTrace   uint64
+	CorrelationNoMatch         uint64
+	CorrelationErrors          uint64
+	AIEventUnitCorrections     uint64
+	AIEventInvalidTotal        uint64
+	SourceEventUnitCorrections uint64
+	SourceEventInvalidTotal    uint64
+	AIToAckBuckets             []utils.HistogramBucket
+	AIToAckCount               uint64
+	AIToAckSumMs               float64
+	AIToAckP95Ms               float64
+	SourceToAckBuckets         []utils.HistogramBucket
+	SourceToAckCount           uint64
+	SourceToAckSumMs           float64
+	SourceToAckP95Ms           float64
+	PublishToAckBuckets        []utils.HistogramBucket
+	PublishToAckCount          uint64
+	PublishToAckSumMs          float64
+	PublishToAckP95Ms          float64
 }
 
 // Server provides read-only API access to backend state
@@ -84,6 +149,7 @@ type Server struct {
 	redisClient  *redis.Client
 	redisMetrics *redisTelemetry
 	outboxStats  PolicyOutboxStatsProvider
+	traceStats   PolicyRuntimeTraceProvider
 
 	nodeAliases   map[string]string
 	nodeAliasList []string
@@ -99,6 +165,8 @@ type Server struct {
 	apiRequestErrors     atomic.Uint64
 	routeMetricsMu       sync.RWMutex
 	routeMetrics         map[requestMetricKey]*routeMetric
+	dashboardMetricsMu   sync.RWMutex
+	dashboardMetrics     map[string]*dashboardSectionMetric
 
 	// Middleware components
 	rateLimiter   *RateLimiter
@@ -158,8 +226,9 @@ type routeLimiter struct {
 }
 
 type requestMetricKey struct {
-	method string
-	path   string
+	method      string
+	path        string
+	statusClass string
 }
 
 type routeMetric struct {
@@ -169,17 +238,37 @@ type routeMetric struct {
 	latencyMicros atomic.Uint64
 	cacheHits     atomic.Uint64
 	cacheMisses   atomic.Uint64
+	latencyHist   *utils.LatencyHistogram
 }
 
 type routeMetricSnapshot struct {
-	method        string
-	path          string
-	requests      uint64
-	errors        uint64
-	bytes         uint64
-	latencyMicros uint64
-	cacheHits     uint64
-	cacheMisses   uint64
+	method         string
+	path           string
+	statusClass    string
+	requests       uint64
+	errors         uint64
+	bytes          uint64
+	latencyMicros  uint64
+	cacheHits      uint64
+	cacheMisses    uint64
+	latencyBuckets []utils.HistogramBucket
+	latencyCount   uint64
+	latencySumMs   float64
+	latencyP95Ms   float64
+	latencyP99Ms   float64
+}
+
+type dashboardSectionMetric struct {
+	hist *utils.LatencyHistogram
+}
+
+type dashboardSectionMetricSnapshot struct {
+	section string
+	buckets []utils.HistogramBucket
+	count   uint64
+	sumMs   float64
+	p95Ms   float64
+	p99Ms   float64
 }
 
 type backendHistorySnapshot struct {
@@ -208,6 +297,7 @@ type Dependencies struct {
 	KafkaProd     *kafka.Producer
 	KafkaCons     *kafka.Consumer
 	OutboxStats   PolicyOutboxStatsProvider
+	TraceStats    PolicyRuntimeTraceProvider
 	NodeAliases   map[string]string
 	NodeAliasList []string
 }
@@ -250,9 +340,11 @@ func NewServer(deps Dependencies) (*Server, error) {
 		kafkaProd:        deps.KafkaProd,
 		kafkaCons:        deps.KafkaCons,
 		outboxStats:      deps.OutboxStats,
+		traceStats:       deps.TraceStats,
 		stopCh:           make(chan struct{}),
 		processStartTime: time.Now().Unix(),
 		routeMetrics:     make(map[requestMetricKey]*routeMetric),
+		dashboardMetrics: make(map[string]*dashboardSectionMetric),
 	}
 	s.controlMutationsSafeMode.Store(deps.Config.ControlMutationsSafeMode)
 	if deps.Config.ControlAPIBreakerEnabled {
@@ -628,7 +720,11 @@ func (s *Server) recordAPIRequest(status int) {
 }
 
 func (s *Server) recordRouteMetrics(method, path string, status int, duration time.Duration, bytes int64) {
-	key := requestMetricKey{method: strings.ToUpper(method), path: path}
+	key := requestMetricKey{
+		method:      strings.ToUpper(method),
+		path:        s.normalizeRoutePath(path),
+		statusClass: normalizeStatusClass(status),
+	}
 	metric := s.getOrCreateRouteMetric(key)
 	metric.totalRequests.Add(1)
 	if status >= 400 {
@@ -636,6 +732,7 @@ func (s *Server) recordRouteMetrics(method, path string, status int, duration ti
 	}
 	if duration > 0 {
 		metric.latencyMicros.Add(uint64(duration / time.Microsecond))
+		metric.latencyHist.Observe(float64(duration) / float64(time.Millisecond))
 	}
 	if bytes > 0 {
 		metric.bytesTotal.Add(uint64(bytes))
@@ -643,13 +740,21 @@ func (s *Server) recordRouteMetrics(method, path string, status int, duration ti
 }
 
 func (s *Server) recordRouteCacheHit(method, path string) {
-	key := requestMetricKey{method: strings.ToUpper(method), path: path}
+	key := requestMetricKey{
+		method:      strings.ToUpper(method),
+		path:        s.normalizeRoutePath(path),
+		statusClass: "all",
+	}
 	metric := s.getOrCreateRouteMetric(key)
 	metric.cacheHits.Add(1)
 }
 
 func (s *Server) recordRouteCacheMiss(method, path string) {
-	key := requestMetricKey{method: strings.ToUpper(method), path: path}
+	key := requestMetricKey{
+		method:      strings.ToUpper(method),
+		path:        s.normalizeRoutePath(path),
+		statusClass: "all",
+	}
 	metric := s.getOrCreateRouteMetric(key)
 	metric.cacheMisses.Add(1)
 }
@@ -731,12 +836,27 @@ func (s *Server) maybeRefreshDashboardCache() {
 }
 
 func (s *Server) buildDashboardSnapshot(ctx context.Context) *DashboardOverviewResponse {
+	snapshot, _ := s.buildDashboardSnapshotMeasured(ctx)
+	return snapshot
+}
+
+func (s *Server) buildDashboardSnapshotMeasured(ctx context.Context) (*DashboardOverviewResponse, map[string]time.Duration) {
+	totalStart := time.Now()
+	sectionDurations := make(map[string]time.Duration, 8)
+	recordSection := func(name string, start time.Time) {
+		d := time.Since(start)
+		sectionDurations[name] = d
+		s.recordDashboardSectionMetric(name, d)
+	}
+
+	backendStart := time.Now()
 	stats := s.buildStatsResponse(ctx)
 	backendMetrics := s.buildDashboardBackendMetrics(stats)
 	backendDerived := s.buildDashboardBackendDerived(stats)
 	backendHistory := s.snapshotBackendHistory(stats, backendMetrics)
 	readiness, _ := s.buildReadinessResponse(ctx)
 	health := healthResponseFromReadiness(readiness)
+	recordSection("backend", backendStart)
 
 	var consensusMetrics consapi.MetricsSnapshot
 	if s.engine != nil {
@@ -754,46 +874,83 @@ func (s *Server) buildDashboardSnapshot(ctx context.Context) *DashboardOverviewR
 	)
 
 	g, gctx := errgroup.WithContext(ctx)
+	var sectionMu sync.Mutex
 
 	if s.engine != nil {
 		g.Go(func() error {
-			networkOverview, _ = s.buildNetworkOverview(gctx, time.Now().UTC())
+			start := time.Now()
+			if overview, err := s.buildNetworkOverview(gctx, time.Now().UTC()); err == nil {
+				networkOverview = overview
+			} else if s.logger != nil {
+				s.logger.WarnContext(gctx, "failed to build network overview", utils.ZapError(err))
+			}
+			sectionMu.Lock()
+			recordSection("network", start)
+			sectionMu.Unlock()
 			return nil
 		})
 		g.Go(func() error {
-			consensusOverview, _ = s.buildConsensusOverview(gctx, time.Now().UTC())
+			start := time.Now()
+			if overview, err := s.buildConsensusOverview(gctx, time.Now().UTC()); err == nil {
+				consensusOverview = overview
+			} else if s.logger != nil {
+				s.logger.WarnContext(gctx, "failed to build consensus overview", utils.ZapError(err))
+			}
+			sectionMu.Lock()
+			recordSection("consensus", start)
+			sectionMu.Unlock()
 			return nil
 		})
 	}
 
 	g.Go(func() error {
+		start := time.Now()
 		blocksSection = s.buildDashboardBlocks(gctx, stats, consensusMetrics)
+		sectionMu.Lock()
+		recordSection("blocks", start)
+		sectionMu.Unlock()
 		return nil
 	})
 
 	g.Go(func() error {
+		start := time.Now()
 		threatsSection = s.buildDashboardThreats(gctx)
+		sectionMu.Lock()
+		recordSection("threats", start)
+		sectionMu.Unlock()
 		return nil
 	})
 
 	g.Go(func() error {
+		start := time.Now()
 		aiSection = s.buildDashboardAI(gctx)
+		sectionMu.Lock()
+		recordSection("ai", start)
+		sectionMu.Unlock()
 		return nil
 	})
 
 	g.Go(func() error {
+		start := time.Now()
 		ledgerSection = s.buildDashboardLedger(gctx, stats)
+		sectionMu.Lock()
+		recordSection("ledger", start)
+		sectionMu.Unlock()
 		return nil
 	})
 
 	g.Go(func() error {
+		start := time.Now()
 		validatorSection = s.buildDashboardValidators(gctx)
+		sectionMu.Lock()
+		recordSection("validators", start)
+		sectionMu.Unlock()
 		return nil
 	})
 
 	_ = g.Wait()
 
-	return &DashboardOverviewResponse{
+	snapshot := &DashboardOverviewResponse{
 		Timestamp: time.Now().UnixMilli(),
 		Backend: DashboardBackendSection{
 			Health:    health,
@@ -811,6 +968,8 @@ func (s *Server) buildDashboardSnapshot(ctx context.Context) *DashboardOverviewR
 		Threats:    threatsSection,
 		AI:         aiSection,
 	}
+	recordSection("total", totalStart)
+	return snapshot, sectionDurations
 }
 
 func (s *Server) recordLoopStatus(ctx context.Context, status string, blocking bool, issues []string) {
@@ -926,7 +1085,9 @@ func (s *Server) getOrCreateRouteMetric(key requestMetricKey) *routeMetric {
 	}
 	s.routeMetricsMu.RUnlock()
 
-	metric := &routeMetric{}
+	metric := &routeMetric{
+		latencyHist: utils.NewLatencyHistogram([]float64{1, 5, 20, 50, 100, 250, 500, 1000, 2500, 5000, 10000}),
+	}
 	s.routeMetricsMu.Lock()
 	if existing, ok := s.routeMetrics[key]; ok {
 		s.routeMetricsMu.Unlock()
@@ -942,18 +1103,126 @@ func (s *Server) snapshotRouteMetrics() []routeMetricSnapshot {
 	defer s.routeMetricsMu.RUnlock()
 	snapshots := make([]routeMetricSnapshot, 0, len(s.routeMetrics))
 	for key, metric := range s.routeMetrics {
+		buckets, count, sumMs := metric.latencyHist.Snapshot()
 		snapshots = append(snapshots, routeMetricSnapshot{
-			method:        key.method,
-			path:          key.path,
-			requests:      metric.totalRequests.Load(),
-			errors:        metric.errorRequests.Load(),
-			bytes:         metric.bytesTotal.Load(),
-			latencyMicros: metric.latencyMicros.Load(),
-			cacheHits:     metric.cacheHits.Load(),
-			cacheMisses:   metric.cacheMisses.Load(),
+			method:         key.method,
+			path:           key.path,
+			statusClass:    key.statusClass,
+			requests:       metric.totalRequests.Load(),
+			errors:         metric.errorRequests.Load(),
+			bytes:          metric.bytesTotal.Load(),
+			latencyMicros:  metric.latencyMicros.Load(),
+			cacheHits:      metric.cacheHits.Load(),
+			cacheMisses:    metric.cacheMisses.Load(),
+			latencyBuckets: buckets,
+			latencyCount:   count,
+			latencySumMs:   sumMs,
+			latencyP95Ms:   metric.latencyHist.Quantile(0.95),
+			latencyP99Ms:   metric.latencyHist.Quantile(0.99),
 		})
 	}
 	return snapshots
+}
+
+func normalizeStatusClass(status int) string {
+	switch {
+	case status >= 200 && status < 300:
+		return "2xx"
+	case status >= 300 && status < 400:
+		return "3xx"
+	case status >= 400 && status < 500:
+		return "4xx"
+	case status >= 500 && status < 600:
+		return "5xx"
+	default:
+		return "unknown"
+	}
+}
+
+func (s *Server) recordDashboardSectionMetric(section string, duration time.Duration) {
+	if s == nil || duration < 0 {
+		return
+	}
+	metric := s.getOrCreateDashboardSectionMetric(section)
+	metric.hist.Observe(float64(duration) / float64(time.Millisecond))
+}
+
+func (s *Server) getOrCreateDashboardSectionMetric(section string) *dashboardSectionMetric {
+	s.dashboardMetricsMu.RLock()
+	if metric, ok := s.dashboardMetrics[section]; ok {
+		s.dashboardMetricsMu.RUnlock()
+		return metric
+	}
+	s.dashboardMetricsMu.RUnlock()
+
+	metric := &dashboardSectionMetric{
+		hist: utils.NewLatencyHistogram([]float64{1, 5, 20, 50, 100, 250, 500, 1000, 2500, 5000, 10000}),
+	}
+	s.dashboardMetricsMu.Lock()
+	if existing, ok := s.dashboardMetrics[section]; ok {
+		s.dashboardMetricsMu.Unlock()
+		return existing
+	}
+	s.dashboardMetrics[section] = metric
+	s.dashboardMetricsMu.Unlock()
+	return metric
+}
+
+func (s *Server) snapshotDashboardSectionMetrics() []dashboardSectionMetricSnapshot {
+	s.dashboardMetricsMu.RLock()
+	defer s.dashboardMetricsMu.RUnlock()
+	snapshots := make([]dashboardSectionMetricSnapshot, 0, len(s.dashboardMetrics))
+	for section, metric := range s.dashboardMetrics {
+		buckets, count, sumMs := metric.hist.Snapshot()
+		snapshots = append(snapshots, dashboardSectionMetricSnapshot{
+			section: section,
+			buckets: buckets,
+			count:   count,
+			sumMs:   sumMs,
+			p95Ms:   metric.hist.Quantile(0.95),
+			p99Ms:   metric.hist.Quantile(0.99),
+		})
+	}
+	return snapshots
+}
+
+func (s *Server) normalizeRoutePath(path string) string {
+	if s == nil || s.config == nil {
+		return path
+	}
+	basePath := strings.TrimSuffix(s.config.BasePath, "/")
+	if basePath == "" || !strings.HasPrefix(path, basePath) {
+		return path
+	}
+	trimmed := strings.TrimPrefix(path, basePath)
+	switch {
+	case trimmed == "/blocks/latest":
+		return basePath + "/blocks/latest"
+	case trimmed == "/blocks":
+		return basePath + "/blocks"
+	case strings.HasPrefix(trimmed, "/blocks/"):
+		return basePath + "/blocks/{height}"
+	case trimmed == "/state/root":
+		return basePath + "/state/root"
+	case strings.HasPrefix(trimmed, "/state/"):
+		return basePath + "/state/{key}"
+	case strings.HasPrefix(trimmed, "/policies/acks/"):
+		return basePath + "/policies/acks/{id}"
+	case trimmed == "/control/outbox/backlog":
+		return basePath + "/control/outbox/backlog"
+	case strings.HasSuffix(trimmed, ":retry") && strings.HasPrefix(trimmed, "/control/outbox/"):
+		return basePath + "/control/outbox/{id}:retry"
+	case strings.HasSuffix(trimmed, ":requeue") && strings.HasPrefix(trimmed, "/control/outbox/"):
+		return basePath + "/control/outbox/{id}:requeue"
+	case strings.HasSuffix(trimmed, ":mark-terminal") && strings.HasPrefix(trimmed, "/control/outbox/"):
+		return basePath + "/control/outbox/{id}:mark-terminal"
+	case strings.HasPrefix(trimmed, "/control/outbox/"):
+		return basePath + "/control/outbox/{id}"
+	case strings.HasPrefix(trimmed, "/control/trace/"):
+		return basePath + "/control/trace/{policyId}"
+	default:
+		return path
+	}
 }
 
 func (s *Server) getStorageLatencyMs() float64 {

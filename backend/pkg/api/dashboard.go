@@ -12,10 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/sync/errgroup"
-
 	consapi "backend/pkg/consensus/api"
 	"backend/pkg/utils"
+	"golang.org/x/sync/errgroup"
 )
 
 func (s *Server) handleDashboardOverview(w http.ResponseWriter, r *http.Request) {
@@ -38,104 +37,14 @@ func (s *Server) handleDashboardOverview(w http.ResponseWriter, r *http.Request)
 	ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
 	defer cancel()
 
-	stats := s.buildStatsResponse(ctx)
-	backendMetrics := s.buildDashboardBackendMetrics(stats)
-	backendDerived := s.buildDashboardBackendDerived(stats)
-	backendHistory := s.snapshotBackendHistory(stats, backendMetrics)
-	readiness, _ := s.buildReadinessResponse(ctx)
-	health := healthResponseFromReadiness(readiness)
-
-	var consensusMetrics consapi.MetricsSnapshot
-	if s.engine != nil {
-		consensusMetrics = s.engine.GetMetrics()
+	response, _ := s.buildDashboardSnapshotMeasured(ctx)
+	if response == nil {
+		writeErrorResponse(w, r, "DASHBOARD_BUILD_FAILED", "failed to build dashboard overview", http.StatusInternalServerError)
+		return
 	}
 
-	var (
-		networkOverview   *NetworkOverviewResponse
-		consensusOverview *ConsensusOverviewResponse
-		blocksSection     DashboardBlocksSection
-		threatsSection    DashboardThreatsSection
-		aiSection         DashboardAISection
-		ledgerSection     *DashboardLedgerSection
-		validatorSection  *DashboardValidatorsSection
-	)
-
-	g, gctx := errgroup.WithContext(ctx)
-
-	if s.engine != nil {
-		g.Go(func() error {
-			if overview, err := s.buildNetworkOverview(gctx, time.Now().UTC()); err == nil {
-				networkOverview = overview
-			} else if s.logger != nil {
-				s.logger.WarnContext(gctx, "failed to build network overview", utils.ZapError(err))
-			}
-			return nil
-		})
-	}
-
-	if s.engine != nil {
-		g.Go(func() error {
-			if overview, err := s.buildConsensusOverview(gctx, time.Now().UTC()); err == nil {
-				consensusOverview = overview
-			} else if s.logger != nil {
-				s.logger.WarnContext(gctx, "failed to build consensus overview", utils.ZapError(err))
-			}
-			return nil
-		})
-	}
-
-	g.Go(func() error {
-		blocksSection = s.buildDashboardBlocks(gctx, stats, consensusMetrics)
-		return nil
-	})
-
-	g.Go(func() error {
-		threatsSection = s.buildDashboardThreats(gctx)
-		return nil
-	})
-
-	g.Go(func() error {
-		aiSection = s.buildDashboardAI(gctx)
-		return nil
-	})
-
-	g.Go(func() error {
-		ledgerSection = s.buildDashboardLedger(gctx, stats)
-		return nil
-	})
-
-	g.Go(func() error {
-		validatorSection = s.buildDashboardValidators(gctx)
-		return nil
-	})
-
-	if err := g.Wait(); err != nil {
-		if s.logger != nil {
-			s.logger.WarnContext(ctx, "dashboard parallel build error", utils.ZapError(err))
-		}
-	}
-
-	response := DashboardOverviewResponse{
-		Timestamp: time.Now().UnixMilli(),
-		Backend: DashboardBackendSection{
-			Health:    health,
-			Readiness: readiness,
-			Stats:     stats,
-			Metrics:   backendMetrics,
-			Derived:   backendDerived,
-			History:   backendHistory,
-		},
-		Ledger:     ledgerSection,
-		Validators: validatorSection,
-		Network:    networkOverview,
-		Consensus:  consensusOverview,
-		Blocks:     blocksSection,
-		Threats:    threatsSection,
-		AI:         aiSection,
-	}
-
-	s.setDashboardCache(&response, time.Now())
-	writeJSONResponse(w, r, NewSuccessResponse(&response), http.StatusOK)
+	s.setDashboardCache(response, time.Now())
+	writeJSONResponse(w, r, NewSuccessResponse(response), http.StatusOK)
 }
 
 func (s *Server) buildDashboardBackendMetrics(stats StatsResponse) DashboardBackendMetrics {
@@ -208,7 +117,14 @@ func (s *Server) loadAIMetricsSnapshot(ctx context.Context) (*AIMetricsResponse,
 
 	var issues []string
 	statusDegraded := false
+	recentPublishedActivity := false
 	if metrics.Loop != nil {
+		if metrics.Loop.SecondsSinceLastDetection != nil && *metrics.Loop.SecondsSinceLastDetection <= 600 {
+			if metrics.Loop.Counters != nil && (metrics.Loop.Counters.DetectionsPublished > 0 || metrics.Loop.Counters.DetectionsTotal > 0) {
+				recentPublishedActivity = true
+			}
+		}
+
 		loopStatus := strings.ToLower(metrics.Loop.Status)
 		loopIssues := metrics.Loop.Issues
 		switch loopStatus {
@@ -222,9 +138,14 @@ func (s *Server) loadAIMetricsSnapshot(ctx context.Context) (*AIMetricsResponse,
 		}
 
 		if len(loopIssues) > 0 {
-			issues = append(issues, loopIssues...)
+			for _, issue := range loopIssues {
+				if recentPublishedActivity && (strings.Contains(issue, "since last iteration") || strings.Contains(issue, "since last detection") || strings.Contains(issue, "no detections recorded yet")) {
+					continue
+				}
+				issues = append(issues, issue)
+			}
 		}
-		if metrics.Loop.SecondsSinceLastIteration != nil && *metrics.Loop.SecondsSinceLastIteration > 20 {
+		if !recentPublishedActivity && metrics.Loop.SecondsSinceLastIteration != nil && *metrics.Loop.SecondsSinceLastIteration > 20 {
 			issues = append(issues, fmt.Sprintf("%.0fs since last iteration", *metrics.Loop.SecondsSinceLastIteration))
 		}
 		if metrics.Loop.SecondsSinceLastDetection != nil && *metrics.Loop.SecondsSinceLastDetection > 600 {
@@ -1107,7 +1028,7 @@ func (s *Server) buildDashboardAI(ctx context.Context) DashboardAISection {
 	})
 
 	g.Go(func() error {
-		suspicious, _ = s.fetchAISuspiciousNodesDetailed(gctx, 20)
+		suspicious, _ = s.fetchAISuspiciousNodesDetailed(gctx, 20, "")
 		return nil
 	})
 

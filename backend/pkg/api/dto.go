@@ -186,6 +186,7 @@ type NetworkStats struct {
 	BytesReceived         uint64               `json:"bytes_received"`
 	BytesSent             uint64               `json:"bytes_sent"`
 	AvgLatencyMs          float64              `json:"avg_latency_ms,omitempty"`
+	AvgMessageGapMs       float64              `json:"avg_message_gap_ms,omitempty"`
 	InboundThroughputBps  float64              `json:"inbound_throughput_bytes_per_second,omitempty"`
 	OutboundThroughputBps float64              `json:"outbound_throughput_bytes_per_second,omitempty"`
 	Timestamp             time.Time            `json:"timestamp"`
@@ -194,13 +195,14 @@ type NetworkStats struct {
 
 // NetworkTrendSample captures historical network telemetry for charting.
 type NetworkTrendSample struct {
-	Timestamp     time.Time `json:"timestamp"`
-	PeerCount     int       `json:"peer_count"`
-	InboundPeers  int       `json:"inbound_peers"`
-	OutboundPeers int       `json:"outbound_peers"`
-	AvgLatencyMs  float64   `json:"avg_latency_ms"`
-	BytesReceived uint64    `json:"bytes_received"`
-	BytesSent     uint64    `json:"bytes_sent"`
+	Timestamp       time.Time `json:"timestamp"`
+	PeerCount       int       `json:"peer_count"`
+	InboundPeers    int       `json:"inbound_peers"`
+	OutboundPeers   int       `json:"outbound_peers"`
+	AvgLatencyMs    float64   `json:"avg_latency_ms"`
+	AvgMessageGapMs float64   `json:"avg_message_gap_ms,omitempty"`
+	BytesReceived   uint64    `json:"bytes_received"`
+	BytesSent       uint64    `json:"bytes_sent"`
 }
 
 // KafkaStats represents Kafka telemetry
@@ -315,6 +317,7 @@ type AIMetricsResponse struct {
 	Derived  *AiMetricsDerived       `json:"derived,omitempty"`
 	Engines  []AiEngineMetric        `json:"engines"`
 	Variants []AiVariantMetric       `json:"variants"`
+	Sentinel *AiSentinelMetric       `json:"sentinel,omitempty"`
 }
 
 // AiDetectionLoopSummary captures runtime loop metrics
@@ -327,6 +330,7 @@ type AiDetectionLoopSummary struct {
 	Healthy                   bool                     `json:"healthy,omitempty"`
 	AvgLatencyMs              float64                  `json:"avg_latency_ms"`
 	LastLatencyMs             float64                  `json:"last_latency_ms"`
+	ConfiguredIntervalSeconds *float64                 `json:"configured_interval_seconds,omitempty"`
 	SecondsSinceLastDetection *float64                 `json:"seconds_since_last_detection,omitempty"`
 	SecondsSinceLastIteration *float64                 `json:"seconds_since_last_iteration,omitempty"`
 	CacheAgeSeconds           *float64                 `json:"cache_age_seconds,omitempty"`
@@ -377,6 +381,19 @@ type AiVariantMetric struct {
 	LastUpdated         *float64 `json:"last_updated,omitempty"`
 }
 
+// AiSentinelMetric captures Sentinel pipeline activity distinct from engine inference.
+type AiSentinelMetric struct {
+	Status               string   `json:"status"`
+	EventsTotal          int64    `json:"events_total"`
+	DetectionsTotal      int64    `json:"detections_total"`
+	PublishRatio         float64  `json:"publish_ratio"`
+	LastDetectionTime    *float64 `json:"last_detection_time,omitempty"`
+	LastHistoryEventTime *float64 `json:"last_history_event_time,omitempty"`
+	TopThreatType        string   `json:"top_threat_type,omitempty"`
+	LastEntityID         string   `json:"last_entity_id,omitempty"`
+	LastEntityType       string   `json:"last_entity_type,omitempty"`
+}
+
 // AiDetectionHistoryEntry represents a single detection event from the AI service
 type AiDetectionHistoryEntry struct {
 	Timestamp     string                 `json:"timestamp"`
@@ -400,6 +417,7 @@ type AiDetectionHistoryResponse struct {
 // AiSuspiciousNode mirrors AI service suspicious node payload
 type AiSuspiciousNode struct {
 	ID             string   `json:"id"`
+	EntityType     string   `json:"entity_type,omitempty"`
 	Status         string   `json:"status"`
 	SuspicionScore float64  `json:"suspicion_score"`
 	EventCount     int      `json:"event_count"`
@@ -423,6 +441,8 @@ type NetworkNodeDTO struct {
 	Name            string     `json:"name"`
 	Status          string     `json:"status"`
 	Latency         float64    `json:"latency"`
+	PingLatencyMs   float64    `json:"ping_latency_ms,omitempty"`
+	MessageGapMs    float64    `json:"message_gap_ms,omitempty"`
 	Uptime          float64    `json:"uptime"`
 	ThroughputBytes uint64     `json:"throughput_bytes"`
 	LastSeen        *time.Time `json:"last_seen,omitempty"`
@@ -448,22 +468,23 @@ type VotingStatusDTO struct {
 
 // NetworkOverviewResponse aggregates network health and validator participation data.
 type NetworkOverviewResponse struct {
-	ConnectedPeers   int               `json:"connected_peers"`
-	TotalPeers       int               `json:"total_peers"`
-	ExpectedPeers    int               `json:"expected_peers"`
-	AverageLatencyMs float64           `json:"average_latency_ms"`
-	ConsensusRound   uint64            `json:"consensus_round"`
-	LeaderStability  float64           `json:"leader_stability"`
-	Phase            string            `json:"phase"`
-	Leader           string            `json:"leader,omitempty"`
-	LeaderID         string            `json:"leader_id,omitempty"`
-	Nodes            []NetworkNodeDTO  `json:"nodes"`
-	VotingStatus     []VotingStatusDTO `json:"voting_status"`
-	Edges            []NetworkEdgeDTO  `json:"edges,omitempty"`
-	Self             string            `json:"self,omitempty"`
-	InboundRateBps   float64           `json:"inbound_rate_bps,omitempty"`
-	OutboundRateBps  float64           `json:"outbound_rate_bps,omitempty"`
-	UpdatedAt        time.Time         `json:"updated_at"`
+	ConnectedPeers      int               `json:"connected_peers"`
+	TotalPeers          int               `json:"total_peers"`
+	ExpectedPeers       int               `json:"expected_peers"`
+	AverageLatencyMs    float64           `json:"average_latency_ms"`
+	AverageMessageGapMs float64           `json:"average_message_gap_ms,omitempty"`
+	ConsensusRound      uint64            `json:"consensus_round"`
+	LeaderStability     float64           `json:"leader_stability"`
+	Phase               string            `json:"phase"`
+	Leader              string            `json:"leader,omitempty"`
+	LeaderID            string            `json:"leader_id,omitempty"`
+	Nodes               []NetworkNodeDTO  `json:"nodes"`
+	VotingStatus        []VotingStatusDTO `json:"voting_status"`
+	Edges               []NetworkEdgeDTO  `json:"edges,omitempty"`
+	Self                string            `json:"self,omitempty"`
+	InboundRateBps      float64           `json:"inbound_rate_bps,omitempty"`
+	OutboundRateBps     float64           `json:"outbound_rate_bps,omitempty"`
+	UpdatedAt           time.Time         `json:"updated_at"`
 }
 
 // Consensus overview DTOs
@@ -487,6 +508,7 @@ type ConsensusVoteDTO struct {
 // SuspiciousNodeDTO represents a validator flagged for potential issues.
 type SuspiciousNodeDTO struct {
 	ID             string  `json:"id"`
+	EntityType     string  `json:"entity_type,omitempty"`
 	Status         string  `json:"status"`
 	Uptime         float64 `json:"uptime"`
 	SuspicionScore float64 `json:"suspicion_score"`

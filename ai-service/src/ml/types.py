@@ -115,6 +115,7 @@ class InstrumentedResult:
     feature_count: int = 0
     candidate_count: int = 0
     error: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
     
     def __post_init__(self):
         """Validate latency consistency."""

@@ -193,7 +193,8 @@ class MessageHandlers:
         try:
             # Run pipeline
             result = self.service_manager.detection_pipeline.process(
-                trigger_event={'commit_height': event.height}
+                trigger_event={'commit_height': event.height},
+                telemetry_wait_policy="non_blocking",
             )
             
             # Record metrics
@@ -205,6 +206,12 @@ class MessageHandlers:
                     feature_count=result.feature_count,
                     candidate_count=result.candidate_count
                 )
+
+            if self.service_manager and isinstance(getattr(result, "metadata", None), dict):
+                engine_snapshots = result.metadata.get("engine_snapshots") or []
+                variant_snapshots = result.metadata.get("variant_snapshots") or []
+                if engine_snapshots or variant_snapshots:
+                    self.service_manager.record_engine_metrics(engine_snapshots, variant_snapshots)
 
             # Persist detection history for API consumers
             if self.service_manager and result.decision:
@@ -226,6 +233,17 @@ class MessageHandlers:
                         "block_hash": block_hash_prefix,
                         "transaction_count": getattr(event, "transaction_count", None),
                         "abstention_reason": decision.abstention_reason,
+                    },
+                )
+            elif result.error and str(result.error).startswith("no_telemetry_data:"):
+                abstention_reason = None
+                if isinstance(getattr(result, "metadata", None), dict):
+                    abstention_reason = result.metadata.get("abstention_reason")
+                self.logger.info(
+                    "Detection abstained",
+                    extra={
+                        "reason": abstention_reason or "telemetry_unavailable:unknown",
+                        "error": result.error,
                     },
                 )
             

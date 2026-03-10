@@ -8,7 +8,8 @@ import (
 )
 
 type Store struct {
-	db *sql.DB
+	db               *sql.DB
+	hasSourceColumns bool
 }
 
 func NewStore(db *sql.DB) (*Store, error) {
@@ -50,6 +51,17 @@ func (s *Store) EnsureSchema(ctx context.Context) error {
 	if traceCols < 2 {
 		return fmt.Errorf("policy outbox: required trace columns missing; ensure migration 008 applied")
 	}
+	var sourceCols int
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT count(*)
+		FROM information_schema.columns
+		WHERE table_schema = 'public'
+		  AND table_name = 'control_policy_outbox'
+		  AND column_name IN ('source_event_id', 'source_event_ts_ms')
+	`).Scan(&sourceCols); err != nil {
+		return fmt.Errorf("policy outbox: source trace column check failed: %w", err)
+	}
+	s.hasSourceColumns = sourceCols >= 2
 
 	return nil
 }
@@ -65,32 +77,75 @@ func (s *Store) TryAcquireLease(ctx context.Context, leaseKey, holderID string, 
 		return false, 0, fmt.Errorf("policy outbox: ttl must be positive")
 	}
 
-	var holder string
-	var epoch int64
-	err := s.db.QueryRowContext(ctx, `
+	// Step 1: Create lease row if missing.
+	insRows, err := s.db.QueryContext(ctx, `
 		INSERT INTO control_dispatcher_leases (lease_key, holder_id, epoch, lease_until, updated_at)
 		VALUES ($1, $2, 1, now() + $3::INTERVAL, now())
-		ON CONFLICT (lease_key) DO UPDATE
-		SET holder_id = CASE
-				WHEN control_dispatcher_leases.holder_id = $2 OR control_dispatcher_leases.lease_until < now()
-				THEN $2
-				ELSE control_dispatcher_leases.holder_id
-			END,
+		ON CONFLICT (lease_key) DO NOTHING
+		RETURNING holder_id, epoch
+	`, leaseKey, holderID, ttl.String())
+	if err != nil {
+		return false, 0, fmt.Errorf("policy outbox: acquire lease insert: %w", err)
+	}
+	defer insRows.Close()
+
+	var holder string
+	var epoch int64
+	if insRows.Next() {
+		if scanErr := insRows.Scan(&holder, &epoch); scanErr != nil {
+			return false, 0, fmt.Errorf("policy outbox: acquire lease insert scan: %w", scanErr)
+		}
+		if rowsErr := insRows.Err(); rowsErr != nil {
+			return false, 0, fmt.Errorf("policy outbox: acquire lease insert rows: %w", rowsErr)
+		}
+		return true, epoch, nil
+	}
+	if rowsErr := insRows.Err(); rowsErr != nil {
+		return false, 0, fmt.Errorf("policy outbox: acquire lease insert rows: %w", rowsErr)
+	}
+
+	// Step 2: Renew if already holder, or take over if expired.
+	updRows, err := s.db.QueryContext(ctx, `
+		UPDATE control_dispatcher_leases
+		SET holder_id = $2,
 			epoch = CASE
 				WHEN control_dispatcher_leases.holder_id = $2 THEN control_dispatcher_leases.epoch
-				WHEN control_dispatcher_leases.lease_until < now() THEN control_dispatcher_leases.epoch + 1
-				ELSE control_dispatcher_leases.epoch
+				ELSE control_dispatcher_leases.epoch + 1
 			END,
-			lease_until = CASE
-				WHEN control_dispatcher_leases.holder_id = $2 OR control_dispatcher_leases.lease_until < now()
-				THEN now() + $3::INTERVAL
-				ELSE control_dispatcher_leases.lease_until
-			END,
+			lease_until = now() + $3::INTERVAL,
 			updated_at = now()
+		WHERE lease_key = $1
+		  AND (control_dispatcher_leases.holder_id = $2 OR control_dispatcher_leases.lease_until < now())
 		RETURNING holder_id, epoch
-	`, leaseKey, holderID, ttl.String()).Scan(&holder, &epoch)
+	`, leaseKey, holderID, ttl.String())
 	if err != nil {
-		return false, 0, fmt.Errorf("policy outbox: acquire lease: %w", err)
+		return false, 0, fmt.Errorf("policy outbox: acquire lease update: %w", err)
+	}
+	defer updRows.Close()
+	if updRows.Next() {
+		if scanErr := updRows.Scan(&holder, &epoch); scanErr != nil {
+			return false, 0, fmt.Errorf("policy outbox: acquire lease update scan: %w", scanErr)
+		}
+		if rowsErr := updRows.Err(); rowsErr != nil {
+			return false, 0, fmt.Errorf("policy outbox: acquire lease update rows: %w", rowsErr)
+		}
+		return holder == holderID, epoch, nil
+	}
+	if rowsErr := updRows.Err(); rowsErr != nil {
+		return false, 0, fmt.Errorf("policy outbox: acquire lease update rows: %w", rowsErr)
+	}
+
+	// Step 3: Read current holder (no write for non-holders while lease is valid).
+	err = s.db.QueryRowContext(ctx, `
+		SELECT holder_id, epoch
+		FROM control_dispatcher_leases
+		WHERE lease_key = $1
+	`, leaseKey).Scan(&holder, &epoch)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return false, 0, nil
+		}
+		return false, 0, fmt.Errorf("policy outbox: acquire lease read current: %w", err)
 	}
 	return holder == holderID, epoch, nil
 }
@@ -109,7 +164,7 @@ func (s *Store) ClaimPending(ctx context.Context, holderID string, epoch int64, 
 		reclaimAfter = 30 * time.Second
 	}
 
-	rows, err := s.db.QueryContext(ctx, `
+	query := `
 		WITH candidates AS (
 			SELECT o.id
 			FROM control_policy_outbox o
@@ -140,8 +195,15 @@ func (s *Store) ClaimPending(ctx context.Context, holderID string, epoch int64, 
 			lease_epoch=$3,
 			updated_at=now()
 		WHERE id IN (SELECT id FROM candidates)
-		RETURNING id::STRING, block_height, block_ts, tx_index, policy_id, COALESCE(trace_id, ''), COALESCE(ai_event_ts_ms, 0), rule_hash, payload, status, retries, lease_epoch
-	`, limit, holderID, epoch, reclaimAfter.String())
+	`
+	if s.hasSourceColumns {
+		query += `
+		RETURNING id::STRING, block_height, block_ts, tx_index, policy_id, COALESCE(trace_id, ''), COALESCE(ai_event_ts_ms, 0), COALESCE(source_event_id, ''), COALESCE(source_event_ts_ms, 0), rule_hash, payload, status, retries, lease_epoch`
+	} else {
+		query += `
+		RETURNING id::STRING, block_height, block_ts, tx_index, policy_id, COALESCE(trace_id, ''), COALESCE(ai_event_ts_ms, 0), rule_hash, payload, status, retries, lease_epoch`
+	}
+	rows, err := s.db.QueryContext(ctx, query, limit, holderID, epoch, reclaimAfter.String())
 	if err != nil {
 		return nil, fmt.Errorf("policy outbox: claim pending: %w", err)
 	}
@@ -150,9 +212,17 @@ func (s *Store) ClaimPending(ctx context.Context, holderID string, epoch int64, 
 	out := make([]Row, 0, limit)
 	for rows.Next() {
 		var r Row
-		if scanErr := rows.Scan(
-			&r.ID, &r.BlockHeight, &r.BlockTS, &r.TxIndex, &r.PolicyID, &r.TraceID, &r.AIEventTsMs, &r.RuleHash, &r.Payload, &r.Status, &r.Retries, &r.LeaseEpoch,
-		); scanErr != nil {
+		var scanErr error
+		if s.hasSourceColumns {
+			scanErr = rows.Scan(
+				&r.ID, &r.BlockHeight, &r.BlockTS, &r.TxIndex, &r.PolicyID, &r.TraceID, &r.AIEventTsMs, &r.SourceEventID, &r.SourceEventTsMs, &r.RuleHash, &r.Payload, &r.Status, &r.Retries, &r.LeaseEpoch,
+			)
+		} else {
+			scanErr = rows.Scan(
+				&r.ID, &r.BlockHeight, &r.BlockTS, &r.TxIndex, &r.PolicyID, &r.TraceID, &r.AIEventTsMs, &r.RuleHash, &r.Payload, &r.Status, &r.Retries, &r.LeaseEpoch,
+			)
+		}
+		if scanErr != nil {
 			return nil, fmt.Errorf("policy outbox: claim scan: %w", scanErr)
 		}
 		out = append(out, r)

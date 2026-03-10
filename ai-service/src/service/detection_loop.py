@@ -5,12 +5,14 @@ Runs in background thread, publishes detections to Kafka.
 """
 
 import logging
+import os
 import random
 import threading
 import time
 from typing import Optional, Dict, Any, Callable, List, TYPE_CHECKING
 
 from .policy_emitter import PolicyContext, build_policy_candidate
+from ..utils.metrics import get_metrics_collector
 
 if TYPE_CHECKING:  # pragma: no cover - avoid runtime dependency cycle
     from ..feedback.tracker import AnomalyLifecycleTracker
@@ -36,6 +38,10 @@ def _extract_raw_score(decision) -> Optional[float]:
         return float(raw)
     except Exception:
         return None
+
+
+def _policy_stage_markers_enabled() -> bool:
+    return os.getenv("POLICY_STAGE_MARKERS_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 
 
 class DetectionLoop:
@@ -83,6 +89,7 @@ class DetectionLoop:
         self.config = config
         self.logger = logger or logging.getLogger(__name__)
         self._metrics_collector = metrics
+        self._service_metrics = get_metrics_collector()
         self._event_recorder = event_recorder
         self._engine_metrics_callback = engine_metrics_callback
         self._tracker: Optional["AnomalyLifecycleTracker"] = None
@@ -112,6 +119,12 @@ class DetectionLoop:
             "policy_failed": 0,
             "policy_skipped": 0,
             "policy_skip_reasons": {},
+            "telemetry_fetch": {
+                "total_calls": 0,
+                "by_wait_policy": {},
+                "by_reason": {},
+                "last": None,
+            },
         }
         self._metrics_lock = threading.Lock()
         self._summary_interval = max(1, int(config.get('DETECTION_SUMMARY_INTERVAL', 10)))
@@ -347,13 +360,28 @@ class DetectionLoop:
         
         while self._running:
             iteration_start = time.time()
+            iteration_op_start = time.monotonic()
             rate_limited = False
+            iteration_status = "ok"
             
             try:
                 # 1. Run detection pipeline
                 detection_start = time.time()
-                result = self.pipeline.process()
+                result = self.pipeline.process(telemetry_wait_policy="streaming_batch")
                 detection_latency = (time.time() - detection_start) * 1000  # ms
+                self._record_telemetry_fetch_metrics(getattr(result, "metadata", {}) or {})
+                if self._engine_metrics_callback is not None and isinstance(getattr(result, "metadata", None), dict):
+                    try:
+                        self._engine_metrics_callback(
+                            result.metadata.get("engine_snapshots") or [],
+                            result.metadata.get("variant_snapshots") or [],
+                        )
+                    except Exception as metrics_err:
+                        self.logger.debug(
+                            "Failed to record engine metrics",
+                            exc_info=True,
+                            extra={"error": str(metrics_err)},
+                        )
 
                 # Never fail silently: when no telemetry is available (or pipeline errored),
                 # emit a low-noise debug line so E2E runs can pinpoint the stall quickly.
@@ -487,6 +515,7 @@ class DetectionLoop:
                         payload_bytes = json.dumps(payload_obj, separators=(",", ":")).encode('utf-8')
                         
                         published = False
+                        anomaly_publish_start = time.monotonic()
                         try:
                             self.publisher.publish_anomaly(
                                 anomaly_id=anomaly_id,
@@ -499,6 +528,14 @@ class DetectionLoop:
                             )
                             published = True
                         finally:
+                            try:
+                                self._service_metrics.record_service_operation(
+                                    "detection_publish_anomaly",
+                                    time.monotonic() - anomaly_publish_start,
+                                    status="ok" if published else "error",
+                                )
+                            except Exception:
+                                self.logger.debug("Failed to record anomaly publish metric", exc_info=True)
                             if published:
                                 self._increment_metric("detections_published")
 
@@ -596,6 +633,7 @@ class DetectionLoop:
                         **(network_context or {}),
                     }
                     payload_bytes = json.dumps(payload_obj, separators=(",", ":")).encode("utf-8")
+                    diagnostics_publish_start = time.monotonic()
                     try:
                         self.publisher.publish_anomaly(
                             anomaly_id=anomaly_id,
@@ -607,11 +645,27 @@ class DetectionLoop:
                             model_version="diagnostics",
                         )
                         self._increment_metric("detections_published")
+                        try:
+                            self._service_metrics.record_service_operation(
+                                "detection_publish_anomaly",
+                                time.monotonic() - diagnostics_publish_start,
+                                status="ok",
+                            )
+                        except Exception:
+                            self.logger.debug("Failed to record diagnostics anomaly publish metric", exc_info=True)
                         self.logger.info(
                             "Published diagnostics anomaly (forced)",
                             extra={"anomaly_id": anomaly_id, "abstention_reason": getattr(decision, "abstention_reason", None)},
                         )
                     except Exception as err:
+                        try:
+                            self._service_metrics.record_service_operation(
+                                "detection_publish_anomaly",
+                                time.monotonic() - diagnostics_publish_start,
+                                status="error",
+                            )
+                        except Exception:
+                            self.logger.debug("Failed to record diagnostics anomaly publish metric", exc_info=True)
                         self._increment_metric("errors")
                         self.logger.error("Diagnostics anomaly publish failed", extra={"error": str(err)}, exc_info=True)
                 
@@ -750,6 +804,7 @@ class DetectionLoop:
                         self.logger.debug("Failed to record engine analytics", exc_info=True)
                 
             except Exception as e:
+                iteration_status = "error"
                 self._increment_metric("errors")
                 self.logger.error(
                     f"Detection loop error: {e}",
@@ -769,6 +824,15 @@ class DetectionLoop:
                     rate_limited=False,
                     errored=True,
                 )
+            finally:
+                try:
+                    self._service_metrics.record_service_operation(
+                        "detection_iteration",
+                        time.monotonic() - iteration_op_start,
+                        status=iteration_status,
+                    )
+                except Exception:
+                    self.logger.debug("Failed to record detection iteration metric", exc_info=True)
             
             # Flush tracker buffer if interval elapsed
             self._maybe_flush_tracker_buffer()
@@ -848,7 +912,26 @@ class DetectionLoop:
 
         candidate = decision.candidate
         self._increment_metric("policy_candidates")
+        if _policy_stage_markers_enabled():
+            trace_id = (
+                (candidate.payload.get("trace") or {}).get("id")
+                or (candidate.payload.get("metadata") or {}).get("trace_id")
+                or candidate.payload.get("trace_id")
+                or candidate.payload.get("qc_reference")
+                or ""
+            )
+            if trace_id:
+                self.logger.info(
+                    "policy stage marker",
+                    extra={
+                        "stage": "t_ai_decision_done",
+                        "policy_id": candidate.policy_id,
+                        "trace_id": str(trace_id),
+                        "t_ms": int(time.time() * 1000),
+                    },
+                )
 
+        publish_start = time.monotonic()
         try:
             self.publisher.publish_policy_violation(
                 policy_id=candidate.policy_id,
@@ -858,6 +941,14 @@ class DetectionLoop:
             )
         except Exception as exc:  # pragma: no cover - defensive
             self._increment_metric("policy_failed")
+            try:
+                self._service_metrics.record_service_operation(
+                    "detection_publish_policy",
+                    time.monotonic() - publish_start,
+                    status="error",
+                )
+            except Exception:
+                self.logger.debug("Failed to record detection policy publish metric", exc_info=True)
             self.logger.error(
                 "Failed to publish policy violation",
                 exc_info=True,
@@ -869,6 +960,14 @@ class DetectionLoop:
             )
         else:
             self._increment_metric("policy_published")
+            try:
+                self._service_metrics.record_service_operation(
+                    "detection_publish_policy",
+                    time.monotonic() - publish_start,
+                    status="ok",
+                )
+            except Exception:
+                self.logger.debug("Failed to record detection policy publish metric", exc_info=True)
 
             tracker = self._tracker
             if tracker is not None:
@@ -913,7 +1012,16 @@ class DetectionLoop:
             - Returns copy of metrics (safe to read while loop runs)
         """
         with self._metrics_lock:
-            return self._metrics.copy()
+            metrics = dict(self._metrics)
+            telemetry_fetch = metrics.get("telemetry_fetch")
+            if isinstance(telemetry_fetch, dict):
+                metrics["telemetry_fetch"] = {
+                    "total_calls": int(telemetry_fetch.get("total_calls", 0) or 0),
+                    "by_wait_policy": dict(telemetry_fetch.get("by_wait_policy", {})),
+                    "by_reason": dict(telemetry_fetch.get("by_reason", {})),
+                    "last": dict(telemetry_fetch.get("last", {})) if isinstance(telemetry_fetch.get("last"), dict) else telemetry_fetch.get("last"),
+                }
+            return metrics
     
     def is_running(self) -> bool:
         """Return True when the background loop thread is active."""
@@ -1008,6 +1116,39 @@ class DetectionLoop:
         }
 
         return snapshot
+
+    def _record_telemetry_fetch_metrics(self, metadata: Dict[str, Any]) -> None:
+        telemetry_fetch = metadata.get("telemetry_fetch")
+        if not isinstance(telemetry_fetch, dict):
+            return
+
+        reason = str(telemetry_fetch.get("reason", "unknown"))[:64]
+        wait_policy = str(telemetry_fetch.get("wait_policy", "unknown"))[:32]
+        safe_snapshot = {
+            "reason": reason,
+            "wait_policy": wait_policy,
+            "accepted_count": int(telemetry_fetch.get("accepted_count", 0) or 0),
+            "rejected_count": int(telemetry_fetch.get("rejected_count", 0) or 0),
+            "coverage_reject_count": int(telemetry_fetch.get("coverage_reject_count", 0) or 0),
+            "duplicate_count": int(telemetry_fetch.get("duplicate_count", 0) or 0),
+            "empty_polls": int(telemetry_fetch.get("empty_polls", 0) or 0),
+            "assignment_polls": int(telemetry_fetch.get("assignment_polls", 0) or 0),
+            "poll_count": int(telemetry_fetch.get("poll_count", 0) or 0),
+            "assignment_wait_ms": float(telemetry_fetch.get("assignment_wait_ms", 0.0) or 0.0),
+            "total_duration_ms": float(telemetry_fetch.get("total_duration_ms", 0.0) or 0.0),
+        }
+
+        with self._metrics_lock:
+            aggregate = self._metrics.setdefault(
+                "telemetry_fetch",
+                {"total_calls": 0, "by_wait_policy": {}, "by_reason": {}, "last": None},
+            )
+            aggregate["total_calls"] = int(aggregate.get("total_calls", 0) or 0) + 1
+            by_wait_policy = aggregate.setdefault("by_wait_policy", {})
+            by_wait_policy[wait_policy] = int(by_wait_policy.get(wait_policy, 0) or 0) + 1
+            by_reason = aggregate.setdefault("by_reason", {})
+            by_reason[reason] = int(by_reason.get(reason, 0) or 0) + 1
+            aggregate["last"] = safe_snapshot
 
     def is_healthy(self) -> bool:
         """

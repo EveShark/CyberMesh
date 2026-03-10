@@ -26,7 +26,8 @@ from .policy_manager import PolicyManager
 from .threshold_manager import ThresholdManager
 from .storage import RedisStorage
 from ..config.settings import Settings, FeedbackConfig
-from ..contracts import PolicyUpdateEvent, CommitEvent
+from ..contracts import PolicyUpdateEvent, CommitEvent, PolicyAckEvent
+from ..utils.errors import ValidationError
 
 if TYPE_CHECKING:  # pragma: no cover
     from ..kafka.consumer import AIConsumer
@@ -126,6 +127,9 @@ class FeedbackService:
         self._running = False
         self._last_calibration_check = 0
         self._last_threshold_check = 0
+        self._calibration_insufficient_samples_count = 0
+        self._calibration_insufficient_samples_last_log = 0.0
+        self._calibration_insufficient_samples_log_interval_seconds = 300.0
         
         self.logger.info("FeedbackService initialized")
     
@@ -133,6 +137,7 @@ class FeedbackService:
         """Register handlers for backend messages"""
         self.consumer.register_handler("policy_update", self._handle_policy_update)
         self.consumer.register_handler("commit", self._handle_commit)
+        self.consumer.register_handler("policy_ack", self._handle_policy_ack)
     
     def _handle_policy_update(self, msg: PolicyUpdateEvent):
         """
@@ -159,9 +164,16 @@ class FeedbackService:
                     f"Failed to apply policy {msg.policy_id} "
                     f"(type={msg.rule_type}, action={msg.action})"
                 )
+                # Fail-closed: force consumer retry path instead of committing
+                # offset when policy application did not succeed.
+                raise RuntimeError(
+                    f"policy update apply failed for policy_id={msg.policy_id} "
+                    f"type={msg.rule_type} action={msg.action}"
+                )
         
         except Exception as e:
             self.logger.error(f"Policy update error: {e}", exc_info=True)
+            raise
     
     def _handle_commit(self, msg):
         """
@@ -204,6 +216,33 @@ class FeedbackService:
             self._check_threshold_adjustment()
         except Exception as e:
             self.logger.error(f"Commit handling error: {e}", exc_info=True)
+
+    def _handle_policy_ack(self, msg: PolicyAckEvent):
+        """Record enforcement acknowledgement in lifecycle tracker."""
+        try:
+            anomaly_id = self.tracker.record_policy_ack(
+                policy_id=msg.policy_id,
+                result=msg.result,
+                reason=msg.reason,
+                error_code=msg.error_code,
+                applied_at=msg.applied_at if msg.applied_at else None,
+                acked_at=msg.acked_at if msg.acked_at else None,
+                fast_path=msg.fast_path,
+            )
+            if anomaly_id:
+                self.logger.info(
+                    "Policy ACK mapped to anomaly lifecycle",
+                    extra={
+                        "policy_id": msg.policy_id,
+                        "anomaly_id": anomaly_id,
+                        "result": msg.result,
+                    },
+                )
+        except Exception as e:  # pragma: no cover - defensive logging
+            self.logger.error(f"Policy ACK handling error: {e}", exc_info=True)
+            # Do not swallow ACK persistence errors. Let consumer retry and
+            # avoid at-most-once loss of lifecycle linkage.
+            raise
     
     def _check_calibration(self):
         """Check if calibrator should retrain"""
@@ -232,6 +271,22 @@ class FeedbackService:
                         )
         
         except Exception as e:
+            message = str(e).lower()
+            if isinstance(e, ValidationError) and "insufficient samples for training" in message:
+                self._calibration_insufficient_samples_count += 1
+                if (
+                    now - self._calibration_insufficient_samples_last_log
+                    >= self._calibration_insufficient_samples_log_interval_seconds
+                ):
+                    self._calibration_insufficient_samples_last_log = now
+                    self.logger.warning(
+                        "Calibration skipped: insufficient samples",
+                        extra={
+                            "skipped_total": self._calibration_insufficient_samples_count,
+                            "min_samples": self.feedback_config.calibration_min_samples,
+                        },
+                    )
+                return
             self.logger.error(f"Calibration check error: {e}", exc_info=True)
     
     def _check_threshold_adjustment(self):
@@ -276,6 +331,7 @@ class FeedbackService:
                 "topics": [
                     self.config.kafka_topics.control_commits,
                     self.config.kafka_topics.control_policy,
+                    getattr(self.config.kafka_topics, "control_policy_ack", "control.enforcement_ack.v1"),
                     self.config.kafka_topics.control_evidence
                 ]
             }
@@ -323,5 +379,6 @@ class FeedbackService:
             "tracker": self.tracker.get_stats(),
             "calibrator": self.calibrator.get_stats(),
             "policy_manager": self.policy_manager.get_stats(),
-            "threshold_manager": self.threshold_manager.get_stats()
+            "threshold_manager": self.threshold_manager.get_stats(),
+            "calibration_skipped_insufficient_samples_total": self._calibration_insufficient_samples_count,
         }

@@ -98,6 +98,11 @@ type Coordinator struct {
 		lastHash [32]byte
 		lastSend time.Time
 	}
+	certificateRelay struct {
+		mu          sync.Mutex
+		minInterval time.Duration
+		lastByPeer  map[types.ValidatorID]time.Time
+	}
 
 	certificateOnce sync.Once
 	startOnce       sync.Once
@@ -168,6 +173,11 @@ func NewCoordinator(
 		coord.rebroadcast.max = coord.rebroadcast.base
 	}
 	coord.rebroadcast.current = coord.rebroadcast.base
+	coord.certificateRelay.minInterval = coord.rebroadcast.base
+	if coord.certificateRelay.minInterval < 5*time.Second {
+		coord.certificateRelay.minInterval = 5 * time.Second
+	}
+	coord.certificateRelay.lastByPeer = make(map[types.ValidatorID]time.Time)
 	return coord, nil
 }
 
@@ -417,11 +427,6 @@ func (c *Coordinator) OnGenesisReady(ctx context.Context, ready *messages.Genesi
 	c.recordReadyEvent(ctx, ReadyEventReceived, ready.ValidatorID, readyHash, reason)
 
 	c.mu.Lock()
-	if c.completed {
-		c.mu.Unlock()
-		return
-	}
-
 	c.logger.DebugContext(ctx, "genesis ready attestation received",
 		"validator", validatorLabel,
 		"hash", hashLabel,
@@ -554,7 +559,9 @@ func (c *Coordinator) OnGenesisReady(ctx context.Context, ready *messages.Genesi
 
 	c.mu.Lock()
 	if c.completed {
+		cert := c.certificate
 		c.mu.Unlock()
+		c.maybeRelayCertificate(ctx, ready.ValidatorID, cert, "late_ready_after_completion")
 		return
 	}
 	if existing, ok := c.attestations[ready.ValidatorID]; ok {
@@ -612,6 +619,28 @@ func (c *Coordinator) OnGenesisReady(ctx context.Context, ready *messages.Genesi
 		go c.publishCertificate(ctx, cert)
 		c.setCertificate(ctx, cert)
 	}
+}
+
+func (c *Coordinator) maybeRelayCertificate(ctx context.Context, validatorID types.ValidatorID, cert *messages.GenesisCertificate, reason string) {
+	if cert == nil {
+		return
+	}
+	now := time.Now()
+	c.certificateRelay.mu.Lock()
+	last := c.certificateRelay.lastByPeer[validatorID]
+	if !last.IsZero() && now.Sub(last) < c.certificateRelay.minInterval {
+		c.certificateRelay.mu.Unlock()
+		return
+	}
+	c.certificateRelay.lastByPeer[validatorID] = now
+	c.certificateRelay.mu.Unlock()
+
+	c.logger.InfoContext(ctx, "rebroadcasting trusted genesis certificate for validator",
+		"validator", shortValidator(validatorID),
+		"reason", reason,
+		"aggregator", shortValidator(cert.Aggregator),
+		"attestations", len(cert.Attestations))
+	go c.publishCertificate(ctx, cert)
 }
 
 // OnGenesisCertificate processes a quorum certificate from the aggregator.
@@ -1053,9 +1082,9 @@ func (c *Coordinator) restoreFromDatabase(ctx context.Context) (bool, error) {
 		c.logger.InfoContext(ctx, "db backend unavailable, skipping restore")
 		return false, nil
 	}
-	
+
 	c.logger.InfoContext(ctx, "checking db for genesis certificate")
-	
+
 	data, found, err := c.backend.LoadGenesisCertificate(ctx)
 	if err != nil {
 		c.logger.ErrorContext(ctx, "db query failed", "error", err)
@@ -1065,28 +1094,28 @@ func (c *Coordinator) restoreFromDatabase(ctx context.Context) (bool, error) {
 		c.logger.InfoContext(ctx, "no genesis certificate in db")
 		return false, nil
 	}
-	
+
 	c.logger.InfoContext(ctx, "found genesis certificate", "bytes", len(data))
-	
+
 	var cert messages.GenesisCertificate
 	if err := cbor.Unmarshal(data, &cert); err != nil {
 		c.logger.ErrorContext(ctx, "failed to decode certificate", "error", err)
 		return false, fmt.Errorf("decode persisted genesis certificate: %w", err)
 	}
-	
+
 	c.logger.InfoContext(ctx, "decoded genesis certificate",
 		"attestations", len(cert.Attestations),
 		"aggregator", fmt.Sprintf("%x", cert.Aggregator[:8]),
 		"timestamp", cert.Timestamp)
-	
+
 	if err := c.validateCertificate(ctx, &cert, true); err != nil {
 		c.logger.WarnContext(ctx, "certificate failed validation", "error", err)
 		c.handleInvalidPersistedCertificate(ctx, err, &cert)
 		return false, nil
 	}
-	
+
 	c.logger.InfoContext(ctx, "validation passed, restoring state")
-	
+
 	c.applyRestoredCertificate(ctx, &cert, "cockroachdb", nil)
 	return true, nil
 }
@@ -1096,21 +1125,21 @@ func (c *Coordinator) applyRestoredCertificate(ctx context.Context, cert *messag
 		return
 	}
 	c.logger.InfoContext(ctx, "applying genesis state", "source", source, "attestations", len(cert.Attestations))
-	
+
 	c.mu.Lock()
 	c.attestations = make(map[types.ValidatorID]*messages.GenesisReady, len(cert.Attestations))
 	for i := range cert.Attestations {
 		attCopy := cert.Attestations[i]
 		attPtr := &attCopy
 		c.attestations[attCopy.ValidatorID] = attPtr
-		
+
 		// Mark validators ready for deterministic leader selection
 		if c.host != nil {
 			c.host.MarkValidatorReady(attCopy.ValidatorID)
 			c.logger.InfoContext(ctx, "marked validator ready",
 				"validator", fmt.Sprintf("%x", attCopy.ValidatorID[:8]))
 		}
-		
+
 		if attCopy.ValidatorID == c.localID {
 			c.readyMu.Lock()
 			c.localReady = attPtr

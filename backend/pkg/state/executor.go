@@ -35,9 +35,15 @@ type Receipt struct {
 // ApplyBlock validates and applies a list of transactions atomically to the latest version of the store.
 // On success, it commits version latest+1 and returns the new version, merkle root, and receipts for each tx.
 // On any failure, no changes are committed and an error is returned (fail-closed).
-func ApplyBlock(store StateStore, now time.Time, skew time.Duration, txs []Transaction) (uint64, [32]byte, []Receipt, error) {
+func ApplyBlock(store StateStore, now time.Time, skew time.Duration, txs []Transaction) (newVersion uint64, root [32]byte, receipts []Receipt, err error) {
+	start := time.Now()
+	metrics := ApplyBlockMetrics{}
 	var zeroRoot [32]byte
-	receipts := make([]Receipt, len(txs))
+	receipts = make([]Receipt, len(txs))
+	defer func() {
+		metrics.Total = time.Since(start)
+		reportApplyBlockMetrics(metrics)
+	}()
 
 	// Block-level bounds
 	if len(txs) > MaxBlockTxs {
@@ -61,6 +67,7 @@ func ApplyBlock(store StateStore, now time.Time, skew time.Duration, txs []Trans
 	// Validate and apply sequentially
 	for i, tx := range txs {
 		r := Receipt{Index: i, Type: tx.Type()}
+		validateStart := time.Now()
 		// Pre-compute content hash if available via envelope; fall back to hashing payload
 		if env := tx.Envelope(); env != nil {
 			r.ContentHash = env.ContentHash
@@ -71,14 +78,18 @@ func ApplyBlock(store StateStore, now time.Time, skew time.Duration, txs []Trans
 		}
 
 		if err := tx.Validate(now, skew); err != nil {
+			metrics.Validate += time.Since(validateStart)
 			r.Code, r.Error = ExecCodeInvalid, err.Error()
 			receipts[i] = r
 			return 0, zeroRoot, receipts, err
 		}
+		metrics.Validate += time.Since(validateStart)
 
 		// Enforce nonce uniqueness at execution time (defense-in-depth)
 		if env := tx.Envelope(); env != nil {
+			nonceStart := time.Now()
 			if v, ok := txn.Get(keyNonce(env.ProducerID, env.Nonce)); ok && len(v) > 0 {
+				metrics.NonceCheck += time.Since(nonceStart)
 				// Check if this is a replay of an already-committed transaction
 				var existingHash [32]byte
 				copy(existingHash[:], v)
@@ -92,28 +103,41 @@ func ApplyBlock(store StateStore, now time.Time, skew time.Duration, txs []Trans
 				receipts[i] = r
 				return 0, zeroRoot, receipts, ErrNonceReplay
 			}
+			metrics.NonceCheck += time.Since(nonceStart)
 		}
 
 		// Apply deterministic reducer
 		switch tx.Type() {
 		case TxEvent:
+			metrics.EventTxs++
+			reducerStart := time.Now()
 			if err := ApplyEvent(tx.(*EventTx), txn); err != nil {
+				metrics.ReducerEvent += time.Since(reducerStart)
 				r.Code, r.Error = ExecCodeReducerError, err.Error()
 				receipts[i] = r
 				return 0, zeroRoot, receipts, err
 			}
+			metrics.ReducerEvent += time.Since(reducerStart)
 		case TxEvidence:
+			metrics.EvidenceTxs++
+			reducerStart := time.Now()
 			if err := ApplyEvidence(tx.(*EvidenceTx), txn); err != nil {
+				metrics.ReducerEvidence += time.Since(reducerStart)
 				r.Code, r.Error = ExecCodeReducerError, err.Error()
 				receipts[i] = r
 				return 0, zeroRoot, receipts, err
 			}
+			metrics.ReducerEvidence += time.Since(reducerStart)
 		case TxPolicy:
+			metrics.PolicyTxs++
+			reducerStart := time.Now()
 			if err := ApplyPolicy(tx.(*PolicyTx), txn); err != nil {
+				metrics.ReducerPolicy += time.Since(reducerStart)
 				r.Code, r.Error = ExecCodeReducerError, err.Error()
 				receipts[i] = r
 				return 0, zeroRoot, receipts, err
 			}
+			metrics.ReducerPolicy += time.Since(reducerStart)
 		default:
 			r.Code, r.Error = ExecCodeInvalid, "unknown tx type"
 			receipts[i] = r
@@ -125,8 +149,10 @@ func ApplyBlock(store StateStore, now time.Time, skew time.Duration, txs []Trans
 	}
 
 	// Commit atomically to next version and compute new root
-	newVersion := latest + 1
-	root, err := txn.Commit(newVersion)
+	newVersion = latest + 1
+	commitStart := time.Now()
+	root, err = txn.Commit(newVersion)
+	metrics.CommitState = time.Since(commitStart)
 	if err != nil {
 		return 0, zeroRoot, receipts, err
 	}

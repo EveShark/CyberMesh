@@ -5,6 +5,7 @@ Flow: Telemetry → Features → Engines → Ensemble → Evidence
 Instrumented: Per-stage latency tracking, error handling, metrics
 """
 
+from collections import defaultdict
 import time
 from typing import Dict, List, Optional, TYPE_CHECKING
 
@@ -88,8 +89,95 @@ class DetectionPipeline:
         self.logger.info(
             f"Initialized DetectionPipeline with {len(engines)} engines"
         )
+
+    def _build_engine_metrics_snapshots(
+        self,
+        candidates,
+        decision,
+        *,
+        timestamp: float,
+        iteration_latency_ms: float,
+    ) -> Dict[str, List[Dict[str, object]]]:
+        """Build additive engine and variant snapshots from current candidates."""
+
+        engine_entries = defaultdict(lambda: {
+            "candidates": 0,
+            "published": 0,
+            "confidence_sum": 0.0,
+            "threat_types": set(),
+        })
+        variant_entries = defaultdict(lambda: {
+            "total": 0,
+            "published": 0,
+            "confidence_sum": 0.0,
+            "engines": set(),
+            "threat_types": set(),
+        })
+
+        published_ids = set()
+        if decision and getattr(decision, "should_publish", False):
+            for candidate in getattr(decision, "candidates", []) or []:
+                published_ids.add(id(candidate))
+
+        for candidate in candidates or []:
+            engine_type = getattr(getattr(candidate, "engine_type", None), "value", None)
+            if not engine_type:
+                continue
+
+            confidence = float(getattr(candidate, "confidence", 0.0) or 0.0)
+            threat_type = str(getattr(getattr(candidate, "threat_type", None), "value", "unknown"))
+            published = 1 if id(candidate) in published_ids else 0
+
+            engine_entry = engine_entries[engine_type]
+            engine_entry["candidates"] += 1
+            engine_entry["published"] += published
+            engine_entry["confidence_sum"] += confidence
+            engine_entry["threat_types"].add(threat_type)
+
+            metadata = getattr(candidate, "metadata", None) or {}
+            variant = metadata.get("variant")
+            if not isinstance(variant, str) or not variant.strip():
+                continue
+
+            variant_key = variant.strip()
+            variant_entry = variant_entries[variant_key]
+            variant_entry["total"] += 1
+            variant_entry["published"] += published
+            variant_entry["confidence_sum"] += confidence
+            variant_entry["engines"].add(engine_type)
+            variant_entry["threat_types"].add(threat_type)
+
+        engine_snapshots = []
+        for engine, entry in engine_entries.items():
+            engine_snapshots.append({
+                "engine": engine,
+                "candidates": int(entry["candidates"]),
+                "published": int(entry["published"]),
+                "confidence_sum": float(entry["confidence_sum"]),
+                "threat_types": sorted(entry["threat_types"]),
+                "timestamp": timestamp,
+                "iteration_latency_ms": iteration_latency_ms,
+            })
+
+        variant_snapshots = []
+        for variant, entry in variant_entries.items():
+            variant_snapshots.append({
+                "variant": variant,
+                "engines": sorted(entry["engines"]),
+                "engine": sorted(entry["engines"])[0] if entry["engines"] else None,
+                "total": int(entry["total"]),
+                "published": int(entry["published"]),
+                "confidence_sum": float(entry["confidence_sum"]),
+                "threat_types": sorted(entry["threat_types"]),
+                "timestamp": timestamp,
+            })
+
+        return {
+            "engine_snapshots": engine_snapshots,
+            "variant_snapshots": variant_snapshots,
+        }
     
-    def process(self, trigger_event: Optional[Dict] = None) -> InstrumentedResult:
+    def process(self, trigger_event: Optional[Dict] = None, *, telemetry_wait_policy: Optional[str] = None) -> InstrumentedResult:
         """
         Run full detection pipeline.
         
@@ -117,7 +205,7 @@ class DetectionPipeline:
             stage_start = time.perf_counter()
             telemetry_limit = int(self.config.get('TELEMETRY_BATCH_SIZE', 1000))
             limit = max(1, min(self._max_flows_per_iteration, telemetry_limit))
-            flows = self.telemetry.get_network_flows(limit=limit)
+            flows = self.telemetry.get_network_flows(limit=limit, wait_policy=telemetry_wait_policy)
             latencies['telemetry_load'] = (time.perf_counter() - stage_start) * 1000
             self._warn_if_slow('telemetry_load', latencies['telemetry_load'], limit=limit)
 
@@ -137,13 +225,27 @@ class DetectionPipeline:
                         self.metrics.record_db_timings(**db_timings)
                     except Exception:
                         self.logger.debug("Failed to record DB timing metrics", exc_info=True)
+
+            fetch_stats = {}
+            get_fetch_stats = getattr(self.telemetry, "get_last_fetch_stats", None)
+            if callable(get_fetch_stats):
+                try:
+                    fetch_stats = get_fetch_stats() or {}
+                except Exception:
+                    fetch_stats = {}
             
             if not flows:
+                fetch_reason = str(fetch_stats.get("reason", "unknown"))
+                error_code = f"no_telemetry_data:{fetch_reason}"
+                metadata = {"telemetry_fetch": fetch_stats}
+                if telemetry_wait_policy == "non_blocking":
+                    metadata["abstention_reason"] = f"telemetry_unavailable:{fetch_reason}"
                 return InstrumentedResult(
                     decision=None,
                     latency_ms=latencies,
                     total_latency_ms=(time.perf_counter() - pipeline_start) * 1000,
-                    error='no_telemetry_data'
+                    error=error_code,
+                    metadata=metadata,
                 )
             
             # Stage 2: Feature extraction
@@ -212,6 +314,8 @@ class DetectionPipeline:
                         'dst_port': _get('dst_port', 'dport', 'destination_port', default=0),
                         'protocol': _get('protocol', 'proto', default=''),
                         'flow_id': _get('flow_id', 'id', default=''),
+                        'source_event_ts_ms': _get('source_event_ts_ms', default=0),
+                        'telemetry_ingest_ts_ms': _get('telemetry_ingest_ts_ms', default=0),
                     }
                     decision.metadata['network_context'] = net_ctx
             except Exception:
@@ -240,6 +344,12 @@ class DetectionPipeline:
             
             # Calculate total latency
             total_latency = (time.perf_counter() - pipeline_start) * 1000
+            metrics_snapshots = self._build_engine_metrics_snapshots(
+                all_candidates,
+                decision,
+                timestamp=time.time(),
+                iteration_latency_ms=total_latency,
+            )
             
             # Log if latency exceeds target
             if total_latency > 50.0:
@@ -255,7 +365,11 @@ class DetectionPipeline:
                 total_latency_ms=total_latency,
                 feature_count=feature_count,
                 candidate_count=len(all_candidates),
-                error=None
+                error=None,
+                metadata={
+                    "telemetry_fetch": fetch_stats,
+                    **metrics_snapshots,
+                },
             )
         
         except Exception as e:
@@ -270,7 +384,8 @@ class DetectionPipeline:
                 decision=None,
                 latency_ms=latencies,
                 total_latency_ms=(time.perf_counter() - pipeline_start) * 1000,
-                error=error_msg
+                error=error_msg,
+                metadata={"telemetry_fetch": locals().get("fetch_stats", {})},
             )
     
     def _warn_if_slow(self, stage: str, duration_ms: float, **kwargs) -> None:

@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"backend/pkg/control/policytrace"
 	"backend/pkg/utils"
 	pb "backend/proto"
 	"github.com/IBM/sarama"
@@ -22,6 +23,7 @@ type Consumer struct {
 	log         *utils.Logger
 	audit       *utils.AuditLogger
 	dlqProducer sarama.SyncProducer
+	trace       *policytrace.Collector
 	ctx         context.Context
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
@@ -59,24 +61,38 @@ type ConsumerStats struct {
 }
 
 type CausalStats struct {
-	SkewCorrectionsTotal uint64
-	AIToAckBuckets       []utils.HistogramBucket
-	AIToAckCount         uint64
-	AIToAckSumMs         float64
-	AIToAckP95Ms         float64
-	PublishToAckBuckets  []utils.HistogramBucket
-	PublishToAckCount    uint64
-	PublishToAckSumMs    float64
-	PublishToAckP95Ms    float64
+	SkewCorrectionsTotal       uint64
+	CorrelationExact           uint64
+	CorrelationFallbackHash    uint64
+	CorrelationFallbackTrace   uint64
+	CorrelationNoMatch         uint64
+	CorrelationErrors          uint64
+	AIEventUnitCorrections     uint64
+	AIEventInvalidTotal        uint64
+	SourceEventUnitCorrections uint64
+	SourceEventInvalidTotal    uint64
+	AIToAckBuckets             []utils.HistogramBucket
+	AIToAckCount               uint64
+	AIToAckSumMs               float64
+	AIToAckP95Ms               float64
+	SourceToAckBuckets         []utils.HistogramBucket
+	SourceToAckCount           uint64
+	SourceToAckSumMs           float64
+	SourceToAckP95Ms           float64
+	PublishToAckBuckets        []utils.HistogramBucket
+	PublishToAckCount          uint64
+	PublishToAckSumMs          float64
+	PublishToAckP95Ms          float64
 }
 
 type Options struct {
-	Config Config
-	Store  *Store
-	Trust  *TrustedKeys
-	Logger *utils.Logger
-	Audit  *utils.AuditLogger
-	DLQ    sarama.SyncProducer
+	Config         Config
+	Store          *Store
+	Trust          *TrustedKeys
+	Logger         *utils.Logger
+	Audit          *utils.AuditLogger
+	DLQ            sarama.SyncProducer
+	TraceCollector *policytrace.Collector
 }
 
 func New(ctx context.Context, group sarama.ConsumerGroup, opts Options) (*Consumer, error) {
@@ -101,6 +117,7 @@ func New(ctx context.Context, group sarama.ConsumerGroup, opts Options) (*Consum
 		log:         opts.Logger,
 		audit:       opts.Audit,
 		dlqProducer: opts.DLQ,
+		trace:       opts.TraceCollector,
 		ctx:         cctx,
 		cancel:      cancel,
 		cg:          group,
@@ -376,6 +393,14 @@ func (c *Consumer) process(ctx context.Context, msg *sarama.ConsumerMessage) err
 				"signature_alg":       algo,
 			})
 		}
+		if c.trace != nil {
+			c.trace.Record(policytrace.Marker{
+				Stage:       "t_ack",
+				PolicyID:    ack.PolicyId,
+				TraceID:     strings.TrimSpace(ack.QcReference),
+				TimestampMs: time.Now().UnixMilli(),
+			})
+		}
 		return nil
 	}
 
@@ -497,14 +522,27 @@ func (c *Consumer) CausalStats() CausalStats {
 	}
 	s := c.store.Stats()
 	return CausalStats{
-		SkewCorrectionsTotal: s.SkewCorrectionsTotal,
-		AIToAckBuckets:       s.AIToAckBuckets,
-		AIToAckCount:         s.AIToAckCount,
-		AIToAckSumMs:         s.AIToAckSumMs,
-		AIToAckP95Ms:         s.AIToAckP95Ms,
-		PublishToAckBuckets:  s.PublishToAckBuckets,
-		PublishToAckCount:    s.PublishToAckCount,
-		PublishToAckSumMs:    s.PublishToAckSumMs,
-		PublishToAckP95Ms:    s.PublishToAckP95Ms,
+		SkewCorrectionsTotal:       s.SkewCorrectionsTotal,
+		CorrelationExact:           s.CorrelationExact,
+		CorrelationFallbackHash:    s.CorrelationFallbackHash,
+		CorrelationFallbackTrace:   s.CorrelationFallbackTrace,
+		CorrelationNoMatch:         s.CorrelationNoMatch,
+		CorrelationErrors:          s.CorrelationErrors,
+		AIEventUnitCorrections:     s.AIEventUnitCorrections,
+		AIEventInvalidTotal:        s.AIEventInvalidTotal,
+		SourceEventUnitCorrections: s.SourceEventUnitCorrections,
+		SourceEventInvalidTotal:    s.SourceEventInvalidTotal,
+		AIToAckBuckets:             s.AIToAckBuckets,
+		AIToAckCount:               s.AIToAckCount,
+		AIToAckSumMs:               s.AIToAckSumMs,
+		AIToAckP95Ms:               s.AIToAckP95Ms,
+		SourceToAckBuckets:         s.SourceToAckBuckets,
+		SourceToAckCount:           s.SourceToAckCount,
+		SourceToAckSumMs:           s.SourceToAckSumMs,
+		SourceToAckP95Ms:           s.SourceToAckP95Ms,
+		PublishToAckBuckets:        s.PublishToAckBuckets,
+		PublishToAckCount:          s.PublishToAckCount,
+		PublishToAckSumMs:          s.PublishToAckSumMs,
+		PublishToAckP95Ms:          s.PublishToAckP95Ms,
 	}
 }

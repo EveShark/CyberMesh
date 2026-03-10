@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"database/sql"
-	"encoding/hex"
 	"net/http"
 	"strings"
 	"time"
@@ -27,6 +26,9 @@ type policyAckRow struct {
 	RuleHash           []byte
 	ProducerID         []byte
 	ObservedAt         time.Time
+	AckHistoryCount    int64
+	FirstEventAckedAt  sql.NullTime
+	LatestEventAckedAt sql.NullTime
 }
 
 type policyAckResponse struct {
@@ -51,6 +53,9 @@ type policyAckPayload struct {
 	RuleHashHex        string `json:"rule_hash_hex,omitempty"`
 	ProducerIDHex      string `json:"producer_id_hex,omitempty"`
 	ObservedAt         int64  `json:"observed_at"`
+	AckHistoryCount    int64  `json:"ack_history_count,omitempty"`
+	FirstEventAckedAt  int64  `json:"first_event_acked_at,omitempty"`
+	LatestEventAckedAt int64  `json:"latest_event_acked_at,omitempty"`
 }
 
 // handlePolicyAcks handles:
@@ -86,16 +91,31 @@ func (s *Server) handlePolicyAcks(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := db.QueryContext(ctx, `
 		SELECT
-			policy_id, controller_instance,
-			scope_identifier, tenant, region,
-			result, reason, error_code,
-			applied_at, acked_at,
-			qc_reference, fast_path,
-			rule_hash, producer_id,
-			observed_at
-		FROM policy_acks
-		WHERE policy_id = $1
-		ORDER BY acked_at DESC NULLS LAST, observed_at DESC
+			pa.policy_id, pa.controller_instance,
+			pa.scope_identifier, pa.tenant, pa.region,
+			pa.result, pa.reason, pa.error_code,
+			pa.applied_at, pa.acked_at,
+			pa.qc_reference, pa.fast_path,
+			pa.rule_hash, pa.producer_id,
+			pa.observed_at,
+			COALESCE(hist.ack_history_count, 0) AS ack_history_count,
+			hist.first_event_acked_at,
+			hist.latest_event_acked_at
+		FROM policy_acks pa
+		LEFT JOIN (
+			SELECT
+				policy_id,
+				controller_instance,
+				count(*) AS ack_history_count,
+				min(acked_at) AS first_event_acked_at,
+				max(acked_at) AS latest_event_acked_at
+			FROM policy_ack_events
+			GROUP BY policy_id, controller_instance
+		) hist
+		  ON hist.policy_id = pa.policy_id
+		 AND hist.controller_instance = pa.controller_instance
+		WHERE pa.policy_id = $1
+		ORDER BY pa.acked_at DESC NULLS LAST, pa.observed_at DESC
 		LIMIT 100
 	`, policyID)
 	if err != nil {
@@ -119,48 +139,14 @@ func (s *Server) handlePolicyAcks(w http.ResponseWriter, r *http.Request) {
 			&row.QCReference, &row.FastPath,
 			&row.RuleHash, &row.ProducerID,
 			&row.ObservedAt,
+			&row.AckHistoryCount,
+			&row.FirstEventAckedAt,
+			&row.LatestEventAckedAt,
 		); scanErr != nil {
 			writeErrorResponse(w, r, "ACKS_SCAN_FAILED", "failed to read policy ack row", http.StatusInternalServerError)
 			return
 		}
-		p := policyAckPayload{
-			PolicyID:           row.PolicyID,
-			ControllerInstance: row.ControllerInstance,
-			Result:             row.Result,
-			FastPath:           row.FastPath,
-			ObservedAt:         row.ObservedAt.UTC().Unix(),
-		}
-		if row.ScopeIdentifier.Valid {
-			p.ScopeIdentifier = row.ScopeIdentifier.String
-		}
-		if row.Tenant.Valid {
-			p.Tenant = row.Tenant.String
-		}
-		if row.Region.Valid {
-			p.Region = row.Region.String
-		}
-		if row.Reason.Valid {
-			p.Reason = row.Reason.String
-		}
-		if row.ErrorCode.Valid {
-			p.ErrorCode = row.ErrorCode.String
-		}
-		if row.AppliedAt.Valid {
-			p.AppliedAt = row.AppliedAt.Time.UTC().Unix()
-		}
-		if row.AckedAt.Valid {
-			p.AckedAt = row.AckedAt.Time.UTC().Unix()
-		}
-		if row.QCReference.Valid {
-			p.QCReference = row.QCReference.String
-		}
-		if len(row.RuleHash) > 0 {
-			p.RuleHashHex = hex.EncodeToString(row.RuleHash)
-		}
-		if len(row.ProducerID) > 0 {
-			p.ProducerIDHex = hex.EncodeToString(row.ProducerID)
-		}
-		acks = append(acks, p)
+		acks = append(acks, policyAckToPayload(row))
 	}
 	if err := rows.Err(); err != nil {
 		writeErrorResponse(w, r, "ACKS_ITERATION_FAILED", "failed to iterate policy acks", http.StatusInternalServerError)
