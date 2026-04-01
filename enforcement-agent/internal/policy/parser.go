@@ -48,7 +48,31 @@ func parseBlockPolicy(raw map[string]any, spec PolicySpec) (PolicySpec, error) {
 	if err != nil {
 		return PolicySpec{}, fmt.Errorf("policy: block action: %w", err)
 	}
-	spec.Action = action
+	spec.Action = strings.ToLower(strings.TrimSpace(action))
+
+	if spec.Action == "remove" {
+		if tenantVal, ok := raw["tenant"]; ok {
+			tenant, terr := toString(tenantVal)
+			if terr != nil {
+				return PolicySpec{}, fmt.Errorf("policy: tenant: %w", terr)
+			}
+			spec.Tenant = strings.TrimSpace(tenant)
+		}
+		if regionVal, ok := raw["region"]; ok {
+			region, rerr := toString(regionVal)
+			if rerr != nil {
+				return PolicySpec{}, fmt.Errorf("policy: region: %w", rerr)
+			}
+			spec.Region = strings.TrimSpace(region)
+		}
+
+		audit, err := parseAudit(raw["audit"])
+		if err != nil {
+			return PolicySpec{}, err
+		}
+		spec.Audit = audit
+		return spec, nil
+	}
 
 	// target
 	targetRaw, ok := raw["target"].(map[string]any)
@@ -406,8 +430,42 @@ func parseGuardrails(raw any) (Guardrails, error) {
 		guardrails.EscalationCooldown = ptrInt(i)
 	}
 
-	if allowlistRaw, ok := m["allowlist"].(map[string]any); ok {
-		if ipsRaw, ok := allowlistRaw["ips"].([]any); ok {
+	if allowlistRaw, ok := m["allowlist"]; ok {
+		allowlistMap, ok := allowlistRaw.(map[string]any)
+		if !ok {
+			flat, ok := allowlistRaw.([]any)
+			if !ok {
+				return guardrails, errors.New("policy: guardrails.allowlist must be object or list")
+			}
+			normalized := map[string]any{
+				"ips":        []any{},
+				"cidrs":      []any{},
+				"namespaces": []any{},
+			}
+			for _, entryVal := range flat {
+				entry, err := toString(entryVal)
+				if err != nil {
+					return guardrails, fmt.Errorf("policy: guardrails.allowlist: %w", err)
+				}
+				entry = strings.TrimSpace(entry)
+				if entry == "" {
+					return guardrails, errors.New("policy: guardrails.allowlist entry must be non-empty")
+				}
+				if strings.HasPrefix(strings.ToLower(entry), "ns:") {
+					ns := strings.TrimSpace(entry[3:])
+					if ns == "" {
+						return guardrails, errors.New("policy: guardrails.allowlist namespace entry must be non-empty")
+					}
+					normalized["namespaces"] = append(normalized["namespaces"].([]any), ns)
+				} else if strings.Contains(entry, "/") {
+					normalized["cidrs"] = append(normalized["cidrs"].([]any), entry)
+				} else {
+					normalized["ips"] = append(normalized["ips"].([]any), entry)
+				}
+			}
+			allowlistMap = normalized
+		}
+		if ipsRaw, ok := allowlistMap["ips"].([]any); ok {
 			for _, ipVal := range ipsRaw {
 				ip, err := toString(ipVal)
 				if err != nil {
@@ -419,7 +477,7 @@ func parseGuardrails(raw any) (Guardrails, error) {
 				guardrails.AllowlistIPs = append(guardrails.AllowlistIPs, ip)
 			}
 		}
-		if cidrsRaw, ok := allowlistRaw["cidrs"].([]any); ok {
+		if cidrsRaw, ok := allowlistMap["cidrs"].([]any); ok {
 			for _, cidrVal := range cidrsRaw {
 				cidr, err := toString(cidrVal)
 				if err != nil {
@@ -431,7 +489,7 @@ func parseGuardrails(raw any) (Guardrails, error) {
 				guardrails.AllowlistCIDRs = append(guardrails.AllowlistCIDRs, cidr)
 			}
 		}
-		if namespacesRaw, ok := allowlistRaw["namespaces"].([]any); ok {
+		if namespacesRaw, ok := allowlistMap["namespaces"].([]any); ok {
 			for _, nsVal := range namespacesRaw {
 				ns, err := toString(nsVal)
 				if err != nil {

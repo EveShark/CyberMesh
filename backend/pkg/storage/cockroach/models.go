@@ -120,16 +120,27 @@ type QuarantineRow struct {
 
 // PolicyRow represents a row in the state_policies table
 type PolicyRow struct {
-	PolicyID      []byte
-	PolicyType    string // "allow", "deny", "rate_limit", "threshold"
-	Target        string
-	Rules         []byte // JSONB stored as bytes
-	Active        bool
-	Priority      int
-	CreatedHeight uint64
-	CreatedAt     time.Time
-	UpdatedHeight *uint64    // nullable
-	UpdatedAt     *time.Time // nullable
+	PolicyID        []byte
+	PolicyIDText    string
+	PolicyType      string // "allow", "deny", "rate_limit", "threshold"
+	Target          string
+	Rules           []byte // JSONB stored as bytes
+	Active          bool
+	Priority        int
+	CreatedHeight   uint64
+	CreatedAt       time.Time
+	UpdatedHeight   *uint64    // nullable
+	UpdatedAt       *time.Time // nullable
+	WorkflowID      *string
+	Tenant          *string
+	CurrentStatus   *string
+	LatestAction    *string
+	LatestAckResult *string
+	LatestAckReason *string
+	TraceID         *string
+	AnomalyID       *string
+	SourceEventID   *string
+	SentinelEventID *string
 }
 
 // AuditLogRow represents a row in the audit_logs table

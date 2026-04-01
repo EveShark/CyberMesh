@@ -31,6 +31,8 @@ type aiHistoryFetcher func(context.Context) (aiHistoryResult, error)
 type aiSuspiciousNodesFetcher func(context.Context) (aiSuspiciousNodesResult, error)
 type controlStatusFetcher func(context.Context) (controlStatusResponse, error)
 type controlToggleFetcher func(context.Context, string, bool, actionDraft) error
+type ackFetcher func(context.Context) (ackListResponse, error)
+type validatorsFetcher func(context.Context) (validatorListResponse, error)
 
 type monitorData struct {
 	Consensus consensusOverview  `json:"consensus"`
@@ -89,6 +91,16 @@ var launchInteractiveBacklog = func(model tea.Model, out io.Writer) error {
 }
 
 var launchInteractiveAI = func(model tea.Model, out io.Writer) error {
+	_, err := tea.NewProgram(model, tea.WithAltScreen(), tea.WithOutput(out)).Run()
+	return err
+}
+
+var launchInteractiveAck = func(model tea.Model, out io.Writer) error {
+	_, err := tea.NewProgram(model, tea.WithAltScreen(), tea.WithOutput(out)).Run()
+	return err
+}
+
+var launchInteractiveValidators = func(model tea.Model, out io.Writer) error {
 	_, err := tea.NewProgram(model, tea.WithAltScreen(), tea.WithOutput(out)).Run()
 	return err
 }
@@ -156,6 +168,14 @@ type aiHistoryLoadedMsg struct {
 }
 type aiSuspiciousNodesLoadedMsg struct {
 	data aiSuspiciousNodesResult
+	err  error
+}
+type ackLoadedMsg struct {
+	data ackListResponse
+	err  error
+}
+type validatorsLoadedMsg struct {
+	data validatorListResponse
 	err  error
 }
 
@@ -258,6 +278,20 @@ func asyncAISuspiciousNodesLoad(ctx context.Context, fetch aiSuspiciousNodesFetc
 	return func() tea.Msg {
 		data, err := fetch(ctx)
 		return aiSuspiciousNodesLoadedMsg{data: data, err: err}
+	}
+}
+
+func asyncAckLoad(ctx context.Context, fetch ackFetcher) tea.Cmd {
+	return func() tea.Msg {
+		data, err := fetch(ctx)
+		return ackLoadedMsg{data: data, err: err}
+	}
+}
+
+func asyncValidatorsLoad(ctx context.Context, fetch validatorsFetcher) tea.Cmd {
+	return func() tea.Msg {
+		data, err := fetch(ctx)
+		return validatorsLoadedMsg{data: data, err: err}
 	}
 }
 

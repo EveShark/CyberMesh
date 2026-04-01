@@ -88,7 +88,15 @@ class MessageHandlers:
             "commit": {"processed": 0, "failed": 0},
             "reputation": {"processed": 0, "failed": 0},
             "policy_update": {"processed": 0, "failed": 0},
-            "policy_ack": {"processed": 0, "failed": 0, "applied": 0, "failed_result": 0, "missing_mapping": 0},
+            "policy_ack": {
+                "processed": 0,
+                "failed": 0,
+                "applied": 0,
+                "failed_result": 0,
+                "missing_mapping": 0,
+                "validation_failed": 0,
+                "storage_failed": 0,
+            },
             "evidence_request": {"processed": 0, "failed": 0},
         }
         self._metrics_lock = threading.Lock()
@@ -526,6 +534,23 @@ class MessageHandlers:
         if event.applied_at and event.acked_at:
             ack_latency_ms = max(0.0, (event.acked_at - event.applied_at) * 1000.0)
 
+        log_extra = {
+            "event_type": "policy_ack",
+            "policy_id": event.policy_id,
+            "trace_id": getattr(event, "trace_id", None),
+            "source_event_id": getattr(event, "source_event_id", None),
+            "sentinel_event_id": getattr(event, "sentinel_event_id", None),
+            "result": event.result,
+            "reason": event.reason,
+            "error_code": event.error_code,
+            "controller": event.controller_instance,
+            "scope": event.scope_identifier,
+            "tenant": event.tenant,
+            "region": event.region,
+            "fast_path": event.fast_path,
+            "ack_latency_ms": ack_latency_ms,
+        }
+
         if tracker is not None:
             try:
                 anomaly_id = tracker.record_policy_ack(
@@ -537,18 +562,26 @@ class MessageHandlers:
                     acked_at=event.acked_at if event.acked_at else None,
                     fast_path=event.fast_path,
                 )
-            except (ValidationError, StorageError) as err:
+            except ValidationError as err:
                 with self._metrics_lock:
                     self._metrics["policy_ack"]["failed"] += 1
+                    self._metrics["policy_ack"]["validation_failed"] += 1
+
+                self.logger.error(
+                    "Policy acknowledgement rejected by validation",
+                    exc_info=True,
+                    extra={**log_extra, "error": str(err), "failure_kind": "validation"},
+                )
+                return
+            except StorageError as err:
+                with self._metrics_lock:
+                    self._metrics["policy_ack"]["failed"] += 1
+                    self._metrics["policy_ack"]["storage_failed"] += 1
 
                 self.logger.error(
                     "Failed to persist policy acknowledgement",
                     exc_info=True,
-                    extra={
-                        "event_type": "policy_ack",
-                        "policy_id": event.policy_id,
-                        "error": str(err),
-                    },
+                    extra={**log_extra, "error": str(err), "failure_kind": "storage"},
                 )
                 return
             except Exception as err:  # pragma: no cover
@@ -557,11 +590,7 @@ class MessageHandlers:
                 self.logger.error(
                     "Unexpected error handling policy acknowledgement",
                     exc_info=True,
-                    extra={
-                        "event_type": "policy_ack",
-                        "policy_id": event.policy_id,
-                        "error": str(err),
-                    },
+                    extra={**log_extra, "error": str(err), "failure_kind": "unexpected"},
                 )
                 return
 
@@ -574,20 +603,6 @@ class MessageHandlers:
                 metrics["failed_result"] += 1
             if anomaly_id is None:
                 metrics["missing_mapping"] += 1
-
-        log_extra = {
-            "event_type": "policy_ack",
-            "policy_id": event.policy_id,
-            "result": event.result,
-            "reason": event.reason,
-            "error_code": event.error_code,
-            "controller": event.controller_instance,
-            "scope": event.scope_identifier,
-            "tenant": event.tenant,
-            "region": event.region,
-            "fast_path": event.fast_path,
-            "ack_latency_ms": ack_latency_ms,
-        }
 
         if anomaly_id:
             log_extra["anomaly_id"] = anomaly_id
@@ -623,5 +638,7 @@ class MessageHandlers:
                     entry["applied"] = counts.get("applied", 0)
                     entry["failed_result"] = counts.get("failed_result", 0)
                     entry["missing_mapping"] = counts.get("missing_mapping", 0)
+                    entry["validation_failed"] = counts.get("validation_failed", 0)
+                    entry["storage_failed"] = counts.get("storage_failed", 0)
                 snapshot[handler_type] = entry
             return snapshot

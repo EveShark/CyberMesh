@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"backend/pkg/block"
+	"backend/pkg/consensus/messages"
 	"backend/pkg/control/policytrace"
 	"backend/pkg/state"
 	"backend/pkg/utils"
@@ -34,6 +35,13 @@ func effectiveProposalCooldown(
 		effective = policyFast
 	}
 	return effective
+}
+
+func shouldEnforceActivePeerGate(requireActivePeers bool, activePeers, requiredPeers int) bool {
+	if !requireActivePeers {
+		return false
+	}
+	return activePeers < requiredPeers
 }
 
 func (s *Service) runProposer(ctx context.Context) {
@@ -231,9 +239,10 @@ func (s *Service) tryPropose(ctx context.Context) {
 			}
 		}
 
-		// Verify peers are active, not just connected
+		// Optionally require active peers in addition to connected peers.
+		// Default is liveness-first: connected quorum is enough to keep proposals flowing.
 		activePeers := s.router.GetActivePeerCount(20 * time.Second)
-		if activePeers < requiredPeers {
+		if shouldEnforceActivePeerGate(s.cfg.RequireActivePeers, activePeers, requiredPeers) {
 			if s.cfg.AllowSoloProposal {
 				s.log.WarnContext(ctx, "peer activity override enabled - proceeding despite inactive peers",
 					utils.ZapInt("connected_peers", connectedPeers),
@@ -251,6 +260,14 @@ func (s *Service) tryPropose(ctx context.Context) {
 					utils.ZapUint64("view", currentView))
 				return
 			}
+		} else if activePeers < requiredPeers {
+			s.log.WarnContext(ctx, "active peer quorum below target but not enforced",
+				utils.ZapInt("connected_peers", connectedPeers),
+				utils.ZapInt("active_peers", activePeers),
+				utils.ZapInt("required_peers", requiredPeers),
+				utils.ZapInt("total_validators", totalValidators),
+				utils.ZapBool("require_active_peers", s.cfg.RequireActivePeers),
+				utils.ZapUint64("view", currentView))
 		}
 
 		msg := "quorum check passed"
@@ -522,9 +539,50 @@ func (s *Service) recordProposedTxHold(blk *block.AppBlock, now time.Time) {
 		return
 	}
 	until := now.Add(s.proposalTxHoldDuration)
+	s.recordTxHoldUntil(blk.Transactions(), until)
+}
+
+func (s *Service) recordObservedProposalTxHold(proposal interface{}, now time.Time) {
+	if s == nil || s.proposalTxHoldDuration <= 0 || proposal == nil {
+		return
+	}
+
+	var txs []state.Transaction
+	switch p := proposal.(type) {
+	case *messages.Proposal:
+		if p != nil {
+			txs = proposalTransactions(p.Block)
+		}
+	case messages.Proposal:
+		txs = proposalTransactions(p.Block)
+	}
+	if len(txs) == 0 {
+		return
+	}
+
+	s.recordTxHoldUntil(txs, now.Add(s.proposalTxHoldDuration))
+}
+
+func proposalTransactions(blk interface{}) []state.Transaction {
+	if blk == nil {
+		return nil
+	}
+	if appBlk, ok := blk.(*block.AppBlock); ok && appBlk != nil {
+		return appBlk.Transactions()
+	}
+	if txSource, ok := blk.(interface{ Transactions() []state.Transaction }); ok {
+		return txSource.Transactions()
+	}
+	return nil
+}
+
+func (s *Service) recordTxHoldUntil(txs []state.Transaction, until time.Time) {
+	if s == nil || len(txs) == 0 {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, tx := range blk.Transactions() {
+	for _, tx := range txs {
 		if tx == nil || tx.Envelope() == nil {
 			continue
 		}

@@ -16,7 +16,9 @@ import (
 	"time"
 
 	consensusapi "backend/pkg/consensus/api"
+	"backend/pkg/control/policystate"
 	"backend/pkg/utils"
+	"github.com/google/uuid"
 )
 
 var reasonCodePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_.:-]{1,63}$`)
@@ -26,11 +28,14 @@ type controlMutationRequest struct {
 	ReasonCode         string `json:"reason_code"`
 	ReasonText         string `json:"reason_text"`
 	Classification     string `json:"classification,omitempty"`
+	WorkflowID         string `json:"workflow_id,omitempty"`
 	ExpectedLeaseEpoch *int64 `json:"expected_lease_epoch,omitempty"`
 }
 
 type controlMutationResponse struct {
 	ActionID         string              `json:"action_id"`
+	CommandID        string              `json:"command_id,omitempty"`
+	WorkflowID       string              `json:"workflow_id,omitempty"`
 	ActionType       string              `json:"action_type"`
 	IdempotentReplay bool                `json:"idempotent_replay"`
 	Outbox           controlOutboxRowDTO `json:"outbox,omitempty"`
@@ -65,7 +70,7 @@ func (s *Server) handleControlOutboxMutation(w http.ResponseWriter, r *http.Requ
 
 	rowID, action, ok := parseOutboxMutationRef(rowRef)
 	if !ok {
-		writeErrorResponse(w, r, "INVALID_MUTATION_PATH", "path must use :retry, :requeue, or :mark-terminal", http.StatusBadRequest)
+		writeErrorResponse(w, r, "INVALID_MUTATION_PATH", "path must use :retry, :requeue, :mark-terminal, or :revoke", http.StatusBadRequest)
 		return
 	}
 	if err := s.requireControlMutationAllowed(r); err != nil {
@@ -126,13 +131,23 @@ func (s *Server) handleControlOutboxMutation(w http.ResponseWriter, r *http.Requ
 	defer cancel()
 	actor := s.resolveMutationActor(r)
 	requestID := getRequestID(r.Context())
+	commandID := generateCommandID()
+	workflowID := resolveWorkflowID(r, req.WorkflowID)
 	// Rate limit remains per actor, while cooldown is keyed by mutation target.
 	if gateErr := s.enforceMutationThrottle(actor, action+"|"+rowID); gateErr != nil {
 		writeErrorResponse(w, r, gateErr.Code, gateErr.Message, gateErr.HTTPStatus)
 		return
 	}
 
-	replay, replayErr := s.tryOutboxMutationReplay(ctx, db, action, idemKey, actor, rowID)
+	var (
+		replay    *controlMutationResponse
+		replayErr error
+	)
+	if action == "revoke" {
+		replay, replayErr = s.tryOutboxRevokeReplay(ctx, db, idemKey, actor, rowID)
+	} else {
+		replay, replayErr = s.tryOutboxMutationReplay(ctx, db, action, idemKey, actor, rowID)
+	}
 	if replayErr != nil {
 		s.noteControlTimeout(replayErr, true)
 		breakerFailure = true
@@ -178,6 +193,9 @@ func (s *Server) handleControlOutboxMutation(w http.ResponseWriter, r *http.Requ
 			writeErrorResponse(w, r, "TENANT_SCOPE_QUERY_FAILED", "failed to verify tenant scope", http.StatusInternalServerError)
 			return
 		}
+		if !visible && tenantScopeMatchesOutboxRow(row, tenantScope) {
+			visible = true
+		}
 		if !visible {
 			writeErrorResponse(w, r, "TENANT_SCOPE_FORBIDDEN", "requested outbox row is outside tenant scope", http.StatusForbidden)
 			return
@@ -198,29 +216,62 @@ func (s *Server) handleControlOutboxMutation(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	if err := applyOutboxMutation(ctx, tx, rowID, action, req); err != nil {
-		s.noteControlTimeout(err, true)
-		if errors.Is(err, errLeaseEpochFence) {
-			writeErrorResponse(w, r, "LEASE_EPOCH_FENCE_CONFLICT", "lease epoch precondition failed", http.StatusConflict)
+	updated := row
+	journalTargetKind := "outbox"
+	journalOutboxID := rowID
+	journalLeaseKey := ""
+	if action == "revoke" {
+		latestHeight := row.BlockHeight
+		if s.stateStore != nil {
+			if current := int64(s.stateStore.Latest()); current > latestHeight {
+				latestHeight = current
+			}
+		}
+		updated, err = insertRevokeOutboxRow(ctx, tx, latestHeight, row, requestID, commandID, workflowID)
+		if err != nil {
+			s.noteControlTimeout(err, true)
+			breakerFailure = true
+			writeErrorResponse(w, r, "OUTBOX_REVOKE_FAILED", "failed to create revoke outbox row", http.StatusInternalServerError)
 			return
 		}
-		breakerFailure = true
-		writeErrorResponse(w, r, "OUTBOX_MUTATION_FAILED", "failed to update outbox row", http.StatusInternalServerError)
-		return
-	}
+		journalTargetKind = "outbox_revoke"
+		journalLeaseKey = updated.ID
+	} else {
+		if err := applyOutboxMutation(ctx, tx, rowID, action, req); err != nil {
+			s.noteControlTimeout(err, true)
+			if errors.Is(err, errLeaseEpochFence) {
+				writeErrorResponse(w, r, "LEASE_EPOCH_FENCE_CONFLICT", "lease epoch precondition failed", http.StatusConflict)
+				return
+			}
+			breakerFailure = true
+			writeErrorResponse(w, r, "OUTBOX_MUTATION_FAILED", "failed to update outbox row", http.StatusInternalServerError)
+			return
+		}
 
-	updated, err := s.loadOutboxRowForUpdate(ctx, tx, rowID)
-	if err != nil {
-		s.noteControlTimeout(err, true)
-		breakerFailure = true
-		writeErrorResponse(w, r, "OUTBOX_ROW_RELOAD_FAILED", "failed to reload mutated outbox row", http.StatusInternalServerError)
-		return
+		updated, err = s.loadOutboxRowForUpdate(ctx, tx, rowID)
+		if err != nil {
+			s.noteControlTimeout(err, true)
+			breakerFailure = true
+			writeErrorResponse(w, r, "OUTBOX_ROW_RELOAD_FAILED", "failed to reload mutated outbox row", http.StatusInternalServerError)
+			return
+		}
+	}
+	if action != "revoke" {
+		if err := policystate.Refresh(ctx, db, tx, updated.PolicyID); err != nil {
+			s.noteControlTimeout(err, true)
+			breakerFailure = true
+			writeErrorResponse(w, r, "POLICY_STATE_REFRESH_FAILED", "failed to refresh policy state projection", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	actionID, err := insertControlActionJournal(ctx, tx, controlActionJournalInsert{
 		ActionType:       action,
-		TargetKind:       "outbox",
-		OutboxID:         rowID,
+		TargetKind:       journalTargetKind,
+		OutboxID:         journalOutboxID,
+		LeaseKey:         journalLeaseKey,
+		WorkflowID:       workflowID,
+		PolicyID:         row.PolicyID,
 		Actor:            actor,
 		ReasonCode:       req.ReasonCode,
 		ReasonText:       req.ReasonText,
@@ -242,11 +293,15 @@ func (s *Server) handleControlOutboxMutation(w http.ResponseWriter, r *http.Requ
 				writeErrorResponse(w, r, "MUTATION_REPLAY_LOOKUP_FAILED", "failed to check idempotency replay", http.StatusInternalServerError)
 				return
 			}
-			if existing != nil && (existing.TargetKind != "outbox" || !existing.OutboxID.Valid || existing.OutboxID.String != rowID) {
+			if existing != nil && (existing.TargetKind != journalTargetKind || !existing.OutboxID.Valid || existing.OutboxID.String != rowID) {
 				writeErrorResponse(w, r, "IDEMPOTENCY_KEY_CONFLICT", "idempotency key already used for a different mutation target", http.StatusConflict)
 				return
 			}
-			replay, replayErr := s.tryOutboxMutationReplay(ctx, db, action, idemKey, actor, rowID)
+			if action == "revoke" {
+				replay, replayErr = s.tryOutboxRevokeReplay(ctx, db, idemKey, actor, rowID)
+			} else {
+				replay, replayErr = s.tryOutboxMutationReplay(ctx, db, action, idemKey, actor, rowID)
+			}
 			if replayErr == nil && replay != nil {
 				writeJSONResponse(w, r, NewSuccessResponse(*replay), http.StatusOK)
 				return
@@ -264,13 +319,19 @@ func (s *Server) handleControlOutboxMutation(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	if s.outboxStats != nil {
+		s.outboxStats.NotifyPolicyOutboxDispatcher()
+	}
+
 	if s.audit != nil {
 		s.audit.Log("control.mutation", utils.AuditInfo, map[string]interface{}{
 			"request_id":      requestID,
+			"command_id":      commandID,
+			"workflow_id":     workflowID,
 			"actor":           actor,
 			"action_type":     action,
-			"target_kind":     "outbox",
-			"outbox_id":       rowID,
+			"target_kind":     journalTargetKind,
+			"outbox_id":       journalOutboxID,
 			"before_status":   before,
 			"after_status":    updated.Status,
 			"reason_code":     req.ReasonCode,
@@ -282,6 +343,8 @@ func (s *Server) handleControlOutboxMutation(w http.ResponseWriter, r *http.Requ
 
 	writeJSONResponse(w, r, NewSuccessResponse(controlMutationResponse{
 		ActionID:         actionID,
+		CommandID:        commandID,
+		WorkflowID:       workflowID,
 		ActionType:       action,
 		IdempotentReplay: false,
 		Outbox:           outboxRowToDTO(updated),
@@ -358,6 +421,8 @@ func (s *Server) handleControlLeaseForceTakeover(w http.ResponseWriter, r *http.
 	defer cancel()
 	actor := s.resolveMutationActor(r)
 	requestID := getRequestID(r.Context())
+	commandID := generateCommandID()
+	workflowID := resolveWorkflowID(r, "")
 
 	replay, replayErr := s.tryLeaseTakeoverReplay(ctx, db, idemKey, actor)
 	if replayErr != nil {
@@ -428,6 +493,7 @@ func (s *Server) handleControlLeaseForceTakeover(w http.ResponseWriter, r *http.
 		ActionType:       "force_takeover",
 		TargetKind:       "lease",
 		LeaseKey:         leaseKey,
+		WorkflowID:       workflowID,
 		Actor:            actor,
 		ReasonCode:       req.ReasonCode,
 		ReasonText:       req.ReasonText,
@@ -474,6 +540,8 @@ func (s *Server) handleControlLeaseForceTakeover(w http.ResponseWriter, r *http.
 	if s.audit != nil {
 		s.audit.Log("control.lease_force_takeover", utils.AuditWarn, map[string]interface{}{
 			"request_id":      requestID,
+			"command_id":      commandID,
+			"workflow_id":     workflowID,
 			"actor":           actor,
 			"action_type":     "force_takeover",
 			"lease_key":       leaseKey,
@@ -485,6 +553,8 @@ func (s *Server) handleControlLeaseForceTakeover(w http.ResponseWriter, r *http.
 
 	writeJSONResponse(w, r, NewSuccessResponse(controlMutationResponse{
 		ActionID:         actionID,
+		CommandID:        commandID,
+		WorkflowID:       workflowID,
 		ActionType:       "force_takeover",
 		IdempotentReplay: false,
 		Lease:            &row,
@@ -501,9 +571,21 @@ func (s *Server) requireControlMutationAllowed(r *http.Request) *controlMutation
 	if !s.config.ControlMutationsEnabled {
 		return &controlMutationGateError{Code: "CONTROL_MUTATIONS_DISABLED", Message: "control mutations are disabled", HTTPStatus: http.StatusForbidden}
 	}
-	if s.controlMutationsSafeMode.Load() {
+	enabled, err := s.currentControlMutationSafeModeState(r.Context())
+	if err != nil {
+		return &controlMutationGateError{Code: "CONTROL_SAFE_MODE_STATE_UNAVAILABLE", Message: "failed to load shared safe mode state", HTTPStatus: http.StatusServiceUnavailable}
+	}
+	if enabled {
 		s.controlMutationBlockedSafeMode.Add(1)
 		return &controlMutationGateError{Code: "CONTROL_MUTATIONS_SAFE_MODE", Message: "control mutations are disabled by safe mode", HTTPStatus: http.StatusServiceUnavailable}
+	}
+	killSwitchEnabled, err := s.currentControlMutationKillSwitchState(r.Context())
+	if err != nil {
+		return &controlMutationGateError{Code: "CONTROL_KILL_SWITCH_STATE_UNAVAILABLE", Message: "failed to load shared kill-switch state", HTTPStatus: http.StatusServiceUnavailable}
+	}
+	if killSwitchEnabled {
+		s.controlMutationBlockedKillSwitch.Add(1)
+		return &controlMutationGateError{Code: "CONTROL_KILL_SWITCH_ENABLED", Message: "control mutations are disabled by kill-switch", HTTPStatus: http.StatusServiceUnavailable}
 	}
 	if s.config.ControlMutationRequireConsensus {
 		if s.engine == nil {
@@ -552,6 +634,8 @@ func parseOutboxMutationRef(rowRef string) (string, string, bool) {
 		return rowID, "requeue", true
 	case "mark-terminal":
 		return rowID, "mark_terminal", true
+	case "revoke":
+		return rowID, "revoke", true
 	default:
 		return "", "", false
 	}
@@ -571,10 +655,20 @@ func parseControlMutationRequest(r *http.Request) (controlMutationRequest, error
 	req.ReasonCode = strings.ToLower(strings.TrimSpace(req.ReasonCode))
 	req.ReasonText = strings.TrimSpace(req.ReasonText)
 	req.Classification = strings.ToLower(strings.TrimSpace(req.Classification))
+	req.WorkflowID = strings.TrimSpace(req.WorkflowID)
 	if req.ExpectedLeaseEpoch != nil && *req.ExpectedLeaseEpoch <= 0 {
 		return controlMutationRequest{}, fmt.Errorf("invalid expected_lease_epoch")
 	}
 	return req, nil
+}
+
+func resolveWorkflowID(r *http.Request, bodyWorkflowID string) string {
+	if r != nil {
+		if headerWorkflowID := strings.TrimSpace(r.Header.Get("X-Workflow-Id")); headerWorkflowID != "" {
+			return headerWorkflowID
+		}
+	}
+	return strings.TrimSpace(bodyWorkflowID)
 }
 
 func (s *Server) loadOutboxRowForUpdate(ctx context.Context, tx *sql.Tx, rowID string) (controlOutboxRow, error) {
@@ -582,20 +676,18 @@ func (s *Server) loadOutboxRowForUpdate(ctx context.Context, tx *sql.Tx, rowID s
 	err := tx.QueryRowContext(ctx, `
 		SELECT
 			id::STRING, block_height, block_ts, tx_index, policy_id,
-			trace_id, ai_event_ts_ms, status, retries, next_retry_at,
-			last_error, lease_holder, lease_epoch, kafka_topic,
-			kafka_partition, kafka_offset, published_at,
-			ack_result, ack_reason, ack_controller, acked_at,
+			request_id, command_id, workflow_id, trace_id, ai_event_ts_ms, source_event_id, source_event_ts_ms, sentinel_event_id, payload,
+			status, retries, next_retry_at, last_error, lease_holder, lease_epoch, kafka_topic,
+			kafka_partition, kafka_offset, published_at, ack_result, ack_reason, ack_controller, acked_at,
 			created_at, updated_at, rule_hash
 		FROM control_policy_outbox
-		WHERE id::STRING = $1
+		WHERE id = $1::UUID
 		FOR UPDATE
 	`, rowID).Scan(
 		&row.ID, &row.BlockHeight, &row.BlockTS, &row.TxIndex, &row.PolicyID,
-		&row.TraceID, &row.AIEventTsMs, &row.Status, &row.Retries, &row.NextRetryAt,
-		&row.LastError, &row.LeaseHolder, &row.LeaseEpoch, &row.KafkaTopic,
-		&row.KafkaPartition, &row.KafkaOffset, &row.PublishedAt,
-		&row.AckResult, &row.AckReason, &row.AckController, &row.AckedAt,
+		&row.RequestID, &row.CommandID, &row.WorkflowID, &row.TraceID, &row.AIEventTsMs, &row.SourceEventID, &row.SourceEventTsMs, &row.SentinelEventID, &row.Payload,
+		&row.Status, &row.Retries, &row.NextRetryAt, &row.LastError, &row.LeaseHolder, &row.LeaseEpoch, &row.KafkaTopic,
+		&row.KafkaPartition, &row.KafkaOffset, &row.PublishedAt, &row.AckResult, &row.AckReason, &row.AckController, &row.AckedAt,
 		&row.CreatedAt, &row.UpdatedAt, &row.RuleHash,
 	)
 	return row, err
@@ -614,6 +706,10 @@ func validateOutboxTransition(action, status string) error {
 	case "mark_terminal":
 		if status != "pending" && status != "retry" && status != "publishing" {
 			return fmt.Errorf("mark-terminal allowed only from pending, retry, or publishing")
+		}
+	case "revoke":
+		if status == "terminal_failed" {
+			return fmt.Errorf("revoke not allowed from terminal_failed")
 		}
 	default:
 		return fmt.Errorf("unsupported action")
@@ -642,6 +738,9 @@ func validateLeaseEpochFence(action string, row controlOutboxRow, req controlMut
 }
 
 func validateOutboxRaceSafety(action string, row controlOutboxRow) error {
+	if action == "revoke" {
+		return nil
+	}
 	if row.AckedAt.Valid || row.AckResult.Valid {
 		return fmt.Errorf("row already acked; mutation blocked to prevent ack/publish race")
 	}
@@ -650,6 +749,363 @@ func validateOutboxRaceSafety(action string, row controlOutboxRow) error {
 		return fmt.Errorf("row has publish metadata; mutation blocked to prevent publish/ack race")
 	}
 	return nil
+}
+
+func tenantScopeMatchesOutboxRow(row controlOutboxRow, tenantScope string) bool {
+	if strings.TrimSpace(tenantScope) == "" || len(row.Payload) == 0 {
+		return false
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(row.Payload, &payload); err != nil {
+		return false
+	}
+	candidates := []string{
+		extractMapString(payload, "tenant"),
+	}
+	if metadata, ok := payload["metadata"].(map[string]interface{}); ok {
+		candidates = append(candidates, extractMapString(metadata, "tenant"))
+	}
+	if trace, ok := payload["trace"].(map[string]interface{}); ok {
+		candidates = append(candidates, extractMapString(trace, "tenant"))
+	}
+	if target, ok := payload["target"].(map[string]interface{}); ok {
+		candidates = append(candidates, extractMapString(target, "tenant"))
+		candidates = append(candidates, extractMapString(target, "tenant_id"))
+	}
+	for _, candidate := range candidates {
+		if strings.TrimSpace(candidate) == strings.TrimSpace(tenantScope) {
+			return true
+		}
+	}
+	return false
+}
+
+func loadOutboxRowByID(ctx context.Context, query rowQueryer, rowID string) (controlOutboxRow, error) {
+	var row controlOutboxRow
+	err := query.QueryRowContext(ctx, `
+		SELECT
+			id::STRING, block_height, block_ts, tx_index, policy_id,
+			request_id, command_id, workflow_id, trace_id, ai_event_ts_ms, source_event_id, source_event_ts_ms, sentinel_event_id, payload,
+			status, retries, next_retry_at, last_error, lease_holder, lease_epoch, kafka_topic,
+			kafka_partition, kafka_offset, published_at, ack_result, ack_reason, ack_controller,
+			acked_at, created_at, updated_at, rule_hash
+		FROM control_policy_outbox
+		WHERE id = $1::UUID
+	`, rowID).Scan(
+		&row.ID, &row.BlockHeight, &row.BlockTS, &row.TxIndex, &row.PolicyID,
+		&row.RequestID, &row.CommandID, &row.WorkflowID, &row.TraceID, &row.AIEventTsMs, &row.SourceEventID, &row.SourceEventTsMs, &row.SentinelEventID, &row.Payload,
+		&row.Status, &row.Retries, &row.NextRetryAt, &row.LastError, &row.LeaseHolder, &row.LeaseEpoch, &row.KafkaTopic,
+		&row.KafkaPartition, &row.KafkaOffset, &row.PublishedAt, &row.AckResult, &row.AckReason, &row.AckController,
+		&row.AckedAt, &row.CreatedAt, &row.UpdatedAt, &row.RuleHash,
+	)
+	return row, err
+}
+
+func resolveOutboxAnomalyID(ctx context.Context, query rowQueryer, row controlOutboxRow) (string, error) {
+	if anomalyID := strings.TrimSpace(row.AnomalyID); anomalyID != "" {
+		return anomalyID, nil
+	}
+	if ctxValues := parseOutboxOperationalContext(row.Payload); strings.TrimSpace(ctxValues.AnomalyID) != "" {
+		return strings.TrimSpace(ctxValues.AnomalyID), nil
+	}
+	if !controlQueryerTableExists(ctx, query, "anomalies") {
+		return "", nil
+	}
+	for _, lookup := range []struct {
+		column string
+		value  string
+	}{
+		{column: "source_event_id", value: strings.TrimSpace(row.SourceEventID.String)},
+		{column: "sentinel_event_id", value: strings.TrimSpace(row.SentinelEventID.String)},
+	} {
+		if lookup.value == "" {
+			continue
+		}
+		var anomalyID string
+		err := query.QueryRowContext(ctx, fmt.Sprintf(`
+			SELECT anomaly_id
+			FROM anomalies
+			WHERE %s = $1
+			ORDER BY detected_at DESC, created_at DESC
+			LIMIT 1
+		`, lookup.column), lookup.value).Scan(&anomalyID)
+		if err == sql.ErrNoRows {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		if strings.TrimSpace(anomalyID) != "" {
+			return strings.TrimSpace(anomalyID), nil
+		}
+	}
+	return "", nil
+}
+
+func controlQueryerTableExists(ctx context.Context, query rowQueryer, tableName string) bool {
+	var exists bool
+	err := query.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.tables
+			WHERE table_schema = current_schema()
+			  AND table_name = $1
+		)
+	`, tableName).Scan(&exists)
+	return err == nil && exists
+}
+
+type rowQueryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
+}
+
+func (s *Server) tryOutboxRevokeReplay(ctx context.Context, db *sql.DB, idempotencyKey, actor, rowID string) (*controlMutationResponse, error) {
+	var (
+		actionID    string
+		revokeRowID sql.NullString
+	)
+	err := db.QueryRowContext(ctx, `
+		SELECT action_id::STRING, lease_key
+		FROM control_actions_journal
+		WHERE action_type = 'revoke'
+		  AND idempotency_key = $1
+		  AND actor = $2
+		  AND target_kind = 'outbox_revoke'
+		  AND outbox_id = $3::UUID
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, idempotencyKey, actor, rowID).Scan(&actionID, &revokeRowID)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !revokeRowID.Valid || strings.TrimSpace(revokeRowID.String) == "" {
+		return nil, fmt.Errorf("revoke replay missing created outbox id")
+	}
+
+	queryCtx, cancel := context.WithTimeout(ctx, s.config.RequestTimeout)
+	defer cancel()
+	row, err := loadOutboxRowByID(queryCtx, db, strings.TrimSpace(revokeRowID.String))
+	if err != nil {
+		return nil, err
+	}
+	return &controlMutationResponse{
+		ActionID:         actionID,
+		ActionType:       "revoke",
+		IdempotentReplay: true,
+		Outbox:           outboxRowToDTO(row),
+	}, nil
+}
+
+func buildRevokeOutboxPayload(row controlOutboxRow, now time.Time, requestID, commandID, workflowID string) ([]byte, string, error) {
+	if len(row.Payload) == 0 {
+		return nil, "", fmt.Errorf("source outbox payload is empty")
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(row.Payload, &raw); err != nil {
+		return nil, "", fmt.Errorf("decode source payload: %w", err)
+	}
+	action := strings.ToLower(strings.TrimSpace(asString(raw["action"])))
+	if action == "remove" {
+		return nil, "", fmt.Errorf("source payload already represents revoke")
+	}
+	ruleType := strings.TrimSpace(asString(raw["rule_type"]))
+	if ruleType == "" {
+		ruleType = "block"
+	}
+	if ruleType != "block" {
+		return nil, "", fmt.Errorf("revoke only supported for block policies")
+	}
+
+	revokeTraceID := fmt.Sprintf("trace:revoke:%s:%d", row.PolicyID, now.UnixMilli())
+	payload := map[string]any{
+		"schema_version": 1,
+		"policy_id":      row.PolicyID,
+		"rule_type":      "block",
+		"action":         "remove",
+		"trace": map[string]any{
+			"id": revokeTraceID,
+		},
+	}
+	if strings.TrimSpace(requestID) != "" {
+		payload["request_id"] = strings.TrimSpace(requestID)
+		trace, _ := payload["trace"].(map[string]any)
+		trace["request_id"] = strings.TrimSpace(requestID)
+	}
+	if strings.TrimSpace(commandID) != "" {
+		payload["command_id"] = strings.TrimSpace(commandID)
+		trace, _ := payload["trace"].(map[string]any)
+		trace["command_id"] = strings.TrimSpace(commandID)
+	}
+	if strings.TrimSpace(workflowID) != "" {
+		payload["workflow_id"] = strings.TrimSpace(workflowID)
+		trace, _ := payload["trace"].(map[string]any)
+		trace["workflow_id"] = strings.TrimSpace(workflowID)
+	}
+	if row.TraceID.Valid && strings.TrimSpace(row.TraceID.String) != "" {
+		payload["metadata"] = map[string]any{
+			"parent_trace_id": strings.TrimSpace(row.TraceID.String),
+			"trace_id":        revokeTraceID,
+		}
+	}
+	if strings.TrimSpace(row.AnomalyID) != "" {
+		payload["anomaly_id"] = strings.TrimSpace(row.AnomalyID)
+	}
+	if strings.TrimSpace(requestID) != "" {
+		metadata, _ := payload["metadata"].(map[string]any)
+		if metadata == nil {
+			metadata = map[string]any{}
+			payload["metadata"] = metadata
+		}
+		metadata["request_id"] = strings.TrimSpace(requestID)
+	}
+	if strings.TrimSpace(commandID) != "" {
+		metadata, _ := payload["metadata"].(map[string]any)
+		if metadata == nil {
+			metadata = map[string]any{}
+			payload["metadata"] = metadata
+		}
+		metadata["command_id"] = strings.TrimSpace(commandID)
+	}
+	if strings.TrimSpace(workflowID) != "" {
+		metadata, _ := payload["metadata"].(map[string]any)
+		if metadata == nil {
+			metadata = map[string]any{}
+			payload["metadata"] = metadata
+		}
+		metadata["workflow_id"] = strings.TrimSpace(workflowID)
+	}
+	if row.SourceEventID.Valid && strings.TrimSpace(row.SourceEventID.String) != "" {
+		metadata, _ := payload["metadata"].(map[string]any)
+		if metadata == nil {
+			metadata = map[string]any{}
+			payload["metadata"] = metadata
+		}
+		metadata["source_event_id"] = strings.TrimSpace(row.SourceEventID.String)
+		payload["source_event_id"] = strings.TrimSpace(row.SourceEventID.String)
+	}
+	if row.SourceEventTsMs.Valid && row.SourceEventTsMs.Int64 > 0 {
+		metadata, _ := payload["metadata"].(map[string]any)
+		if metadata == nil {
+			metadata = map[string]any{}
+			payload["metadata"] = metadata
+		}
+		metadata["source_event_ts_ms"] = row.SourceEventTsMs.Int64
+		payload["source_event_ts_ms"] = row.SourceEventTsMs.Int64
+	}
+	if row.SentinelEventID.Valid && strings.TrimSpace(row.SentinelEventID.String) != "" {
+		metadata, _ := payload["metadata"].(map[string]any)
+		if metadata == nil {
+			metadata = map[string]any{}
+			payload["metadata"] = metadata
+		}
+		metadata["sentinel_event_id"] = strings.TrimSpace(row.SentinelEventID.String)
+		payload["sentinel_event_id"] = strings.TrimSpace(row.SentinelEventID.String)
+	}
+	if strings.TrimSpace(row.AnomalyID) != "" {
+		metadata, _ := payload["metadata"].(map[string]any)
+		if metadata == nil {
+			metadata = map[string]any{}
+			payload["metadata"] = metadata
+		}
+		metadata["anomaly_id"] = strings.TrimSpace(row.AnomalyID)
+	}
+	if tenant := firstNonEmpty(asString(raw["tenant"]), nestedString(raw, "target", "tenant"), nestedString(raw, "target", "tenant_id")); tenant != "" {
+		payload["tenant"] = tenant
+	}
+	if region := firstNonEmpty(asString(raw["region"]), nestedString(raw, "target", "region")); region != "" {
+		payload["region"] = region
+	}
+	if guardrails, ok := raw["guardrails"].(map[string]any); ok {
+		if requiresAck, exists := guardrails["requires_ack"]; exists {
+			payload["guardrails"] = map[string]any{"requires_ack": requiresAck}
+		}
+	}
+	if audit, ok := raw["audit"].(map[string]any); ok && len(audit) > 0 {
+		payload["audit"] = audit
+	}
+
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil, "", fmt.Errorf("encode revoke payload: %w", err)
+	}
+	return encoded, revokeTraceID, nil
+}
+
+func insertRevokeOutboxRow(ctx context.Context, tx *sql.Tx, latestHeight int64, source controlOutboxRow, requestID, commandID, workflowID string) (controlOutboxRow, error) {
+	now := time.Now().UTC()
+	if anomalyID, resolveErr := resolveOutboxAnomalyID(ctx, tx, source); resolveErr != nil {
+		return controlOutboxRow{}, fmt.Errorf("resolve revoke anomaly lineage: %w", resolveErr)
+	} else if anomalyID != "" {
+		source.AnomalyID = anomalyID
+	}
+	payload, traceID, err := buildRevokeOutboxPayload(source, now, requestID, commandID, workflowID)
+	if err != nil {
+		return controlOutboxRow{}, err
+	}
+	var txIndex int
+	err = tx.QueryRowContext(ctx, `
+		SELECT COALESCE(MIN(tx_index), 0) - 1
+		FROM control_policy_outbox
+		WHERE block_height = $1
+	`, latestHeight).Scan(&txIndex)
+	if err != nil {
+		return controlOutboxRow{}, fmt.Errorf("allocate revoke tx_index: %w", err)
+	}
+	ruleHash := sha256.Sum256(payload)
+
+	var revokeID string
+	err = tx.QueryRowContext(ctx, `
+		INSERT INTO control_policy_outbox (
+			block_height, block_ts, tx_index, policy_id, rule_hash, payload,
+			request_id, command_id, workflow_id, trace_id, ai_event_ts_ms, source_event_id, source_event_ts_ms, sentinel_event_id,
+			status, next_retry_at, created_at, updated_at
+		) VALUES (
+			$1, $2, $3, $4, $5, $6,
+			NULLIF($7, ''), NULLIF($8, ''), NULLIF($9, ''), $10, $11, NULLIF($12, ''), NULLIF($13, 0), NULLIF($14, ''),
+			'pending', NOW(), NOW(), NOW()
+		)
+		RETURNING id::STRING
+	`, latestHeight, now.Unix(), txIndex, source.PolicyID, ruleHash[:], payload,
+		requestID, commandID, workflowID, traceID, now.UnixMilli(), source.SourceEventID.String, source.SourceEventTsMs.Int64, source.SentinelEventID.String,
+	).Scan(&revokeID)
+	if err != nil {
+		return controlOutboxRow{}, fmt.Errorf("insert revoke outbox row: %w", err)
+	}
+	return loadOutboxRowByID(ctx, tx, revokeID)
+}
+
+func asString(v any) string {
+	if s, ok := v.(string); ok {
+		return strings.TrimSpace(s)
+	}
+	return ""
+}
+
+func nestedString(root map[string]any, path ...string) string {
+	cur := any(root)
+	for _, segment := range path {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return ""
+		}
+		cur, ok = m[segment]
+		if !ok {
+			return ""
+		}
+	}
+	return asString(cur)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func applyOutboxMutation(ctx context.Context, tx *sql.Tx, rowID, action string, req controlMutationRequest) error {
@@ -665,7 +1121,7 @@ func applyOutboxMutation(ctx context.Context, tx *sql.Tx, rowID, action string, 
 				last_error = NULL,
 				lease_holder = NULL,
 				updated_at = now()
-			WHERE id::STRING = $1
+			WHERE id = $1::UUID
 		`
 	case "requeue":
 		q = `
@@ -675,7 +1131,7 @@ func applyOutboxMutation(ctx context.Context, tx *sql.Tx, rowID, action string, 
 				last_error = $2,
 				lease_holder = NULL,
 				updated_at = now()
-			WHERE id::STRING = $1
+			WHERE id = $1::UUID
 		`
 		args = append(args, fmt.Sprintf("manual_%s:%s", action, req.ReasonCode))
 	case "mark_terminal":
@@ -686,7 +1142,7 @@ func applyOutboxMutation(ctx context.Context, tx *sql.Tx, rowID, action string, 
 				lease_holder = NULL,
 				last_error = $2,
 				updated_at = now()
-			WHERE id::STRING = $1
+			WHERE id = $1::UUID
 		`
 		args = append(args, fmt.Sprintf("manual_%s:%s", action, req.ReasonCode))
 	default:
@@ -716,6 +1172,8 @@ type controlActionJournalInsert struct {
 	TargetKind       string
 	OutboxID         string
 	LeaseKey         string
+	WorkflowID       string
+	PolicyID         string
 	Actor            string
 	ReasonCode       string
 	ReasonText       string
@@ -743,6 +1201,18 @@ func insertControlActionJournal(ctx context.Context, tx *sql.Tx, p controlAction
 	} else {
 		leaseArg = p.LeaseKey
 	}
+	var workflowArg interface{}
+	if strings.TrimSpace(p.WorkflowID) == "" {
+		workflowArg = nil
+	} else {
+		workflowArg = p.WorkflowID
+	}
+	var policyArg interface{}
+	if strings.TrimSpace(p.PolicyID) == "" {
+		policyArg = nil
+	} else {
+		policyArg = p.PolicyID
+	}
 	var tenantArg interface{}
 	if strings.TrimSpace(p.TenantScope) == "" {
 		tenantArg = nil
@@ -764,15 +1234,15 @@ func insertControlActionJournal(ctx context.Context, tx *sql.Tx, p controlAction
 
 	err := tx.QueryRowContext(ctx, `
 		INSERT INTO control_actions_journal (
-			action_type, target_kind, outbox_id, lease_key, actor,
+			action_type, target_kind, outbox_id, lease_key, workflow_id, policy_id, actor,
 			reason_code, reason_text, idempotency_key, request_id,
 			before_status, after_status, tenant_scope, classification,
 			before_lease_epoch, after_lease_epoch, decision_hash
 		)
-		VALUES ($1, $2, $3::UUID, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+		VALUES ($1, $2, $3::UUID, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 		RETURNING action_id::STRING
 	`,
-		p.ActionType, p.TargetKind, outboxArg, leaseArg, p.Actor,
+		p.ActionType, p.TargetKind, outboxArg, leaseArg, workflowArg, policyArg, p.Actor,
 		p.ReasonCode, p.ReasonText, p.IdempotencyKey, p.RequestID,
 		p.BeforeStatus, p.AfterStatus, tenantArg, classArg,
 		p.BeforeLeaseEpoch, p.AfterLeaseEpoch, decisionHash,
@@ -786,6 +1256,14 @@ func isUniqueConstraintErr(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "23505") || strings.Contains(msg, "duplicate key")
+}
+
+func generateCommandID() string {
+	id, err := uuid.NewV7()
+	if err != nil {
+		return uuid.NewString()
+	}
+	return id.String()
 }
 
 func lookupControlActionByIdempotency(ctx context.Context, db *sql.DB, actionType, idempotencyKey, actor string) (*controlActionJournalRow, error) {
@@ -817,7 +1295,7 @@ func (s *Server) tryOutboxMutationReplay(ctx context.Context, db *sql.DB, action
 		  AND idempotency_key = $2
 		  AND actor = $3
 		  AND target_kind = 'outbox'
-		  AND outbox_id::STRING = $4
+		  AND outbox_id = $4::UUID
 		ORDER BY created_at DESC
 		LIMIT 1
 	`, action, idempotencyKey, actor, rowID).Scan(&actionID)
@@ -834,16 +1312,16 @@ func (s *Server) tryOutboxMutationReplay(ctx context.Context, db *sql.DB, action
 	err = db.QueryRowContext(queryCtx, `
 		SELECT
 			id::STRING, block_height, block_ts, tx_index, policy_id,
-			trace_id, ai_event_ts_ms, status, retries, next_retry_at,
+			trace_id, ai_event_ts_ms, source_event_id, source_event_ts_ms, sentinel_event_id, status, retries, next_retry_at,
 			last_error, lease_holder, lease_epoch, kafka_topic,
 			kafka_partition, kafka_offset, published_at,
 			ack_result, ack_reason, ack_controller, acked_at,
 			created_at, updated_at, rule_hash
 		FROM control_policy_outbox
-		WHERE id::STRING = $1
+		WHERE id = $1::UUID
 	`, rowID).Scan(
 		&row.ID, &row.BlockHeight, &row.BlockTS, &row.TxIndex, &row.PolicyID,
-		&row.TraceID, &row.AIEventTsMs, &row.Status, &row.Retries, &row.NextRetryAt,
+		&row.TraceID, &row.AIEventTsMs, &row.SourceEventID, &row.SourceEventTsMs, &row.SentinelEventID, &row.Status, &row.Retries, &row.NextRetryAt,
 		&row.LastError, &row.LeaseHolder, &row.LeaseEpoch, &row.KafkaTopic,
 		&row.KafkaPartition, &row.KafkaOffset, &row.PublishedAt,
 		&row.AckResult, &row.AckReason, &row.AckController, &row.AckedAt,

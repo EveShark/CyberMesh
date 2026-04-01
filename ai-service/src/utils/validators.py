@@ -3,7 +3,7 @@ from typing import Optional
 from .errors import ValidationError, TimestampSkewError
 from .time import now
 from .limits import VALUE_LIMITS, TIME_LIMITS
-from .id_gen import validate_uuid4
+from .id_gen import validate_uuid as is_valid_uuid, validate_uuid4 as is_valid_uuid4
 
 
 def validate_size(data_size: int, max_size: int, data_type: str):
@@ -94,7 +94,12 @@ def validate_timestamp(timestamp: int, max_skew_seconds: int = None):
 
 
 def validate_uuid(value: str, field_name: str = "ID"):
-    if not validate_uuid4(value):
+    if not is_valid_uuid(value):
+        raise ValidationError(f"{field_name} must be a valid UUID")
+
+
+def validate_uuid4(value: str, field_name: str = "ID"):
+    if not is_valid_uuid4(value):
         raise ValidationError(f"{field_name} must be a valid UUIDv4")
 
 

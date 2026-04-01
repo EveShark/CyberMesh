@@ -2,6 +2,7 @@ package policyack
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"strings"
@@ -13,8 +14,11 @@ import (
 	"backend/pkg/utils"
 	pb "backend/proto"
 	"github.com/IBM/sarama"
+	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
 )
+
+var legacyAckEventNamespace = uuid.MustParse("645a4f66-b019-5290-9d8d-9c44bb5f9d58")
 
 type Consumer struct {
 	cfg         Config
@@ -45,6 +49,9 @@ type Consumer struct {
 	lastStoreWarnLogNs      int64
 	lastRejectLogNs         int64
 	lastDLQErrLogNs         int64
+	partitionAssignments    atomic.Uint64
+	partitionRevocations    atomic.Uint64
+	partitionsOwnedCurrent  atomic.Uint64
 }
 
 type ConsumerStats struct {
@@ -58,6 +65,9 @@ type ConsumerStats struct {
 	WorkQueueWaits          uint64
 	SoftThrottleActivations uint64
 	LogsThrottled           uint64
+	PartitionAssignments    uint64
+	PartitionRevocations    uint64
+	PartitionsOwnedCurrent  uint64
 }
 
 type CausalStats struct {
@@ -83,6 +93,14 @@ type CausalStats struct {
 	PublishToAckCount          uint64
 	PublishToAckSumMs          float64
 	PublishToAckP95Ms          float64
+	PublishToAppliedBuckets    []utils.HistogramBucket
+	PublishToAppliedCount      uint64
+	PublishToAppliedSumMs      float64
+	PublishToAppliedP95Ms      float64
+	AppliedToAckBuckets        []utils.HistogramBucket
+	AppliedToAckCount          uint64
+	AppliedToAckSumMs          float64
+	AppliedToAckP95Ms          float64
 }
 
 type Options struct {
@@ -180,8 +198,31 @@ type handler struct {
 	c *Consumer
 }
 
-func (h *handler) Setup(sarama.ConsumerGroupSession) error   { return nil }
-func (h *handler) Cleanup(sarama.ConsumerGroupSession) error { return nil }
+func (h *handler) Setup(sess sarama.ConsumerGroupSession) error {
+	if h == nil || h.c == nil || sess == nil {
+		return nil
+	}
+	var claims uint64
+	for _, parts := range sess.Claims() {
+		claims += uint64(len(parts))
+	}
+	h.c.partitionAssignments.Add(claims)
+	h.c.partitionsOwnedCurrent.Store(claims)
+	return nil
+}
+
+func (h *handler) Cleanup(sess sarama.ConsumerGroupSession) error {
+	if h == nil || h.c == nil || sess == nil {
+		return nil
+	}
+	var claims uint64
+	for _, parts := range sess.Claims() {
+		claims += uint64(len(parts))
+	}
+	h.c.partitionRevocations.Add(claims)
+	h.c.partitionsOwnedCurrent.Store(0)
+	return nil
+}
 
 func (h *handler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
 	workers := h.c.cfg.Workers
@@ -299,10 +340,10 @@ func (c *Consumer) process(ctx context.Context, msg *sarama.ConsumerMessage) err
 		c.sendDLQ(ctx, msg, "invalid_required_fields", fmt.Errorf("policy_id/controller_instance required"))
 		return fmt.Errorf("%w: invalid required fields", errPermanent)
 	}
-	if c.cfg.RequireQCRef && strings.TrimSpace(ack.QcReference) == "" {
+	if c.cfg.RequireQCRef && strings.TrimSpace(ack.QcReference) == "" && strings.TrimSpace(ack.TraceId) == "" {
 		c.rejectedTotal.Add(1)
-		c.sendDLQ(ctx, msg, "missing_qc_reference", fmt.Errorf("qc_reference required"))
-		return fmt.Errorf("%w: missing qc_reference", errPermanent)
+		c.sendDLQ(ctx, msg, "missing_trace_reference", fmt.Errorf("trace_id or qc_reference required"))
+		return fmt.Errorf("%w: missing trace_id or qc_reference", errPermanent)
 	}
 	if c.cfg.RequireRuleHash && len(ack.RuleHash) == 0 {
 		c.rejectedTotal.Add(1)
@@ -332,6 +373,9 @@ func (c *Consumer) process(ctx context.Context, msg *sarama.ConsumerMessage) err
 		return fmt.Errorf("%w: invalid result", errPermanent)
 	}
 	ack.Result = res
+	if strings.TrimSpace(ack.AckEventId) == "" {
+		ack.AckEventId = fallbackAckEventID(msg)
+	}
 
 	sig := header(msg.Headers, "ack-signature")
 	algo := strings.ToLower(string(header(msg.Headers, "ack-signature-alg")))
@@ -394,10 +438,14 @@ func (c *Consumer) process(ctx context.Context, msg *sarama.ConsumerMessage) err
 			})
 		}
 		if c.trace != nil {
+			traceID := strings.TrimSpace(ack.TraceId)
+			if traceID == "" {
+				traceID = strings.TrimSpace(ack.QcReference)
+			}
 			c.trace.Record(policytrace.Marker{
 				Stage:       "t_ack",
 				PolicyID:    ack.PolicyId,
-				TraceID:     strings.TrimSpace(ack.QcReference),
+				TraceID:     traceID,
 				TimestampMs: time.Now().UnixMilli(),
 			})
 		}
@@ -410,6 +458,19 @@ func (c *Consumer) process(ctx context.Context, msg *sarama.ConsumerMessage) err
 		return fmt.Errorf("policy ack store retries exhausted: %w", last)
 	}
 	return fmt.Errorf("policy ack store retries exhausted")
+}
+
+func fallbackAckEventID(msg *sarama.ConsumerMessage) string {
+	if msg == nil {
+		return uuid.NewSHA1(legacyAckEventNamespace, []byte("ack:nil")).String()
+	}
+	if msg.Topic != "" || msg.Partition != 0 || msg.Offset != 0 {
+		seed := fmt.Sprintf("ack:%s:%d:%d", msg.Topic, msg.Partition, msg.Offset)
+		return uuid.NewSHA1(legacyAckEventNamespace, []byte(seed)).String()
+	}
+	sum := sha256.Sum256(msg.Value)
+	seed := fmt.Sprintf("ack:raw:%x", sum[:])
+	return uuid.NewSHA1(legacyAckEventNamespace, []byte(seed)).String()
 }
 
 func header(headers []*sarama.RecordHeader, key string) []byte {
@@ -513,6 +574,9 @@ func (c *Consumer) Stats() ConsumerStats {
 		WorkQueueWaits:          c.workQueueWaits.Load(),
 		SoftThrottleActivations: c.softThrottleActivations.Load(),
 		LogsThrottled:           c.logsThrottled.Load(),
+		PartitionAssignments:    c.partitionAssignments.Load(),
+		PartitionRevocations:    c.partitionRevocations.Load(),
+		PartitionsOwnedCurrent:  c.partitionsOwnedCurrent.Load(),
 	}
 }
 
@@ -544,5 +608,13 @@ func (c *Consumer) CausalStats() CausalStats {
 		PublishToAckCount:          s.PublishToAckCount,
 		PublishToAckSumMs:          s.PublishToAckSumMs,
 		PublishToAckP95Ms:          s.PublishToAckP95Ms,
+		PublishToAppliedBuckets:    s.PublishToAppliedBuckets,
+		PublishToAppliedCount:      s.PublishToAppliedCount,
+		PublishToAppliedSumMs:      s.PublishToAppliedSumMs,
+		PublishToAppliedP95Ms:      s.PublishToAppliedP95Ms,
+		AppliedToAckBuckets:        s.AppliedToAckBuckets,
+		AppliedToAckCount:          s.AppliedToAckCount,
+		AppliedToAckSumMs:          s.AppliedToAckSumMs,
+		AppliedToAckP95Ms:          s.AppliedToAckP95Ms,
 	}
 }

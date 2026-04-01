@@ -28,7 +28,7 @@ type VerifierConfig struct {
 	MaxTimestampSkew      time.Duration       // Max clock skew allowed (default: 5m)
 	PolicyPubKeyAllowlist map[string]struct{} // Hex-encoded Ed25519 pubkeys allowed to publish policies
 	PolicyRequireTrace    bool                // Require trace contract fields in ai.policy payload
-	PolicyRequireQCRef    bool                // Require qc_reference in ai.policy payload
+	PolicyRequireQCRef    bool                // Require an approval reference or explicit trace contract in ai.policy payload
 	PolicyTraceFutureSkew time.Duration       // Max future skew for ai_event_ts_ms
 }
 
@@ -528,9 +528,6 @@ func validatePolicyTraceContract(params []byte, cfg VerifierConfig) error {
 		parseFrom(wrapped)
 	}
 
-	if cfg.PolicyRequireQCRef && qcReference == "" {
-		return fmt.Errorf("missing qc_reference")
-	}
 	if cfg.PolicyRequireTrace {
 		if traceID == "" && traceIDAlt == "" {
 			return fmt.Errorf("missing trace_id")
@@ -542,13 +539,13 @@ func validatePolicyTraceContract(params []byte, cfg VerifierConfig) error {
 	if traceID != "" && traceIDAlt != "" && traceID != traceIDAlt {
 		return fmt.Errorf("trace id mismatch between metadata.trace_id and trace.id")
 	}
-	if qcReference != "" {
+	if cfg.PolicyRequireQCRef && qcReference == "" {
 		activeTraceID := traceID
 		if activeTraceID == "" {
 			activeTraceID = traceIDAlt
 		}
-		if activeTraceID != "" && qcReference != activeTraceID {
-			return fmt.Errorf("qc_reference does not match trace id")
+		if activeTraceID == "" {
+			return fmt.Errorf("missing qc_reference")
 		}
 	}
 

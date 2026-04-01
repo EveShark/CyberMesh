@@ -2,7 +2,7 @@
 // versions:
 // 	protoc-gen-go v1.36.10
 // 	protoc        v6.32.1
-// source: backend/proto/control_policy_ack.proto
+// source: control_policy_ack.proto
 
 package pb
 
@@ -40,13 +40,20 @@ type PolicyAckEvent struct {
 	ProducerId         []byte                 `protobuf:"bytes,14,opt,name=producer_id,json=producerId,proto3" json:"producer_id,omitempty"`                         // Original backend producer id for traceability
 	AppliedAtMs        int64                  `protobuf:"varint,15,opt,name=applied_at_ms,json=appliedAtMs,proto3" json:"applied_at_ms,omitempty"`                   // Unix timestamp in milliseconds when apply finished (preferred when set)
 	AckedAtMs          int64                  `protobuf:"varint,16,opt,name=acked_at_ms,json=ackedAtMs,proto3" json:"acked_at_ms,omitempty"`                         // Unix timestamp in milliseconds when ACK emitted (preferred when set)
+	TraceId            string                 `protobuf:"bytes,17,opt,name=trace_id,json=traceId,proto3" json:"trace_id,omitempty"`                                  // Optional propagated trace identifier
+	SourceEventId      string                 `protobuf:"bytes,18,opt,name=source_event_id,json=sourceEventId,proto3" json:"source_event_id,omitempty"`              // Optional original upstream source event identifier
+	SentinelEventId    string                 `protobuf:"bytes,19,opt,name=sentinel_event_id,json=sentinelEventId,proto3" json:"sentinel_event_id,omitempty"`        // Optional Sentinel-owned analysis event identifier
+	AckEventId         string                 `protobuf:"bytes,20,opt,name=ack_event_id,json=ackEventId,proto3" json:"ack_event_id,omitempty"`                       // Optional immutable ACK event identifier
+	RequestId          string                 `protobuf:"bytes,21,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`                            // Optional originating API/plugin request identifier
+	CommandId          string                 `protobuf:"bytes,22,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`                            // Optional operator command identifier
+	WorkflowId         string                 `protobuf:"bytes,23,opt,name=workflow_id,json=workflowId,proto3" json:"workflow_id,omitempty"`                         // Optional higher-level workflow identifier
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
 
 func (x *PolicyAckEvent) Reset() {
 	*x = PolicyAckEvent{}
-	mi := &file_backend_proto_control_policy_ack_proto_msgTypes[0]
+	mi := &file_control_policy_ack_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -58,7 +65,7 @@ func (x *PolicyAckEvent) String() string {
 func (*PolicyAckEvent) ProtoMessage() {}
 
 func (x *PolicyAckEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_backend_proto_control_policy_ack_proto_msgTypes[0]
+	mi := &file_control_policy_ack_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -71,7 +78,7 @@ func (x *PolicyAckEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PolicyAckEvent.ProtoReflect.Descriptor instead.
 func (*PolicyAckEvent) Descriptor() ([]byte, []int) {
-	return file_backend_proto_control_policy_ack_proto_rawDescGZIP(), []int{0}
+	return file_control_policy_ack_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *PolicyAckEvent) GetPolicyId() string {
@@ -186,11 +193,60 @@ func (x *PolicyAckEvent) GetAckedAtMs() int64 {
 	return 0
 }
 
-var File_backend_proto_control_policy_ack_proto protoreflect.FileDescriptor
+func (x *PolicyAckEvent) GetTraceId() string {
+	if x != nil {
+		return x.TraceId
+	}
+	return ""
+}
 
-const file_backend_proto_control_policy_ack_proto_rawDesc = "" +
+func (x *PolicyAckEvent) GetSourceEventId() string {
+	if x != nil {
+		return x.SourceEventId
+	}
+	return ""
+}
+
+func (x *PolicyAckEvent) GetSentinelEventId() string {
+	if x != nil {
+		return x.SentinelEventId
+	}
+	return ""
+}
+
+func (x *PolicyAckEvent) GetAckEventId() string {
+	if x != nil {
+		return x.AckEventId
+	}
+	return ""
+}
+
+func (x *PolicyAckEvent) GetRequestId() string {
+	if x != nil {
+		return x.RequestId
+	}
+	return ""
+}
+
+func (x *PolicyAckEvent) GetCommandId() string {
+	if x != nil {
+		return x.CommandId
+	}
+	return ""
+}
+
+func (x *PolicyAckEvent) GetWorkflowId() string {
+	if x != nil {
+		return x.WorkflowId
+	}
+	return ""
+}
+
+var File_control_policy_ack_proto protoreflect.FileDescriptor
+
+const file_control_policy_ack_proto_rawDesc = "" +
 	"\n" +
-	"&backend/proto/control_policy_ack.proto\x12\x14cybermesh.control.v1\"\x84\x04\n" +
+	"\x18control_policy_ack.proto\x12\x14cybermesh.control.v1\"\xf4\x05\n" +
 	"\x0ePolicyAckEvent\x12\x1b\n" +
 	"\tpolicy_id\x18\x01 \x01(\tR\bpolicyId\x12)\n" +
 	"\x10scope_identifier\x18\x02 \x01(\tR\x0fscopeIdentifier\x12\x16\n" +
@@ -211,25 +267,36 @@ const file_backend_proto_control_policy_ack_proto_rawDesc = "" +
 	"\vproducer_id\x18\x0e \x01(\fR\n" +
 	"producerId\x12\"\n" +
 	"\rapplied_at_ms\x18\x0f \x01(\x03R\vappliedAtMs\x12\x1e\n" +
-	"\vacked_at_ms\x18\x10 \x01(\x03R\tackedAtMsB\x12Z\x10backend/proto;pbb\x06proto3"
+	"\vacked_at_ms\x18\x10 \x01(\x03R\tackedAtMs\x12\x19\n" +
+	"\btrace_id\x18\x11 \x01(\tR\atraceId\x12&\n" +
+	"\x0fsource_event_id\x18\x12 \x01(\tR\rsourceEventId\x12*\n" +
+	"\x11sentinel_event_id\x18\x13 \x01(\tR\x0fsentinelEventId\x12 \n" +
+	"\fack_event_id\x18\x14 \x01(\tR\n" +
+	"ackEventId\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\x15 \x01(\tR\trequestId\x12\x1d\n" +
+	"\n" +
+	"command_id\x18\x16 \x01(\tR\tcommandId\x12\x1f\n" +
+	"\vworkflow_id\x18\x17 \x01(\tR\n" +
+	"workflowIdB\x12Z\x10backend/proto;pbb\x06proto3"
 
 var (
-	file_backend_proto_control_policy_ack_proto_rawDescOnce sync.Once
-	file_backend_proto_control_policy_ack_proto_rawDescData []byte
+	file_control_policy_ack_proto_rawDescOnce sync.Once
+	file_control_policy_ack_proto_rawDescData []byte
 )
 
-func file_backend_proto_control_policy_ack_proto_rawDescGZIP() []byte {
-	file_backend_proto_control_policy_ack_proto_rawDescOnce.Do(func() {
-		file_backend_proto_control_policy_ack_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_backend_proto_control_policy_ack_proto_rawDesc), len(file_backend_proto_control_policy_ack_proto_rawDesc)))
+func file_control_policy_ack_proto_rawDescGZIP() []byte {
+	file_control_policy_ack_proto_rawDescOnce.Do(func() {
+		file_control_policy_ack_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_control_policy_ack_proto_rawDesc), len(file_control_policy_ack_proto_rawDesc)))
 	})
-	return file_backend_proto_control_policy_ack_proto_rawDescData
+	return file_control_policy_ack_proto_rawDescData
 }
 
-var file_backend_proto_control_policy_ack_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
-var file_backend_proto_control_policy_ack_proto_goTypes = []any{
+var file_control_policy_ack_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
+var file_control_policy_ack_proto_goTypes = []any{
 	(*PolicyAckEvent)(nil), // 0: cybermesh.control.v1.PolicyAckEvent
 }
-var file_backend_proto_control_policy_ack_proto_depIdxs = []int32{
+var file_control_policy_ack_proto_depIdxs = []int32{
 	0, // [0:0] is the sub-list for method output_type
 	0, // [0:0] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
@@ -237,26 +304,26 @@ var file_backend_proto_control_policy_ack_proto_depIdxs = []int32{
 	0, // [0:0] is the sub-list for field type_name
 }
 
-func init() { file_backend_proto_control_policy_ack_proto_init() }
-func file_backend_proto_control_policy_ack_proto_init() {
-	if File_backend_proto_control_policy_ack_proto != nil {
+func init() { file_control_policy_ack_proto_init() }
+func file_control_policy_ack_proto_init() {
+	if File_control_policy_ack_proto != nil {
 		return
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_backend_proto_control_policy_ack_proto_rawDesc), len(file_backend_proto_control_policy_ack_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_control_policy_ack_proto_rawDesc), len(file_control_policy_ack_proto_rawDesc)),
 			NumEnums:      0,
 			NumMessages:   1,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
-		GoTypes:           file_backend_proto_control_policy_ack_proto_goTypes,
-		DependencyIndexes: file_backend_proto_control_policy_ack_proto_depIdxs,
-		MessageInfos:      file_backend_proto_control_policy_ack_proto_msgTypes,
+		GoTypes:           file_control_policy_ack_proto_goTypes,
+		DependencyIndexes: file_control_policy_ack_proto_depIdxs,
+		MessageInfos:      file_control_policy_ack_proto_msgTypes,
 	}.Build()
-	File_backend_proto_control_policy_ack_proto = out.File
-	file_backend_proto_control_policy_ack_proto_goTypes = nil
-	file_backend_proto_control_policy_ack_proto_depIdxs = nil
+	File_control_policy_ack_proto = out.File
+	file_control_policy_ack_proto_goTypes = nil
+	file_control_policy_ack_proto_depIdxs = nil
 }

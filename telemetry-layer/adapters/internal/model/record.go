@@ -4,6 +4,8 @@ type Record struct {
 	Timestamp        int64    `json:"ts"`
 	SourceEventTsMs  int64    `json:"source_event_ts_ms,omitempty"`
 	TenantID         string   `json:"tenant_id"`
+	TraceID          string   `json:"trace_id,omitempty"`
+	SourceEventID    string   `json:"source_event_id,omitempty"`
 	SrcIP            string   `json:"src_ip"`
 	DstIP            string   `json:"dst_ip"`
 	SrcPort          int      `json:"src_port"`

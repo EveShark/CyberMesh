@@ -1,10 +1,13 @@
 package adapter
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"cybermesh/telemetry-layer/adapters/internal/hash"
@@ -45,6 +48,14 @@ func ToFlow(rec Record, windowSeconds int64) (model.FlowAggregate, error) {
 	windowStart := (rec.Timestamp / windowSeconds) * windowSeconds
 	flowKey := fmt.Sprintf("%s:%d-%s:%d-%d", rec.SrcIP, rec.SrcPort, rec.DstIP, rec.DstPort, rec.Proto)
 	flowID := hash.FlowID(flowKey, windowStart)
+	traceID := strings.TrimSpace(rec.TraceID)
+	if !isValidTraceID(traceID) {
+		traceID = newTraceID()
+	}
+	sourceEventID := strings.TrimSpace(rec.SourceEventID)
+	if sourceEventID == "" {
+		sourceEventID = newUUIDv7()
+	}
 	return model.FlowAggregate{
 		Schema:              "flow.v1",
 		Timestamp:           windowStart,
@@ -55,8 +66,8 @@ func ToFlow(rec Record, windowSeconds int64) (model.FlowAggregate, error) {
 		DstPort:             rec.DstPort,
 		Proto:               rec.Proto,
 		FlowID:              flowID,
-		TraceID:             flowID,
-		SourceEventID:       flowID,
+		TraceID:             traceID,
+		SourceEventID:       sourceEventID,
 		SourceEventTsMs:     sourceEventTsMs,
 		TelemetryIngestTsMs: ingestTsMs,
 		BytesFwd:            rec.BytesFwd,
@@ -104,4 +115,56 @@ func ToFlow(rec Record, windowSeconds int64) (model.FlowAggregate, error) {
 		CweFlagCount:        rec.CweFlagCount,
 		EceFlagCnt:          rec.EceFlagCnt,
 	}, nil
+}
+
+func isValidTraceID(value string) bool {
+	if len(value) != 32 || value != strings.ToLower(value) {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	if err != nil || len(decoded) != 16 {
+		return false
+	}
+	for _, b := range decoded {
+		if b != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func newTraceID() string {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(buf)
+}
+
+func newUUIDv7() string {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		panic(err)
+	}
+	ts := time.Now().UnixMilli()
+	buf[0] = byte(ts >> 40)
+	buf[1] = byte(ts >> 32)
+	buf[2] = byte(ts >> 24)
+	buf[3] = byte(ts >> 16)
+	buf[4] = byte(ts >> 8)
+	buf[5] = byte(ts)
+	buf[6] = (buf[6] & 0x0f) | 0x70
+	buf[8] = (buf[8] & 0x3f) | 0x80
+
+	dst := make([]byte, 36)
+	hex.Encode(dst[0:8], buf[0:4])
+	dst[8] = '-'
+	hex.Encode(dst[9:13], buf[4:6])
+	dst[13] = '-'
+	hex.Encode(dst[14:18], buf[6:8])
+	dst[18] = '-'
+	hex.Encode(dst[19:23], buf[8:10])
+	dst[23] = '-'
+	hex.Encode(dst[24:36], buf[10:16])
+	return string(dst)
 }

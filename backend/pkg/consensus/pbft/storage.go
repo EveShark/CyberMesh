@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,9 +26,10 @@ type Storage struct {
 	blocks    map[uint64]Block // height -> block
 
 	// Committed state
-	lastCommitted   uint64
-	lastQC          QC
-	committedBlocks map[uint64]BlockHash // height -> hash
+	lastCommitted         uint64
+	lastQC                QC
+	committedBlocks       map[uint64]BlockHash // height -> hash
+	allowRestartBootstrap bool
 
 	// Persistent storage backend
 	backend StorageBackend
@@ -47,6 +49,11 @@ type voteBackend interface {
 
 type evidenceBackend interface {
 	SaveEvidence(ctx context.Context, hash []byte, height uint64, data []byte) error
+}
+
+type durableTipBackend interface {
+	GetLatestHeight(ctx context.Context) (uint64, error)
+	GetCommittedBlockHash(ctx context.Context, height uint64) ([]byte, bool, error)
 }
 
 // StorageConfig contains storage parameters
@@ -175,6 +182,31 @@ func (s *Storage) restoreCommittedState(ctx context.Context) error {
 		return fmt.Errorf("load last committed: %w", err)
 	}
 
+	s.allowRestartBootstrap = false
+
+	if tipBackend, ok := s.backend.(durableTipBackend); ok {
+		durableHeight, tipErr := tipBackend.GetLatestHeight(ctx)
+		if tipErr != nil {
+			s.logger.WarnContext(ctx, "failed to query durable block tip during committed-state restore", "error", tipErr)
+		} else if durableHeight > lastHeight {
+			durableHash, found, hashErr := tipBackend.GetCommittedBlockHash(ctx, durableHeight)
+			if hashErr != nil {
+				s.logger.WarnContext(ctx, "failed to load durable block tip hash during committed-state restore",
+					"height", durableHeight,
+					"error", hashErr)
+			} else if found && len(durableHash) == 32 {
+				s.logger.WarnContext(ctx, "consensus metadata behind durable block tip; reconciling to durable chain",
+					"metadata_height", lastHeight,
+					"durable_height", durableHeight)
+				lastHeight = durableHeight
+				blockHashBytes = durableHash
+				// The persisted QC payload belongs to the older metadata height, so discard it.
+				qcData = nil
+				s.allowRestartBootstrap = true
+			}
+		}
+	}
+
 	s.lastCommitted = lastHeight
 
 	if len(blockHashBytes) == 32 {
@@ -189,6 +221,7 @@ func (s *Storage) restoreCommittedState(ctx context.Context) error {
 			s.logger.WarnContext(ctx, "failed to decode last committed qc", "error", decodeErr)
 		} else {
 			s.lastQC = qc
+			s.allowRestartBootstrap = false
 		}
 	}
 
@@ -223,6 +256,7 @@ func (s *Storage) restoreReplayWindow(ctx context.Context) error {
 		if committedHash, ok := s.committedBlocks[s.lastCommitted]; ok {
 			if qc, exists := s.qcs[committedHash]; exists && qc != nil {
 				s.lastQC = qc
+				s.allowRestartBootstrap = false
 			}
 		}
 	}
@@ -626,11 +660,27 @@ func (s *Storage) GetCommittedBlockHash(height uint64) (BlockHash, bool) {
 	return hash, exists
 }
 
-func (s *Storage) encodeProposal(p *messages.Proposal) ([]byte, error) {
-	if s.encMode == nil {
-		return nil, fmt.Errorf("cbor encoder not initialized")
+// AllowRestartBootstrap reports whether the next proposal can legally omit a QC
+// because storage reconciled to a durable committed tip without a persisted QC.
+func (s *Storage) AllowRestartBootstrap(parentHash BlockHash, proposalHeight uint64) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if !s.allowRestartBootstrap || s.lastQC != nil || s.lastCommitted == 0 {
+		return false
 	}
-	data, err := s.encMode.Marshal(p)
+	if proposalHeight != s.lastCommitted+1 {
+		return false
+	}
+	committedHash, ok := s.committedBlocks[s.lastCommitted]
+	if !ok {
+		return false
+	}
+	return committedHash == parentHash
+}
+
+func (s *Storage) encodeProposal(p *messages.Proposal) ([]byte, error) {
+	data, err := messages.EncodeProposalWire(s.encMode, p)
 	if err != nil {
 		return nil, err
 	}
@@ -641,14 +691,18 @@ func (s *Storage) encodeProposal(p *messages.Proposal) ([]byte, error) {
 }
 
 func (s *Storage) decodeProposal(data []byte) (*messages.Proposal, error) {
-	if s.decMode == nil {
-		return nil, fmt.Errorf("cbor decoder not initialized")
+	proposal, err := messages.DecodeProposalWire(s.decMode, data)
+	if err == nil {
+		return proposal, nil
 	}
-	var proposal messages.Proposal
-	if err := s.decMode.Unmarshal(data, &proposal); err != nil {
-		return nil, err
+	errText := err.Error()
+	if strings.Contains(errText, "block hash mismatch") || strings.Contains(errText, "decode block payload") {
+		legacyProposal, legacyErr := messages.DecodeProposalWireMetadataOnly(s.decMode, data)
+		if legacyErr == nil {
+			return legacyProposal, nil
+		}
 	}
-	return &proposal, nil
+	return nil, err
 }
 
 func (s *Storage) encodeVote(v *messages.Vote) ([]byte, error) {

@@ -22,6 +22,7 @@ from ..contracts import (
     PolicyAckEvent,
     EvidenceRequestEvent,
 )
+from ..contracts.policy_ack import PolicyAckContractError
 from ..utils.errors import ContractError, KafkaError, ValidationError, StorageError, TimestampSkewError
 from ..utils.metrics import get_metrics_collector
 import hashlib
@@ -134,6 +135,8 @@ class AIConsumer:
         self._tracker_updates = 0
         self._tracker_errors = 0
         self._messages_by_topic: Dict[str, int] = {}
+        self._messages_dropped = 0
+        self._messages_dropped_by_reason: Dict[str, int] = {}
         self._last_poll_ts: Optional[float] = None
         self._last_message_ts: Optional[float] = None
         self._last_error: Optional[str] = None
@@ -306,6 +309,7 @@ class AIConsumer:
             is_skew = isinstance(cause, TimestampSkewError)
             if is_skew:
                 reason = "timestamp_skew"
+                self._record_drop(topic, reason)
                 if self.logger:
                     self.logger.warning(
                         f"Dropping message due to timestamp skew from {topic}: {cause}"
@@ -324,7 +328,8 @@ class AIConsumer:
             # ACK topic is best-effort feedback; malformed historical records must not poison
             # the consumer loop for control-plane ingest.
             if topic == self.config.kafka_topics.control_policy_ack:
-                reason = "invalid_policy_ack"
+                reason = self._classify_policy_ack_error(e)
+                self._record_drop(topic, reason)
                 if self.logger:
                     self.logger.warning(
                         f"Dropping malformed policy ACK from {topic}: {e}"
@@ -480,6 +485,8 @@ class AIConsumer:
             "messages_received": self._messages_received,
             "messages_processed": self._messages_processed,
             "messages_failed": self._messages_failed,
+            "messages_dropped": self._messages_dropped,
+            "messages_dropped_by_reason": dict(self._messages_dropped_by_reason),
             "evidence_accepted": self._evidence_accepted,
             "evidence_rejected": self._evidence_rejected,
             "commits_processed": self._commits_processed,
@@ -487,6 +494,31 @@ class AIConsumer:
             "tracker_errors": self._tracker_errors,
             "messages_by_topic": dict(self._messages_by_topic),
         }
+
+    def _record_drop(self, topic: str, reason: str):
+        self._messages_dropped += 1
+        key = f"{topic}:{reason}"
+        self._messages_dropped_by_reason[key] = self._messages_dropped_by_reason.get(key, 0) + 1
+        try:
+            self._metrics.record_validation_failure(message_type=topic, failure_reason=reason)
+        except Exception:
+            if self.logger:
+                self.logger.error("Failed to emit validation failure metric", exc_info=True)
+
+    @staticmethod
+    def _classify_policy_ack_error(err: ContractError) -> str:
+        if isinstance(err, PolicyAckContractError) and getattr(err, "reason_code", ""):
+            return str(err.reason_code)
+        text = str(err).strip().lower()
+        if "timestamps must be non-negative" in text:
+            return "invalid_policy_ack_negative_timestamps"
+        if "missing policy_id" in text:
+            return "invalid_policy_ack_missing_policy_id"
+        if "invalid policy_id" in text:
+            return "invalid_policy_ack_invalid_policy_id"
+        if "result must be 'applied' or 'failed'" in text:
+            return "invalid_policy_ack_invalid_result"
+        return "invalid_policy_ack"
 
     def get_runtime_status(self) -> dict:
         """Best-effort runtime status for operational debugging."""

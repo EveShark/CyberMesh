@@ -18,6 +18,7 @@ import (
 // Event wraps a protobuf PolicyUpdateEvent plus computed spec.
 type Event struct {
 	Proto *pb.PolicyUpdateEvent
+	Fast  *FastMitigationEnvelope
 	Spec  PolicySpec
 }
 

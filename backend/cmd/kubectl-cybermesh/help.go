@@ -105,6 +105,10 @@ Examples:
 Interactive:
   On a real terminal, policies list|get open the interactive view by default.
   Use --no-interactive for plain table output and -o json for automation.
+
+Mutation prompts:
+  On a real terminal, policy mutations can prompt for missing reason fields
+  after you arm the command with --yes.
 `)
 	}
 	switch args[0] {
@@ -234,6 +238,7 @@ Required:
 Notes:
   - Mutations may require --tenant depending on backend policy.
   - Safe mode and kill switch can block the request.
+  - On a real terminal, missing reason fields can be prompted after --yes is present.
   - Use policies get, audit get, or trace policy to verify the result.
 
 Examples:
@@ -256,6 +261,10 @@ Examples:
   kubectl cybermesh workflows list --limit 20
   kubectl cybermesh workflows get incident-42
   kubectl cybermesh --tenant default workflows rollback incident-42 --reason-code operator.rollback --reason-text "bounded rollback" --yes
+
+Mutation prompts:
+  On a real terminal, workflow rollback can prompt for missing reason fields
+  after you arm the command with --yes.
 `)
 	}
 	switch args[0] {
@@ -316,6 +325,10 @@ Usage:
   kubectl cybermesh audit get [--policy-id <id>] [--workflow-id <id>] [--action-type <type>] [--actor <actor>] [--window <duration>] [--limit N]
 
 Shows recent action journal rows. On a real terminal, this opens the interactive audit view by default.
+
+Note:
+  Audit shows control mutations and operator actions. Automatic policy creation
+  and normal ACK flow should be inspected through trace, outbox, and ack.
 `)
 	case "export":
 		return strings.TrimSpace(`
@@ -339,6 +352,9 @@ Control
 Usage:
   kubectl cybermesh control
 
+Shows:
+  summary state, lease snapshot, operator interpretation, and suggested next commands.
+
 Interactive:
   On a real terminal, control opens the interactive control view by default.
   Keys include safe-mode and kill-switch toggles with guarded drafts.
@@ -356,7 +372,7 @@ Usage:
   kubectl cybermesh leases
 
 Shows:
-  lease holders, epochs, lease expiry, safe mode, and kill switch state.
+  lease holders, epochs, lease expiry, safe mode, kill switch state, timeline context, and suggested next commands.
 
 Interactive:
   On a real terminal, leases opens a read-only interactive lease view by default.
@@ -388,6 +404,12 @@ Usage:
   kubectl cybermesh trace sentinel <sentinel_event_id> [--interactive]
   kubectl cybermesh trace source <source_event_id> [--interactive]
   kubectl cybermesh trace workflow <workflow_id> [--interactive]
+
+Shows:
+  summary, timeline, latest ACK, materialized context, related IDs, and suggested follow-up commands.
+
+Interactive:
+  The trace subcommand accepts --interactive directly, and the global interactive mode also opens the trace viewer.
 `)
 }
 
@@ -398,6 +420,9 @@ Monitor
 
 Usage:
   kubectl cybermesh monitor [--policy-id <id>] [--workflow-id <id>] [--status <status>]
+
+Behavior:
+  Monitor is intentionally interactive-only and opens the live operator console directly.
 `)
 }
 
@@ -424,6 +449,9 @@ Use selectors such as:
   --anomaly-id
   --source-id
   --source-type
+
+Shows:
+  summary, delivery timeline, latest delivery state, recent rows, and suggested follow-up commands.
 `)
 }
 
@@ -441,6 +469,12 @@ Use selectors such as:
   --ack-event-id
   --request-id
   --command-id
+
+Shows:
+  summary, timeline, latest ACK state, recent ACK rows, and suggested linked follow-up commands.
+
+Interactive:
+  On a real terminal, ack get opens a read-only interactive ACK view by default.
 `)
 }
 
@@ -449,6 +483,12 @@ func helpValidators() string {
 Validators
 Usage:
   kubectl cybermesh validators [--status active|inactive]
+
+Shows:
+  fleet summary, active/inactive breakdown, validator snapshot, and suggested operator follow-ups.
+
+Interactive:
+  On a real terminal, validators opens a read-only interactive validator view by default.
 `)
 }
 
@@ -457,6 +497,9 @@ func helpConsensus() string {
 Consensus
 Usage:
   kubectl cybermesh consensus
+
+Shows:
+  consensus summary, recent proposal/vote timeline, suspicious node context, and suggested follow-up commands.
 `)
 }
 
@@ -467,6 +510,9 @@ Usage:
   kubectl cybermesh safe-mode enable|disable --reason-code <code> --reason-text <text> --yes
 
 Safe mode is a cluster-wide mutation gate.
+
+Shows:
+  successful table-mode mutations render the resulting state, a short timeline, operator impact, and verification commands.
 `)
 }
 
@@ -477,6 +523,9 @@ Usage:
   kubectl cybermesh kill-switch enable|disable --reason-code <code> --reason-text <text> --yes
 
 Kill switch is a stronger cluster-wide mutation gate and should be used carefully.
+
+Shows:
+  successful table-mode mutations render the resulting state, a short timeline, operator impact, and verification commands.
 `)
 }
 
@@ -487,6 +536,9 @@ Usage:
   kubectl cybermesh revoke --outbox-id <id> --reason-code <code> --reason-text <text> --yes [--classification <value>] [--workflow-id <id>]
 
 Revokes a specific outbox row directly.
+
+Shows:
+  table mode renders the revoke summary, timeline, interpretation, and suggested verification commands.
 `)
 }
 
@@ -497,6 +549,9 @@ Usage:
   kubectl cybermesh version [--verbose]
 
 Shows plugin version. Use --verbose to include build and config context.
+
+Verbose:
+  table mode adds summary fields, timeline context, interpretation, and suggested next commands.
 `)
 }
 
@@ -507,6 +562,9 @@ Usage:
   kubectl cybermesh doctor
 
 Runs local configuration checks and a bounded backend reachability check.
+
+Shows:
+  summary verdict, check timeline, interpretation, snapshot, and suggested next commands.
 
 Examples:
   kubectl cybermesh doctor

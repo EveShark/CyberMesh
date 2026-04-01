@@ -24,6 +24,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from ..utils.errors import ServiceError, ValidationError
 
 
 API_BEARER_TOKEN = os.getenv("AI_SERVICE_API_TOKEN", "")
@@ -81,6 +82,21 @@ class APIHandler(BaseHTTPRequestHandler):
                 self._handle_emitter_status()
         else:
             self.send_error(404, "Not Found")
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == '/ops/policies/revoke':
+            if self._require_auth():
+                self._handle_policy_revoke()
+            return
+        if path == '/ops/pcap/request':
+            if self._require_auth():
+                self._handle_pcap_request()
+            return
+
+        self.send_error(404, "Not Found")
     
     def _handle_health(self):
         """
@@ -370,6 +386,67 @@ class APIHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_json(500, {"error": str(exc)})
 
+    def _handle_policy_revoke(self):
+        try:
+            if self.service_manager is None:
+                self._send_json(503, {"error": "service_manager_not_initialized"})
+                return
+
+            body = self._read_json_body()
+            policy_id = str(body.get("policy_id") or "").strip()
+            if not policy_id:
+                self._send_json(400, {"error": "policy_id_required"})
+                return
+
+            result = self.service_manager.request_policy_revoke(
+                policy_id=policy_id,
+                reason_code=body.get("reason_code"),
+                reason_text=body.get("reason_text"),
+                requested_by=body.get("requested_by"),
+                requires_ack=bool(body.get("requires_ack", True)),
+                rollback_policy_id=body.get("rollback_policy_id"),
+            )
+            self._send_json(202, result)
+        except ValidationError as exc:
+            self._send_json(400, {"error": str(exc)})
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+        except ServiceError as exc:
+            self._send_json(503, {"error": str(exc)})
+        except Exception as exc:
+            self._send_json(500, {"error": str(exc)})
+
+    def _handle_pcap_request(self):
+        try:
+            if self.service_manager is None:
+                self._send_json(503, {"error": "service_manager_not_initialized"})
+                return
+
+            body = self._read_json_body()
+            result = self.service_manager.request_packet_capture(
+                tenant_id=body.get("tenant_id"),
+                sensor_id=body.get("sensor_id"),
+                requester=body.get("requester"),
+                reason=body.get("reason"),
+                src_ip=body.get("src_ip"),
+                dst_ip=body.get("dst_ip"),
+                src_port=body.get("src_port"),
+                dst_port=body.get("dst_port"),
+                proto=body.get("proto"),
+                duration_ms=body.get("duration_ms"),
+                max_bytes=body.get("max_bytes"),
+                request_id=body.get("request_id"),
+            )
+            self._send_json(202, result)
+        except ValidationError as exc:
+            self._send_json(400, {"error": str(exc)})
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+        except ServiceError as exc:
+            self._send_json(503, {"error": str(exc)})
+        except Exception as exc:
+            self._send_json(500, {"error": str(exc)})
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -418,6 +495,19 @@ class APIHandler(BaseHTTPRequestHandler):
             return datetime.fromisoformat(cleaned).timestamp()
         except Exception:
             return None
+
+    def _read_json_body(self):
+        length_header = self.headers.get('Content-Length', '0')
+        try:
+            length = int(length_header)
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        if not raw:
+            return {}
+        return json.loads(raw.decode('utf-8'))
     
     def _send_json(self, status, data):
         """

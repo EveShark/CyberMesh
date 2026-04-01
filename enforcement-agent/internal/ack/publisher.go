@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/IBM/sarama"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 
@@ -117,14 +118,12 @@ func NewKafkaPublisher(opts Options) (*KafkaPublisher, error) {
 func (p *KafkaPublisher) Publish(ctx context.Context, payload Payload) error {
 	var lastErr error
 	backoff := p.retryBackoff
+	ackEventID := newAckEventID()
 	for attempt := 0; attempt < p.retryMax; attempt++ {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		ackTime := payload.AckedAt
-		if ackTime.IsZero() {
-			ackTime = time.Now().UTC()
-		}
+		appliedTime, ackTime := canonicalAckTimes(payload.AppliedAt, payload.AckedAt)
 		ackEvent := &pb.PolicyAckEvent{
 			PolicyId:           payload.Event.Spec.ID,
 			ScopeIdentifier:    payload.Scope,
@@ -133,11 +132,18 @@ func (p *KafkaPublisher) Publish(ctx context.Context, payload Payload) error {
 			Result:             string(payload.Result),
 			Reason:             payload.Reason,
 			ErrorCode:          payload.ErrorCode,
-			AppliedAt:          payload.AppliedAt.Unix(),
-			AppliedAtMs:        payload.AppliedAt.UnixMilli(),
+			AppliedAt:          appliedTime.Unix(),
+			AppliedAtMs:        appliedTime.UnixMilli(),
 			AckedAt:            ackTime.Unix(),
 			AckedAtMs:          ackTime.UnixMilli(),
 			QcReference:        effectiveQCRef(payload),
+			TraceId:            extractTraceID(payload.Event.Spec),
+			SourceEventId:      extractSourceEventID(payload.Event.Spec),
+			SentinelEventId:    extractSentinelEventID(payload.Event.Spec),
+			AckEventId:         ackEventID,
+			RequestId:          extractRequestID(payload.Event.Spec),
+			CommandId:          extractCommandID(payload.Event.Spec),
+			WorkflowId:         extractWorkflowID(payload.Event.Spec),
 			ControllerInstance: payload.Controller,
 			FastPath:           payload.FastPath,
 			RuleHash:           append([]byte(nil), payload.RuleHash...),
@@ -173,7 +179,7 @@ func (p *KafkaPublisher) Publish(ctx context.Context, payload Payload) error {
 				p.metrics.ObserveAckPublish("success")
 			}
 			if p.logger != nil {
-				p.logger.Info("ack message sent to kafka", zap.String("policy_id", payload.Event.Spec.ID), zap.String("topic", p.topic))
+				p.logger.Debug("ack message sent to kafka", zap.String("policy_id", payload.Event.Spec.ID), zap.String("topic", p.topic))
 			}
 			return nil
 		}
@@ -181,7 +187,12 @@ func (p *KafkaPublisher) Publish(ctx context.Context, payload Payload) error {
 		if p.metrics != nil {
 			p.metrics.ObserveAckRetry()
 		}
-		time.Sleep(backoff)
+		if attempt+1 >= p.retryMax {
+			continue
+		}
+		if !waitForRetryBackoff(ctx, backoff) {
+			return ctx.Err()
+		}
 		backoff *= 2
 	}
 	p.logError("publish ack", payload.Event.Spec.ID, lastErr)
@@ -191,18 +202,139 @@ func (p *KafkaPublisher) Publish(ctx context.Context, payload Payload) error {
 	return fmt.Errorf("ack publish: %w", lastErr)
 }
 
+func canonicalAckTimes(appliedAt, ackedAt time.Time) (time.Time, time.Time) {
+	now := time.Now().UTC()
+	ack := ackedAt.UTC()
+	if ack.IsZero() || ack.Unix() < 0 || ack.UnixMilli() < 0 {
+		ack = now
+	}
+	applied := appliedAt.UTC()
+	if applied.IsZero() || applied.Unix() < 0 || applied.UnixMilli() < 0 {
+		applied = ack
+	}
+	return applied, ack
+}
+
+func newAckEventID() string {
+	id, err := uuid.NewV7()
+	if err != nil {
+		return uuid.NewString()
+	}
+	return id.String()
+}
+
 func effectiveQCRef(payload Payload) string {
 	if payload.QCRef != "" {
 		return payload.QCRef
+	}
+	if traceID := extractTraceID(payload.Event.Spec); traceID != "" {
+		return ""
 	}
 	if len(payload.RuleHash) > 0 {
 		hexHash := hex.EncodeToString(payload.RuleHash)
 		if len(hexHash) > 16 {
 			hexHash = hexHash[:16]
 		}
-		return fmt.Sprintf("trace:%s:%s", payload.Event.Spec.ID, hexHash)
+		return fmt.Sprintf("legacy:%s:%s", payload.Event.Spec.ID, hexHash)
 	}
-	return fmt.Sprintf("trace:%s", payload.Event.Spec.ID)
+	return fmt.Sprintf("legacy:%s", payload.Event.Spec.ID)
+}
+
+func extractTraceID(spec policy.PolicySpec) string {
+	if val, ok := spec.Raw["trace_id"].(string); ok && val != "" {
+		return val
+	}
+	if metadata, ok := spec.Raw["metadata"].(map[string]any); ok {
+		if val, ok := metadata["trace_id"].(string); ok && val != "" {
+			return val
+		}
+	}
+	if trace, ok := spec.Raw["trace"].(map[string]any); ok {
+		if val, ok := trace["id"].(string); ok && val != "" {
+			return val
+		}
+	}
+	return ""
+}
+
+func extractSourceEventID(spec policy.PolicySpec) string {
+	if val, ok := spec.Raw["source_event_id"].(string); ok && val != "" {
+		return val
+	}
+	if metadata, ok := spec.Raw["metadata"].(map[string]any); ok {
+		if val, ok := metadata["source_event_id"].(string); ok && val != "" {
+			return val
+		}
+	}
+	if trace, ok := spec.Raw["trace"].(map[string]any); ok {
+		if val, ok := trace["source_event_id"].(string); ok && val != "" {
+			return val
+		}
+	}
+	return ""
+}
+
+func extractSentinelEventID(spec policy.PolicySpec) string {
+	if val, ok := spec.Raw["sentinel_event_id"].(string); ok && val != "" {
+		return val
+	}
+	if metadata, ok := spec.Raw["metadata"].(map[string]any); ok {
+		if val, ok := metadata["sentinel_event_id"].(string); ok && val != "" {
+			return val
+		}
+	}
+	return ""
+}
+
+func extractRequestID(spec policy.PolicySpec) string {
+	if val, ok := spec.Raw["request_id"].(string); ok && val != "" {
+		return val
+	}
+	if metadata, ok := spec.Raw["metadata"].(map[string]any); ok {
+		if val, ok := metadata["request_id"].(string); ok && val != "" {
+			return val
+		}
+	}
+	if trace, ok := spec.Raw["trace"].(map[string]any); ok {
+		if val, ok := trace["request_id"].(string); ok && val != "" {
+			return val
+		}
+	}
+	return ""
+}
+
+func extractCommandID(spec policy.PolicySpec) string {
+	if val, ok := spec.Raw["command_id"].(string); ok && val != "" {
+		return val
+	}
+	if metadata, ok := spec.Raw["metadata"].(map[string]any); ok {
+		if val, ok := metadata["command_id"].(string); ok && val != "" {
+			return val
+		}
+	}
+	if trace, ok := spec.Raw["trace"].(map[string]any); ok {
+		if val, ok := trace["command_id"].(string); ok && val != "" {
+			return val
+		}
+	}
+	return ""
+}
+
+func extractWorkflowID(spec policy.PolicySpec) string {
+	if val, ok := spec.Raw["workflow_id"].(string); ok && val != "" {
+		return val
+	}
+	if metadata, ok := spec.Raw["metadata"].(map[string]any); ok {
+		if val, ok := metadata["workflow_id"].(string); ok && val != "" {
+			return val
+		}
+	}
+	if trace, ok := spec.Raw["trace"].(map[string]any); ok {
+		if val, ok := trace["workflow_id"].(string); ok && val != "" {
+			return val
+		}
+	}
+	return ""
 }
 
 // PublishBatch emits multiple payloads sequentially.
@@ -224,5 +356,23 @@ func (p *KafkaPublisher) Close(ctx context.Context) error {
 func (p *KafkaPublisher) logError(msg, policyID string, err error) {
 	if p.logger != nil {
 		p.logger.Error(msg, zap.String("policy_id", policyID), zap.Error(err))
+	}
+}
+
+func waitForRetryBackoff(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return true
+	}
+	if ctx == nil {
+		time.Sleep(d)
+		return true
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }

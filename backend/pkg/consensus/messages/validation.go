@@ -67,6 +67,10 @@ type ConsensusState interface {
 	GetHighestQC() *QC
 }
 
+type restartBootstrapState interface {
+	AllowRestartBootstrap(parentHash BlockHash, proposalHeight uint64) bool
+}
+
 // DefaultValidationConfig returns secure default validation config
 func DefaultValidationConfig() *ValidationConfig {
 	return &ValidationConfig{
@@ -195,7 +199,15 @@ func (v *Validator) ValidateProposal(ctx context.Context, p *Proposal) error {
 	} else if v.config.RequireJustifyQC && p.Height > 1 {
 		// CRITICAL: Genesis block (height 1) does NOT require JustifyQC
 		// Only blocks at height 2+ require justification from previous blocks
-		return fmt.Errorf("proposal missing required JustifyQC at height %d", p.Height)
+		if bootstrap, ok := v.state.(restartBootstrapState); ok && bootstrap.AllowRestartBootstrap(p.ParentHash, p.Height) {
+			if v.logger != nil {
+				v.logger.WarnContext(ctx, "allowing restart bootstrap proposal without justify qc",
+					"view", p.View,
+					"height", p.Height)
+			}
+		} else {
+			return fmt.Errorf("proposal missing required JustifyQC at height %d", p.Height)
+		}
 	}
 
 	// Mark as seen

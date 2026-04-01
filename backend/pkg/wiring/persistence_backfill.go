@@ -61,6 +61,8 @@ func (s *Service) runPersistenceBackfill(ctx context.Context) {
 
 	ticker := time.NewTicker(s.persistBackfillPollInterval)
 	defer ticker.Stop()
+	timeoutStreak := 0
+	cooldownUntil := time.Time{}
 
 	for {
 		select {
@@ -69,19 +71,44 @@ func (s *Service) runPersistenceBackfill(ctx context.Context) {
 		case <-s.stopCh:
 			return
 		case <-ticker.C:
-			s.tryPersistenceBackfill(ctx)
+			now := time.Now()
+			if !cooldownUntil.IsZero() && now.Before(cooldownUntil) {
+				continue
+			}
+			timedOut := s.tryPersistenceBackfill(ctx)
+			if timedOut {
+				timeoutStreak++
+				cooldown := nextBackgroundProbeCooldown(timeoutStreak, s.persistBackfillPollInterval)
+				cooldownUntil = now.Add(cooldown)
+				if s.log != nil {
+					s.log.Debug("persistence backfill probe cooling down after timeout",
+						utils.ZapInt("timeout_streak", timeoutStreak),
+						utils.ZapDuration("cooldown", cooldown))
+				}
+				continue
+			}
+			timeoutStreak = 0
+			cooldownUntil = time.Time{}
 		}
 	}
 }
 
-func (s *Service) tryPersistenceBackfill(ctx context.Context) {
+func (s *Service) tryPersistenceBackfill(ctx context.Context) bool {
 	if s == nil || s.persistWorker == nil || !s.persistCommitProposerOnly || !s.persistBackfillEnabled {
-		return
+		return false
+	}
+	// In proposer-only persistence mode, limit background backfill DB reads to the
+	// current leader to avoid N-way polling pressure under load.
+	if s.eng != nil {
+		status := s.eng.GetStatus()
+		if !status.IsLeader {
+			return false
+		}
 	}
 
 	adapter := s.persistWorker.GetAdapter()
 	if adapter == nil {
-		return
+		return false
 	}
 
 	checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -91,7 +118,7 @@ func (s *Service) tryPersistenceBackfill(ctx context.Context) {
 		if s.log != nil {
 			s.log.Debug("persistence backfill latest height check failed", utils.ZapError(err))
 		}
-		return
+		return isBackgroundTimeoutErr(err)
 	}
 
 	s.mu.Lock()
@@ -101,7 +128,7 @@ func (s *Service) tryPersistenceBackfill(ctx context.Context) {
 	// Nothing to repair yet.
 	if committed <= latest+s.persistBackfillLagThreshold {
 		s.dropPersistBackfillUpTo(latest)
-		return
+		return false
 	}
 
 	now := time.Now()
@@ -145,6 +172,7 @@ func (s *Service) tryPersistenceBackfill(ctx context.Context) {
 			})
 		}
 	}
+	return false
 }
 
 func (s *Service) collectPersistBackfillCandidates(latest uint64, committed uint64, now time.Time) []uint64 {

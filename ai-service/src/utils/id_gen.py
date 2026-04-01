@@ -9,6 +9,24 @@ def generate_uuid4() -> str:
     return str(uuid.uuid4())
 
 
+def generate_uuid7() -> str:
+    """Generate a UUIDv7 string."""
+    timestamp_ms = int(time.time() * 1000) & ((1 << 48) - 1)
+    random_bits = secrets.randbits(74)
+
+    value = timestamp_ms << 80
+    value |= 0x7 << 76
+    value |= (random_bits >> 62) & ((1 << 12) - 1)
+    value |= 0b10 << 62
+    value |= random_bits & ((1 << 62) - 1)
+    return str(uuid.UUID(int=value))
+
+
+def generate_trace_id() -> str:
+    """Generate a W3C-compatible 16-byte trace id as lowercase hex."""
+    return secrets.token_hex(16)
+
+
 def generate_ulid() -> str:
     """
     Generate a ULID (Universally Unique Lexicographically Sortable Identifier).
@@ -50,6 +68,29 @@ def validate_uuid4(value: str) -> bool:
         return str(parsed) == value
     except (ValueError, AttributeError):
         return False
+
+
+def validate_uuid(value: str) -> bool:
+    """Validate if string is a syntactically valid UUID."""
+    try:
+        parsed = uuid.UUID(value)
+        return str(parsed) == value
+    except (ValueError, AttributeError):
+        return False
+
+
+def validate_trace_id(value: str) -> bool:
+    """Validate W3C trace-id format: 32 lowercase hex chars, non-zero."""
+    if not isinstance(value, str) or len(value) != 32:
+        return False
+    if value.lower() != value:
+        return False
+    try:
+        if int(value, 16) == 0:
+            return False
+    except ValueError:
+        return False
+    return True
 
 
 def validate_ulid(value: str) -> bool:

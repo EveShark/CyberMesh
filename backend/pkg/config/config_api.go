@@ -118,8 +118,8 @@ func DefaultAPIConfig() *APIConfig {
 		ShutdownTimeout:    30 * time.Second,
 		RBACEnabled:        true,
 		RateLimitEnabled:   true,
-		RateLimitPerMinute: 100,
-		RateLimitBurst:     10,
+		RateLimitPerMinute: 300,
+		RateLimitBurst:     30,
 		RouteRateLimits:    make(map[string]RateLimitOverride),
 		EnableMetrics:      true,
 		EnableAudit:        true,
@@ -161,8 +161,8 @@ func DefaultAPIConfig() *APIConfig {
 		ControlAPIBreakerEnabled:        true,
 		ControlAPIBreakerErrorThreshold: 5,
 		ControlAPIBreakerCooldown:       15 * time.Second,
-		ControlMutationCooldown:         3 * time.Second,
-		ControlMutationMaxPerMinute:     30,
+		ControlMutationCooldown:         1 * time.Second,
+		ControlMutationMaxPerMinute:     120,
 	}
 }
 

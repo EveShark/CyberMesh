@@ -19,6 +19,18 @@ import (
 	"github.com/IBM/sarama"
 )
 
+func stageMarkerLineage(flowID, traceID, sourceEventID string) (string, string) {
+	trace := strings.TrimSpace(traceID)
+	if trace == "" {
+		trace = flowID
+	}
+	event := strings.TrimSpace(sourceEventID)
+	if event == "" {
+		event = flowID
+	}
+	return trace, event
+}
+
 func stageMarkersEnabled() bool {
 	return strings.EqualFold(strings.TrimSpace(os.Getenv("TELEMETRY_STAGE_MARKERS_ENABLED")), "true") ||
 		strings.EqualFold(strings.TrimSpace(os.Getenv("TELEMETRY_STAGE_MARKERS_ENABLED")), "1") ||
@@ -152,6 +164,12 @@ func Run(ctx context.Context, cfg Config, logger *utils.Logger) error {
 			if rec.SourceID == "" {
 				rec.SourceID = cfg.SourceID
 			}
+			if !isValidTraceID(strings.TrimSpace(rec.TraceID)) {
+				telemetrymetrics.Global().IncCounter("trace_id_missing_total")
+			}
+			if strings.TrimSpace(rec.SourceEventID) == "" {
+				telemetrymetrics.Global().IncCounter("source_event_id_synthesized_total")
+			}
 			mapStart := time.Now()
 			flow, err := ToFlow(rec, cfg.WindowSeconds)
 			telemetrymetrics.Global().RecordOperation("flow_map", statusFromError(err), time.Since(mapStart))
@@ -201,10 +219,11 @@ func Run(ctx context.Context, cfg Config, logger *utils.Logger) error {
 				continue
 			}
 			if stageMarkersEnabled() {
+				traceID, sourceEventID := stageMarkerLineage(flow.FlowID, flow.TraceID, flow.SourceEventID)
 				logger.Info("runtime stage marker",
 					utils.ZapString("stage", "t_telemetry_publish_ack"),
-					utils.ZapString("trace_id", flow.FlowID),
-					utils.ZapString("event_id", flow.FlowID),
+					utils.ZapString("trace_id", traceID),
+					utils.ZapString("event_id", sourceEventID),
 					utils.ZapString("tenant_id", flow.TenantID),
 					utils.ZapInt64("t_ms", time.Now().UnixMilli()),
 					utils.ZapString("source", "telemetry.adapter"),

@@ -186,27 +186,7 @@ func (m *monitorModel) selectedDetails() string {
 	return "-"
 }
 
-func renderMonitorOutboxList(rows []struct {
-	ID              string `json:"id"`
-	PolicyID        string `json:"policy_id"`
-	RequestID       string `json:"request_id,omitempty"`
-	CommandID       string `json:"command_id,omitempty"`
-	WorkflowID      string `json:"workflow_id,omitempty"`
-	AnomalyID       string `json:"anomaly_id,omitempty"`
-	FlowID          string `json:"flow_id,omitempty"`
-	SourceID        string `json:"source_id,omitempty"`
-	SourceType      string `json:"source_type,omitempty"`
-	SensorID        string `json:"sensor_id,omitempty"`
-	ValidatorID     string `json:"validator_id,omitempty"`
-	ScopeIdentifier string `json:"scope_identifier,omitempty"`
-	TraceID         string `json:"trace_id,omitempty"`
-	SourceEventID   string `json:"source_event_id,omitempty"`
-	SentinelEventID string `json:"sentinel_event_id,omitempty"`
-	Status          string `json:"status"`
-	CreatedAt       int64  `json:"created_at"`
-	AckedAt         int64  `json:"acked_at,omitempty"`
-	AckResult       string `json:"ack_result,omitempty"`
-}, selected int, active bool, maxRows int, compact bool) []string {
+func renderMonitorOutboxList(rows []outboxRow, selected int, active bool, maxRows int, compact bool) []string {
 	lines := []string{labelStyle.Render("Outbox")}
 	if len(rows) == 0 {
 		return append(lines, "- no rows -")
@@ -233,22 +213,7 @@ func renderMonitorOutboxList(rows []struct {
 	return lines
 }
 
-func renderMonitorAckList(rows []struct {
-	PolicyID           string `json:"policy_id"`
-	AckEventID         string `json:"ack_event_id,omitempty"`
-	RequestID          string `json:"request_id,omitempty"`
-	CommandID          string `json:"command_id,omitempty"`
-	WorkflowID         string `json:"workflow_id,omitempty"`
-	ControllerInstance string `json:"controller_instance,omitempty"`
-	ScopeIdentifier    string `json:"scope_identifier,omitempty"`
-	Result             string `json:"result,omitempty"`
-	Reason             string `json:"reason,omitempty"`
-	QCReference        string `json:"qc_reference,omitempty"`
-	TraceID            string `json:"trace_id,omitempty"`
-	SourceEventID      string `json:"source_event_id,omitempty"`
-	SentinelEventID    string `json:"sentinel_event_id,omitempty"`
-	ObservedAt         int64  `json:"observed_at"`
-}, selected int, active bool, maxRows int, compact bool) []string {
+func renderMonitorAckList(rows []ackRow, selected int, active bool, maxRows int, compact bool) []string {
 	lines := []string{labelStyle.Render("ACK History")}
 	if len(rows) == 0 {
 		return append(lines, "- no rows -")

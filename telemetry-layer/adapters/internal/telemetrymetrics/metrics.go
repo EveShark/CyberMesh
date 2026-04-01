@@ -37,6 +37,7 @@ type Collector struct {
 	mu         sync.RWMutex
 	operations map[string]uint64
 	latencies  map[string]*histogram
+	counters   map[string]uint64
 }
 
 var (
@@ -49,6 +50,7 @@ func NewCollector() *Collector {
 	return &Collector{
 		operations: make(map[string]uint64),
 		latencies:  make(map[string]*histogram),
+		counters:   make(map[string]uint64),
 	}
 }
 
@@ -83,6 +85,15 @@ func (c *Collector) RecordOperation(operation, status string, duration time.Dura
 		c.latencies[key] = h
 	}
 	h.observe(seconds)
+}
+
+func (c *Collector) IncCounter(name string) {
+	if c == nil || strings.TrimSpace(name) == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.counters[name]++
 }
 
 func (c *Collector) RenderPrometheus() string {
@@ -139,6 +150,25 @@ func (c *Collector) RenderPrometheus() string {
 			"telemetry_adapter_operation_latency_seconds_count{operation=%q,status=%q} %d\n",
 			parts[0], parts[1], h.count,
 		))
+	}
+
+	counterHelp := map[string]string{
+		"trace_id_missing_total":              "Total records missing a valid upstream trace_id at telemetry ingress",
+		"source_event_id_synthesized_total":   "Total records where telemetry synthesized source_event_id",
+	}
+	counterNames := make([]string, 0, len(c.counters))
+	for name := range c.counters {
+		counterNames = append(counterNames, name)
+	}
+	sort.Strings(counterNames)
+	for _, name := range counterNames {
+		help := counterHelp[name]
+		if help == "" {
+			help = "Telemetry lineage counter"
+		}
+		b.WriteString(fmt.Sprintf("# HELP %s %s\n", name, help))
+		b.WriteString(fmt.Sprintf("# TYPE %s counter\n", name))
+		b.WriteString(fmt.Sprintf("%s %d\n", name, c.counters[name]))
 	}
 
 	return b.String()

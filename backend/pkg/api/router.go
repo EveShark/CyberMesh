@@ -63,8 +63,14 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc(basePath+"/ai/suspicious-nodes", s.handleAISuspiciousNodes)
 
 	// Policy execution visibility (ACKs from enforcement-agent).
+	mux.HandleFunc(basePath+"/policies", s.handlePoliciesList)
+	mux.HandleFunc(basePath+"/policies/", s.handlePoliciesGet)
 	mux.HandleFunc(basePath+"/policies/acks", s.handlePolicyAcks)
 	mux.HandleFunc(basePath+"/policies/acks/", s.handlePolicyAcks)
+	mux.HandleFunc(basePath+"/workflows", s.handleWorkflowsList)
+	mux.HandleFunc(basePath+"/workflows/", s.handleWorkflowsGet)
+	mux.HandleFunc(basePath+"/audit", s.handleAuditList)
+	mux.HandleFunc(basePath+"/audit/export", s.handleAuditExport)
 
 	// Frontend runtime config.
 	mux.HandleFunc(basePath+"/frontend-config", s.handleFrontendConfig)
@@ -78,6 +84,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc(basePath+"/control/leases", s.handleControlLeases)
 	mux.HandleFunc(basePath+"/control/leases:force-takeover", s.handleControlLeases)
 	mux.HandleFunc(basePath+"/control/safe-mode:toggle", s.handleControlSafeModeToggle)
+	mux.HandleFunc(basePath+"/control/kill-switch:toggle", s.handleControlKillSwitchToggle)
 	mux.HandleFunc(basePath+"/control/acks", s.handleControlAcksList)
 
 	// P2P info (for peer discovery) - DISABLED: handler method missing
@@ -98,9 +105,6 @@ func (s *Server) middlewareChain(handler http.Handler) http.Handler {
 	// 2. Request logging
 	handler = s.middlewareLogging(handler)
 
-	// 3. Request ID
-	handler = s.middlewareRequestID(handler)
-
 	// 3.5 Concurrency limit (if configured)
 	if s.sem != nil {
 		handler = s.middlewareConcurrencyLimit(handler)
@@ -119,6 +123,9 @@ func (s *Server) middlewareChain(handler http.Handler) http.Handler {
 	// 6. SECURITY: Global authentication for all non-public endpoints
 	// This middleware checks if endpoint requires auth and validates credentials
 	handler = s.middlewareGlobalAuth(handler)
+
+	// 6.5 Request ID must wrap auth/rate-limit/logging so every error response carries it.
+	handler = s.middlewareRequestID(handler)
 
 	// 7. CORS headers (if needed)
 	handler = s.middlewareCORS(handler)
@@ -237,6 +244,21 @@ func (s *Server) getRequiredRole(method, path string) string {
 	if strings.HasPrefix(path, basePath+"/policies/acks") {
 		return "policy_reader"
 	}
+	if strings.HasPrefix(path, basePath+"/policies") {
+		if method == http.MethodPost {
+			return "control_outbox_operator"
+		}
+		return "policy_reader"
+	}
+	if strings.HasPrefix(path, basePath+"/workflows") {
+		if method == http.MethodPost {
+			return "control_outbox_operator"
+		}
+		return "policy_reader"
+	}
+	if strings.HasPrefix(path, basePath+"/audit") {
+		return "audit_reader"
+	}
 	if strings.HasPrefix(path, basePath+"/frontend-config") {
 		return "stats_reader"
 	}
@@ -256,6 +278,9 @@ func (s *Server) getRequiredRole(method, path string) string {
 		return "control_lease_reader"
 	}
 	if strings.HasPrefix(path, basePath+"/control/safe-mode") {
+		return "control_lease_admin"
+	}
+	if strings.HasPrefix(path, basePath+"/control/kill-switch") {
 		return "control_lease_admin"
 	}
 	if strings.HasPrefix(path, basePath+"/control/acks") {

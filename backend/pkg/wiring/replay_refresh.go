@@ -12,9 +12,11 @@ func (s *Service) runReplayFilterRefresh(ctx context.Context) {
 		return
 	}
 
-	s.refreshReplayFilterFromDB(ctx)
+	_ = s.refreshReplayFilterFromDBWithOptions(ctx, false)
 	ticker := time.NewTicker(s.replayRefreshInterval)
 	defer ticker.Stop()
+	timeoutStreak := 0
+	cooldownUntil := time.Time{}
 
 	for {
 		select {
@@ -23,26 +25,51 @@ func (s *Service) runReplayFilterRefresh(ctx context.Context) {
 		case <-s.stopCh:
 			return
 		case <-ticker.C:
-			s.refreshReplayFilterFromDB(ctx)
+			now := time.Now()
+			if !cooldownUntil.IsZero() && now.Before(cooldownUntil) {
+				continue
+			}
+			err := s.refreshReplayFilterFromDBWithOptions(ctx, false)
+			if err != nil && isBackgroundTimeoutErr(err) {
+				timeoutStreak++
+				cooldown := nextBackgroundProbeCooldown(timeoutStreak, s.replayRefreshInterval)
+				cooldownUntil = now.Add(cooldown)
+				if s.log != nil {
+					s.log.Debug("replay refresh probe cooling down after timeout",
+						utils.ZapInt("timeout_streak", timeoutStreak),
+						utils.ZapDuration("cooldown", cooldown))
+				}
+				continue
+			}
+			timeoutStreak = 0
+			cooldownUntil = time.Time{}
 		}
 	}
 }
 
 func (s *Service) refreshReplayFilterFromDB(ctx context.Context) {
+	_ = s.refreshReplayFilterFromDBWithOptions(ctx, false)
+}
+
+func (s *Service) bootstrapReplayFilterFromDB(ctx context.Context) error {
+	return s.refreshReplayFilterFromDBWithOptions(ctx, true)
+}
+
+func (s *Service) refreshReplayFilterFromDBWithOptions(ctx context.Context, bypassLeaderGate bool) error {
 	if s == nil || !s.replayFilterEnabled || !s.replayRefreshEnabled || s.persistWorker == nil {
-		return
+		return nil
 	}
 	// In proposer-only persistence mode, a single refresh reader is enough.
 	// Non-leaders skip refresh to avoid N-way background DB fan-out.
-	if s.replayRefreshLeaderOnly && s.persistCommitProposerOnly && s.eng != nil {
+	if !bypassLeaderGate && s.replayRefreshLeaderOnly && s.persistCommitProposerOnly && s.eng != nil {
 		status := s.eng.GetStatus()
 		if !status.IsLeader {
-			return
+			return nil
 		}
 	}
 	adapter := s.persistWorker.GetAdapter()
 	if adapter == nil {
-		return
+		return nil
 	}
 
 	checkCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -52,10 +79,10 @@ func (s *Service) refreshReplayFilterFromDB(ctx context.Context) {
 		if s.log != nil {
 			s.log.Debug("replay refresh latest-height check failed", utils.ZapError(err))
 		}
-		return
+		return err
 	}
 	if latest == 0 {
-		return
+		return nil
 	}
 
 	windowStart := uint64(1)
@@ -86,7 +113,7 @@ func (s *Service) refreshReplayFilterFromDB(ctx context.Context) {
 					utils.ZapError(err),
 					utils.ZapUint64("height", h))
 			}
-			continue
+			return err
 		}
 		for _, meta := range metas {
 			if len(meta.TxHash) != 32 {
@@ -99,7 +126,8 @@ func (s *Service) refreshReplayFilterFromDB(ctx context.Context) {
 	}
 	if end >= latest {
 		s.replayRefreshNext = windowStart
-		return
+		return nil
 	}
 	s.replayRefreshNext = end + 1
+	return nil
 }

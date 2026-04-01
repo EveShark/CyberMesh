@@ -2,10 +2,13 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/netip"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,25 +31,27 @@ import (
 
 // Controller bridges Kafka messages to enforcement backend.
 type Controller struct {
-	trust      *policy.TrustedKeys
-	store      *state.Store
-	enforcer   enforcer.Enforcer
-	metrics    *metrics.Recorder
-	logger     *zap.Logger
-	rate       ratelimit.Coordinator
-	killSwitch *control.KillSwitch
-	seenHashes sync.Map // policyID -> string(hash)
-	pending    map[string]policy.Event
-	pendingMu  sync.Mutex
-	fastPath   FastPathConfig
-	acks       ack.Publisher
-	instanceID string
-	replay     replayConfig
-	replaySeen map[string]time.Time
-	replayMu   sync.Mutex
-	decisionMu sync.RWMutex
-	decisions  []DecisionRecord
-	decMax     int
+	trust             *policy.TrustedKeys
+	store             *state.Store
+	enforcer          enforcer.Enforcer
+	metrics           *metrics.Recorder
+	logger            *zap.Logger
+	rate              ratelimit.Coordinator
+	killSwitch        *control.KillSwitch
+	seenHashes        sync.Map // policyID -> string(hash)
+	pending           map[string]policy.Event
+	pendingMu         sync.Mutex
+	fastPath          FastPathConfig
+	acks              ack.Publisher
+	ackEnqueueTimeout time.Duration
+	instanceID        string
+	replay            replayConfig
+	replaySeen        map[string]time.Time
+	replayMu          sync.Mutex
+	scopeLocks        sync.Map // scope key -> *sync.Mutex
+	decisionMu        sync.RWMutex
+	decisions         []DecisionRecord
+	decMax            int
 }
 
 type DecisionRecord struct {
@@ -77,6 +82,7 @@ type Options struct {
 	FastPathMinConfidence float64
 	FastPathSignals       int64
 	AckPublisher          ack.Publisher
+	AckEnqueueTimeout     time.Duration
 	ControllerInstanceID  string
 	ReplayWindow          time.Duration
 	ReplayFutureSkew      time.Duration
@@ -92,10 +98,16 @@ type replayConfig struct {
 }
 
 const (
-	namespaceScopePrefix = "namespace:"
-	nodeScopePrefix      = "node:"
-	clusterScopeKey      = "cluster"
-	globalScopeKey       = "global"
+	namespaceScopePrefix      = "namespace:"
+	nodeScopePrefix           = "node:"
+	clusterScopeKey           = "cluster"
+	globalScopeKey            = "global"
+	maxFastMitigationRenewals = 1
+	stageEnforcementConsume   = "t_enforcement_consume"
+	stageEnforcementApplyDone = "t_enforcement_apply_done"
+	stageEnforcementPersisted = "t_enforcement_persist_done"
+	stageAckPublishStart      = "t_ack_publish_start"
+	stageAckPublishDone       = "t_ack_publish_done"
 )
 
 // New constructs a controller.
@@ -126,8 +138,9 @@ func New(trust *policy.TrustedKeys, store *state.Store, backend enforcer.Enforce
 			MinConfidence:   opts.FastPathMinConfidence,
 			SignalsRequired: opts.FastPathSignals,
 		},
-		acks:       opts.AckPublisher,
-		instanceID: opts.ControllerInstanceID,
+		acks:              opts.AckPublisher,
+		ackEnqueueTimeout: opts.AckEnqueueTimeout,
+		instanceID:        opts.ControllerInstanceID,
 		replay: replayConfig{
 			window:         replayWindow,
 			futureSkew:     replayFutureSkew,
@@ -137,6 +150,9 @@ func New(trust *policy.TrustedKeys, store *state.Store, backend enforcer.Enforce
 		},
 		replaySeen: make(map[string]time.Time, replayMax),
 		decMax:     500,
+	}
+	if c.ackEnqueueTimeout <= 0 {
+		c.ackEnqueueTimeout = 500 * time.Millisecond
 	}
 	c.loadPendingApprovals()
 	return c
@@ -176,7 +192,7 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 	consumeStart := time.Now()
 	c.metrics.ObserveIngest()
 	if c.logger != nil {
-		c.logger.Info(
+		c.logger.Debug(
 			"policy message received",
 			zap.String("topic", msg.Topic),
 			zap.Int32("partition", msg.Partition),
@@ -203,8 +219,9 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 		}
 		return nil
 	}
+	c.emitStageMarker(evt, stageEnforcementConsume, time.Now().UnixMilli())
 	if c.logger != nil {
-		c.logger.Info(
+		c.logger.Debug(
 			"policy verification passed",
 			zap.String("policy_id", evt.Spec.ID),
 			zap.String("action", evt.Spec.Action),
@@ -231,31 +248,20 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 			zap.String("reason", fastPath.Reason))
 	}
 
-	if c.isDuplicate(evt) {
-		if c.logger != nil {
-			c.logger.Debug("duplicate policy event treated as idempotent noop", zap.String("policy_id", evt.Spec.ID))
-		}
-		appliedAt = time.Now().UTC()
+	replayNow := time.Now().UTC()
+	replayReason, replayKey, replayErr := c.checkReplay(evt, replayNow)
+	if replayErr != nil {
 		if c.metrics != nil {
-			c.metrics.ObserveConsumeToApply("duplicate", time.Since(consumeStart))
-			c.metrics.ObserveDuplicateScope(scopeKindLabel(evt.Spec))
-		}
-		c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultApplied, "duplicate_noop", "policy duplicate detected", appliedAt)
-		return nil
-	}
-
-	if reason, replayErr := c.checkReplay(evt, time.Now().UTC()); replayErr != nil {
-		if c.metrics != nil {
-			c.metrics.ObserveGuardrailViolation(reason)
-			c.metrics.ObserveGatewayReplayReject(reason)
+			c.metrics.ObserveGuardrailViolation(replayReason)
+			c.metrics.ObserveGatewayReplayReject(replayReason)
 		}
 		if c.logger != nil {
 			c.logger.Warn("policy replay guard rejected event",
 				zap.String("policy_id", evt.Spec.ID),
-				zap.String("reason", reason),
+				zap.String("reason", replayReason),
 				zap.Error(replayErr))
 		}
-		c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultFailed, reason, replayErr.Error(), appliedAt)
+		c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultFailed, replayReason, replayErr.Error(), appliedAt)
 		return nil
 	}
 
@@ -270,15 +276,41 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 		return nil
 	}
 
+	scopeKey := orderingKey(evt)
+	eventTS, hasEventTS := policyEventTimestamp(evt)
+	advanceScopeWatermark := func() {}
+	if c.store != nil && hasEventTS {
+		unlock := c.lockScope(scopeKey)
+		defer unlock()
+		advanceScopeWatermark = func() {
+			c.store.AdvanceScopeWatermark(scopeKey, eventTS)
+		}
+		if stale, lastAccepted := c.store.IsScopeEventStale(scopeKey, eventTS); stale {
+			if c.metrics != nil {
+				c.metrics.ObserveGuardrailViolation("stale_out_of_order")
+			}
+			if c.logger != nil {
+				c.logger.Warn("policy stale out-of-order event dropped",
+					zap.String("policy_id", evt.Spec.ID),
+					zap.String("ordering_key", scopeKey),
+					zap.Time("event_ts", eventTS),
+					zap.Time("last_accepted_ts", lastAccepted))
+			}
+			c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultFailed, "stale_out_of_order", "policy event timestamp older than accepted scope watermark", appliedAt)
+			return nil
+		}
+	}
+
 	pendingKey := approvalKey(evt.Spec)
 	requiresApproval := evt.Spec.Guardrails.ApprovalRequired
 	approvedFromPending := false
+	rejectedFromPending := false
 	if isApprovalAction(evt.Proto.GetAction()) {
 		c.pendingMu.Lock()
 		pendingEvt, ok := c.pending[pendingKey]
 		c.pendingMu.Unlock()
 		if ok {
-			evt = pendingEvt
+			evt = mergePendingDecisionContext(pendingEvt, evt)
 			requiresApproval = false
 			evt.Spec.Guardrails.ApprovalRequired = false
 			if evt.Proto != nil {
@@ -289,6 +321,29 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 			if c.logger != nil {
 				c.logger.Warn("approval received without pending policy", zap.String("policy_id", evt.Spec.ID), zap.String("scope", rateScope(evt.Spec)))
 			}
+			appliedAt = time.Now().UTC()
+			c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultFailed, "approval_not_pending", "approval received without pending policy", appliedAt)
+			return nil
+		}
+	}
+	if isRejectAction(evt.Proto.GetAction()) {
+		c.pendingMu.Lock()
+		pendingEvt, ok := c.pending[pendingKey]
+		c.pendingMu.Unlock()
+		if ok {
+			evt = mergePendingDecisionContext(pendingEvt, evt)
+			requiresApproval = false
+			evt.Spec.Guardrails.ApprovalRequired = false
+			if evt.Proto != nil {
+				evt.Proto.RequiresAck = false
+			}
+			rejectedFromPending = true
+		} else {
+			if c.logger != nil {
+				c.logger.Warn("rejection received without pending policy", zap.String("policy_id", evt.Spec.ID), zap.String("scope", rateScope(evt.Spec)))
+			}
+			appliedAt = time.Now().UTC()
+			c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultFailed, "reject_not_pending", "rejection received without pending policy", appliedAt)
 			return nil
 		}
 	}
@@ -300,8 +355,87 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 		c.pendingMu.Lock()
 		c.pending[pendingKey] = evt
 		c.pendingMu.Unlock()
+		c.commitReplayKey(replayKey, time.Now().UTC())
 		if c.logger != nil {
 			c.logger.Info("policy pending manual approval", zap.String("policy_id", evt.Spec.ID), zap.String("scope", rateScope(evt.Spec)))
+		}
+		return nil
+	}
+	if rejectedFromPending {
+		appliedAt = time.Now().UTC()
+		c.clearPendingApproval(pendingKey)
+		advanceScopeWatermark()
+		c.commitDuplicateFingerprint(evt)
+		c.commitReplayKey(replayKey, time.Now().UTC())
+		c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultFailed, "manual_reject", rejectDecisionReason(evt.Spec), appliedAt)
+		if c.logger != nil {
+			c.logger.Info("policy manually rejected", zap.String("policy_id", evt.Spec.ID), zap.String("scope", rateScope(evt.Spec)))
+		}
+		return nil
+	}
+
+	if c.isDuplicate(evt) {
+		if c.logger != nil {
+			c.logger.Debug("duplicate policy event treated as idempotent noop", zap.String("policy_id", evt.Spec.ID))
+		}
+		appliedAt = time.Now().UTC()
+		c.emitStageMarker(evt, stageEnforcementApplyDone, appliedAt.UnixMilli(), zap.String("result", "duplicate_noop"))
+		if c.metrics != nil {
+			c.metrics.ObserveConsumeToApply("duplicate", time.Since(consumeStart))
+			c.metrics.ObserveDuplicateScope(scopeKindLabel(evt.Spec))
+		}
+		advanceScopeWatermark()
+		c.commitDuplicateFingerprint(evt)
+		c.commitReplayKey(replayKey, time.Now().UTC())
+		c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultApplied, "duplicate_noop", "policy duplicate detected", appliedAt)
+		return nil
+	}
+
+	if isRemoveAction(evt) {
+		removeReason := ""
+		if c.store != nil {
+			if existing, ok := c.store.Get(evt.Spec.ID); ok && existing.PendingConsensus {
+				removeReason = "provisional_revoked"
+			}
+		}
+		start := time.Now()
+		if c.logger != nil {
+			c.logger.Debug(
+				"policy remove started",
+				zap.String("policy_id", evt.Spec.ID),
+				zap.String("rule_type", evt.Spec.RuleType),
+			)
+		}
+		if err := c.enforcer.Remove(ctx, evt.Spec.ID); err != nil {
+			if c.metrics != nil {
+				c.metrics.ObserveApplyError(time.Since(start))
+				c.metrics.ObserveConsumeToApply("error", time.Since(consumeStart))
+			}
+			c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultFailed, "remove_error", err.Error(), time.Now().UTC())
+			return fmt.Errorf("controller: remove policy %s: %w", evt.Spec.ID, err)
+		}
+		appliedAt = time.Now().UTC()
+		c.emitStageMarker(evt, stageEnforcementApplyDone, appliedAt.UnixMilli(), zap.String("result", "remove"))
+		if c.metrics != nil {
+			c.metrics.ObserveApplied(time.Since(start))
+			c.metrics.ObserveConsumeToApply("success", time.Since(consumeStart))
+		}
+		c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultApplied, "", removeReason, appliedAt)
+		if c.store != nil {
+			if err := c.store.Remove(evt.Spec.ID); err != nil && c.logger != nil {
+				c.logger.Warn("failed to remove policy state", zap.String("policy_id", evt.Spec.ID), zap.Error(err))
+			} else if c.metrics != nil {
+				c.metrics.SetActivePolicies(c.store.ActiveCount())
+			}
+		}
+		advanceScopeWatermark()
+		c.commitDuplicateFingerprint(evt)
+		c.commitReplayKey(replayKey, time.Now().UTC())
+		if approvedFromPending {
+			c.clearPendingApproval(pendingKey)
+		}
+		if c.logger != nil {
+			c.logger.Debug("policy remove succeeded", zap.String("policy_id", evt.Spec.ID), zap.Duration("latency", time.Since(start)))
 		}
 		return nil
 	}
@@ -328,16 +462,75 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 		return nil
 	}
 
-	if fastPath.Eligible && evt.Spec.Guardrails.FastPathTTLSeconds != nil {
-		deadline := time.Now().Add(time.Duration(*evt.Spec.Guardrails.FastPathTTLSeconds) * time.Second)
-		if err := c.store.MarkPendingConsensus(evt.Spec.ID, deadline); err != nil && c.logger != nil {
-			c.logger.Warn("failed to mark pending consensus", zap.String("policy_id", evt.Spec.ID), zap.Error(err))
+	refreshReason := "applied_new"
+	refreshOnly := false
+	promotedFromFast := false
+	if c.store != nil {
+		if existing, ok := c.store.Get(evt.Spec.ID); ok {
+			promotedFromFast = existing.PendingConsensus && existing.Provisional
+			if sameEffectiveRule(existing.Spec, evt.Spec) {
+				refreshOnly = true
+				if promotedFromFast {
+					refreshReason = "applied_promoted"
+				} else {
+					refreshReason = "applied_refresh"
+				}
+			} else {
+				if promotedFromFast {
+					refreshReason = "applied_promoted_reapply"
+				} else {
+					refreshReason = "applied_refresh_reapply"
+				}
+			}
 		}
+	}
+
+	if refreshOnly {
+		appliedAt = time.Now().UTC()
+		c.emitStageMarker(evt, stageEnforcementApplyDone, appliedAt.UnixMilli(), zap.String("result", "refresh_only"))
+		persistStart := time.Now()
+		if err := c.store.Upsert(evt.Spec, appliedAt); err != nil {
+			if c.metrics != nil {
+				c.metrics.ObserveApplyPersist("error", time.Since(persistStart))
+				c.metrics.ObserveConsumeToApply("error", time.Since(consumeStart))
+			}
+			c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultFailed, "refresh_persist_error", err.Error(), appliedAt)
+			return fmt.Errorf("controller: refresh policy %s: %w", evt.Spec.ID, err)
+		}
+		if reservation != nil {
+			if err := reservation.Commit(ctx); err != nil && c.logger != nil {
+				c.logger.Warn("rate reservation commit failed", zap.String("policy_id", evt.Spec.ID), zap.Error(err))
+			}
+		}
+		if c.metrics != nil {
+			c.metrics.ObserveApplyPersist("success", time.Since(persistStart))
+			c.metrics.ObserveConsumeToApply("success", time.Since(consumeStart))
+			c.metrics.SetActivePolicies(c.store.ActiveCount())
+		}
+		c.emitStageMarker(evt, stageEnforcementPersisted, time.Now().UnixMilli())
+		if c.store != nil {
+			if promotedFromFast {
+				_ = c.store.MarkPromoted(evt.Spec.ID, appliedAt)
+			} else {
+				_ = c.store.ClearPendingConsensus(evt.Spec.ID)
+			}
+		}
+		advanceScopeWatermark()
+		c.commitDuplicateFingerprint(evt)
+		c.commitReplayKey(replayKey, time.Now().UTC())
+		c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultApplied, "", refreshReason, appliedAt)
+		if approvedFromPending {
+			c.clearPendingApproval(pendingKey)
+		}
+		if c.logger != nil {
+			c.logger.Debug("policy refresh applied without re-enforce", zap.String("policy_id", evt.Spec.ID))
+		}
+		return nil
 	}
 
 	start := time.Now()
 	if c.logger != nil {
-		c.logger.Info(
+		c.logger.Debug(
 			"policy apply started",
 			zap.String("policy_id", evt.Spec.ID),
 			zap.String("action", evt.Spec.Action),
@@ -358,13 +551,14 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 	}
 	appliedAt = time.Now().UTC()
 	c.metrics.ObserveApplied(time.Since(start))
+	c.emitStageMarker(evt, stageEnforcementApplyDone, appliedAt.UnixMilli())
 	if c.metrics != nil {
 		c.metrics.ObserveConsumeToApply("success", time.Since(consumeStart))
 	}
 	if c.logger != nil {
-		c.logger.Info("policy apply succeeded", zap.String("policy_id", evt.Spec.ID), zap.Duration("latency", time.Since(start)))
+		c.logger.Debug("policy apply succeeded", zap.String("policy_id", evt.Spec.ID), zap.Duration("latency", time.Since(start)))
 	}
-	c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultApplied, "", "", appliedAt)
+	c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultApplied, "", refreshReason, appliedAt)
 
 	if reservation != nil {
 		if err := reservation.Commit(ctx); err != nil && c.logger != nil {
@@ -384,13 +578,24 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 		c.metrics.ObserveApplyPersist("success", time.Since(persistStart))
 		c.metrics.SetActivePolicies(c.store.ActiveCount())
 	}
+	c.emitStageMarker(evt, stageEnforcementPersisted, time.Now().UnixMilli())
+	if c.store != nil {
+		if promotedFromFast {
+			_ = c.store.MarkPromoted(evt.Spec.ID, appliedAt)
+		} else {
+			_ = c.store.ClearPendingConsensus(evt.Spec.ID)
+		}
+	}
+	advanceScopeWatermark()
+	c.commitDuplicateFingerprint(evt)
+	c.commitReplayKey(replayKey, time.Now().UTC())
 
 	if approvedFromPending {
 		c.clearPendingApproval(pendingKey)
 	}
 
 	if c.logger != nil {
-		c.logger.Info("policy applied",
+		c.logger.Debug("policy applied",
 			zap.String("policy_id", evt.Spec.ID),
 			zap.String("rule_type", evt.Spec.RuleType),
 			zap.Bool("dry_run", evt.Spec.Guardrails.DryRun),
@@ -404,37 +609,156 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 	return nil
 }
 
-func (c *Controller) isDuplicate(evt policy.Event) bool {
-	hash := fmt.Sprintf("%x", evt.Proto.RuleHash)
-	key := fmt.Sprintf("%s:%s", evt.Spec.ID, scopeIdentifier(evt.Spec))
-	prev, ok := c.seenHashes.Load(key)
-	if ok && prev.(string) == hash {
-		return true
-	}
-	c.seenHashes.Store(key, hash)
-	return false
+func sameEffectiveRule(a policy.PolicySpec, b policy.PolicySpec) bool {
+	return effectiveRuleFingerprint(a) == effectiveRuleFingerprint(b)
 }
 
-func (c *Controller) checkReplay(evt policy.Event, now time.Time) (string, error) {
+func effectiveRuleFingerprint(spec policy.PolicySpec) string {
+	target := map[string]any{
+		"ips":       append([]string(nil), spec.Target.IPs...),
+		"cidrs":     append([]string(nil), spec.Target.CIDRs...),
+		"direction": strings.ToLower(strings.TrimSpace(spec.Target.Direction)),
+		"scope":     strings.ToLower(strings.TrimSpace(spec.Target.Scope)),
+		"selectors": cloneStringMap(spec.Target.Selectors),
+		"namespace": strings.ToLower(strings.TrimSpace(spec.Target.Namespace)),
+		"ports":     normalizePortRanges(spec.Target.Ports),
+		"protocols": normalizeStrings(spec.Target.Protocols),
+		"tenant":    strings.ToLower(strings.TrimSpace(spec.Target.Tenant)),
+		"region":    strings.ToLower(strings.TrimSpace(spec.Target.Region)),
+	}
+	guardrails := map[string]any{
+		"dry_run":                spec.Guardrails.DryRun,
+		"canary_scope":           spec.Guardrails.CanaryScope,
+		"cidr_max_prefix_len":    valueOrNil(spec.Guardrails.CIDRMaxPrefixLen),
+		"max_targets":            valueOrNil(spec.Guardrails.MaxTargets),
+		"fast_path_enabled":      spec.Guardrails.FastPathEnabled,
+		"fast_path_canary_scope": spec.Guardrails.FastPathCanaryScope,
+		"allowlist_ips":          normalizeStrings(spec.Guardrails.AllowlistIPs),
+		"allowlist_cidrs":        normalizeStrings(spec.Guardrails.AllowlistCIDRs),
+		"allowlist_namespaces":   normalizeStrings(spec.Guardrails.AllowlistNamespaces),
+		"approval_required":      spec.Guardrails.ApprovalRequired,
+	}
+	criteria := map[string]any{
+		"min_confidence":      floatValueOrNil(spec.Criteria.MinConfidence),
+		"attempts_per_window": valueOrNil(spec.Criteria.AttemptsPerWindow),
+		"window_seconds":      valueOrNil(spec.Criteria.WindowSeconds),
+	}
+	payload := map[string]any{
+		"id":       strings.TrimSpace(spec.ID),
+		"ruleType": strings.ToLower(strings.TrimSpace(spec.RuleType)),
+		"action":   strings.ToLower(strings.TrimSpace(spec.Action)),
+		"tenant":   strings.ToLower(strings.TrimSpace(spec.Tenant)),
+		"region":   strings.ToLower(strings.TrimSpace(spec.Region)),
+		"target":   target,
+		"criteria": criteria,
+		"guards":   guardrails,
+	}
+	encoded, _ := json.Marshal(payload)
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return map[string]string{}
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		// Selector keys are canonicalized, but values are preserved (trimmed only)
+		// because some selector backends can treat value case as semantic input.
+		out[strings.ToLower(strings.TrimSpace(k))] = strings.TrimSpace(v)
+	}
+	return out
+}
+
+func normalizeStrings(in []string) []string {
+	if len(in) == 0 {
+		return []string{}
+	}
+	out := make([]string, 0, len(in))
+	for _, item := range in {
+		token := strings.ToLower(strings.TrimSpace(item))
+		if token != "" {
+			out = append(out, token)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func normalizePortRanges(in []policy.PortRange) []string {
+	if len(in) == 0 {
+		return []string{}
+	}
+	out := make([]string, 0, len(in))
+	for _, pr := range in {
+		out = append(out, fmt.Sprintf("%d-%d", pr.From, pr.To))
+	}
+	sort.Strings(out)
+	return out
+}
+
+func valueOrNil[T any](ptr *T) any {
+	if ptr == nil {
+		return nil
+	}
+	return *ptr
+}
+
+func floatValueOrNil(ptr *float64) any {
+	if ptr == nil {
+		return nil
+	}
+	return *ptr
+}
+
+func (c *Controller) isDuplicate(evt policy.Event) bool {
+	hash := duplicateFingerprint(evt)
+	key := fmt.Sprintf("%s:%s", evt.Spec.ID, scopeIdentifier(evt.Spec))
+	prev, ok := c.seenHashes.Load(key)
+	return ok && prev.(string) == hash
+}
+
+func (c *Controller) commitDuplicateFingerprint(evt policy.Event) {
+	if c == nil {
+		return
+	}
+	hash := duplicateFingerprint(evt)
+	key := fmt.Sprintf("%s:%s", evt.Spec.ID, scopeIdentifier(evt.Spec))
+	c.seenHashes.Store(key, hash)
+}
+
+func duplicateFingerprint(evt policy.Event) string {
+	if evt.Fast != nil {
+		return strings.Join([]string{
+			"fast",
+			strings.TrimSpace(evt.Fast.MitigationID),
+			strings.TrimSpace(evt.Fast.ContentHash),
+		}, "|")
+	}
+	return fmt.Sprintf("%x", evtRuleHash(evt))
+}
+
+func (c *Controller) checkReplay(evt policy.Event, now time.Time) (string, string, error) {
 	if !c.replay.enabled {
-		return "", nil
+		return "", "", nil
 	}
 	if evt.Proto == nil {
 		if c.replay.requirePayload {
-			return "replay_missing_envelope", fmt.Errorf("missing policy envelope for replay validation")
+			return "replay_missing_envelope", "", fmt.Errorf("missing policy envelope for replay validation")
 		}
-		return "", nil
+		return "", "", nil
 	}
 
 	eventTS := time.Unix(evt.Proto.GetTimestamp(), 0).UTC()
 	if evt.Proto.GetTimestamp() <= 0 {
-		return "replay_invalid_timestamp", fmt.Errorf("invalid timestamp in policy envelope")
+		return "replay_invalid_timestamp", "", fmt.Errorf("invalid timestamp in policy envelope")
 	}
 	if now.Add(c.replay.futureSkew).Before(eventTS) {
-		return "replay_future_timestamp", fmt.Errorf("policy timestamp %s exceeds future skew %s", eventTS.Format(time.RFC3339), c.replay.futureSkew.String())
+		return "replay_future_timestamp", "", fmt.Errorf("policy timestamp %s exceeds future skew %s", eventTS.Format(time.RFC3339), c.replay.futureSkew.String())
 	}
 	if eventTS.Before(now.Add(-c.replay.window)) {
-		return "replay_stale_timestamp", fmt.Errorf("policy timestamp %s outside replay window %s", eventTS.Format(time.RFC3339), c.replay.window.String())
+		return "replay_stale_timestamp", "", fmt.Errorf("policy timestamp %s outside replay window %s", eventTS.Format(time.RFC3339), c.replay.window.String())
 	}
 
 	key := replayKey(evt)
@@ -444,14 +768,27 @@ func (c *Controller) checkReplay(evt policy.Event, now time.Time) (string, error
 
 	if seenAt, ok := c.replaySeen[key]; ok {
 		if now.Sub(seenAt) <= c.replay.window {
-			return "replay_duplicate", fmt.Errorf("duplicate replay key within window")
+			return "replay_duplicate", key, fmt.Errorf("duplicate replay key within window")
 		}
 	}
+	return "", key, nil
+}
+
+func (c *Controller) commitReplayKey(key string, now time.Time) {
+	if c == nil || !c.replay.enabled {
+		return
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return
+	}
+	c.replayMu.Lock()
+	defer c.replayMu.Unlock()
+	c.pruneReplayLocked(now)
 	c.replaySeen[key] = now
 	if len(c.replaySeen) > c.replay.cacheMax {
 		c.evictReplayLocked(len(c.replaySeen) - c.replay.cacheMax)
 	}
-	return "", nil
 }
 
 func replayKey(evt policy.Event) string {
@@ -465,6 +802,36 @@ func replayKey(evt policy.Event) string {
 		hex.EncodeToString(evt.Proto.GetProducerId()),
 		strconv.FormatInt(evt.Proto.GetTimestamp(), 10),
 	}, "|")
+}
+
+func policyEventTimestamp(evt policy.Event) (time.Time, bool) {
+	if evt.Proto == nil || evt.Proto.GetTimestamp() <= 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(evt.Proto.GetTimestamp(), 0).UTC(), true
+}
+
+func orderingKey(evt policy.Event) string {
+	if evt.Proto != nil {
+		if id := strings.TrimSpace(evt.Proto.GetPolicyId()); id != "" {
+			return "policy:" + id
+		}
+	}
+	if id := strings.TrimSpace(evt.Spec.ID); id != "" {
+		return "policy:" + id
+	}
+	return "scope:" + scopeIdentifier(evt.Spec)
+}
+
+func (c *Controller) lockScope(scopeKey string) func() {
+	scopeKey = strings.TrimSpace(scopeKey)
+	if scopeKey == "" {
+		scopeKey = globalScopeKey
+	}
+	muAny, _ := c.scopeLocks.LoadOrStore(scopeKey, &sync.Mutex{})
+	mu := muAny.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 func (c *Controller) pruneReplayLocked(now time.Time) {
@@ -645,11 +1012,11 @@ func (c *Controller) EvaluateGuardrails(ctx context.Context, spec policy.PolicyS
 }
 
 func rateScope(spec policy.PolicySpec) string {
-	return scopeIdentifier(spec)
+	return policy.RateScope(spec)
 }
 
 func windowScope(spec policy.PolicySpec) string {
-	return "window:" + rateScope(spec)
+	return policy.WindowScope(spec)
 }
 
 func approvalKey(spec policy.PolicySpec) string {
@@ -663,6 +1030,285 @@ func isApprovalAction(action string) bool {
 	default:
 		return false
 	}
+}
+
+func isRejectAction(action string) bool {
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case "reject", "rejected", "deny", "denied":
+		return true
+	default:
+		return false
+	}
+}
+
+func mergePendingDecisionContext(pending policy.Event, decision policy.Event) policy.Event {
+	merged := pending
+	if merged.Spec.Raw == nil {
+		merged.Spec.Raw = map[string]any{}
+	}
+	if pending.Proto != nil {
+		clone := proto.Clone(pending.Proto)
+		if evt, ok := clone.(*pb.PolicyUpdateEvent); ok {
+			if decision.Proto != nil {
+				evt.Action = decision.Proto.GetAction()
+				evt.RequiresAck = decision.Proto.GetRequiresAck()
+			}
+			merged.Proto = evt
+		}
+	}
+	copyDecisionField := func(key string) {
+		if val, ok := decision.Spec.Raw[key].(string); ok && strings.TrimSpace(val) != "" {
+			merged.Spec.Raw[key] = strings.TrimSpace(val)
+		}
+	}
+	for _, key := range []string{"request_id", "command_id", "workflow_id", "control_action"} {
+		copyDecisionField(key)
+	}
+	decisionMetadata, _ := decision.Spec.Raw["metadata"].(map[string]any)
+	mergedMetadata, _ := merged.Spec.Raw["metadata"].(map[string]any)
+	if mergedMetadata == nil {
+		mergedMetadata = map[string]any{}
+		merged.Spec.Raw["metadata"] = mergedMetadata
+	}
+	for _, key := range []string{"request_id", "command_id", "workflow_id", "decision_reason_code", "decision_reason_text", "control_action"} {
+		if val, ok := decisionMetadata[key].(string); ok && strings.TrimSpace(val) != "" {
+			mergedMetadata[key] = strings.TrimSpace(val)
+		}
+	}
+	mergedTrace, _ := merged.Spec.Raw["trace"].(map[string]any)
+	if mergedTrace == nil {
+		mergedTrace = map[string]any{}
+		merged.Spec.Raw["trace"] = mergedTrace
+	}
+	if decisionTrace, ok := decision.Spec.Raw["trace"].(map[string]any); ok {
+		for _, key := range []string{"request_id", "command_id", "workflow_id"} {
+			if val, ok := decisionTrace[key].(string); ok && strings.TrimSpace(val) != "" {
+				mergedTrace[key] = strings.TrimSpace(val)
+			}
+		}
+	}
+	return merged
+}
+
+func rejectDecisionReason(spec policy.PolicySpec) string {
+	if metadata, ok := spec.Raw["metadata"].(map[string]any); ok {
+		if val, ok := metadata["decision_reason_text"].(string); ok && strings.TrimSpace(val) != "" {
+			return strings.TrimSpace(val)
+		}
+		if val, ok := metadata["decision_reason_code"].(string); ok && strings.TrimSpace(val) != "" {
+			return strings.TrimSpace(val)
+		}
+	}
+	return "policy manually rejected"
+}
+
+func isRemoveAction(evt policy.Event) bool {
+	if strings.EqualFold(strings.TrimSpace(evt.Spec.Action), "remove") {
+		return true
+	}
+	if evt.Proto != nil && strings.EqualFold(strings.TrimSpace(evt.Proto.GetAction()), "remove") {
+		return true
+	}
+	return false
+}
+
+func isFastEvent(evt policy.Event) bool {
+	return evt.Fast != nil
+}
+
+func evtRuleHash(evt policy.Event) []byte {
+	if evt.Proto != nil {
+		return append([]byte(nil), evt.Proto.GetRuleHash()...)
+	}
+	if evt.Fast != nil {
+		raw, err := hex.DecodeString(strings.TrimSpace(evt.Fast.ContentHash))
+		if err == nil {
+			return raw
+		}
+	}
+	return nil
+}
+
+func evtProducerID(evt policy.Event) []byte {
+	if evt.Proto != nil {
+		return append([]byte(nil), evt.Proto.GetProducerId()...)
+	}
+	if evt.Fast != nil {
+		raw, err := hex.DecodeString(strings.TrimSpace(evt.Fast.Pubkey))
+		if err == nil {
+			return raw
+		}
+	}
+	return nil
+}
+
+func (c *Controller) HandleFastEvent(ctx context.Context, evt policy.Event) error {
+	consumeStart := time.Now()
+	if c.metrics != nil {
+		c.metrics.ObserveIngest()
+		c.metrics.ObserveValidated()
+	}
+	if evt.Fast == nil {
+		if c.metrics != nil {
+			c.metrics.ObserveRejected()
+		}
+		return fmt.Errorf("controller: fast event missing envelope")
+	}
+	requiresAck := true
+	appliedAt := time.Time{}
+	fastPath := FastPathEligibility{Eligible: true, Reason: "fast_mitigation"}
+
+	if reason, replayErr := c.checkFastReplay(evt, time.Now().UTC()); replayErr != nil {
+		if c.metrics != nil {
+			c.metrics.ObserveGuardrailViolation(reason)
+		}
+		c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultFailed, reason, replayErr.Error(), appliedAt)
+		return nil
+	}
+
+	if c.killSwitch != nil && c.killSwitch.Enabled() {
+		if c.metrics != nil {
+			c.metrics.ObserveGuardrailViolation("kill_switch")
+		}
+		c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultFailed, "kill_switch", "enforcement disabled via kill switch", appliedAt)
+		return nil
+	}
+
+	if c.isDuplicate(evt) {
+		appliedAt = time.Now().UTC()
+		if c.metrics != nil {
+			c.metrics.ObserveConsumeToApply("duplicate", time.Since(consumeStart))
+			c.metrics.ObserveDuplicateScope(scopeKindLabel(evt.Spec))
+		}
+		c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultApplied, "duplicate_noop", "fast mitigation duplicate detected", appliedAt)
+		return nil
+	}
+
+	refreshReason := "applied_provisional"
+	refreshOnly := false
+	if c.store != nil {
+		if existing, ok := c.store.Get(evt.Spec.ID); ok {
+			if existing.PendingConsensus && existing.Provisional && existing.RenewalCount >= maxFastMitigationRenewals {
+				if c.metrics != nil {
+					c.metrics.ObserveGuardrailViolation("fast_renewal_exceeded")
+				}
+				c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultFailed, "fast_renewal_exceeded", "fast mitigation renewal limit exceeded", appliedAt)
+				return nil
+			}
+			if sameEffectiveRule(existing.Spec, evt.Spec) {
+				refreshOnly = true
+				refreshReason = "applied_provisional_refresh"
+			} else {
+				refreshReason = "applied_provisional_reapply"
+			}
+		}
+	}
+
+	if refreshOnly {
+		appliedAt = time.Now().UTC()
+		persistStart := time.Now()
+		if err := c.store.Upsert(evt.Spec, appliedAt); err != nil {
+			if c.metrics != nil {
+				c.metrics.ObserveApplyPersist("error", time.Since(persistStart))
+				c.metrics.ObserveConsumeToApply("error", time.Since(consumeStart))
+			}
+			c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultFailed, "refresh_persist_error", err.Error(), appliedAt)
+			return fmt.Errorf("controller: refresh fast mitigation %s: %w", evt.Spec.ID, err)
+		}
+		if err := c.store.MarkProvisional(evt.Spec.ID, evt.Fast.MitigationID, fastDeadline(evt.Spec, appliedAt), appliedAt); err != nil && c.logger != nil {
+			c.logger.Warn("failed to mark fast mitigation pending consensus", zap.String("policy_id", evt.Spec.ID), zap.Error(err))
+		}
+		if c.metrics != nil {
+			c.metrics.ObserveApplyPersist("success", time.Since(persistStart))
+			c.metrics.ObserveConsumeToApply("success", time.Since(consumeStart))
+			c.metrics.SetActivePolicies(c.store.ActiveCount())
+		}
+		c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultApplied, "", refreshReason, appliedAt)
+		return nil
+	}
+
+	start := time.Now()
+	if err := c.enforcer.Apply(ctx, evt.Spec); err != nil {
+		if c.metrics != nil {
+			c.metrics.ObserveApplyError(time.Since(start))
+			c.metrics.ObserveConsumeToApply("error", time.Since(consumeStart))
+		}
+		c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultFailed, "apply_error", err.Error(), time.Now().UTC())
+		return fmt.Errorf("controller: apply fast mitigation %s: %w", evt.Spec.ID, err)
+	}
+	appliedAt = time.Now().UTC()
+	if c.metrics != nil {
+		c.metrics.ObserveApplied(time.Since(start))
+		c.metrics.ObserveConsumeToApply("success", time.Since(consumeStart))
+	}
+	c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultApplied, "", refreshReason, appliedAt)
+
+	persistStart := time.Now()
+	if err := c.store.Upsert(evt.Spec, appliedAt); err != nil {
+		if c.metrics != nil {
+			c.metrics.ObserveApplyPersist("error", time.Since(persistStart))
+		}
+		return fmt.Errorf("controller: persist fast mitigation %s: %w", evt.Spec.ID, err)
+	}
+	if err := c.store.MarkProvisional(evt.Spec.ID, evt.Fast.MitigationID, fastDeadline(evt.Spec, appliedAt), appliedAt); err != nil && c.logger != nil {
+		c.logger.Warn("failed to mark fast mitigation pending consensus", zap.String("policy_id", evt.Spec.ID), zap.Error(err))
+	}
+	if c.metrics != nil {
+		c.metrics.ObserveApplyPersist("success", time.Since(persistStart))
+		c.metrics.SetActivePolicies(c.store.ActiveCount())
+	}
+	return nil
+}
+
+func fastDeadline(spec policy.PolicySpec, appliedAt time.Time) time.Time {
+	if spec.Guardrails.FastPathTTLSeconds != nil && *spec.Guardrails.FastPathTTLSeconds > 0 {
+		return appliedAt.Add(time.Duration(*spec.Guardrails.FastPathTTLSeconds) * time.Second)
+	}
+	if spec.Guardrails.TTLSeconds > 0 {
+		return appliedAt.Add(time.Duration(spec.Guardrails.TTLSeconds) * time.Second)
+	}
+	return time.Time{}
+}
+
+func (c *Controller) checkFastReplay(evt policy.Event, now time.Time) (string, error) {
+	if !c.replay.enabled {
+		return "", nil
+	}
+	if evt.Fast == nil {
+		return "replay_missing_envelope", fmt.Errorf("missing fast mitigation envelope")
+	}
+	eventTS := time.Unix(evt.Fast.Timestamp, 0).UTC()
+	if evt.Fast.Timestamp <= 0 {
+		return "replay_invalid_timestamp", fmt.Errorf("invalid timestamp in fast mitigation envelope")
+	}
+	if now.Add(c.replay.futureSkew).Before(eventTS) {
+		return "replay_future_timestamp", fmt.Errorf("fast mitigation timestamp %s exceeds future skew %s", eventTS.Format(time.RFC3339), c.replay.futureSkew.String())
+	}
+	if eventTS.Before(now.Add(-c.replay.window)) {
+		return "replay_stale_timestamp", fmt.Errorf("fast mitigation timestamp %s outside replay window %s", eventTS.Format(time.RFC3339), c.replay.window.String())
+	}
+	key := strings.Join([]string{
+		"fast",
+		evt.Fast.MitigationID,
+		evt.Fast.PolicyID,
+		strings.TrimSpace(evt.Fast.ContentHash),
+		strings.TrimSpace(evt.Fast.Pubkey),
+		strings.TrimSpace(evt.Fast.Nonce),
+		strconv.FormatInt(evt.Fast.Timestamp, 10),
+	}, "|")
+	c.replayMu.Lock()
+	defer c.replayMu.Unlock()
+	c.pruneReplayLocked(now)
+	if seenAt, ok := c.replaySeen[key]; ok {
+		if now.Sub(seenAt) <= c.replay.window {
+			return "replay_duplicate", fmt.Errorf("duplicate fast mitigation replay key within window")
+		}
+	}
+	c.replaySeen[key] = now
+	if len(c.replaySeen) > c.replay.cacheMax {
+		c.evictReplayLocked(len(c.replaySeen) - c.replay.cacheMax)
+	}
+	return "", nil
 }
 
 func (c *Controller) savePendingApproval(key string, evt policy.Event) error {
@@ -723,11 +1369,12 @@ func (c *Controller) emitAck(ctx context.Context, evt policy.Event, requiresAck 
 		return
 	}
 	ackEnqueueAt = time.Now().UTC()
+	c.emitStageMarker(evt, stageAckPublishStart, ackEnqueueAt.UnixMilli())
 	if c.metrics != nil {
 		c.metrics.ObserveGatewayAckPublish("enqueue_requested")
 	}
 	if c.logger != nil {
-		c.logger.Info(
+		c.logger.Debug(
 			"ack publish requested",
 			zap.String("policy_id", evt.Spec.ID),
 			zap.String("result", string(result)),
@@ -747,10 +1394,12 @@ func (c *Controller) emitAck(ctx context.Context, evt policy.Event, requiresAck 
 		Region:     effectiveRegion(evt.Spec),
 		Controller: c.instanceID,
 		QCRef:      extractQCReference(evt.Spec),
-		RuleHash:   append([]byte(nil), evt.Proto.GetRuleHash()...),
-		ProducerID: append([]byte(nil), evt.Proto.GetProducerId()...),
+		RuleHash:   evtRuleHash(evt),
+		ProducerID: evtProducerID(evt),
 	}
-	if err := c.acks.Publish(ctx, payload); err != nil {
+	ackCtx, cancelAck := context.WithTimeout(context.Background(), c.ackEnqueueTimeout)
+	defer cancelAck()
+	if err := c.acks.Publish(ackCtx, payload); err != nil {
 		if c.metrics != nil && !appliedAt.IsZero() {
 			c.metrics.ObserveApplyToAckEnqueue("error", time.Since(appliedAt))
 		}
@@ -772,9 +1421,54 @@ func (c *Controller) emitAck(ctx context.Context, evt policy.Event, requiresAck 
 		c.metrics.ObserveGatewayAckPublish("enqueue_ok")
 	}
 	ackStatus = "enqueue_ok"
+	c.emitStageMarker(evt, stageAckPublishDone, ackJournaledAt.UnixMilli())
 	if c.logger != nil {
-		c.logger.Info("ack publish succeeded", zap.String("policy_id", evt.Spec.ID), zap.String("result", string(result)))
+		c.logger.Debug("ack publish succeeded", zap.String("policy_id", evt.Spec.ID), zap.String("result", string(result)))
 	}
+}
+
+func (c *Controller) emitStageMarker(evt policy.Event, stage string, tMs int64, extras ...zap.Field) {
+	if c == nil || c.logger == nil || strings.TrimSpace(stage) == "" {
+		return
+	}
+	fields := []zap.Field{
+		zap.String("stage", stage),
+		zap.String("policy_id", strings.TrimSpace(evt.Spec.ID)),
+		zap.Int64("t_ms", tMs),
+	}
+	if traceID := traceIDFromSpec(evt.Spec); traceID != "" {
+		fields = append(fields, zap.String("trace_id", traceID))
+	}
+	fields = append(fields, extras...)
+	c.logger.Info("policy stage marker", fields...)
+}
+
+func traceIDFromSpec(spec policy.PolicySpec) string {
+	raw := spec.Raw
+	if raw == nil {
+		return ""
+	}
+	if traceID := strings.TrimSpace(stringValue(raw["trace_id"])); traceID != "" {
+		return traceID
+	}
+	if md, ok := raw["metadata"].(map[string]any); ok {
+		if traceID := strings.TrimSpace(stringValue(md["trace_id"])); traceID != "" {
+			return traceID
+		}
+	}
+	if trace, ok := raw["trace"].(map[string]any); ok {
+		if traceID := strings.TrimSpace(stringValue(trace["id"])); traceID != "" {
+			return traceID
+		}
+	}
+	return ""
+}
+
+func stringValue(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
 }
 
 func scopeKindLabel(spec policy.PolicySpec) string {
@@ -877,35 +1571,7 @@ func regionScope(region string) string {
 }
 
 func scopeIdentifier(spec policy.PolicySpec) string {
-	scope := strings.ToLower(strings.TrimSpace(spec.Target.Scope))
-	switch scope {
-	case "namespace":
-		if ns := effectiveNamespace(spec); ns != "" {
-			return namespaceScopePrefix + ns
-		}
-		return globalScopeKey
-	case "tenant":
-		if tenant := effectiveTenant(spec); tenant != "" {
-			return tenantScope(tenant)
-		}
-		return globalScopeKey
-	case "region":
-		if region := effectiveRegion(spec); region != "" {
-			return regionScope(region)
-		}
-		return globalScopeKey
-	case "node":
-		if node := effectiveNode(spec); node != "" {
-			return nodeScopePrefix + node
-		}
-		return globalScopeKey
-	case "cluster":
-		return clusterScopeKey
-	case "global", "", "any", "both":
-		return globalScopeKey
-	default:
-		return scope
-	}
+	return policy.ScopeIdentifier(spec)
 }
 
 func checkAllowlist(spec policy.PolicySpec) (string, error) {

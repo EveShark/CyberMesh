@@ -2,8 +2,10 @@ package policyoutbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,8 +21,8 @@ type Publisher interface {
 
 type storeOps interface {
 	TryAcquireLease(ctx context.Context, leaseKey, holderID string, ttl time.Duration) (bool, int64, error)
-	ClaimPending(ctx context.Context, holderID string, epoch int64, limit int, reclaimAfter time.Duration) ([]Row, error)
-	MarkPublished(ctx context.Context, id, holderID string, epoch int64, topic string, partition int32, offset int64) error
+	ClaimPending(ctx context.Context, holderID string, epoch int64, limit int, reclaimAfter time.Duration, leaseKey string, dispatchShard string, dispatchShardCount int, shardCompat bool) ([]Row, error)
+	MarkPublished(ctx context.Context, id, holderID string, epoch int64, leaseKey string, topic string, partition int32, offset int64) error
 	MarkRetry(ctx context.Context, id, holderID string, epoch int64, retries int, nextRetryAt time.Time, errMsg string) error
 	MarkTerminal(ctx context.Context, id, holderID string, epoch int64, retries int, errMsg string) error
 }
@@ -36,10 +38,14 @@ type Dispatcher struct {
 
 	stopCh chan struct{}
 	doneCh chan struct{}
+	wakeCh chan struct{}
+	markQ  chan markTask
+	markWG sync.WaitGroup
 
 	leaseAcquireAttempts uint64
 	leaseAcquireSuccess  uint64
 	leaseAcquireErrors   uint64
+	leaseAcquireTimeouts uint64
 	rowsClaimedTotal     uint64
 	currentBatchSize     uint64
 	batchScaleUpTotal    uint64
@@ -52,20 +58,25 @@ type Dispatcher struct {
 	fencedFailures       uint64
 	throttledLogs        uint64
 	ticksTotal           uint64
+	wakeSignals          uint64
 	skewCorrections      uint64
 	aiEventUnitFixes     uint64
 	aiEventInvalid       uint64
 	sourceEventUnitFixes uint64
 	sourceEventInvalid   uint64
+	claimTimeouts        uint64
+	markTimeouts         uint64
 	leaseHeld            uint32
 	lastLeaseEpoch       int64
 	publishLatency       *utils.LatencyHistogram
 	claimLatency         *utils.LatencyHistogram
+	leaseAcquireLatency  *utils.LatencyHistogram
 	markLatency          *utils.LatencyHistogram
 	tickLatency          *utils.LatencyHistogram
 	aiToPublishLatency   *utils.LatencyHistogram
 	sourceToPublish      *utils.LatencyHistogram
 	commitToPublish      *utils.LatencyHistogram
+	outboxToClaimLatency *utils.LatencyHistogram
 	lastLeaseErrLogAt    int64
 	lastClaimErrLogAt    int64
 	lastMarkErrLogAt     int64
@@ -94,6 +105,37 @@ func NewDispatcher(cfg Config, store storeOps, pub Publisher, logger *utils.Logg
 	if cfg.PolicyTopic == "" {
 		cfg.PolicyTopic = "control.policy.v2"
 	}
+	if cfg.DispatchShardCount <= 0 {
+		if cfg.ClusterShardBuckets > 1 {
+			cfg.DispatchShardCount = cfg.ClusterShardBuckets
+		} else {
+			cfg.DispatchShardCount = 1
+		}
+	}
+	if cfg.DispatchShardCount < 1 {
+		cfg.DispatchShardCount = 1
+	}
+	if cfg.DispatchOwnerCount <= 0 {
+		cfg.DispatchOwnerCount = 1
+	}
+	if cfg.DispatchOwnerCount == 1 {
+		cfg.DispatchOwnerIndex = 0
+	} else if cfg.DispatchOwnerIndex < 0 || cfg.DispatchOwnerIndex >= cfg.DispatchOwnerCount {
+		// Invalid ownership index means "no ownership filter" to avoid accidental
+		// global dispatch freeze from bad config.
+		cfg.DispatchOwnerCount = 1
+		cfg.DispatchOwnerIndex = 0
+	}
+	if cfg.MaxLeaseShards <= 0 {
+		if cfg.DispatchShardCount > 1 {
+			cfg.MaxLeaseShards = minInt(cfg.DispatchShardCount, 4)
+		} else {
+			cfg.MaxLeaseShards = 1
+		}
+	}
+	if cfg.MaxLeaseShards > cfg.DispatchShardCount {
+		cfg.MaxLeaseShards = cfg.DispatchShardCount
+	}
 	rawShardingMode := strings.TrimSpace(cfg.ClusterShardingMode)
 	normalizedRouting, unknownMode := NormalizeRoutingOptions(RoutingOptions{
 		ClusterShardingMode: cfg.ClusterShardingMode,
@@ -116,14 +158,26 @@ func NewDispatcher(cfg Config, store storeOps, pub Publisher, logger *utils.Logg
 	if cfg.LeaseTTL <= 0 {
 		cfg.LeaseTTL = 10 * time.Second
 	}
+	if cfg.LeaseAcquireTimeout <= 0 {
+		cfg.LeaseAcquireTimeout = minDurationBound(5*time.Second, maxDuration(1*time.Second, cfg.LeaseTTL/2))
+	}
+	if cfg.ClaimTimeout <= 0 {
+		cfg.ClaimTimeout = minDurationBound(8*time.Second, maxDuration(2*time.Second, cfg.LeaseTTL))
+	}
 	if cfg.ReclaimAfter <= 0 {
 		cfg.ReclaimAfter = maxDuration(3*cfg.LeaseTTL, 30*time.Second)
 	}
 	if cfg.PollInterval <= 0 {
-		cfg.PollInterval = 500 * time.Millisecond
+		cfg.PollInterval = 250 * time.Millisecond
 	}
 	if cfg.DrainMaxDuration <= 0 {
-		cfg.DrainMaxDuration = 2 * time.Second
+		cfg.DrainMaxDuration = 8 * time.Second
+	}
+	if cfg.LeaseAcquireTimeout >= cfg.DrainMaxDuration {
+		cfg.LeaseAcquireTimeout = maxDuration(500*time.Millisecond, cfg.DrainMaxDuration/6)
+	}
+	if cfg.ClaimTimeout >= cfg.DrainMaxDuration {
+		cfg.ClaimTimeout = maxDuration(2*time.Second, cfg.DrainMaxDuration-500*time.Millisecond)
 	}
 	if cfg.BatchSize <= 0 {
 		cfg.BatchSize = 100
@@ -142,7 +196,7 @@ func NewDispatcher(cfg Config, store storeOps, pub Publisher, logger *utils.Logg
 	}
 	cfg.BatchSize = clampInt(cfg.BatchSize, cfg.BatchSizeMin, cfg.BatchSizeMax)
 	if cfg.MaxInFlight <= 0 {
-		cfg.MaxInFlight = 8
+		cfg.MaxInFlight = 16
 	}
 	if cfg.MarkWorkers <= 0 {
 		cfg.MarkWorkers = maxInt(1, cfg.MaxInFlight/2)
@@ -151,7 +205,7 @@ func NewDispatcher(cfg Config, store storeOps, pub Publisher, logger *utils.Logg
 		cfg.InternalQueue = maxInt(64, cfg.MaxInFlight*4)
 	}
 	if cfg.DrainMaxBatches <= 0 {
-		cfg.DrainMaxBatches = 4
+		cfg.DrainMaxBatches = 8
 	}
 	if cfg.MaxRetries <= 0 {
 		cfg.MaxRetries = 8
@@ -179,10 +233,14 @@ func NewDispatcher(cfg Config, store storeOps, pub Publisher, logger *utils.Logg
 		trace:  trace,
 		stopCh: make(chan struct{}),
 		doneCh: make(chan struct{}),
+		wakeCh: make(chan struct{}, 1),
 		publishLatency: utils.NewLatencyHistogram([]float64{
 			1, 5, 10, 25, 50, 100, 250, 500, 1000, 2000, 5000,
 		}),
 		claimLatency: utils.NewLatencyHistogram([]float64{
+			1, 5, 10, 25, 50, 100, 250, 500, 1000,
+		}),
+		leaseAcquireLatency: utils.NewLatencyHistogram([]float64{
 			1, 5, 10, 25, 50, 100, 250, 500, 1000,
 		}),
 		markLatency: utils.NewLatencyHistogram([]float64{
@@ -198,6 +256,9 @@ func NewDispatcher(cfg Config, store storeOps, pub Publisher, logger *utils.Logg
 			10, 25, 50, 100, 250, 500, 1000, 2000, 5000, 10000, 30000,
 		}),
 		commitToPublish: utils.NewLatencyHistogram([]float64{
+			10, 25, 50, 100, 250, 500, 1000, 2000, 5000, 10000, 30000,
+		}),
+		outboxToClaimLatency: utils.NewLatencyHistogram([]float64{
 			10, 25, 50, 100, 250, 500, 1000, 2000, 5000, 10000, 30000,
 		}),
 		currentBatchSize:    uint64(cfg.BatchSize),
@@ -231,6 +292,8 @@ func (d *Dispatcher) Stop() {
 
 func (d *Dispatcher) run(ctx context.Context) {
 	defer close(d.doneCh)
+	d.startMarkWorkers(ctx)
+	defer d.stopMarkWorkers()
 	t := time.NewTicker(d.cfg.PollInterval)
 	defer t.Stop()
 
@@ -242,7 +305,51 @@ func (d *Dispatcher) run(ctx context.Context) {
 			return
 		case <-t.C:
 			d.tick(ctx)
+		case <-d.wakeCh:
+			d.tick(ctx)
 		}
+	}
+}
+
+func (d *Dispatcher) startMarkWorkers(ctx context.Context) {
+	markWorkers := d.cfg.MarkWorkers
+	if markWorkers <= 0 {
+		markWorkers = 1
+	}
+	qSize := d.cfg.InternalQueue
+	if qSize <= 0 {
+		qSize = maxInt(64, maxInt(1, d.cfg.MaxInFlight)*4)
+	}
+	d.markQ = make(chan markTask, qSize)
+	for i := 0; i < markWorkers; i++ {
+		d.markWG.Add(1)
+		go func() {
+			defer d.markWG.Done()
+			for task := range d.markQ {
+				d.handleMarkTask(ctx, task, task.deadline)
+			}
+		}()
+	}
+}
+
+func (d *Dispatcher) stopMarkWorkers() {
+	if d.markQ == nil {
+		return
+	}
+	close(d.markQ)
+	d.markWG.Wait()
+}
+
+// Notify wakes the dispatcher loop for immediate claim/drain.
+// The signal is coalesced to avoid storms under burst commits.
+func (d *Dispatcher) Notify() {
+	if d == nil {
+		return
+	}
+	select {
+	case d.wakeCh <- struct{}{}:
+		atomic.AddUint64(&d.wakeSignals, 1)
+	default:
 	}
 }
 
@@ -253,57 +360,128 @@ func (d *Dispatcher) tick(ctx context.Context) {
 		d.tickLatency.Observe(float64(time.Since(tickStart).Milliseconds()))
 	}()
 
-	atomic.AddUint64(&d.leaseAcquireAttempts, 1)
-	acquired, epoch, err := d.store.TryAcquireLease(ctx, d.cfg.LeaseKey, d.holder, d.cfg.LeaseTTL)
-	if err != nil {
-		atomic.AddUint64(&d.leaseAcquireErrors, 1)
-		atomic.StoreUint32(&d.leaseHeld, 0)
-		if d.logger != nil && d.shouldLog("lease", &d.lastLeaseErrLogAt) {
-			d.logger.WarnContext(ctx, "policy outbox lease acquire failed", utils.ZapError(err))
+	if d.cfg.RefreshSafeMode != nil {
+		if enabled, err := d.cfg.RefreshSafeMode(ctx); err == nil && d.cfg.DispatchSafeMode != nil {
+			d.cfg.DispatchSafeMode.Store(enabled)
 		}
-		return
 	}
-	if !acquired {
+
+	if d.cfg.DispatchSafeMode != nil && d.cfg.DispatchSafeMode.Load() {
 		atomic.StoreUint32(&d.leaseHeld, 0)
 		return
 	}
-	atomic.AddUint64(&d.leaseAcquireSuccess, 1)
-	atomic.StoreUint32(&d.leaseHeld, 1)
-	atomic.StoreInt64(&d.lastLeaseEpoch, epoch)
 
 	deadline := tickStart.Add(d.cfg.DrainMaxDuration)
+	held := 0
+	type claimedShard struct {
+		shard    string
+		leaseKey string
+		epoch    int64
+		disabled bool
+	}
+	heldShards := make([]claimedShard, 0, d.cfg.MaxLeaseShards)
+	for _, shard := range d.dispatchShardsForTick() {
+		if d.cfg.DrainMaxDuration > 0 && time.Now().After(deadline) {
+			break
+		}
+		if held >= d.cfg.MaxLeaseShards {
+			break
+		}
+		leaseKey := d.cfg.LeaseKey
+		if d.cfg.DispatchShardCount > 1 {
+			leaseKey = leaseKey + ":" + shard
+		}
+		atomic.AddUint64(&d.leaseAcquireAttempts, 1)
+		leaseCtx, leaseCancel := context.WithTimeout(ctx, d.leaseAcquireTimeout(deadline))
+		leaseStart := time.Now()
+		acquired, epoch, err := d.store.TryAcquireLease(leaseCtx, leaseKey, d.holder, d.cfg.LeaseTTL)
+		d.leaseAcquireLatency.Observe(float64(time.Since(leaseStart).Milliseconds()))
+		leaseCancel()
+		if err != nil {
+			atomic.AddUint64(&d.leaseAcquireErrors, 1)
+			if isTimeoutErr(err) {
+				atomic.AddUint64(&d.leaseAcquireTimeouts, 1)
+			}
+			if d.logger != nil && d.shouldLog("lease", &d.lastLeaseErrLogAt) {
+				d.logger.WarnContext(ctx, "policy outbox lease acquire failed", utils.ZapError(err), utils.ZapString("dispatch_shard", shard))
+			}
+			continue
+		}
+		if !acquired {
+			continue
+		}
+		held++
+		atomic.AddUint64(&d.leaseAcquireSuccess, 1)
+		atomic.StoreInt64(&d.lastLeaseEpoch, epoch)
+		heldShards = append(heldShards, claimedShard{
+			shard:    shard,
+			leaseKey: leaseKey,
+			epoch:    epoch,
+		})
+	}
+
 	for batch := 0; batch < d.cfg.DrainMaxBatches; batch++ {
 		if d.cfg.DrainMaxDuration > 0 && time.Now().After(deadline) {
-			return
+			break
 		}
-		batchSize := int(atomic.LoadUint64(&d.currentBatchSize))
-		if batchSize <= 0 {
-			batchSize = d.cfg.BatchSize
-		}
-		claimStart := time.Now()
-		rows, err := d.store.ClaimPending(ctx, d.holder, epoch, batchSize, d.cfg.ReclaimAfter)
-		claimMs := float64(time.Since(claimStart).Milliseconds())
-		d.claimLatency.Observe(claimMs)
-		if err != nil {
-			if d.logger != nil && d.shouldLog("claim", &d.lastClaimErrLogAt) {
-				d.logger.WarnContext(ctx, "policy outbox claim failed", utils.ZapError(err))
+		claimedThisRound := 0
+		for i := range heldShards {
+			if heldShards[i].disabled {
+				continue
 			}
-			d.adjustBatchSize(batchSize, 0, claimMs)
-			return
+			if d.cfg.DrainMaxDuration > 0 && time.Now().After(deadline) {
+				break
+			}
+
+			batchSize := int(atomic.LoadUint64(&d.currentBatchSize))
+			if batchSize <= 0 {
+				batchSize = d.cfg.BatchSize
+			}
+			claimStart := time.Now()
+			claimCtx, claimCancel := context.WithTimeout(ctx, d.claimTimeout(deadline))
+			rows, err := d.store.ClaimPending(claimCtx, d.holder, heldShards[i].epoch, batchSize, d.cfg.ReclaimAfter, heldShards[i].leaseKey, heldShards[i].shard, d.cfg.DispatchShardCount, d.cfg.DispatchShardCompat)
+			claimCancel()
+			claimMs := float64(time.Since(claimStart).Milliseconds())
+			d.claimLatency.Observe(claimMs)
+			if err != nil {
+				if isTimeoutErr(err) {
+					atomic.AddUint64(&d.claimTimeouts, 1)
+				}
+				if d.logger != nil && d.shouldLog("claim", &d.lastClaimErrLogAt) {
+					d.logger.WarnContext(ctx, "policy outbox claim failed", utils.ZapError(err), utils.ZapString("dispatch_shard", heldShards[i].shard))
+				}
+				d.adjustBatchSize(batchSize, 0, claimMs)
+				heldShards[i].disabled = true
+				continue
+			}
+			d.adjustBatchSize(batchSize, len(rows), claimMs)
+			if len(rows) == 0 {
+				continue
+			}
+			claimedThisRound += len(rows)
+			atomic.AddUint64(&d.rowsClaimedTotal, uint64(len(rows)))
+			nowMs := time.Now().UnixMilli()
+			for _, row := range rows {
+				if row.CreatedAtMs > 0 {
+					delayMs := nowMs - row.CreatedAtMs
+					if delayMs < 0 {
+						delayMs = 0
+					}
+					d.outboxToClaimLatency.Observe(float64(delayMs))
+				}
+				d.recordStageMarker("t_outbox_claimed", row, nowMs, nil, nil)
+			}
+			d.processBatch(ctx, rows, deadline)
 		}
-		d.adjustBatchSize(batchSize, len(rows), claimMs)
-		if len(rows) == 0 {
-			return
+		if claimedThisRound == 0 {
+			break
 		}
-		atomic.AddUint64(&d.rowsClaimedTotal, uint64(len(rows)))
-		nowMs := time.Now().UnixMilli()
-		for _, row := range rows {
-			d.recordStageMarker("t_outbox_claimed", row, nowMs, nil, nil)
-		}
-		d.processBatch(ctx, rows, deadline)
-		if len(rows) < batchSize {
-			return
-		}
+	}
+
+	if held > 0 {
+		atomic.StoreUint32(&d.leaseHeld, 1)
+	} else {
+		atomic.StoreUint32(&d.leaseHeld, 0)
 	}
 }
 
@@ -316,29 +494,49 @@ func (d *Dispatcher) processBatch(ctx context.Context, rows []Row, deadline time
 	if publishWorkers <= 0 {
 		publishWorkers = 1
 	}
-	markWorkers := d.cfg.MarkWorkers
-	if markWorkers <= 0 {
-		markWorkers = 1
-	}
 	qSize := d.cfg.InternalQueue
 	if qSize <= 0 {
 		qSize = maxInt(64, publishWorkers*4)
 	}
 
 	publishQ := make(chan Row, qSize)
-	markQ := make(chan markTask, qSize)
-	var pubWG sync.WaitGroup
-	var markWG sync.WaitGroup
-
-	for i := 0; i < markWorkers; i++ {
-		markWG.Add(1)
-		go func() {
-			defer markWG.Done()
-			for task := range markQ {
-				d.handleMarkTask(ctx, task, deadline)
-			}
-		}()
+	enqueueMark := func(task markTask) {
+		task.deadline = deadline
+		select {
+		case d.markQ <- task:
+		default:
+			atomic.AddUint64(&d.markQueueWaits, 1)
+			d.markQ <- task
+		}
 	}
+	var localMarkQ chan markTask
+	var localMarkWG sync.WaitGroup
+	if d.markQ == nil {
+		markWorkers := d.cfg.MarkWorkers
+		if markWorkers <= 0 {
+			markWorkers = 1
+		}
+		localMarkQ = make(chan markTask, qSize)
+		for i := 0; i < markWorkers; i++ {
+			localMarkWG.Add(1)
+			go func() {
+				defer localMarkWG.Done()
+				for task := range localMarkQ {
+					d.handleMarkTask(ctx, task, task.deadline)
+				}
+			}()
+		}
+		enqueueMark = func(task markTask) {
+			task.deadline = deadline
+			select {
+			case localMarkQ <- task:
+			default:
+				atomic.AddUint64(&d.markQueueWaits, 1)
+				localMarkQ <- task
+			}
+		}
+	}
+	var pubWG sync.WaitGroup
 
 	for i := 0; i < publishWorkers; i++ {
 		pubWG.Add(1)
@@ -349,12 +547,7 @@ func (d *Dispatcher) processBatch(ctx context.Context, rows []Row, deadline time
 				if !ok {
 					continue
 				}
-				select {
-				case markQ <- task:
-				default:
-					atomic.AddUint64(&d.markQueueWaits, 1)
-					markQ <- task
-				}
+				enqueueMark(task)
 			}
 		}()
 	}
@@ -369,8 +562,10 @@ func (d *Dispatcher) processBatch(ctx context.Context, rows []Row, deadline time
 	}
 	close(publishQ)
 	pubWG.Wait()
-	close(markQ)
-	markWG.Wait()
+	if localMarkQ != nil {
+		close(localMarkQ)
+		localMarkWG.Wait()
+	}
 }
 
 type markTaskType int
@@ -386,6 +581,7 @@ type markTask struct {
 	row         Row
 	partition   int32
 	offset      int64
+	deadline    time.Time
 	publishAck  int64
 	retries     int
 	nextRetryAt time.Time
@@ -557,19 +753,24 @@ func (d *Dispatcher) handleMarkTask(ctx context.Context, task markTask, deadline
 	opCtx := ctx
 	cancel := func() {}
 	if d.cfg.DrainMaxDuration > 0 {
-		opCtx, cancel = context.WithTimeout(ctx, d.timeoutFromDeadline(deadline))
+		opCtx, cancel = context.WithTimeout(ctx, d.markTimeout(deadline))
 	}
 	defer cancel()
 
 	switch task.kind {
 	case markTaskPublished:
 		markStart := time.Now()
-		err := d.store.MarkPublished(opCtx, task.row.ID, d.holder, task.row.LeaseEpoch, d.cfg.PolicyTopic, task.partition, task.offset)
+		markCtx, markCancel := context.WithTimeout(context.Background(), d.markPublishBudget(deadline))
+		err := d.store.MarkPublished(markCtx, task.row.ID, d.holder, task.row.LeaseEpoch, d.leaseKeyForRow(task.row), d.cfg.PolicyTopic, task.partition, task.offset)
+		markCancel()
 		d.markLatency.Observe(float64(time.Since(markStart).Milliseconds()))
 		if err != nil {
 			if strings.Contains(err.Error(), "fenced/no-op") {
 				atomic.AddUint64(&d.fencedFailures, 1)
 				return
+			}
+			if isTimeoutErr(err) {
+				atomic.AddUint64(&d.markTimeouts, 1)
 			}
 			if d.logger != nil && d.shouldLog("mark", &d.lastMarkErrLogAt) {
 				d.logger.WarnContext(ctx, "policy outbox mark published failed",
@@ -655,6 +856,24 @@ func (d *Dispatcher) handleMarkTask(ctx context.Context, task markTask, deadline
 	}
 }
 
+func (d *Dispatcher) leaseKeyForRow(row Row) string {
+	if d == nil {
+		return ""
+	}
+	base := strings.TrimSpace(d.cfg.LeaseKey)
+	if base == "" {
+		base = "control.policy.dispatcher"
+	}
+	if d.cfg.DispatchShardCount <= 1 {
+		return base
+	}
+	shard := strings.TrimSpace(row.DispatchShard)
+	if shard == "" {
+		shard = dispatchShardLabel(0)
+	}
+	return base + ":" + shard
+}
+
 // Stats returns a point-in-time dispatcher metrics snapshot.
 func (d *Dispatcher) Stats() DispatcherStats {
 	if d == nil {
@@ -662,11 +881,13 @@ func (d *Dispatcher) Stats() DispatcherStats {
 	}
 	pubBuckets, pubCount, pubSumMs := d.publishLatency.Snapshot()
 	claimBuckets, claimCount, claimSumMs := d.claimLatency.Snapshot()
+	leaseBuckets, leaseCount, leaseSumMs := d.leaseAcquireLatency.Snapshot()
 	markBuckets, markCount, markSumMs := d.markLatency.Snapshot()
 	tickBuckets, tickCount, tickSumMs := d.tickLatency.Snapshot()
 	aiPubBuckets, aiPubCount, aiPubSumMs := d.aiToPublishLatency.Snapshot()
 	sourcePubBuckets, sourcePubCount, sourcePubSumMs := d.sourceToPublish.Snapshot()
 	commitPubBuckets, commitPubCount, commitPubSumMs := d.commitToPublish.Snapshot()
+	outboxClaimBuckets, outboxClaimCount, outboxClaimSumMs := d.outboxToClaimLatency.Snapshot()
 	d.scopeMu.Lock()
 	scopeTotals := make(map[string]uint64, len(d.publishScopeTotals))
 	for key, count := range d.publishScopeTotals {
@@ -685,63 +906,81 @@ func (d *Dispatcher) Stats() DispatcherStats {
 	for key, count := range d.publishPartitions {
 		partitionTotals[key] = count
 	}
+	timeoutCauseTotals := map[string]uint64{
+		"lease_acquire_timeout": atomic.LoadUint64(&d.leaseAcquireTimeouts),
+		"claim_timeout":         atomic.LoadUint64(&d.claimTimeouts),
+		"mark_timeout":          atomic.LoadUint64(&d.markTimeouts),
+	}
 	d.scopeMu.Unlock()
 	return DispatcherStats{
-		LeaseAcquireAttempts:       atomic.LoadUint64(&d.leaseAcquireAttempts),
-		LeaseAcquireSuccesses:      atomic.LoadUint64(&d.leaseAcquireSuccess),
-		LeaseAcquireErrors:         atomic.LoadUint64(&d.leaseAcquireErrors),
-		LeaseHeld:                  atomic.LoadUint32(&d.leaseHeld) == 1,
-		LastLeaseEpoch:             atomic.LoadInt64(&d.lastLeaseEpoch),
-		TicksTotal:                 atomic.LoadUint64(&d.ticksTotal),
-		RowsClaimedTotal:           atomic.LoadUint64(&d.rowsClaimedTotal),
-		CurrentBatchSize:           int(atomic.LoadUint64(&d.currentBatchSize)),
-		BatchScaleUpTotal:          atomic.LoadUint64(&d.batchScaleUpTotal),
-		BatchScaleDownTotal:        atomic.LoadUint64(&d.batchScaleDownTotal),
-		PublishQueueWaits:          atomic.LoadUint64(&d.publishQueueWaits),
-		MarkQueueWaits:             atomic.LoadUint64(&d.markQueueWaits),
-		PublishedTotal:             atomic.LoadUint64(&d.publishedTotal),
-		RetryTotal:                 atomic.LoadUint64(&d.retryTotal),
-		TerminalFailedTotal:        atomic.LoadUint64(&d.terminalTotal),
-		FencedUpdateFailures:       atomic.LoadUint64(&d.fencedFailures),
-		ThrottledLogsTotal:         atomic.LoadUint64(&d.throttledLogs),
-		PublishLatencyBuckets:      pubBuckets,
-		PublishLatencyCount:        pubCount,
-		PublishLatencySumMs:        pubSumMs,
-		PublishLatencyP95Ms:        d.publishLatency.Quantile(0.95),
-		ClaimLatencyBuckets:        claimBuckets,
-		ClaimLatencyCount:          claimCount,
-		ClaimLatencySumMs:          claimSumMs,
-		ClaimLatencyP95Ms:          d.claimLatency.Quantile(0.95),
-		MarkLatencyBuckets:         markBuckets,
-		MarkLatencyCount:           markCount,
-		MarkLatencySumMs:           markSumMs,
-		MarkLatencyP95Ms:           d.markLatency.Quantile(0.95),
-		TickLatencyBuckets:         tickBuckets,
-		TickLatencyCount:           tickCount,
-		TickLatencySumMs:           tickSumMs,
-		TickLatencyP95Ms:           d.tickLatency.Quantile(0.95),
-		AIToPublishBuckets:         aiPubBuckets,
-		AIToPublishCount:           aiPubCount,
-		AIToPublishSumMs:           aiPubSumMs,
-		AIToPublishP95Ms:           d.aiToPublishLatency.Quantile(0.95),
-		SourceToPublishBuckets:     sourcePubBuckets,
-		SourceToPublishCount:       sourcePubCount,
-		SourceToPublishSumMs:       sourcePubSumMs,
-		SourceToPublishP95Ms:       d.sourceToPublish.Quantile(0.95),
-		CommitToPublishBuckets:     commitPubBuckets,
-		CommitToPublishCount:       commitPubCount,
-		CommitToPublishSumMs:       commitPubSumMs,
-		CommitToPublishP95Ms:       d.commitToPublish.Quantile(0.95),
-		SkewCorrectionsTotal:       atomic.LoadUint64(&d.skewCorrections),
-		AIEventUnitCorrections:     atomic.LoadUint64(&d.aiEventUnitFixes),
-		AIEventInvalidTotal:        atomic.LoadUint64(&d.aiEventInvalid),
-		SourceEventUnitCorrections: atomic.LoadUint64(&d.sourceEventUnitFixes),
-		SourceEventInvalidTotal:    atomic.LoadUint64(&d.sourceEventInvalid),
-		PublishScopeResultTotals:   scopeTotals,
-		PublishScopeRouteTotals:    scopeRouteTotals,
-		PublishScopeFallbacks:      scopeFallbacks,
-		PublishResultTotals:        resultTotals,
-		PublishPartitionTotals:     partitionTotals,
+		LeaseAcquireAttempts:          atomic.LoadUint64(&d.leaseAcquireAttempts),
+		LeaseAcquireSuccesses:         atomic.LoadUint64(&d.leaseAcquireSuccess),
+		LeaseAcquireErrors:            atomic.LoadUint64(&d.leaseAcquireErrors),
+		LeaseAcquireTimeouts:          atomic.LoadUint64(&d.leaseAcquireTimeouts),
+		LeaseHeld:                     atomic.LoadUint32(&d.leaseHeld) == 1,
+		LastLeaseEpoch:                atomic.LoadInt64(&d.lastLeaseEpoch),
+		TicksTotal:                    atomic.LoadUint64(&d.ticksTotal),
+		WakeSignalsTotal:              atomic.LoadUint64(&d.wakeSignals),
+		RowsClaimedTotal:              atomic.LoadUint64(&d.rowsClaimedTotal),
+		CurrentBatchSize:              int(atomic.LoadUint64(&d.currentBatchSize)),
+		BatchScaleUpTotal:             atomic.LoadUint64(&d.batchScaleUpTotal),
+		BatchScaleDownTotal:           atomic.LoadUint64(&d.batchScaleDownTotal),
+		PublishQueueWaits:             atomic.LoadUint64(&d.publishQueueWaits),
+		MarkQueueWaits:                atomic.LoadUint64(&d.markQueueWaits),
+		PublishedTotal:                atomic.LoadUint64(&d.publishedTotal),
+		RetryTotal:                    atomic.LoadUint64(&d.retryTotal),
+		TerminalFailedTotal:           atomic.LoadUint64(&d.terminalTotal),
+		FencedUpdateFailures:          atomic.LoadUint64(&d.fencedFailures),
+		ThrottledLogsTotal:            atomic.LoadUint64(&d.throttledLogs),
+		PublishLatencyBuckets:         pubBuckets,
+		PublishLatencyCount:           pubCount,
+		PublishLatencySumMs:           pubSumMs,
+		PublishLatencyP95Ms:           d.publishLatency.Quantile(0.95),
+		ClaimLatencyBuckets:           claimBuckets,
+		ClaimLatencyCount:             claimCount,
+		ClaimLatencySumMs:             claimSumMs,
+		ClaimLatencyP95Ms:             d.claimLatency.Quantile(0.95),
+		ClaimTimeouts:                 atomic.LoadUint64(&d.claimTimeouts),
+		LeaseAcquireLatencyBuckets:    leaseBuckets,
+		LeaseAcquireLatencyCount:      leaseCount,
+		LeaseAcquireLatencySumMs:      leaseSumMs,
+		LeaseAcquireLatencyP95Ms:      d.leaseAcquireLatency.Quantile(0.95),
+		MarkLatencyBuckets:            markBuckets,
+		MarkLatencyCount:              markCount,
+		MarkLatencySumMs:              markSumMs,
+		MarkLatencyP95Ms:              d.markLatency.Quantile(0.95),
+		MarkTimeouts:                  atomic.LoadUint64(&d.markTimeouts),
+		TickLatencyBuckets:            tickBuckets,
+		TickLatencyCount:              tickCount,
+		TickLatencySumMs:              tickSumMs,
+		TickLatencyP95Ms:              d.tickLatency.Quantile(0.95),
+		AIToPublishBuckets:            aiPubBuckets,
+		AIToPublishCount:              aiPubCount,
+		AIToPublishSumMs:              aiPubSumMs,
+		AIToPublishP95Ms:              d.aiToPublishLatency.Quantile(0.95),
+		SourceToPublishBuckets:        sourcePubBuckets,
+		SourceToPublishCount:          sourcePubCount,
+		SourceToPublishSumMs:          sourcePubSumMs,
+		SourceToPublishP95Ms:          d.sourceToPublish.Quantile(0.95),
+		CommitToPublishBuckets:        commitPubBuckets,
+		CommitToPublishCount:          commitPubCount,
+		CommitToPublishSumMs:          commitPubSumMs,
+		CommitToPublishP95Ms:          d.commitToPublish.Quantile(0.95),
+		OutboxCreatedToClaimedBuckets: outboxClaimBuckets,
+		OutboxCreatedToClaimedCount:   outboxClaimCount,
+		OutboxCreatedToClaimedSumMs:   outboxClaimSumMs,
+		OutboxCreatedToClaimedP95Ms:   d.outboxToClaimLatency.Quantile(0.95),
+		SkewCorrectionsTotal:          atomic.LoadUint64(&d.skewCorrections),
+		AIEventUnitCorrections:        atomic.LoadUint64(&d.aiEventUnitFixes),
+		AIEventInvalidTotal:           atomic.LoadUint64(&d.aiEventInvalid),
+		SourceEventUnitCorrections:    atomic.LoadUint64(&d.sourceEventUnitFixes),
+		SourceEventInvalidTotal:       atomic.LoadUint64(&d.sourceEventInvalid),
+		PublishScopeResultTotals:      scopeTotals,
+		PublishScopeRouteTotals:       scopeRouteTotals,
+		PublishScopeFallbacks:         scopeFallbacks,
+		PublishResultTotals:           resultTotals,
+		PublishPartitionTotals:        partitionTotals,
+		TimeoutCauseTotals:            timeoutCauseTotals,
 	}
 }
 
@@ -802,6 +1041,140 @@ func (d *Dispatcher) timeoutFromDeadline(deadline time.Time) time.Duration {
 	return remaining
 }
 
+func (d *Dispatcher) leaseAcquireTimeout(deadline time.Time) time.Duration {
+	timeout := d.phaseBudget(
+		d.cfg.LeaseAcquireTimeout,
+		d.leaseAcquireLatency.Quantile(0.95),
+		300*time.Millisecond,
+		8*time.Second,
+		100*time.Millisecond,
+		deadline,
+	)
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	if deadline.IsZero() {
+		return timeout
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return minDurationBound(timeout, 250*time.Millisecond)
+	}
+	return minDurationBound(timeout, remaining)
+}
+
+func (d *Dispatcher) claimTimeout(deadline time.Time) time.Duration {
+	timeout := d.phaseBudget(
+		d.cfg.ClaimTimeout,
+		d.claimLatency.Quantile(0.95),
+		400*time.Millisecond,
+		8*time.Second,
+		150*time.Millisecond,
+		deadline,
+	)
+	if timeout <= 0 {
+		timeout = 3 * time.Second
+	}
+	if deadline.IsZero() {
+		return timeout
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return minDurationBound(timeout, 250*time.Millisecond)
+	}
+	return minDurationBound(timeout, remaining)
+}
+
+func (d *Dispatcher) markTimeout(deadline time.Time) time.Duration {
+	timeout := d.phaseBudget(
+		8*time.Second,
+		d.markLatency.Quantile(0.95),
+		3*time.Second,
+		30*time.Second,
+		250*time.Millisecond,
+		deadline,
+	)
+	// Marking publish/terminal state is the durable completion edge. Give it a
+	// small minimum budget so a near-expired tick deadline does not strand rows
+	// in publishing after Kafka already accepted the payload.
+	if timeout < 8*time.Second {
+		timeout = 8 * time.Second
+	}
+	if timeout > 30*time.Second {
+		timeout = 30 * time.Second
+	}
+	return timeout
+}
+
+func (d *Dispatcher) markPublishBudget(deadline time.Time) time.Duration {
+	budget := d.phaseBudget(
+		30*time.Second,
+		d.markLatency.Quantile(0.95),
+		10*time.Second,
+		60*time.Second,
+		500*time.Millisecond,
+		deadline,
+	)
+	// Publish->mark is the durable completion edge; keep a larger independent
+	// budget so tick cancellation does not strand rows after Kafka ack.
+	if budget < 30*time.Second {
+		budget = 30 * time.Second
+	}
+	if budget > 60*time.Second {
+		budget = 60 * time.Second
+	}
+	return budget
+}
+
+func (d *Dispatcher) phaseBudget(base time.Duration, p95Ms float64, minBudget time.Duration, maxBudget time.Duration, reserve time.Duration, deadline time.Time) time.Duration {
+	if base <= 0 {
+		base = minBudget
+	}
+	target := base
+	if p95Ms > 0 && !math.IsNaN(p95Ms) && !math.IsInf(p95Ms, 0) {
+		// Keep ~1.5x p95 + fixed headroom for jitter/conflicts.
+		adaptive := time.Duration((p95Ms*1.5)+100) * time.Millisecond
+		if adaptive > target {
+			target = adaptive
+		}
+	}
+	if target < minBudget {
+		target = minBudget
+	}
+	if maxBudget > 0 && target > maxBudget {
+		target = maxBudget
+	}
+	if !deadline.IsZero() {
+		remaining := time.Until(deadline) - reserve
+		if remaining <= 0 {
+			remaining = minBudget
+		}
+		if target > remaining {
+			target = remaining
+		}
+	}
+	if target < minBudget {
+		target = minBudget
+	}
+	if maxBudget > 0 && target > maxBudget {
+		target = maxBudget
+	}
+	return target
+}
+
+func isTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "deadline exceeded") ||
+		strings.Contains(msg, "context canceled") ||
+		strings.Contains(msg, "timeout")
+}
+
 func (d *Dispatcher) adjustBatchSize(current, claimed int, claimMs float64) {
 	if !d.cfg.AdaptiveBatch {
 		return
@@ -853,8 +1226,66 @@ func maxInt(a, b int) int {
 	return b
 }
 
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func (d *Dispatcher) dispatchShardsForTick() []string {
+	count := d.cfg.DispatchShardCount
+	if count <= 1 {
+		return []string{dispatchShardLabel(0)}
+	}
+	start := 0
+	if count > 0 {
+		start = int(atomic.LoadUint64(&d.ticksTotal) % uint64(count))
+	}
+	shards := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		shard := (start + i) % count
+		shards = append(shards, dispatchShardLabel(shard))
+	}
+	if d.cfg.DispatchOwnerCount > 1 {
+		owned := make([]string, 0, len(shards))
+		for _, shard := range shards {
+			idx := parseDispatchShardIndex(shard)
+			if idx < 0 {
+				continue
+			}
+			if idx%d.cfg.DispatchOwnerCount == d.cfg.DispatchOwnerIndex {
+				owned = append(owned, shard)
+			}
+		}
+		if len(owned) > 0 {
+			return owned
+		}
+	}
+	return shards
+}
+
+func parseDispatchShardIndex(shard string) int {
+	shard = strings.TrimSpace(shard)
+	if !strings.HasPrefix(shard, "shard:") {
+		return -1
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(shard, "shard:")))
+	if err != nil || n < 0 {
+		return -1
+	}
+	return n
+}
+
 func maxDuration(a, b time.Duration) time.Duration {
 	if a > b {
+		return a
+	}
+	return b
+}
+
+func minDurationBound(a, b time.Duration) time.Duration {
+	if a < b {
 		return a
 	}
 	return b

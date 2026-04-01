@@ -6,13 +6,13 @@ enabling acceptance rate calibration and false positive analysis.
 """
 
 import time
-import uuid
 import math
 from enum import Enum
 from typing import Dict, List, Optional, Any, Tuple, Iterable
 from dataclasses import dataclass
 
 from ..utils.errors import ValidationError, StorageError
+from ..utils.validators import validate_uuid, validate_uuid4
 from ..config.settings import FeedbackConfig
 from .storage import RedisStorage
 import logging
@@ -74,7 +74,10 @@ class AnomalyLifecycle:
     block_height: Optional[int] = None
     signature: Optional[str] = None
     policy_id: Optional[str] = None
+    policy_mitigation_id: Optional[str] = None
     policy_dispatched_at: Optional[float] = None
+    policy_dispatch_mode: Optional[str] = None
+    policy_handoff_state: Optional[str] = None
     policy_ttl_seconds: Optional[int] = None
     policy_requires_ack: Optional[bool] = None
     policy_fast_path: Optional[bool] = None
@@ -182,7 +185,7 @@ class AnomalyLifecycleTracker:
         timestamp = timestamp or time.time()
         
         # Validation
-        self._validate_uuid(anomaly_id)
+        self._validate_anomaly_uuid(anomaly_id)
         self._validate_timestamp(timestamp)
         self._validate_confidence(confidence)
         self._validate_severity(severity)
@@ -280,7 +283,7 @@ class AnomalyLifecycleTracker:
         """
         timestamp = timestamp or time.time()
         
-        self._validate_uuid(anomaly_id)
+        self._validate_anomaly_uuid(anomaly_id)
         self._validate_timestamp(timestamp)
         self._check_rate_limit(anomaly_id)
         
@@ -296,6 +299,8 @@ class AnomalyLifecycleTracker:
         anomaly_id: str,
         policy_id: str,
         *,
+        mitigation_id: Optional[str] = None,
+        dispatch_mode: Optional[str] = None,
         ttl_seconds: Optional[int] = None,
         requires_ack: Optional[bool] = None,
         fast_path: Optional[bool] = None,
@@ -305,8 +310,8 @@ class AnomalyLifecycleTracker:
 
         timestamp = timestamp or time.time()
 
-        self._validate_uuid(anomaly_id)
-        self._validate_uuid(policy_id)
+        self._validate_anomaly_uuid(anomaly_id)
+        self._validate_policy_uuid(policy_id)
         self._validate_timestamp(timestamp)
 
         if not self._anomaly_exists(anomaly_id):
@@ -318,6 +323,15 @@ class AnomalyLifecycleTracker:
             "policy_id": policy_id,
             "policy_dispatched_at": str(timestamp),
         }
+
+        if mitigation_id:
+            self._validate_policy_uuid(mitigation_id)
+            updates["policy_mitigation_id"] = mitigation_id
+
+        if dispatch_mode:
+            updates["policy_dispatch_mode"] = str(dispatch_mode)
+        if fast_path:
+            updates["policy_handoff_state"] = "provisional"
 
         if ttl_seconds is not None and ttl_seconds > 0:
             updates["policy_ttl_seconds"] = str(int(ttl_seconds))
@@ -345,7 +359,7 @@ class AnomalyLifecycleTracker:
     def resolve_anomaly_for_policy(self, policy_id: str) -> Optional[str]:
         """Resolve anomaly id associated with a policy."""
 
-        self._validate_uuid(policy_id)
+        self._validate_policy_uuid(policy_id)
         try:
             anomaly_id = self.storage._client.get(self._policy_index_key(policy_id))
             if anomaly_id:
@@ -367,7 +381,7 @@ class AnomalyLifecycleTracker:
     ) -> Optional[str]:
         """Persist enforcement acknowledgement and return associated anomaly id."""
 
-        self._validate_uuid(policy_id)
+        self._validate_policy_uuid(policy_id)
 
         anomaly_id = self.resolve_anomaly_for_policy(policy_id)
         if not anomaly_id:
@@ -388,6 +402,9 @@ class AnomalyLifecycleTracker:
 
         if reason is not None:
             updates["policy_ack_reason"] = reason
+            handoff_state = self._handoff_state_from_ack_reason(reason)
+            if handoff_state is not None:
+                updates["policy_handoff_state"] = handoff_state
 
         if error_code is not None:
             updates["policy_ack_error_code"] = error_code
@@ -453,7 +470,7 @@ class AnomalyLifecycleTracker:
                     raw_score_val = float(raw_score)
 
                 anomaly_id_str = str(anomaly_id)
-                self._validate_uuid(anomaly_id_str)
+                self._validate_anomaly_uuid(anomaly_id_str)
                 self._validate_timestamp(timestamp)
                 self._validate_confidence(confidence_val)
                 self._validate_severity(severity_val)
@@ -558,7 +575,7 @@ class AnomalyLifecycleTracker:
         """
         timestamp = timestamp or time.time()
         
-        self._validate_uuid(anomaly_id)
+        self._validate_anomaly_uuid(anomaly_id)
         self._validate_timestamp(timestamp)
         self._check_rate_limit(anomaly_id)
         
@@ -597,7 +614,7 @@ class AnomalyLifecycleTracker:
         """
         timestamp = timestamp or time.time()
         
-        self._validate_uuid(anomaly_id)
+        self._validate_anomaly_uuid(anomaly_id)
         self._validate_timestamp(timestamp)
         self._check_rate_limit(anomaly_id)
         
@@ -638,7 +655,7 @@ class AnomalyLifecycleTracker:
         """
         timestamp = timestamp or time.time()
         
-        self._validate_uuid(anomaly_id)
+        self._validate_anomaly_uuid(anomaly_id)
         self._validate_timestamp(timestamp)
         self._check_rate_limit(anomaly_id)
         
@@ -676,7 +693,7 @@ class AnomalyLifecycleTracker:
         """
         timestamp = timestamp or time.time()
         
-        self._validate_uuid(anomaly_id)
+        self._validate_anomaly_uuid(anomaly_id)
         self._validate_timestamp(timestamp)
         self._check_rate_limit(anomaly_id)
         
@@ -708,7 +725,7 @@ class AnomalyLifecycleTracker:
         """
         timestamp = timestamp or time.time()
         
-        self._validate_uuid(anomaly_id)
+        self._validate_anomaly_uuid(anomaly_id)
         self._validate_timestamp(timestamp)
         self._check_rate_limit(anomaly_id)
         
@@ -729,7 +746,7 @@ class AnomalyLifecycleTracker:
         Returns:
             AnomalyLifecycle object or None if not found
         """
-        self._validate_uuid(anomaly_id)
+        self._validate_anomaly_uuid(anomaly_id)
         
         key = self._lifecycle_key(anomaly_id)
         data = self.storage._client.hgetall(key)
@@ -755,7 +772,10 @@ class AnomalyLifecycleTracker:
             block_height=int(data.get("block_height", 0)) or None,
             signature=data.get("signature"),
             policy_id=data.get("policy_id"),
+            policy_mitigation_id=data.get("policy_mitigation_id"),
             policy_dispatched_at=self._parse_optional_float(data.get("policy_dispatched_at")),
+            policy_dispatch_mode=data.get("policy_dispatch_mode"),
+            policy_handoff_state=data.get("policy_handoff_state"),
             policy_ttl_seconds=self._parse_optional_int(data.get("policy_ttl_seconds")),
             policy_requires_ack=self._parse_optional_bool(data.get("policy_requires_ack")),
             policy_fast_path=self._parse_optional_bool(data.get("policy_fast_path")),
@@ -1029,14 +1049,13 @@ class AnomalyLifecycleTracker:
         
         return counts
     
-    def _validate_uuid(self, anomaly_id: str):
-        """Validate UUID v4 format."""
-        try:
-            parsed = uuid.UUID(anomaly_id, version=4)
-            if str(parsed) != anomaly_id:
-                raise ValidationError(f"Invalid UUID v4: {anomaly_id}")
-        except (ValueError, AttributeError) as e:
-            raise ValidationError(f"Invalid UUID v4: {anomaly_id}") from e
+    def _validate_anomaly_uuid(self, anomaly_id: str):
+        """Validate anomaly identifier as UUIDv4."""
+        validate_uuid4(anomaly_id, "Anomaly ID")
+
+    def _validate_policy_uuid(self, policy_id: str):
+        """Validate policy identifier as a generic UUID."""
+        validate_uuid(policy_id, "Policy ID")
     
     def _validate_timestamp(self, timestamp: float):
         """Validate timestamp within clock skew tolerance."""
@@ -1114,6 +1133,19 @@ class AnomalyLifecycleTracker:
     def _policy_index_key(self, policy_id: str) -> str:
         """Get Redis key for policy-to-anomaly mapping."""
         return f"anomaly:policy-index:{policy_id}"
+
+    @staticmethod
+    def _handoff_state_from_ack_reason(reason: str) -> Optional[str]:
+        token = str(reason or "").strip().lower()
+        if token == "":
+            return None
+        if token.startswith("applied_provisional"):
+            return "provisional"
+        if token.startswith("applied_promoted"):
+            return "promoted"
+        if token == "provisional_revoked":
+            return "revoked"
+        return None
 
     @staticmethod
     def _parse_optional_float(value) -> Optional[float]:

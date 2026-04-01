@@ -41,6 +41,11 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 	// Since OnQC advances height before onCommit is called, we must check
 	// block.Height against lastCommitted+1 from storage, not currentHeight.
 	if err := s.validateBlock(b); err != nil {
+		if errors.Is(err, errAlreadyCommittedBlock) {
+			s.log.InfoContext(ctx, "skipping duplicate already-committed block callback",
+				utils.ZapUint64("height", b.GetHeight()))
+			return nil
+		}
 		s.metrics.IncrementValidationFailures()
 		s.log.ErrorContext(ctx, "block validation failed", utils.ZapError(err))
 		return fmt.Errorf("block validation failed: %w", err)
@@ -141,9 +146,17 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 	}
 	qcTsMs := int64(0)
 	qcView := uint64(0)
+	var qcData []byte
 	if qc != nil {
 		qcTsMs = qc.GetTimestamp().UnixMilli()
 		qcView = qc.GetView()
+		var encodeErr error
+		qcData, encodeErr = encodeCommittedQC(qc)
+		if encodeErr != nil {
+			s.log.Warn("failed to encode committed QC metadata",
+				utils.ZapUint64("height", ab.GetHeight()),
+				utils.ZapError(encodeErr))
+		}
 	}
 	s.logPolicyStageForBlock("t_qc_formed", ab, qcView, ab.GetHeight(), qcTsMs)
 	s.logPolicyStageForBlock("t_commit", ab, qcView, ab.GetHeight(), qcTsMs)
@@ -168,6 +181,7 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 			Block:     ab,
 			Receipts:  receipts,
 			StateRoot: root,
+			QCData:    qcData,
 			Attempt:   0,
 		}
 		decision := s.persistWriterDecisionForBlock(ab)
@@ -370,7 +384,7 @@ func (s *Service) persistWriterDecisionForBlock(ab *block.AppBlock) persistWrite
 	return decidePersistFromCommit(s.persistCommitProposerOnly, status.NodeID, ab.Proposer())
 }
 
-func (s *Service) persistCommittedMetadataOnly(ctx context.Context, ab *block.AppBlock) error {
+func (s *Service) persistCommittedMetadataOnly(ctx context.Context, ab *block.AppBlock, qc ctypes.QC) error {
 	if s == nil || ab == nil || s.persistWorker == nil {
 		return nil
 	}
@@ -381,10 +395,14 @@ func (s *Service) persistCommittedMetadataOnly(ctx context.Context, ab *block.Ap
 	}
 
 	bh := ab.GetHash()
+	qcData, err := encodeCommittedQC(qc)
+	if err != nil {
+		return fmt.Errorf("encode committed qc metadata: %w", err)
+	}
 	metaCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	if err := adapter.SaveCommittedBlock(metaCtx, ab.GetHeight(), bh[:], nil); err != nil {
+	if err := adapter.SaveCommittedBlock(metaCtx, ab.GetHeight(), bh[:], qcData); err != nil {
 		return fmt.Errorf("save committed block metadata: %w", err)
 	}
 	return nil

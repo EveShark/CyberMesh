@@ -10,6 +10,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ManifestName = ".kubectl-cybermesh-install.json"
+$ScriptRoot = if ($PSScriptRoot) {
+    $PSScriptRoot
+} elseif ($PSCommandPath) {
+    Split-Path -Parent $PSCommandPath
+} else {
+    (Get-Location).Path
+}
 
 function Write-Step {
     param([string]$Message)
@@ -30,8 +37,7 @@ function Resolve-SourceBinary {
         return (Resolve-Path -LiteralPath $RequestedPath).Path
     }
 
-    $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-    $repoBinary = Join-Path (Split-Path -Parent (Split-Path -Parent $scriptRoot)) "bin\kubectl-cybermesh.exe"
+    $repoBinary = Join-Path (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $ScriptRoot))) "bin\kubectl-cybermesh.exe"
     if (Test-Path -LiteralPath $repoBinary) {
         return (Resolve-Path -LiteralPath $repoBinary).Path
     }

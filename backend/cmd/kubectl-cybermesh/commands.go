@@ -26,8 +26,14 @@ type commandRunner struct {
 }
 
 var (
-	buildCommit = "dev"
-	buildTime   = "unknown"
+	buildCommit       = "dev"
+	buildTime         = "unknown"
+	promptInputReader = func() io.Reader { return os.Stdin }
+	promptInputTTY    = func() bool { return isTerminalFile(os.Stdin) }
+	promptOutputTTY   = func(w io.Writer) bool {
+		file, ok := w.(*os.File)
+		return ok && isTerminalFile(file)
+	}
 )
 
 type interactiveMode string
@@ -116,46 +122,11 @@ type policyAcksResult struct {
 }
 
 type outboxListResponse struct {
-	Rows []struct {
-		ID              string `json:"id"`
-		PolicyID        string `json:"policy_id"`
-		RequestID       string `json:"request_id,omitempty"`
-		CommandID       string `json:"command_id,omitempty"`
-		WorkflowID      string `json:"workflow_id,omitempty"`
-		AnomalyID       string `json:"anomaly_id,omitempty"`
-		FlowID          string `json:"flow_id,omitempty"`
-		SourceID        string `json:"source_id,omitempty"`
-		SourceType      string `json:"source_type,omitempty"`
-		SensorID        string `json:"sensor_id,omitempty"`
-		ValidatorID     string `json:"validator_id,omitempty"`
-		ScopeIdentifier string `json:"scope_identifier,omitempty"`
-		TraceID         string `json:"trace_id,omitempty"`
-		SourceEventID   string `json:"source_event_id,omitempty"`
-		SentinelEventID string `json:"sentinel_event_id,omitempty"`
-		Status          string `json:"status"`
-		CreatedAt       int64  `json:"created_at"`
-		AckedAt         int64  `json:"acked_at,omitempty"`
-		AckResult       string `json:"ack_result,omitempty"`
-	} `json:"rows"`
+	Rows []outboxRow `json:"rows"`
 }
 
 type ackListResponse struct {
-	Rows []struct {
-		PolicyID           string `json:"policy_id"`
-		AckEventID         string `json:"ack_event_id,omitempty"`
-		RequestID          string `json:"request_id,omitempty"`
-		CommandID          string `json:"command_id,omitempty"`
-		WorkflowID         string `json:"workflow_id,omitempty"`
-		ControllerInstance string `json:"controller_instance,omitempty"`
-		ScopeIdentifier    string `json:"scope_identifier,omitempty"`
-		Result             string `json:"result,omitempty"`
-		Reason             string `json:"reason,omitempty"`
-		QCReference        string `json:"qc_reference,omitempty"`
-		TraceID            string `json:"trace_id,omitempty"`
-		SourceEventID      string `json:"source_event_id,omitempty"`
-		SentinelEventID    string `json:"sentinel_event_id,omitempty"`
-		ObservedAt         int64  `json:"observed_at"`
-	} `json:"rows"`
+	Rows []ackRow `json:"rows"`
 }
 
 type validatorListResponse struct {
@@ -424,18 +395,18 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if len(remaining) == 0 {
-		return usageError()
-	}
-	if hasHelpArg(remaining) {
-		_, err := fmt.Fprintln(stdout, helpTextForArgs(remaining))
-		return err
-	}
 	client, err := newAPIClient(cfg)
 	if err != nil {
 		return enhanceOperatorError(err)
 	}
 	runner := &commandRunner{client: client, cfg: cfg, out: stdout, errOut: stderr}
+	if len(remaining) == 0 {
+		return enhanceOperatorError(runner.runLanding(ctx))
+	}
+	if hasHelpArg(remaining) {
+		_, err := fmt.Fprintln(stdout, helpTextForArgs(remaining))
+		return err
+	}
 	return enhanceOperatorError(runner.run(ctx, remaining))
 }
 
@@ -803,16 +774,25 @@ func (r *commandRunner) runPolicyMutation(ctx context.Context, action string, ar
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
-	if *reasonCode == "" || *reasonText == "" {
+	if !*yes {
+		return fmt.Errorf("policy %s requires --yes", action)
+	}
+	draft := actionDraft{
+		Action:         action,
+		ReasonCode:     strings.TrimSpace(*reasonCode),
+		ReasonText:     strings.TrimSpace(*reasonText),
+		Classification: strings.TrimSpace(*classification),
+	}
+	if err := r.fillMutationDraft(fmt.Sprintf("policy %s", action), policyID, &draft, true); err != nil {
+		return err
+	}
+	if draft.ReasonCode == "" || draft.ReasonText == "" {
 		return fmt.Errorf("--reason-code and --reason-text are required")
 	}
 	if strings.TrimSpace(*workflowID) != "" {
 		if err := requireNonEmpty("workflow_id", *workflowID); err != nil {
 			return err
 		}
-	}
-	if !*yes {
-		return fmt.Errorf("policy %s requires --yes", action)
 	}
 	if err := r.confirmDestructiveAction(fmt.Sprintf("policy %s", action), policyID); err != nil {
 		return err
@@ -827,11 +807,11 @@ func (r *commandRunner) runPolicyMutation(ctx context.Context, action string, ar
 		headers[headerWorkflowID] = strings.TrimSpace(*workflowID)
 	}
 	body := map[string]any{
-		"reason_code": *reasonCode,
-		"reason_text": *reasonText,
+		"reason_code": draft.ReasonCode,
+		"reason_text": draft.ReasonText,
 	}
-	if strings.TrimSpace(*classification) != "" {
-		body["classification"] = *classification
+	if strings.TrimSpace(draft.Classification) != "" {
+		body["classification"] = draft.Classification
 	}
 	if strings.TrimSpace(*workflowID) != "" {
 		body["workflow_id"] = *workflowID
@@ -848,7 +828,7 @@ func (r *commandRunner) runPolicyMutation(ctx context.Context, action string, ar
 	if r.cfg.Output == "json" {
 		return writeJSON(r.out, resp)
 	}
-	return r.renderMutationResult(resp)
+	return r.renderRevokeResult(resp)
 }
 
 func (r *commandRunner) runWorkflows(ctx context.Context, args []string) error {
@@ -920,11 +900,20 @@ func (r *commandRunner) runWorkflows(ctx context.Context, args []string) error {
 		if err := fs.Parse(args[2:]); err != nil {
 			return err
 		}
-		if *reasonCode == "" || *reasonText == "" {
-			return fmt.Errorf("--reason-code and --reason-text are required")
-		}
 		if !*yes {
 			return fmt.Errorf("workflow rollback requires --yes")
+		}
+		draft := actionDraft{
+			Action:         "rollback",
+			ReasonCode:     strings.TrimSpace(*reasonCode),
+			ReasonText:     strings.TrimSpace(*reasonText),
+			Classification: strings.TrimSpace(*classification),
+		}
+		if err := r.fillMutationDraft("workflow rollback", workflowID, &draft, true); err != nil {
+			return err
+		}
+		if draft.ReasonCode == "" || draft.ReasonText == "" {
+			return fmt.Errorf("--reason-code and --reason-text are required")
 		}
 		if err := r.confirmDestructiveAction("workflow rollback", workflowID); err != nil {
 			return err
@@ -933,11 +922,11 @@ func (r *commandRunner) runWorkflows(ctx context.Context, args []string) error {
 		idemKey := newRequestID()
 		body := map[string]any{
 			"workflow_id": workflowID,
-			"reason_code": *reasonCode,
-			"reason_text": *reasonText,
+			"reason_code": draft.ReasonCode,
+			"reason_text": draft.ReasonText,
 		}
-		if strings.TrimSpace(*classification) != "" {
-			body["classification"] = *classification
+		if strings.TrimSpace(draft.Classification) != "" {
+			body["classification"] = draft.Classification
 		}
 		var resp workflowRollbackResult
 		if err := r.client.do(ctx, requestOptions{
@@ -1083,11 +1072,23 @@ func (r *commandRunner) runKillSwitch(ctx context.Context, args []string) error 
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
-	if *reasonCode == "" || *reasonText == "" {
-		return fmt.Errorf("--reason-code and --reason-text are required")
-	}
 	if !*yes {
 		return fmt.Errorf("kill-switch mutation requires --yes")
+	}
+	if *reasonCode == "" || *reasonText == "" {
+		draft := actionDraft{
+			Action:     "kill-switch-" + args[0],
+			ReasonCode: strings.TrimSpace(*reasonCode),
+			ReasonText: strings.TrimSpace(*reasonText),
+		}
+		if err := r.fillMutationDraft("kill-switch toggle", args[0], &draft, false); err != nil {
+			return err
+		}
+		*reasonCode = draft.ReasonCode
+		*reasonText = draft.ReasonText
+	}
+	if strings.TrimSpace(*reasonCode) == "" || strings.TrimSpace(*reasonText) == "" {
+		return fmt.Errorf("--reason-code and --reason-text are required")
 	}
 	if err := r.confirmDestructiveAction("kill-switch toggle", args[0]); err != nil {
 		return err
@@ -1101,8 +1102,8 @@ func (r *commandRunner) runKillSwitch(ctx context.Context, args []string) error 
 		},
 		Body: map[string]any{
 			"enabled":     enable,
-			"reason_code": *reasonCode,
-			"reason_text": *reasonText,
+			"reason_code": strings.TrimSpace(*reasonCode),
+			"reason_text": strings.TrimSpace(*reasonText),
 		},
 	}, &resp); err != nil {
 		return err
@@ -1121,6 +1122,7 @@ func (r *commandRunner) runTrace(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	interactive = interactive || (r.cfg.Output != "json" && r.shouldUseInteractiveByDefault())
 	switch args[0] {
 	case "policy":
 		if err := requireUUIDLike("policy_id", args[1]); err != nil {
@@ -1338,6 +1340,9 @@ func (r *commandRunner) runAck(ctx context.Context, args []string) error {
 	if r.cfg.Output == "json" {
 		return writeJSON(r.out, resp)
 	}
+	if r.shouldUseInteractiveByDefault() {
+		return r.runAckInteractive(ctx, query)
+	}
 	return r.renderAckRows(resp)
 }
 
@@ -1348,12 +1353,18 @@ func (r *commandRunner) runValidators(ctx context.Context, args []string) error 
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if len(fs.Args()) > 0 {
+		return fmt.Errorf("usage: kubectl cybermesh validators [--status active|inactive]")
+	}
 	var resp validatorListResponse
 	if err := r.client.do(ctx, requestOptions{Method: http.MethodGet, Path: "/validators", Query: map[string]string{"status": *status}}, &resp); err != nil {
 		return err
 	}
 	if r.cfg.Output == "json" {
 		return writeJSON(r.out, resp)
+	}
+	if r.shouldUseInteractiveByDefault() {
+		return r.runValidatorsInteractive(ctx, map[string]string{"status": *status})
 	}
 	return r.renderValidators(resp)
 }
@@ -1403,7 +1414,7 @@ func (r *commandRunner) runLeases(ctx context.Context, args []string) error {
 	if r.cfg.Output == "json" {
 		return writeJSON(r.out, resp)
 	}
-	return r.renderControlStatus(resp)
+	return r.renderLeases(resp)
 }
 
 func (r *commandRunner) runSafeMode(ctx context.Context, args []string) error {
@@ -1427,11 +1438,23 @@ func (r *commandRunner) runSafeMode(ctx context.Context, args []string) error {
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
-	if *reasonCode == "" || *reasonText == "" {
-		return fmt.Errorf("--reason-code and --reason-text are required")
-	}
 	if !*yes {
 		return fmt.Errorf("safe-mode mutation requires --yes")
+	}
+	if *reasonCode == "" || *reasonText == "" {
+		draft := actionDraft{
+			Action:     "safe-mode-" + args[0],
+			ReasonCode: strings.TrimSpace(*reasonCode),
+			ReasonText: strings.TrimSpace(*reasonText),
+		}
+		if err := r.fillMutationDraft("safe-mode toggle", args[0], &draft, false); err != nil {
+			return err
+		}
+		*reasonCode = draft.ReasonCode
+		*reasonText = draft.ReasonText
+	}
+	if strings.TrimSpace(*reasonCode) == "" || strings.TrimSpace(*reasonText) == "" {
+		return fmt.Errorf("--reason-code and --reason-text are required")
 	}
 	if err := r.confirmDestructiveAction("safe-mode toggle", args[0]); err != nil {
 		return err
@@ -1442,8 +1465,8 @@ func (r *commandRunner) runSafeMode(ctx context.Context, args []string) error {
 		Path:   "/control/safe-mode:toggle",
 		Body: map[string]any{
 			"enabled":     enable,
-			"reason_code": *reasonCode,
-			"reason_text": *reasonText,
+			"reason_code": strings.TrimSpace(*reasonCode),
+			"reason_text": strings.TrimSpace(*reasonText),
 		},
 		Headers: map[string]string{headerRequestID: newRequestID()},
 	}, &resp); err != nil {
@@ -1468,18 +1491,32 @@ func (r *commandRunner) runRevoke(ctx context.Context, args []string) error {
 		return err
 	}
 	if *outboxID == "" || *reasonCode == "" || *reasonText == "" {
-		return fmt.Errorf("--outbox-id, --reason-code, and --reason-text are required")
+		if strings.TrimSpace(*outboxID) == "" {
+			return fmt.Errorf("--outbox-id, --reason-code, and --reason-text are required")
+		}
 	}
 	if err := requireUUIDLike("outbox_id", *outboxID); err != nil {
 		return err
+	}
+	if !*yes {
+		return fmt.Errorf("revoke mutation requires --yes")
+	}
+	draft := actionDraft{
+		Action:         "revoke",
+		ReasonCode:     strings.TrimSpace(*reasonCode),
+		ReasonText:     strings.TrimSpace(*reasonText),
+		Classification: strings.TrimSpace(*classification),
+	}
+	if err := r.fillMutationDraft("outbox revoke", *outboxID, &draft, true); err != nil {
+		return err
+	}
+	if draft.ReasonCode == "" || draft.ReasonText == "" {
+		return fmt.Errorf("--outbox-id, --reason-code, and --reason-text are required")
 	}
 	if strings.TrimSpace(*workflowID) != "" {
 		if err := requireNonEmpty("workflow_id", *workflowID); err != nil {
 			return err
 		}
-	}
-	if !*yes {
-		return fmt.Errorf("revoke mutation requires --yes")
 	}
 	if err := r.confirmDestructiveAction("outbox revoke", *outboxID); err != nil {
 		return err
@@ -1494,11 +1531,11 @@ func (r *commandRunner) runRevoke(ctx context.Context, args []string) error {
 		headers[headerWorkflowID] = strings.TrimSpace(*workflowID)
 	}
 	body := map[string]any{
-		"reason_code": *reasonCode,
-		"reason_text": *reasonText,
+		"reason_code": draft.ReasonCode,
+		"reason_text": draft.ReasonText,
 	}
-	if strings.TrimSpace(*classification) != "" {
-		body["classification"] = *classification
+	if strings.TrimSpace(draft.Classification) != "" {
+		body["classification"] = draft.Classification
 	}
 	if strings.TrimSpace(*workflowID) != "" {
 		body["workflow_id"] = *workflowID
@@ -1516,7 +1553,7 @@ func (r *commandRunner) runRevoke(ctx context.Context, args []string) error {
 	if r.cfg.Output == "json" {
 		return writeJSON(r.out, resp)
 	}
-	return r.renderMutationResult(resp)
+	return r.renderRevokeResult(resp)
 }
 
 func (r *commandRunner) writeAny(v any) error {
@@ -1552,18 +1589,7 @@ func (r *commandRunner) runVersion(args []string) error {
 		_, err := fmt.Fprintf(r.out, "kubectl-cybermesh %s\n", pluginVersion)
 		return err
 	}
-	renderTitle(r.out, "Version")
-	renderKV(r.out, map[string]string{
-		"Version":          pluginVersion,
-		"Commit":           buildCommit,
-		"Build Time":       buildTime,
-		"Base URL":         r.cfg.BaseURL,
-		"Output":           r.cfg.Output,
-		"Interactive Mode": r.cfg.InteractiveMode,
-		"Tenant":           blankDash(r.cfg.Tenant),
-		"Auth Mode":        r.authMode(),
-	})
-	return nil
+	return r.renderVersionVerbose(info)
 }
 
 type doctorCheck struct {
@@ -1575,6 +1601,11 @@ type doctorCheck struct {
 type doctorResult struct {
 	Version string        `json:"version"`
 	Checks  []doctorCheck `json:"checks"`
+}
+
+type landingResult struct {
+	Control controlStatusResponse `json:"control"`
+	Backlog outboxBacklogResult   `json:"backlog"`
 }
 
 func (r *commandRunner) runDoctor(ctx context.Context, args []string) error {
@@ -1612,6 +1643,20 @@ func (r *commandRunner) runDoctor(ctx context.Context, args []string) error {
 		return writeJSON(r.out, result)
 	}
 	return r.renderDoctor(result)
+}
+
+func (r *commandRunner) runLanding(ctx context.Context) error {
+	var resp landingResult
+	if err := r.client.do(ctx, requestOptions{Method: http.MethodGet, Path: "/control/leases"}, &resp.Control); err != nil {
+		return err
+	}
+	if err := r.client.do(ctx, requestOptions{Method: http.MethodGet, Path: "/control/outbox/backlog"}, &resp.Backlog); err != nil {
+		return err
+	}
+	if r.cfg.Output == "json" {
+		return writeJSON(r.out, resp)
+	}
+	return r.renderLanding(resp)
 }
 
 func (r *commandRunner) runOutboxList(ctx context.Context, query map[string]string) error {
@@ -1665,21 +1710,85 @@ func (r *commandRunner) authMode() string {
 	}
 }
 
+func (r *commandRunner) canPromptForMutations() bool {
+	if r.cfg.Output == "json" {
+		return false
+	}
+	return promptInputTTY() && promptOutputTTY(r.errOut)
+}
+
+func (r *commandRunner) fillMutationDraft(action, target string, draft *actionDraft, askClassification bool) error {
+	if draft == nil || !r.canPromptForMutations() {
+		return nil
+	}
+	reader := bufio.NewReader(promptInputReader())
+	if strings.TrimSpace(draft.ReasonCode) == "" {
+		value, err := promptLine(reader, r.errOut, "Reason code", false)
+		if err != nil {
+			return err
+		}
+		draft.ReasonCode = value
+	}
+	if strings.TrimSpace(draft.ReasonText) == "" {
+		value, err := promptLine(reader, r.errOut, "Reason text", false)
+		if err != nil {
+			return err
+		}
+		draft.ReasonText = value
+	}
+	if askClassification && strings.TrimSpace(draft.Classification) == "" {
+		value, err := promptLine(reader, r.errOut, "Classification (optional)", true)
+		if err != nil {
+			return err
+		}
+		draft.Classification = value
+	}
+	_, _ = fmt.Fprintf(r.errOut, "Prepared %s for %s\n", action, target)
+	_, _ = fmt.Fprintf(r.errOut, "  reason-code: %s\n", blankDash(draft.ReasonCode))
+	_, _ = fmt.Fprintf(r.errOut, "  reason-text: %s\n", blankDash(draft.ReasonText))
+	if askClassification {
+		_, _ = fmt.Fprintf(r.errOut, "  classification: %s\n", blankDash(draft.Classification))
+	}
+	return nil
+}
+
+func promptLine(reader *bufio.Reader, out io.Writer, label string, optional bool) (string, error) {
+	for {
+		suffix := ": "
+		if optional {
+			suffix = " [optional]: "
+		}
+		if _, err := fmt.Fprintf(out, "%s%s", label, suffix); err != nil {
+			return "", err
+		}
+		line, err := reader.ReadString('\n')
+		if err != nil && err != io.EOF {
+			return "", fmt.Errorf("read %s: %w", strings.ToLower(label), err)
+		}
+		value := strings.TrimSpace(line)
+		if value != "" || optional {
+			return value, nil
+		}
+		if _, err := fmt.Fprintln(out, "  value is required"); err != nil {
+			return "", err
+		}
+	}
+}
+
 func (r *commandRunner) confirmDestructiveAction(action, target string) error {
 	if strings.EqualFold(strings.TrimSpace(os.Getenv("CYBERMESH_SKIP_CONFIRM_PROMPT")), "1") {
 		return nil
 	}
-	if !isTerminalFile(os.Stdin) {
+	if !promptInputTTY() {
 		return nil
 	}
-	file, ok := r.errOut.(*os.File)
-	if !ok || !isTerminalFile(file) {
+	if !promptOutputTTY(r.errOut) {
 		return nil
 	}
 	if _, err := fmt.Fprintf(r.errOut, "Confirm %s for %s. Type the exact target to continue: ", action, target); err != nil {
 		return err
 	}
-	reader := bufio.NewReader(os.Stdin)
+	reader := bufio.NewReader(promptInputReader())
 	line, err := reader.ReadString('\n')
 	if err != nil && err != io.EOF {
 		return fmt.Errorf("read confirmation: %w", err)
@@ -1713,6 +1822,12 @@ func enhanceOperatorError(err error) error {
 		hint = "Hint: safe mode is enabled. Use `kubectl cybermesh control` or disable safe mode explicitly before retrying."
 	case strings.Contains(msg, "CONTROL_KILL_SWITCH_ENABLED"):
 		hint = "Hint: kill switch is enabled. Use `kubectl cybermesh control` or disable the kill switch before retrying destructive actions."
+	case strings.Contains(msg, "CONTROL_MUTATION_COOLDOWN_ACTIVE"):
+		hint = "Hint: the same target was mutated too recently. Wait briefly, inspect the latest policy or workflow state, and then retry once."
+	case strings.Contains(msg, "CONTROL_MUTATION_RATE_LIMITED"):
+		hint = "Hint: too many mutation requests were sent for this actor. Slow down repeated approve/reject/revoke/rollback actions and retry after the limiter window."
+	case strings.Contains(msg, "RATE_LIMIT_EXCEEDED"):
+		hint = "Hint: the API rate limit was hit. Reduce bursty retries, wait for the reset window, or raise the trusted CLI limit on the backend."
 	case strings.Contains(msg, "INVALID_STATE_TRANSITION"):
 		hint = "Hint: the selected object is already in a terminal or incompatible state. Check `policies get`, `workflows get`, or `audit get` before retrying."
 	case strings.Contains(msg, "TENANT_SCOPE_FORBIDDEN"), strings.Contains(lower, "tenant scope"), strings.Contains(lower, "missing tenant"), strings.Contains(lower, "requires --tenant"):
@@ -2434,6 +2549,24 @@ func (r *commandRunner) runAIInteractive(ctx context.Context, initialTab aiTab) 
 	return launchInteractiveAI(newAIModel(ctx, initialTab, historyFetch, nodesFetch), r.out)
 }
 
+func (r *commandRunner) runAckInteractive(ctx context.Context, query map[string]string) error {
+	fetch := func(fetchCtx context.Context) (ackListResponse, error) {
+		var resp ackListResponse
+		err := r.client.do(fetchCtx, requestOptions{Method: http.MethodGet, Path: "/control/acks", Query: query}, &resp)
+		return resp, err
+	}
+	return launchInteractiveAck(newAckModel(ctx, "CyberMesh ACK", fetch), r.out)
+}
+
+func (r *commandRunner) runValidatorsInteractive(ctx context.Context, query map[string]string) error {
+	fetch := func(fetchCtx context.Context) (validatorListResponse, error) {
+		var resp validatorListResponse
+		err := r.client.do(fetchCtx, requestOptions{Method: http.MethodGet, Path: "/validators", Query: query}, &resp)
+		return resp, err
+	}
+	return launchInteractiveValidators(newValidatorsModel(ctx, fetch), r.out)
+}
+
 func (r *commandRunner) runControl(ctx context.Context, args []string) error {
 	if len(args) != 0 {
 		return fmt.Errorf("usage: kubectl cybermesh control")
@@ -2576,6 +2709,9 @@ func usageError() error {
 func usageText() string {
 	return strings.TrimSpace(`
 kubectl cybermesh [global flags] <command>
+
+No command:
+  Show a compact operator overview using control and backlog state.
 
 Global flags:
   --base-url URL               (default: ` + defaultPluginBaseURL + `, env: CYBERMESH_BASE_URL)

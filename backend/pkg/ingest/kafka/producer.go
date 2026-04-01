@@ -73,13 +73,16 @@ func NewProducer(ctx context.Context, cfg ProducerConfig, saramaCfg *sarama.Conf
 	if len(cfg.Brokers) == 0 {
 		return nil, fmt.Errorf("kafka producer: no brokers configured")
 	}
-	if cfg.Topics.Commits == "" {
-		return nil, fmt.Errorf("kafka producer: commits topic required")
+	if cfg.Topics.Commits == "" && cfg.Topics.Policy == "" {
+		return nil, fmt.Errorf("kafka producer: commits or policy topic required")
 	}
-	if cfg.Signer == nil {
+	if cfg.Topics.Commits != "" && cfg.Signer == nil {
 		return nil, fmt.Errorf("kafka producer: commit signer not configured")
 	}
 	if cfg.Topics.Policy != "" && cfg.PolicySigner == nil {
+		if cfg.Topics.Commits == "" {
+			return nil, fmt.Errorf("kafka producer: policy signer not configured")
+		}
 		if logger != nil {
 			logger.Warn("Kafka policy topic configured without signer; policy publishing disabled")
 		}
@@ -350,6 +353,7 @@ func (p *Producer) publishPolicyWithKey(ctx context.Context, evt *pb.PolicyUpdat
 		Headers: []sarama.RecordHeader{
 			{Key: []byte("version"), Value: []byte("1")},
 			{Key: []byte("type"), Value: []byte("policy")},
+			{Key: []byte("policy_id"), Value: []byte(evt.GetPolicyId())},
 		},
 	}
 	if routingKey != "" {

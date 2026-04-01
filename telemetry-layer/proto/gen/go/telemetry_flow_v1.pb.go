@@ -114,6 +114,9 @@ type FlowV1 struct {
 	PktsFwd    int64 `protobuf:"varint,12,opt,name=pkts_fwd,json=pktsFwd,proto3" json:"pkts_fwd,omitempty"`
 	PktsBwd    int64 `protobuf:"varint,13,opt,name=pkts_bwd,json=pktsBwd,proto3" json:"pkts_bwd,omitempty"`
 	DurationMs int64 `protobuf:"varint,14,opt,name=duration_ms,json=durationMs,proto3" json:"duration_ms,omitempty"`
+	// Optional lineage identifiers from the telemetry ingress boundary.
+	TraceId       string `protobuf:"bytes,57,opt,name=trace_id,json=traceId,proto3" json:"trace_id,omitempty"`
+	SourceEventId string `protobuf:"bytes,58,opt,name=source_event_id,json=sourceEventId,proto3" json:"source_event_id,omitempty"`
 	// Identity information (optional).
 	Identity *Identity `protobuf:"bytes,15,opt,name=identity,proto3" json:"identity,omitempty"`
 	// Verdict string (FORWARDED/DROPPED/etc).
@@ -296,6 +299,20 @@ func (x *FlowV1) GetDurationMs() int64 {
 		return x.DurationMs
 	}
 	return 0
+}
+
+func (x *FlowV1) GetTraceId() string {
+	if x != nil {
+		return x.TraceId
+	}
+	return ""
+}
+
+func (x *FlowV1) GetSourceEventId() string {
+	if x != nil {
+		return x.SourceEventId
+	}
+	return ""
 }
 
 func (x *FlowV1) GetIdentity() *Identity {
@@ -656,7 +673,7 @@ var File_telemetry_flow_v1_proto protoreflect.FileDescriptor
 
 const file_telemetry_flow_v1_proto_rawDesc = "" +
 	"\n" +
-	"\x17telemetry_flow_v1.proto\x12\x16cybermesh.telemetry.v1\"\xbb\x0e\n" +
+	"\x17telemetry_flow_v1.proto\x12\x16cybermesh.telemetry.v1\"\xfe\x0e\n" +
 	"\x06FlowV1\x12\x16\n" +
 	"\x06schema\x18\x01 \x01(\tR\x06schema\x12\x0e\n" +
 	"\x02ts\x18\x02 \x01(\x03R\x02ts\x12\x1b\n" +
@@ -673,7 +690,9 @@ const file_telemetry_flow_v1_proto_rawDesc = "" +
 	"\bpkts_fwd\x18\f \x01(\x03R\apktsFwd\x12\x19\n" +
 	"\bpkts_bwd\x18\r \x01(\x03R\apktsBwd\x12\x1f\n" +
 	"\vduration_ms\x18\x0e \x01(\x03R\n" +
-	"durationMs\x12<\n" +
+	"durationMs\x12\x19\n" +
+	"\btrace_id\x189 \x01(\tR\atraceId\x12&\n" +
+	"\x0fsource_event_id\x18: \x01(\tR\rsourceEventId\x12<\n" +
 	"\bidentity\x18\x0f \x01(\v2 .cybermesh.telemetry.v1.IdentityR\bidentity\x12\x18\n" +
 	"\averdict\x18\x10 \x01(\tR\averdict\x12!\n" +
 	"\ffeature_mask\x18\x11 \x01(\fR\vfeatureMask\x12#\n" +

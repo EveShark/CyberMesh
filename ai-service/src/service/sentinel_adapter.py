@@ -25,6 +25,8 @@ from ..config.settings import Settings
 from ..contracts.generated.sentinel_result_pb2 import SentinelResultEvent
 from ..feedback.tracker import AnomalyLifecycleTracker
 from .policy_emitter import PolicyContext, build_policy_candidate
+from .policy_aggregation import PolicyAggregationManager
+from .fast_mitigation import decide_fast_mitigation
 from .publisher import MessagePublisher
 from ..utils.errors import StorageError, ValidationError
 from ..utils.metrics import get_metrics_collector
@@ -69,6 +71,15 @@ def _normalize_event_ts_ms(value: Any) -> int:
     if 946684800000000000 <= numeric <= 4102444800000000000:
         return int(numeric / 1_000_000)
     return 0
+
+
+def _copy_operational_context(dst: Dict[str, Any], src: Dict[str, Any], *keys: str) -> None:
+    for key in keys:
+        value = src.get(key)
+        if isinstance(value, str):
+            value = value.strip()
+        if value not in (None, "", [], {}):
+            dst[key] = value
 
 
 @dataclass(frozen=True)
@@ -129,6 +140,7 @@ class SentinelKafkaAdapter:
         logger,
         tracker: Optional[AnomalyLifecycleTracker] = None,
         event_recorder: Optional[Callable[..., None]] = None,
+        policy_aggregator: Optional[PolicyAggregationManager] = None,
     ):
         self._settings = settings
         self._publisher = publisher
@@ -137,6 +149,9 @@ class SentinelKafkaAdapter:
         self._event_recorder = event_recorder
         self._cfg = SentinelAdapterConfig.from_env(settings)
         self._policy_cfg = settings.policy_publishing
+        self._policy_aggregator = policy_aggregator
+        if self._policy_aggregator is None and self._policy_cfg is not None:
+            self._policy_aggregator = PolicyAggregationManager(self._policy_cfg)
         self._service_metrics = get_metrics_collector()
         self._validator_ip_map = dict(getattr(settings, "sentinel_validator_ip_map", {}) or {})
 
@@ -380,7 +395,7 @@ class SentinelKafkaAdapter:
                 self._metric_inc("invalid")
                 return
 
-            threat_level = str(analysis.get("threat_level") or "").lower()
+            threat_level = self._normalize_threat_level_value(analysis.get("threat_level"))
             if threat_level in ("clean", "unknown", ""):
                 handle_status = "skipped"
                 self._metric_inc("skipped_clean")
@@ -391,7 +406,7 @@ class SentinelKafkaAdapter:
             severity = self._map_severity(analysis)
             source = self._extract_source(envelope)
 
-            anomaly_id = self._stable_uuid4(event_id)
+            anomaly_id = self._deterministic_uuid4_from_seed(event_id)
             payload_bytes = self._build_anomaly_payload(
                 envelope,
                 severity=severity,
@@ -410,16 +425,24 @@ class SentinelKafkaAdapter:
                 return
 
             try:
+                source_event_id = str(labels.get("source_event_id") or "").strip()
+                if not source_event_id:
+                    source_event_id = str(
+                        (((payload.get("input") or {}) if isinstance(payload, dict) else {}).get("id") or "")
+                    ).strip()
                 event_metadata = {
                     "timestamp": now,
-                    "source_event_id": event_id,
+                    "source_event_id": source_event_id or event_id,
+                    "sentinel_event_id": event_id,
                     "source": source,
+                    "anomaly_id": anomaly_id,
                 }
                 network_context = self._extract_network_context(payload, analysis.get("findings") or [])
                 for key in ("src_ip", "source_ip", "dst_ip", "destination_ip", "source_event_ts_ms"):
                     if key in network_context:
                         event_metadata[key] = network_context[key]
-                for key in ("scenario", "profile_mode", "trace_id", "source_event_id"):
+                _copy_operational_context(event_metadata, network_context, "flow_id", "source_id", "source_type", "sensor_id")
+                for key in ("scenario", "profile_mode", "trace_id", "source_event_id", "flow_id", "source_id", "source_type", "sensor_id"):
                     value = labels.get(key)
                     if isinstance(value, str) and value:
                         event_metadata[key] = value
@@ -519,10 +542,50 @@ class SentinelKafkaAdapter:
 
         labels = envelope.get("labels") if isinstance(envelope, dict) else {}
         if isinstance(labels, dict):
-            scenario_hint = labels.get("scenario")
-            normalized = SentinelKafkaAdapter._normalize_anomaly_hint(scenario_hint)
-            if normalized != "anomaly":
-                return normalized
+            for hint in (
+                labels.get("scenario"),
+                labels.get("attack_type"),
+                labels.get("threat_type"),
+                labels.get("profile_mode"),
+            ):
+                normalized = SentinelKafkaAdapter._normalize_anomaly_hint(hint)
+                if normalized != "anomaly":
+                    return normalized
+
+        payload = envelope.get("payload") if isinstance(envelope, dict) else {}
+        if isinstance(payload, dict):
+            input_part = payload.get("input")
+            if isinstance(input_part, dict):
+                modality = str(input_part.get("modality") or "").strip().lower()
+                threat_level = SentinelKafkaAdapter._normalize_threat_level_value(analysis.get("threat_level"))
+                if modality == "network_flow":
+                    if threat_level in ("malicious", "critical"):
+                        return "ddos"
+                    if threat_level == "suspicious":
+                        return "network_intrusion"
+                input_labels = input_part.get("labels")
+                if isinstance(input_labels, dict):
+                    for hint in (
+                        input_labels.get("scenario"),
+                        input_labels.get("attack_type"),
+                        input_labels.get("threat_type"),
+                        input_labels.get("profile_mode"),
+                    ):
+                        normalized = SentinelKafkaAdapter._normalize_anomaly_hint(hint)
+                        if normalized != "anomaly":
+                            return normalized
+                for hint in (
+                    input_part.get("scenario"),
+                    input_part.get("attack_type"),
+                    input_part.get("threat_type"),
+                    input_part.get("profile_mode"),
+                    input_part.get("source"),
+                    input_part.get("source_id"),
+                    input_part.get("dataset"),
+                ):
+                    normalized = SentinelKafkaAdapter._normalize_anomaly_hint(hint)
+                    if normalized != "anomaly":
+                        return normalized
 
         findings = analysis.get("findings") or []
         if isinstance(findings, list):
@@ -549,6 +612,15 @@ class SentinelKafkaAdapter:
         if "malware" in token or "yara" in token or "ransom" in token:
             return "malware"
         return "anomaly"
+
+    @staticmethod
+    def _normalize_threat_level_value(value: Any) -> str:
+        token = str(value or "").strip().lower()
+        if not token:
+            return ""
+        if "." in token:
+            token = token.rsplit(".", 1)[-1]
+        return token
 
     def _maybe_publish_policy(
         self,
@@ -583,10 +655,22 @@ class SentinelKafkaAdapter:
         label_ingest_ts_ms = _normalize_event_ts_ms(labels.get("telemetry_ingest_ts_ms"))
         if label_ingest_ts_ms > 0:
             network_context["telemetry_ingest_ts_ms"] = label_ingest_ts_ms
+        for key in ("flow_id", "source_id", "source_type", "sensor_id"):
+            value = labels.get(key)
+            if isinstance(value, str) and value.strip() and not network_context.get(key):
+                network_context[key] = value.strip()
+        validator_id = self._resolve_validator_id(
+            envelope=envelope,
+            payload=payload if isinstance(payload, dict) else {},
+            network_context=network_context,
+        )
+        if validator_id and not network_context.get("validator_id"):
+            network_context["validator_id"] = validator_id
         metadata = {
             "tenant_id": envelope.get("tenant_id"),
             "region": envelope.get("region"),
             "source": envelope.get("source"),
+            "anomaly_id": anomaly_id,
             "sentinel_event_id": event_id,
             "source_event_id": network_context.get("source_event_id") or "",
             "source_event_ts_ms": _normalize_event_ts_ms(network_context.get("source_event_ts_ms")),
@@ -605,18 +689,19 @@ class SentinelKafkaAdapter:
             "acceptance_rate": labels.get("acceptance_rate"),
             "findings_count": len(findings),
         }
+        if validator_id:
+            metadata["validator_id"] = validator_id
+        _copy_operational_context(metadata, network_context, "flow_id", "source_id", "source_type", "sensor_id")
 
-        decision = build_policy_candidate(
-            PolicyContext(
-                anomaly_id=anomaly_id,
-                anomaly_type=anomaly_type,
-                severity=severity,
-                confidence=confidence,
-                network_context=network_context,
-                metadata=metadata,
-            ),
-            self._policy_cfg,
+        context = PolicyContext(
+            anomaly_id=anomaly_id,
+            anomaly_type=anomaly_type,
+            severity=severity,
+            confidence=confidence,
+            network_context=network_context,
+            metadata=metadata,
         )
+        decision = build_policy_candidate(context, self._policy_cfg)
 
         if decision.candidate is None:
             self._metric_inc("policy_skipped")
@@ -641,8 +726,77 @@ class SentinelKafkaAdapter:
             return
 
         candidate = decision.candidate
-        target = network_context.get("src_ip") or network_context.get("source_ip") or ""
-        policy_id = self._stable_uuid4(f"{event_id}|{candidate.rule_type}|{candidate.action}|{target}")
+        aggregation_metadata = None
+        aggregation = None
+        if self._policy_aggregator is not None:
+            aggregation = self._policy_aggregator.admit(candidate=candidate, context=context)
+            if not aggregation.publish:
+                self._metric_inc("policy_skipped")
+                reason = aggregation.reason or "aggregation_suppressed"
+                self._logger.info(
+                    "Sentinel policy suppressed by aggregation",
+                    extra={
+                        "event_id": event_id,
+                        "anomaly_id": anomaly_id,
+                        "reason": reason,
+                        "policy_id": candidate.policy_id,
+                    },
+                )
+                return
+            if aggregation.policy_id and aggregation.policy_id != candidate.policy_id:
+                aggregation_metadata = {
+                    "mode": aggregation.mode,
+                    "reason": aggregation.reason,
+                    "aggregation_key": aggregation.aggregation_key,
+                    "signal_count": aggregation.signal_count,
+                    "refresh_count": aggregation.refresh_count,
+                }
+                decision = build_policy_candidate(
+                    context,
+                    self._policy_cfg,
+                    policy_id_override=aggregation.policy_id,
+                    aggregation_metadata=aggregation_metadata,
+                )
+                if decision.candidate is None:
+                    self._metric_inc("policy_skipped")
+                    return
+                candidate = decision.candidate
+            elif aggregation.mode != "publish_new":
+                aggregation_metadata = {
+                    "mode": aggregation.mode,
+                    "reason": aggregation.reason,
+                    "aggregation_key": aggregation.aggregation_key,
+                    "signal_count": aggregation.signal_count,
+                    "refresh_count": aggregation.refresh_count,
+                }
+                policy_payload = dict(candidate.payload)
+                metadata_obj = dict(policy_payload.get("metadata") or {})
+                metadata_obj["aggregation"] = aggregation_metadata
+                policy_payload["metadata"] = metadata_obj
+                candidate = type(candidate)(
+                    policy_id=candidate.policy_id,
+                    rule_type=candidate.rule_type,
+                    action=candidate.action,
+                    payload=policy_payload,
+                )
+
+        aggregation_mode = str(
+            (((candidate.payload.get("metadata") or {}).get("aggregation") or {}).get("mode"))
+            or (aggregation.mode if aggregation is not None else "publish_new")
+        )
+        signal_count = int(
+            (((candidate.payload.get("metadata") or {}).get("aggregation") or {}).get("signal_count"))
+            or (aggregation.signal_count if aggregation is not None else 1)
+        )
+        fast_mitigation = decide_fast_mitigation(
+            candidate=candidate,
+            context=context,
+            config=self._policy_cfg,
+            aggregation_mode=aggregation_mode,
+            signal_count=signal_count,
+        )
+
+        policy_id = str(candidate.policy_id)
         policy_payload = dict(candidate.payload)
         policy_payload["policy_id"] = policy_id
         if _env_bool("POLICY_STAGE_MARKERS_ENABLED", False):
@@ -672,6 +826,10 @@ class SentinelKafkaAdapter:
             "rule_type": candidate.rule_type,
             "enforcement_action": candidate.action,
             "policy_payload": policy_payload,
+            "dispatch_mode": aggregation_mode,
+            "fast_mitigation_publish": bool(fast_mitigation.publish),
+            "fast_mitigation_id": str(fast_mitigation.mitigation_id or ""),
+            "fast_mitigation_payload": fast_mitigation.payload,
         }
         if self._policy_publish_queue is not None:
             try:
@@ -687,6 +845,33 @@ class SentinelKafkaAdapter:
     def _publish_policy_task(self, task: Dict[str, Any]) -> None:
         publish_start = time.monotonic()
         try:
+            publish_fast = getattr(self._publisher, "publish_fast_mitigation_async", None)
+            if not callable(publish_fast):
+                publish_fast = getattr(self._publisher, "publish_fast_mitigation", None)
+            if task.get("fast_mitigation_publish") and callable(publish_fast):
+                try:
+                    fast_accepted = publish_fast(
+                        mitigation_id=task["fast_mitigation_id"],
+                        policy_id=task["policy_id"],
+                        rule_type=task["rule_type"],
+                        enforcement_action=task["enforcement_action"],
+                        payload=task["fast_mitigation_payload"],
+                    )
+                    if fast_accepted is False:
+                        self._metric_inc("fast_mitigation_dispatch_rejected")
+                    else:
+                        self._metric_inc("fast_mitigation_dispatch_requested")
+                except Exception as exc:
+                    self._metric_inc("fast_mitigation_failed")
+                    self._logger.warning(
+                        "Sentinel fast mitigation publish failed; durable policy path continues",
+                        extra={
+                            "event_id": task["event_id"],
+                            "anomaly_id": task["anomaly_id"],
+                            "policy_id": task["policy_id"],
+                            "error": str(exc),
+                        },
+                    )
             self._publisher.publish_policy_violation(
                 policy_id=task["policy_id"],
                 rule_type=task["rule_type"],
@@ -698,9 +883,11 @@ class SentinelKafkaAdapter:
                 self._tracker.record_policy_dispatched(
                     anomaly_id=task["anomaly_id"],
                     policy_id=task["policy_id"],
+                    mitigation_id=str(task.get("fast_mitigation_id") or "") or None,
+                    dispatch_mode=str(task.get("dispatch_mode") or "publish_new"),
                     ttl_seconds=getattr(self._policy_cfg, "ttl_seconds", None),
                     requires_ack=getattr(self._policy_cfg, "requires_ack", None),
-                    fast_path=bool(getattr(self._policy_cfg, "canary_scope", False)),
+                    fast_path=bool(task.get("fast_mitigation_publish")),
                     timestamp=time.time(),
                 )
         except Exception as exc:  # pragma: no cover - defensive
@@ -760,6 +947,10 @@ class SentinelKafkaAdapter:
             source_id = input_part.get("id")
             if isinstance(source_id, str) and source_id:
                 network_context["source_event_id"] = source_id
+            for key in ("flow_id", "source_id", "source_type", "sensor_id"):
+                value = input_part.get(key)
+                if isinstance(value, str) and value.strip():
+                    network_context[key] = value.strip()
             explicit_source_ts = _normalize_event_ts_ms(input_part.get("source_event_ts_ms"))
             if explicit_source_ts > 0:
                 network_context["source_event_ts_ms"] = explicit_source_ts
@@ -842,8 +1033,8 @@ class SentinelKafkaAdapter:
             return default
 
     @staticmethod
-    def _stable_uuid4(event_id: str) -> str:
-        digest = bytearray(hashlib.sha256(event_id.encode("utf-8")).digest()[:16])
+    def _deterministic_uuid4_from_seed(seed: str) -> str:
+        digest = bytearray(hashlib.sha256(seed.encode("utf-8")).digest()[:16])
         digest[6] = (digest[6] & 0x0F) | 0x40  # version 4
         digest[8] = (digest[8] & 0x3F) | 0x80  # RFC 4122 variant
         return str(uuid.UUID(bytes=bytes(digest)))
@@ -867,6 +1058,11 @@ class SentinelKafkaAdapter:
             "event_id": envelope.get("event_id"),
             "tenant_id": envelope.get("tenant_id"),
             "source": envelope.get("source"),
+            "labels": {
+                key: value
+                for key, value in ((envelope.get("labels") or {}) if isinstance(envelope, dict) else {}).items()
+                if key in {"trace_id", "source_event_id", "flow_id", "source_id", "source_type", "sensor_id"}
+            },
             "severity": severity,
             "confidence": float(confidence),
             "analysis": {
@@ -877,6 +1073,26 @@ class SentinelKafkaAdapter:
                 "findings": findings[:20],
             },
         }
+        if isinstance(payload, dict):
+            input_part = payload.get("input")
+            if isinstance(input_part, dict):
+                compact["input"] = {
+                    key: input_part.get(key)
+                    for key in (
+                        "id",
+                        "source",
+                        "modality",
+                        "features_version",
+                        "timestamp",
+                        "flow_id",
+                        "source_id",
+                        "source_type",
+                        "sensor_id",
+                        "src_ip",
+                        "dst_ip",
+                    )
+                    if input_part.get(key) not in (None, "", [], {})
+                }
         encoded = json.dumps(compact, separators=(",", ":")).encode("utf-8")
         if len(encoded) <= max_size:
             return encoded

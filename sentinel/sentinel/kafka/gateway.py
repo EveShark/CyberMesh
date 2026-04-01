@@ -26,6 +26,7 @@ from sentinel.utils.error_codes import (
 )
 
 from .config import KafkaWorkerConfig
+from .id_utils import derive_trace_id
 from .telemetry_decoder import decode_telemetry_topic_message
 
 logger = get_logger(__name__)
@@ -129,6 +130,46 @@ def _set_event_stage_label(event: CanonicalEvent, key: str, timestamp_ms: int) -
     event.labels = labels
 
 
+def _input_reference_id(event: CanonicalEvent) -> str:
+    if isinstance(event.labels, dict):
+        source_event_id = str(event.labels.get("source_event_id") or "").strip()
+        if source_event_id:
+            return source_event_id
+    return str(event.id)
+
+
+def _normalized_source_event_id(current: Any, fallback: str) -> str:
+    value = str(current or "").strip()
+    if value:
+        return value
+    _metrics.inc_counter("lineage_missing_source_event_id_total")
+    return str(fallback or "").strip()
+
+
+def _normalized_trace_id(current: Any, *, source_event_id: str, event_id: str) -> str:
+    value = str(current or "").strip()
+    normalized = derive_trace_id(value, source_event_id, event_id)
+    if value == "":
+        _metrics.inc_counter("lineage_missing_trace_id_total")
+    elif normalized != value:
+        _metrics.inc_counter("lineage_invalid_trace_id_normalized_total")
+    return normalized
+
+
+def _populate_operational_labels(event: CanonicalEvent, labels: Dict[str, str]) -> Dict[str, str]:
+    out = dict(labels or {})
+    raw_context = event.raw_context if isinstance(event.raw_context, dict) else {}
+    for key in ("flow_id", "source_id", "source_type", "sensor_id"):
+        value = ""
+        if isinstance(event.labels, dict):
+            value = str(event.labels.get(key) or "").strip()
+        if not value:
+            value = str(raw_context.get(key) or "").strip()
+        if value:
+            out.setdefault(key, value)
+    return out
+
+
 def _parse_modality(value: Any) -> Modality:
     if not isinstance(value, str):
         raise ValueError(format_error(ERR_INVALID_FIELDS, "payload.modality must be a string"))
@@ -176,8 +217,18 @@ def _build_canonical_event(payload: Dict[str, Any], envelope: Dict[str, Any]) ->
     modality = _parse_modality(payload.get("modality"))
     ts = _coerce_timestamp(payload.get("timestamp") or envelope.get("timestamp"))
     normalized_labels = {str(k): str(v) for k, v in labels.items()}
-    normalized_labels.setdefault("trace_id", str(event_id))
-    normalized_labels.setdefault("source_event_id", str(event_id))
+    payload_input = payload.get("input") if isinstance(payload.get("input"), dict) else {}
+    fallback_source_event_id = str(payload_input.get("id") or "").strip() or str(event_id)
+    source_event_id = _normalized_source_event_id(
+        normalized_labels.get("source_event_id"),
+        fallback_source_event_id,
+    )
+    normalized_labels["source_event_id"] = source_event_id
+    normalized_labels["trace_id"] = _normalized_trace_id(
+        normalized_labels.get("trace_id"),
+        source_event_id=source_event_id,
+        event_id=str(event_id),
+    )
     normalized_labels.setdefault("source_event_ts_ms", str(int(ts * 1000)))
     return CanonicalEvent(
         id=str(event_id),
@@ -456,10 +507,14 @@ class KafkaGatewayWorker:
 
     @staticmethod
     def _result_envelope(event: CanonicalEvent, result: Dict[str, Any]) -> Dict[str, Any]:
-        labels = dict(event.labels or {})
-        # Sentinel-owned lineage/stage keys are authoritative on egress.
-        labels["trace_id"] = str(event.id)
-        labels["source_event_id"] = str(event.id)
+        labels = _populate_operational_labels(event, dict(event.labels or {}))
+        # Preserve upstream lineage when present, but never emit blank lineage IDs.
+        labels["source_event_id"] = _normalized_source_event_id(labels.get("source_event_id"), str(event.id))
+        labels["trace_id"] = _normalized_trace_id(
+            labels.get("trace_id"),
+            source_event_id=labels["source_event_id"],
+            event_id=str(event.id),
+        )
         labels["source_event_ts_ms"] = str(labels.get("source_event_ts_ms") or int(float(event.timestamp) * 1000.0))
         labels["sentinel_source"] = "sentinel.kafka.gateway"
         labels["t_sentinel_emit_ms"] = str(int(time.time() * 1000))
@@ -473,7 +528,7 @@ class KafkaGatewayWorker:
             "labels": labels,
             "payload": {
                 "input": {
-                    "id": event.id,
+                    "id": _input_reference_id(event),
                     "tenant_id": event.tenant_id,
                     "source": event.source,
                     "modality": event.modality.value,
@@ -511,16 +566,20 @@ class KafkaGatewayWorker:
             model_version=str(result.get("model_version") or "sentinel-kafka.v1"),
         )
 
-        msg.input.id = event.id
+        msg.input.id = _input_reference_id(event)
         msg.input.tenant_id = event.tenant_id
         msg.input.source = event.source
         msg.input.modality = event.modality.value
         msg.input.features_version = event.features_version
         msg.input.timestamp = float(event.timestamp)
-        result_labels = dict(event.labels or {})
-        # Sentinel-owned lineage/stage keys are authoritative on egress.
-        result_labels["trace_id"] = str(event.id)
-        result_labels["source_event_id"] = str(event.id)
+        result_labels = _populate_operational_labels(event, dict(event.labels or {}))
+        # Preserve upstream lineage when present, but never emit blank lineage IDs.
+        result_labels["source_event_id"] = _normalized_source_event_id(result_labels.get("source_event_id"), str(event.id))
+        result_labels["trace_id"] = _normalized_trace_id(
+            result_labels.get("trace_id"),
+            source_event_id=result_labels["source_event_id"],
+            event_id=str(event.id),
+        )
         result_labels["source_event_ts_ms"] = str(result_labels.get("source_event_ts_ms") or int(float(event.timestamp) * 1000.0))
         result_labels["sentinel_source"] = "sentinel.kafka.gateway"
         result_labels["t_sentinel_emit_ms"] = str(int(time.time() * 1000))

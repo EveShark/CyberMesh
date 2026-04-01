@@ -210,6 +210,11 @@ func (s *Server) middlewareRateLimit(next http.Handler) http.Handler {
 				})
 			}
 
+			retryAfter := resetTime - time.Now().Unix()
+			if retryAfter < 1 {
+				retryAfter = 1
+			}
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", retryAfter))
 			writeErrorResponse(w, r, "RATE_LIMIT_EXCEEDED", "rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}

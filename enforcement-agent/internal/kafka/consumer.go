@@ -4,8 +4,11 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
+	"hash/fnv"
 	"io/ioutil"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,6 +28,8 @@ type Consumer struct {
 	group     sarama.ConsumerGroup
 	handler   MessageHandler
 	topic     string
+	workers   int
+	queueSize int
 	mu        sync.Mutex
 	closed    bool
 	metrics   *metrics.Recorder
@@ -48,6 +53,8 @@ type Config struct {
 	SASLMechanism   string
 	SASLUsername    string
 	SASLPassword    string
+	HandlerWorkers  int
+	HandlerQueue    int
 	Metrics         *metrics.Recorder
 	Logger          *zap.Logger
 }
@@ -103,13 +110,23 @@ func NewConsumer(cfg Config, handler MessageHandler) (*Consumer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("kafka consumer: create group: %w", err)
 	}
+	workers := cfg.HandlerWorkers
+	if workers <= 0 {
+		workers = 8
+	}
+	queueSize := cfg.HandlerQueue
+	if queueSize <= 0 {
+		queueSize = 256
+	}
 
 	return &Consumer{
-		group:   group,
-		handler: handler,
-		topic:   cfg.Topic,
-		metrics: cfg.Metrics,
-		logger:  cfg.Logger,
+		group:     group,
+		handler:   handler,
+		topic:     cfg.Topic,
+		workers:   workers,
+		queueSize: queueSize,
+		metrics:   cfg.Metrics,
+		logger:    cfg.Logger,
 	}, nil
 }
 
@@ -126,7 +143,13 @@ func (c *Consumer) Close() error {
 
 // Run starts consuming messages until the context is cancelled.
 func (c *Consumer) Run(ctx context.Context) error {
-	consumer := &groupHandler{handler: c.handler, metrics: c.metrics, logger: c.logger}
+	consumer := &groupHandler{
+		handler:   c.handler,
+		metrics:   c.metrics,
+		logger:    c.logger,
+		workers:   c.workers,
+		queueSize: c.queueSize,
+	}
 
 	c.errorOnce.Do(func() {
 		go c.observeErrors(ctx)
@@ -163,9 +186,11 @@ func (c *Consumer) observeErrors(ctx context.Context) {
 }
 
 type groupHandler struct {
-	handler MessageHandler
-	metrics *metrics.Recorder
-	logger  *zap.Logger
+	handler   MessageHandler
+	metrics   *metrics.Recorder
+	logger    *zap.Logger
+	workers   int
+	queueSize int
 }
 
 func (g *groupHandler) Setup(session sarama.ConsumerGroupSession) error {
@@ -226,44 +251,251 @@ func (g *groupHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim s
 		}
 	}()
 
-	for {
-		select {
-		case <-session.Context().Done():
-			return nil
-		case message, ok := <-claim.Messages():
-			if !ok {
-				return nil
+	workers := g.workers
+	if workers <= 0 {
+		workers = 8
+	}
+	queueSize := g.queueSize
+	if queueSize <= 0 {
+		queueSize = 256
+	}
+	return g.consumeClaimParallel(session, claim, workers, queueSize)
+}
+
+type consumerTask struct {
+	msg   *sarama.ConsumerMessage
+	start time.Time
+}
+
+type consumerResult struct {
+	msg      *sarama.ConsumerMessage
+	start    time.Time
+	done     time.Time
+	err      error
+	canceled bool
+}
+
+func (g *groupHandler) consumeClaimParallel(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim, workers int, queueSize int) error {
+	if workers < 1 {
+		workers = 1
+	}
+	if queueSize < workers {
+		queueSize = workers
+	}
+	if queueSize < 1 {
+		queueSize = 1
+	}
+
+	workerQueues := make([]chan consumerTask, workers)
+	for i := 0; i < workers; i++ {
+		workerQueues[i] = make(chan consumerTask, queueSize)
+	}
+	results := make(chan consumerResult, queueSize*2)
+
+	var workerWG sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		workerWG.Add(1)
+		go func(ch <-chan consumerTask) {
+			defer workerWG.Done()
+			for task := range ch {
+				err := g.handler.HandleMessage(session.Context(), task.msg)
+				done := time.Now()
+				canceled := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+				res := consumerResult{
+					msg:      task.msg,
+					start:    task.start,
+					done:     done,
+					err:      err,
+					canceled: canceled,
+				}
+				select {
+				case results <- res:
+				case <-session.Context().Done():
+					return
+				}
 			}
+		}(workerQueues[i])
+	}
+
+	defer func() {
+		for _, ch := range workerQueues {
+			close(ch)
+		}
+		workerWG.Wait()
+		close(results)
+	}()
+
+	var (
+		inflight      int
+		nextOffset    int64
+		nextOffsetSet bool
+		pending       = make(map[int64]consumerResult)
+		readOpen      = true
+		msgPending    *sarama.ConsumerMessage
+	)
+
+	for {
+		if session.Context().Err() != nil {
+			return nil
+		}
+		if !readOpen && inflight == 0 && msgPending == nil {
+			return nil
+		}
+
+		if msgPending == nil && readOpen {
+			select {
+			case <-session.Context().Done():
+				return nil
+			case res := <-results:
+				if res.msg == nil {
+					continue
+				}
+				inflight--
+				pending[res.msg.Offset] = res
+				drainMarkableResults(g, session, pending, &nextOffset, &nextOffsetSet)
+			case msg, ok := <-claim.Messages():
+				if !ok {
+					readOpen = false
+					continue
+				}
+				msgPending = msg
+			}
+			continue
+		}
+
+		if msgPending != nil {
 			if g.metrics != nil {
-				lag := claim.HighWaterMarkOffset() - message.Offset - 1
+				lag := claim.HighWaterMarkOffset() - msgPending.Offset - 1
 				if lag < 0 {
 					lag = 0
 				}
-				g.metrics.ObserveKafkaLag(message.Partition, lag)
-				if !message.Timestamp.IsZero() {
-					publishToConsume := time.Since(message.Timestamp)
+				g.metrics.ObserveKafkaLag(msgPending.Partition, lag)
+				if !msgPending.Timestamp.IsZero() {
+					publishToConsume := time.Since(msgPending.Timestamp)
 					if publishToConsume >= 0 {
 						g.metrics.ObservePublishToConsume(publishToConsume.Seconds())
 					}
 				}
 			}
-			if err := g.handler.HandleMessage(session.Context(), message); err != nil {
+			if !nextOffsetSet {
+				nextOffset = msgPending.Offset
+				nextOffsetSet = true
+			}
+			task := consumerTask{msg: msgPending, start: time.Now()}
+			stripe := workerStripeForMessage(msgPending, workers)
+			dispatchStart := time.Now()
+			select {
+			case workerQueues[stripe] <- task:
 				if g.metrics != nil {
-					g.metrics.ObserveKafkaError("handler")
-					g.metrics.ObserveKafkaConsumed(message.Partition, "error")
+					g.metrics.ObserveKafkaDispatchWait(time.Since(dispatchStart))
 				}
-				return err
+				inflight++
+				msgPending = nil
+			default:
+				if g.metrics != nil {
+					g.metrics.ObserveKafkaQueueSaturated()
+				}
+				select {
+				case <-session.Context().Done():
+					return nil
+				case res := <-results:
+					if res.msg == nil {
+						continue
+					}
+					inflight--
+					pending[res.msg.Offset] = res
+					drainMarkableResults(g, session, pending, &nextOffset, &nextOffsetSet)
+				case workerQueues[stripe] <- task:
+					if g.metrics != nil {
+						g.metrics.ObserveKafkaDispatchWait(time.Since(dispatchStart))
+					}
+					inflight++
+					msgPending = nil
+				}
 			}
-			if g.metrics != nil {
-				g.metrics.ObserveKafkaConsumed(message.Partition, "success")
+			continue
+		}
+
+		select {
+		case <-session.Context().Done():
+			return nil
+		case res := <-results:
+			if res.msg == nil {
+				continue
 			}
-			markStart := time.Now()
-			session.MarkMessage(message, "")
-			if g.metrics != nil {
-				g.metrics.ObserveOffsetMark(time.Since(markStart))
-			}
+			inflight--
+			pending[res.msg.Offset] = res
+			drainMarkableResults(g, session, pending, &nextOffset, &nextOffsetSet)
 		}
 	}
+}
+
+func drainMarkableResults(g *groupHandler, session sarama.ConsumerGroupSession, pending map[int64]consumerResult, nextOffset *int64, nextOffsetSet *bool) {
+	if !*nextOffsetSet {
+		return
+	}
+	for {
+		res, ok := pending[*nextOffset]
+		if !ok {
+			return
+		}
+		delete(pending, *nextOffset)
+
+		if res.err != nil {
+			if !(res.canceled && session.Context().Err() != nil) {
+				if g.metrics != nil {
+					g.metrics.ObserveKafkaError("handler")
+					g.metrics.ObserveKafkaConsumed(res.msg.Partition, "error")
+					g.metrics.ObserveConsumeToDone("error", res.done.Sub(res.start))
+				}
+				if g.logger != nil {
+					g.logger.Warn("policy consumer handler error; marking message and continuing",
+						zap.String("topic", res.msg.Topic),
+						zap.Int32("partition", res.msg.Partition),
+						zap.Int64("offset", res.msg.Offset),
+						zap.Error(res.err))
+				}
+			}
+		} else if g.metrics != nil {
+			g.metrics.ObserveKafkaConsumed(res.msg.Partition, "success")
+			g.metrics.ObserveConsumeToDone("success", res.done.Sub(res.start))
+		}
+
+		markStart := time.Now()
+		session.MarkMessage(res.msg, "")
+		if g.metrics != nil {
+			g.metrics.ObserveOffsetMark(time.Since(markStart))
+		}
+		*nextOffset = *nextOffset + 1
+	}
+}
+
+func workerStripeForMessage(msg *sarama.ConsumerMessage, workers int) int {
+	if workers <= 1 {
+		return 0
+	}
+	key := strings.TrimSpace(policyIDHeader(msg))
+	if key == "" {
+		key = strings.TrimSpace(string(msg.Key))
+	}
+	if key == "" {
+		key = fmt.Sprintf("partition:%d", msg.Partition)
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	return int(h.Sum32() % uint32(workers))
+}
+
+func policyIDHeader(msg *sarama.ConsumerMessage) string {
+	if msg == nil || len(msg.Headers) == 0 {
+		return ""
+	}
+	for _, h := range msg.Headers {
+		if strings.EqualFold(strings.TrimSpace(string(h.Key)), "policy_id") {
+			return strings.TrimSpace(string(h.Value))
+		}
+	}
+	return ""
 }
 
 func buildTLSConfig(cfg Config) (*tls.Config, error) {

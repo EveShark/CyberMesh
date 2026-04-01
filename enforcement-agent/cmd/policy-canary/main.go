@@ -36,12 +36,24 @@ func main() {
 		trustOutDir    = flag.String("trust-out", "", "optional dir to write signer public key PEM for the agent trust store")
 
 		policyID  = flag.String("policy-id", "canary-1", "policy id (also used as Kafka key)")
+		eventAction = flag.String("event-action", "add", "event action: add|approve")
 		action    = flag.String("action", "drop", "policy action in rule_data: drop|reject")
 		target    = flag.String("target", "10.0.0.1", "IP or CIDR to block")
+		tenant    = flag.String("tenant", "default", "tenant identifier stamped into the rule payload")
+		workflowID = flag.String("workflow-id", "", "workflow identifier stamped into payload/metadata/trace")
+		requestID = flag.String("request-id", "", "request identifier stamped into payload/metadata/trace")
+		commandID = flag.String("command-id", "", "command identifier stamped into payload/metadata/trace")
 		namespace = flag.String("namespace", "cybermesh", "target namespace selector (for namespaced mode)")
 		direction = flag.String("direction", "ingress", "ingress|egress|both")
 		dryRun    = flag.Bool("dry-run", true, "set guardrails.dry_run in rule_data")
 		ttl       = flag.Int("ttl-seconds", 60, "set guardrails.ttl_seconds in rule_data")
+		approvalRequired = flag.Bool("approval-required", false, "set guardrails.approval_required in rule_data")
+		preConsensusTTL = flag.Int("pre-consensus-ttl-seconds", 0, "set guardrails.pre_consensus_ttl_seconds in rule_data")
+		rollbackIfNoCommitAfter = flag.Int("rollback-if-no-commit-after-s", 0, "set guardrails.rollback_if_no_commit_after_s in rule_data")
+		allowlistIPs = flag.String("allowlist-ips", "", "comma-separated guardrails.allowlist.ips entries")
+		allowlistCIDRs = flag.String("allowlist-cidrs", "", "comma-separated guardrails.allowlist.cidrs entries")
+		allowlistNamespaces = flag.String("allowlist-namespaces", "", "comma-separated guardrails.allowlist.namespaces entries")
+		timestampUnix = flag.Int64("timestamp-unix", 0, "override envelope timestamp (unix seconds)")
 		selectors = flag.String("selectors", "", "comma-separated selectors for endpointSelector (e.g. app=cm-client,team=prod)")
 		ports     = flag.String("ports", "", "comma-separated ports or ranges (e.g. 80 or 80-81)")
 		protocols = flag.String("protocols", "TCP", "comma-separated protocols (e.g. TCP,UDP)")
@@ -124,11 +136,23 @@ func main() {
 	event, err := buildSignedPolicyEvent(priv, pub, buildPolicyOptions{
 		PolicyID:   *policyID,
 		Action:     *action,
+		EventAction: *eventAction,
 		Target:     *target,
+		Tenant:     *tenant,
+		WorkflowID: *workflowID,
+		RequestID:  *requestID,
+		CommandID:  *commandID,
 		Namespace:  *namespace,
 		Direction:  *direction,
 		DryRun:     *dryRun,
 		TTLSeconds: *ttl,
+		ApprovalRequired: *approvalRequired,
+		PreConsensusTTLSeconds: *preConsensusTTL,
+		RollbackIfNoCommitAfter: *rollbackIfNoCommitAfter,
+		AllowlistIPs: *allowlistIPs,
+		AllowlistCIDRs: *allowlistCIDRs,
+		AllowlistNamespaces: *allowlistNamespaces,
+		TimestampUnix: *timestampUnix,
 		Selectors:  *selectors,
 		Ports:      *ports,
 		Protocols:  *protocols,
@@ -228,11 +252,23 @@ func writePublicKeyPEM(dir, name string, pub ed25519.PublicKey) error {
 type buildPolicyOptions struct {
 	PolicyID   string
 	Action     string
+	EventAction string
 	Target     string
+	Tenant     string
+	WorkflowID string
+	RequestID  string
+	CommandID  string
 	Namespace  string
 	Direction  string
 	DryRun     bool
 	TTLSeconds int
+	ApprovalRequired bool
+	PreConsensusTTLSeconds int
+	RollbackIfNoCommitAfter int
+	AllowlistIPs string
+	AllowlistCIDRs string
+	AllowlistNamespaces string
+	TimestampUnix int64
 	Selectors  string
 	Ports      string
 	Protocols  string
@@ -240,6 +276,9 @@ type buildPolicyOptions struct {
 
 func buildSignedPolicyEvent(priv ed25519.PrivateKey, pub ed25519.PublicKey, opts buildPolicyOptions) (*pb.PolicyUpdateEvent, error) {
 	now := time.Now().UTC()
+	if opts.TimestampUnix > 0 {
+		now = time.Unix(opts.TimestampUnix, 0).UTC()
+	}
 
 	dir := strings.ToLower(strings.TrimSpace(opts.Direction))
 	if dir == "both" {
@@ -256,20 +295,67 @@ func buildSignedPolicyEvent(priv ed25519.PrivateKey, pub ed25519.PublicKey, opts
 	if act != "drop" && act != "reject" {
 		return nil, fmt.Errorf("invalid action %q (expected drop|reject)", opts.Action)
 	}
+	eventAction := strings.ToLower(strings.TrimSpace(opts.EventAction))
+	if eventAction == "" {
+		eventAction = "add"
+	}
+	if eventAction != "add" && eventAction != "approve" {
+		return nil, fmt.Errorf("invalid event action %q (expected add|approve)", opts.EventAction)
+	}
 
 	// rule_data is the source of truth for the agent. It must match policy.ParseSpec expectations.
 	rule := map[string]any{
 		"policy_id": opts.PolicyID,
 		"rule_type": "block",
 		"action":    act,
+		"tenant":    strings.TrimSpace(opts.Tenant),
 		"target": map[string]any{
 			"direction": dir,
 			"namespace": strings.ToLower(strings.TrimSpace(opts.Namespace)),
+			"tenant":    strings.TrimSpace(opts.Tenant),
 		},
 		"guardrails": map[string]any{
 			"dry_run":     opts.DryRun,
 			"ttl_seconds": normalizeTTLSeconds(opts.TTLSeconds),
 		},
+	}
+	if workflowID := strings.TrimSpace(opts.WorkflowID); workflowID != "" {
+		rule["workflow_id"] = workflowID
+	}
+	metadata := map[string]any{}
+	trace := map[string]any{}
+	if requestID := strings.TrimSpace(opts.RequestID); requestID != "" {
+		rule["request_id"] = requestID
+		metadata["request_id"] = requestID
+		trace["request_id"] = requestID
+	}
+	if commandID := strings.TrimSpace(opts.CommandID); commandID != "" {
+		rule["command_id"] = commandID
+		metadata["command_id"] = commandID
+		trace["command_id"] = commandID
+	}
+	if workflowID := strings.TrimSpace(opts.WorkflowID); workflowID != "" {
+		metadata["workflow_id"] = workflowID
+		trace["workflow_id"] = workflowID
+	}
+	if tenant := strings.TrimSpace(opts.Tenant); tenant != "" {
+		metadata["tenant"] = tenant
+		trace["tenant"] = tenant
+	}
+	if len(metadata) > 0 {
+		rule["metadata"] = metadata
+	}
+	if len(trace) > 0 {
+		rule["trace"] = trace
+	}
+	if opts.ApprovalRequired {
+		rule["guardrails"].(map[string]any)["approval_required"] = true
+	}
+	if opts.PreConsensusTTLSeconds > 0 {
+		rule["guardrails"].(map[string]any)["pre_consensus_ttl_seconds"] = opts.PreConsensusTTLSeconds
+	}
+	if opts.RollbackIfNoCommitAfter > 0 {
+		rule["guardrails"].(map[string]any)["rollback_if_no_commit_after_s"] = opts.RollbackIfNoCommitAfter
 	}
 	t := strings.TrimSpace(opts.Target)
 	if t == "" {
@@ -290,6 +376,9 @@ func buildSignedPolicyEvent(priv ed25519.PrivateKey, pub ed25519.PublicKey, opts
 	if protos := splitCSV(opts.Protocols); len(protos) > 0 {
 		rule["target"].(map[string]any)["protocols"] = protos
 	}
+	if allowlist := buildAllowlist(opts.AllowlistIPs, opts.AllowlistCIDRs, opts.AllowlistNamespaces); allowlist != nil {
+		rule["guardrails"].(map[string]any)["allowlist"] = allowlist
+	}
 
 	ruleBytes, err := json.Marshal(rule)
 	if err != nil {
@@ -299,7 +388,7 @@ func buildSignedPolicyEvent(priv ed25519.PrivateKey, pub ed25519.PublicKey, opts
 
 	evt := &pb.PolicyUpdateEvent{
 		PolicyId:         opts.PolicyID,
-		Action:           "add",
+		Action:           eventAction,
 		RuleType:         "block",
 		RuleData:         ruleBytes,
 		RuleHash:         hash[:],
@@ -334,6 +423,20 @@ func buildSignedPolicyEvent(priv ed25519.PrivateKey, pub ed25519.PublicKey, opts
 	msg := append([]byte("control.policy.v2"), raw...)
 	evt.Signature = ed25519.Sign(priv, msg)
 	return evt, nil
+}
+
+func buildAllowlist(ipsCSV, cidrsCSV, namespacesCSV string) map[string]any {
+	ips := splitCSV(ipsCSV)
+	cidrs := splitCSV(cidrsCSV)
+	namespaces := splitCSV(namespacesCSV)
+	if len(ips) == 0 && len(cidrs) == 0 && len(namespaces) == 0 {
+		return nil
+	}
+	return map[string]any{
+		"ips":        ips,
+		"cidrs":      cidrs,
+		"namespaces": namespaces,
+	}
 }
 
 func normalizeTTLSeconds(ttl int) int {

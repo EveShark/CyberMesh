@@ -22,4 +22,11 @@ message PolicyAckEvent {
   bytes producer_id = 14;            // Original backend producer id for traceability
   int64 applied_at_ms = 15;          // Unix timestamp in milliseconds when apply finished (preferred when set)
   int64 acked_at_ms = 16;            // Unix timestamp in milliseconds when ACK emitted (preferred when set)
+  string trace_id = 17;              // Optional propagated trace identifier
+  string source_event_id = 18;       // Optional original upstream source event identifier
+  string sentinel_event_id = 19;     // Optional Sentinel-owned analysis event identifier
+  string ack_event_id = 20;          // Optional immutable ACK event identifier
+  string request_id = 21;            // Optional originating API/plugin request identifier
+  string command_id = 22;            // Optional operator command identifier
+  string workflow_id = 23;           // Optional higher-level workflow identifier
 }

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -237,7 +238,10 @@ func (c *apiClient) do(ctx context.Context, opts requestOptions, out any) error 
 			code := sanitizeRemoteText(env.Error.Code)
 			message := sanitizeRemoteText(env.Error.Message)
 			requestID := sanitizeRemoteText(env.Error.RequestID)
-			if env.Error.RequestID != "" {
+			if detail := rateLimitDetail(resp.StatusCode, code, resp.Header); detail != "" {
+				message = message + " (" + detail + ")"
+			}
+			if requestID != "" && !strings.EqualFold(requestID, "unknown") {
 				return fmt.Errorf("%s: %s (request_id=%s)", code, message, requestID)
 			}
 			return fmt.Errorf("%s: %s", code, message)
@@ -267,5 +271,39 @@ func sanitizeRemoteText(s string) string {
 			b.WriteRune('?')
 		}
 	}
-	return b.String()
+	return strings.TrimSpace(b.String())
+}
+
+func rateLimitDetail(statusCode int, code string, header http.Header) string {
+	if statusCode != http.StatusTooManyRequests &&
+		!strings.Contains(code, "RATE_LIMIT") &&
+		!strings.Contains(code, "COOLDOWN_ACTIVE") {
+		return ""
+	}
+
+	retryAfter := strings.TrimSpace(header.Get("Retry-After"))
+	if retryAfter != "" {
+		if seconds, err := strconv.Atoi(retryAfter); err == nil && seconds > 0 {
+			return fmt.Sprintf("retry after %ds", seconds)
+		}
+		return "retry after " + retryAfter
+	}
+
+	reset := strings.TrimSpace(header.Get("X-RateLimit-Reset"))
+	if reset == "" {
+		return ""
+	}
+	resetUnix, err := strconv.ParseInt(reset, 10, 64)
+	if err != nil || resetUnix <= 0 {
+		return ""
+	}
+	wait := time.Until(time.Unix(resetUnix, 0))
+	if wait <= 0 {
+		return ""
+	}
+	seconds := int(wait.Round(time.Second) / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	return fmt.Sprintf("retry after %ds", seconds)
 }

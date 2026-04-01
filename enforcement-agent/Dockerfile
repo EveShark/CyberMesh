@@ -29,6 +29,11 @@ RUN go build \
     -trimpath \
     -o /out/enforcement-agent \
     ./cmd/agent
+RUN go build \
+    -ldflags="-s -w" \
+    -trimpath \
+    -o /out/policy-canary \
+    ./cmd/policy-canary
 
 # ============================================================
 # Stage 2: Runtime
@@ -46,6 +51,7 @@ RUN apt-get update && \
 
 # Copy binary from builder
 COPY --from=builder /out/enforcement-agent /usr/local/bin/enforcement-agent
+COPY --from=builder /out/policy-canary /usr/local/bin/policy-canary
 
 # Create runtime directories used by the agent.
 # /var/run/enforcement-agent is used for local state lock/db files.

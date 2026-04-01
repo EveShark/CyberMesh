@@ -7,6 +7,7 @@ Topics:
 - ai.anomalies.v1
 - ai.evidence.v1
 - ai.policy.v1
+- control.fast_mitigation.v1
 """
 from confluent_kafka import Producer, KafkaException
 import time
@@ -14,7 +15,7 @@ import hashlib
 import threading
 import os
 from typing import Optional
-from ..contracts import AnomalyMessage, EvidenceMessage, PolicyMessage
+from ..contracts import AnomalyMessage, EvidenceMessage, FastMitigationMessage, PolicyMessage
 from ..utils.errors import KafkaError
 from ..utils.circuit_breaker import CircuitBreaker
 from ..utils.backoff import ExponentialBackoff
@@ -154,38 +155,62 @@ class AIProducer:
     def send_policy(self, msg: PolicyMessage) -> bool:
         """Send policy message to ai.policy.v1"""
         return self._send_message(msg, "policy", force_flush=self.policy_sync_flush)
-    
-    def _send_message(self, msg, msg_type: str, force_flush: bool = False) -> bool:
-        """Send message with circuit breaker and retry"""
-        # Get topic from settings
-        topic_map = {
-            "anomaly": self.topics.ai_anomalies,
-            "evidence": self.topics.ai_evidence,
-            "policy": self.topics.ai_policy,
-        }
-        topic = topic_map[msg_type]
-        data = msg.to_bytes()
-        
+
+    def send_fast_mitigation(self, msg: FastMitigationMessage) -> bool:
+        """Send fast mitigation message to control.fast_mitigation.v1."""
+        return self._send_message(
+            msg,
+            "fast_mitigation",
+            force_flush=False,
+            max_attempts=1,
+            retry_enabled=False,
+            send_to_dlq=False,
+            raise_on_failure=False,
+        )
+
+    def send_pcap_request(self, payload: bytes, *, key: Optional[str] = None) -> bool:
+        """Send raw protobuf PCAP request to pcap.request.v1."""
+        return self._send_bytes(
+            self.topics.pcap_request,
+            payload,
+            key=key,
+            force_flush=True,
+        )
+
+    def _send_bytes(
+        self,
+        topic: str,
+        data: bytes,
+        *,
+        key: Optional[str] = None,
+        force_flush: bool = False,
+        metric_type: Optional[str] = None,
+        max_attempts: Optional[int] = None,
+        retry_enabled: bool = True,
+        send_to_dlq: bool = True,
+        raise_on_failure: bool = True,
+    ) -> bool:
         last_error = None
         start = time.monotonic()
         backoff = self._new_backoff()
+        attempts = 0
+        configured_max_attempts = max(1, int(max_attempts)) if max_attempts is not None else None
         while True:
+            attempts += 1
             attempt_start = time.monotonic()
             try:
-                # CircuitBreaker.call() wraps the operation
                 def _send():
                     self.producer.produce(
                         topic,
                         value=data,
+                        key=key,
                         callback=self._delivery_callback
                     )
-                    # Process delivery callbacks
                     self.producer.poll(0)
                     self._maybe_flush(force=force_flush)
 
                 self.circuit_breaker.call(_send)
-                
-                # Check for delivery errors
+
                 with self._lock:
                     if self._delivery_errors:
                         error = self._delivery_errors.pop(0)
@@ -195,10 +220,11 @@ class AIProducer:
                     time.monotonic() - attempt_start,
                     "success",
                 )
-                self._metrics_collector.record_message_published(msg_type, "success", len(data))
+                if metric_type:
+                    self._metrics_collector.record_message_published(metric_type, "success", len(data))
                 self._metrics_collector.record_kafka_publish_latency(topic, time.monotonic() - start)
                 return True
-                
+
             except Exception as e:
                 last_error = e
                 self._metrics_collector.record_kafka_publish_attempt_latency(
@@ -206,22 +232,62 @@ class AIProducer:
                     time.monotonic() - attempt_start,
                     "error",
                 )
-                self._metrics_collector.record_kafka_retry(topic, type(e).__name__)
-                
+                if retry_enabled:
+                    self._metrics_collector.record_kafka_retry(topic, type(e).__name__)
+
+                if configured_max_attempts is not None and attempts >= configured_max_attempts:
+                    break
+
+                if not retry_enabled:
+                    break
+
                 try:
                     delay = backoff.next_delay()
                     time.sleep(delay)
                 except Exception:
-                    # Max attempts reached
                     break
-        
-        # Permanent failure - send to DLQ
+
         with self._lock:
             self._messages_failed += 1
-        self._metrics_collector.record_message_published(msg_type, "failed", len(data))
+        if metric_type:
+            self._metrics_collector.record_message_published(metric_type, "failed", len(data))
         self._metrics_collector.record_kafka_publish_latency(topic, time.monotonic() - start)
-        self._send_to_dlq(data, msg_type, str(last_error))
-        raise KafkaError(f"Failed to send after max retries: {last_error}")
+        if send_to_dlq:
+            self._send_to_dlq(data, topic, str(last_error))
+        if raise_on_failure:
+            raise KafkaError(f"Failed to send after max retries: {last_error}")
+        return False
+    
+    def _send_message(
+        self,
+        msg,
+        msg_type: str,
+        force_flush: bool = False,
+        max_attempts: Optional[int] = None,
+        retry_enabled: bool = True,
+        send_to_dlq: bool = True,
+        raise_on_failure: bool = True,
+    ) -> bool:
+        """Send message with circuit breaker and retry"""
+        # Get topic from settings
+        topic_map = {
+            "anomaly": self.topics.ai_anomalies,
+            "evidence": self.topics.ai_evidence,
+            "policy": self.topics.ai_policy,
+            "fast_mitigation": self.topics.control_fast_mitigation,
+        }
+        topic = topic_map[msg_type]
+        data = msg.to_bytes()
+        return self._send_bytes(
+            topic,
+            data,
+            force_flush=force_flush,
+            metric_type=msg_type,
+            max_attempts=max_attempts,
+            retry_enabled=retry_enabled,
+            send_to_dlq=send_to_dlq,
+            raise_on_failure=raise_on_failure,
+        )
     
     def flush(self, timeout: float = 30.0):
         """

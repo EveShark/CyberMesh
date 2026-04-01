@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -60,8 +61,9 @@ type ConsensusEngine struct {
 	genesisBackend ctypes.StorageBackend
 
 	// State
-	running         bool
-	commitCallbacks []CommitCallback
+	running           bool
+	commitCallbacks   []CommitCallback
+	proposalCallbacks []ProposalCallback
 
 	// Metrics
 	metrics             *EngineMetrics
@@ -272,6 +274,11 @@ func (t *genesisReadyTrace) snapshot(limit int) []GenesisReadyTraceRecord {
 // CommitCallback is called when a block is committed
 type CommitCallback func(ctx context.Context, block Block, qc QC) error
 
+// ProposalCallback is invoked when a proposal has been validated and accepted
+// by HotStuff on the local validator. It must remain lightweight because it
+// runs on the consensus hot path.
+type ProposalCallback func(ctx context.Context, proposal interface{}) error
+
 // NetworkPublisher publishes consensus messages onto the network layer.
 type NetworkPublisher interface {
 	Publish(ctx context.Context, topic string, data []byte) error
@@ -360,6 +367,7 @@ func NewConsensusEngine(
 		validatorSet:      validatorSet,
 		config:            config,
 		commitCallbacks:   make([]CommitCallback, 0),
+		proposalCallbacks: make([]ProposalCallback, 0),
 		metrics:           &EngineMetrics{},
 		genesisReadyTrace: genesisReadyTrace{limit: 200},
 		stopCh:            make(chan struct{}),
@@ -467,6 +475,7 @@ func (e *ConsensusEngine) initializeComponents() error {
 		StrictValidation:    e.configMgr.GetBool("CONSENSUS_STRICT_VALIDATION", true),
 		RequireUniqueVoters: e.configMgr.GetBool("CONSENSUS_REQUIRE_UNIQUE_VOTERS", true),
 		AllowSelfVoting:     true,
+		StoreEvidence:       e.storage.StoreEvidence,
 	}
 
 	e.quorum = pbft.NewQuorumVerifier(e.validatorSet, newEncoderAdapter(e.encoder), e.audit, e.logger, quorumConfig)
@@ -704,6 +713,67 @@ func (e *ConsensusEngine) Stop() error {
 		"blocks_committed": e.metrics.BlocksCommitted,
 	})
 
+	return nil
+}
+
+// InjectDuplicateSignerQCSelfTest emits a synthetic duplicate-signer QC into the
+// local quorum verifier. It is intended only for explicit fault-injection
+// validation and should never run unless gated by configuration.
+func (e *ConsensusEngine) InjectDuplicateSignerQCSelfTest(ctx context.Context) error {
+	if e == nil || e.quorum == nil || e.storage == nil || e.validatorSet == nil {
+		return fmt.Errorf("consensus engine not fully initialized")
+	}
+
+	view := e.GetCurrentView()
+	activeValidators := make([]ctypes.ValidatorInfo, 0, len(e.validatorSet.GetValidators()))
+	for _, v := range e.validatorSet.GetValidators() {
+		if e.validatorSet.IsActiveInView(v.ID, view) {
+			activeValidators = append(activeValidators, v)
+		}
+	}
+	if len(activeValidators) < 2 {
+		return fmt.Errorf("need at least 2 active validators to synthesize duplicate-signer QC in view %d", view)
+	}
+
+	var blockHash ctypes.BlockHash
+	if _, err := rand.Read(blockHash[:]); err != nil {
+		return fmt.Errorf("generate synthetic block hash: %w", err)
+	}
+
+	before := len(e.storage.GetAllEvidence())
+	now := time.Now().UTC()
+	qc := &messages.QC{
+		View:      view + 1_000_000,
+		Height:    e.GetCurrentHeight(),
+		BlockHash: blockHash,
+		Timestamp: now,
+		Signatures: []ctypes.Signature{
+			{KeyID: activeValidators[0].ID, Timestamp: now},
+			{KeyID: activeValidators[1].ID, Timestamp: now},
+			{KeyID: activeValidators[0].ID, Timestamp: now},
+		},
+		AggregatorID: e.config.NodeID,
+	}
+
+	err := e.quorum.VerifyQC(ctx, qc)
+	if err == nil {
+		return fmt.Errorf("duplicate-signer self-test unexpectedly verified")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "duplicate signature") {
+		return fmt.Errorf("duplicate-signer self-test returned unexpected error: %w", err)
+	}
+
+	after := len(e.storage.GetAllEvidence())
+	if after <= before {
+		return errors.New("duplicate-signer self-test did not persist evidence")
+	}
+
+	e.logger.WarnContext(ctx, "duplicate-signer self-test persisted evidence",
+		"before", before,
+		"after", after,
+		"view", qc.View,
+		"height", qc.Height,
+	)
 	return nil
 }
 
@@ -1011,6 +1081,14 @@ func (e *ConsensusEngine) RegisterCommitCallback(callback CommitCallback) {
 	e.commitCallbacks = append(e.commitCallbacks, callback)
 }
 
+// RegisterProposalCallback registers a callback for accepted proposals.
+func (e *ConsensusEngine) RegisterProposalCallback(callback ProposalCallback) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.proposalCallbacks = append(e.proposalCallbacks, callback)
+}
+
 // Consensus callback implementations
 
 // OnCommit is called when a block is committed
@@ -1049,6 +1127,15 @@ func (e *ConsensusEngine) OnCommit(block Block, qc QC) error {
 func (e *ConsensusEngine) OnProposal(proposal interface{}) error {
 	ctx := context.Background()
 	e.heartbeat.OnProposal(ctx)
+	e.mu.RLock()
+	proposalCallbacks := make([]ProposalCallback, len(e.proposalCallbacks))
+	copy(proposalCallbacks, e.proposalCallbacks)
+	e.mu.RUnlock()
+	for _, cb := range proposalCallbacks {
+		if err := cb(ctx, proposal); err != nil {
+			e.logger.ErrorContext(ctx, "proposal callback failed", "error", err)
+		}
+	}
 	if e.net != nil {
 		var p *messages.Proposal
 		switch v := proposal.(type) {

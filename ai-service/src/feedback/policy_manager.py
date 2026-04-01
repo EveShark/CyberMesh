@@ -154,6 +154,18 @@ class PolicyManager:
     
     def _apply_policy(self, event: PolicyUpdateEvent, current_height: int) -> bool:
         """Apply policy based on rule type."""
+        normalized_rule_data = self._extract_rule_data(event)
+        if event.rule_type != "block" and not isinstance(normalized_rule_data, dict):
+            self.logger.error(
+                "Policy rule_data must be a JSON object for non-block policies",
+                extra={
+                    "policy_id": event.policy_id,
+                    "rule_type": event.rule_type,
+                    "rule_data_type": type(normalized_rule_data).__name__,
+                },
+            )
+            return False
+
         # Get current policy for this rule type (for rollback)
         previous_policy_id = None
         for pid, record_dict in self._get_active_policies().items():
@@ -163,19 +175,19 @@ class PolicyManager:
         
         # Validate and apply rule
         if event.rule_type == "threshold":
-            success = self._apply_threshold_policy(event.rule_data)
+            success = self._apply_threshold_policy(normalized_rule_data)
         elif event.rule_type == "blacklist":
-            success = self._apply_blacklist_policy(event.rule_data)
+            success = self._apply_blacklist_policy(normalized_rule_data)
         elif event.rule_type == "whitelist":
-            success = self._apply_whitelist_policy(event.rule_data)
+            success = self._apply_whitelist_policy(normalized_rule_data)
         elif event.rule_type == "feature_flag":
-            success = self._apply_feature_flag_policy(event.rule_data)
+            success = self._apply_feature_flag_policy(normalized_rule_data)
         elif event.rule_type == "rate_limit":
-            success = self._apply_rate_limit_policy(event.rule_data)
+            success = self._apply_rate_limit_policy(normalized_rule_data)
         elif event.rule_type == "calibration":
-            success = self._apply_calibration_policy(event.rule_data)
+            success = self._apply_calibration_policy(normalized_rule_data)
         elif event.rule_type == "block":
-            success = self._apply_block_policy(event.rule_data)
+            success = self._apply_block_policy(normalized_rule_data)
         else:
             self.logger.error(f"Unknown rule type: {event.rule_type}")
             return False
@@ -187,7 +199,7 @@ class PolicyManager:
         record = PolicyRecord(
             policy_id=event.policy_id,
             rule_type=event.rule_type,
-            rule_data=event.rule_data,
+            rule_data=self._rule_data_for_record(normalized_rule_data),
             applied_at=time.time(),
             effective_height=event.effective_height,
             expiration_height=event.expiration_height,
@@ -389,9 +401,45 @@ class PolicyManager:
         thresholds based on block control payloads.
         """
         if not isinstance(rule_data, dict):
-            self.logger.error("Block policy rule_data must be a JSON object")
-            return False
+            # Block policies are enforced downstream by the backend/enforcement
+            # path. The feedback loop should not poison its Kafka consumer just
+            # because the payload is unexpectedly shaped.
+            self.logger.warning(
+                "Block policy rule_data was not a JSON object; accepting as lifecycle-only no-op",
+                extra={"rule_data_type": type(rule_data).__name__},
+            )
         return True
+
+    def _extract_rule_data(self, event: PolicyUpdateEvent) -> Any:
+        """
+        Normalize rule_data from mixed PolicyUpdateEvent contract variants.
+
+        Newer contract (`contracts/policy.py`) carries raw bytes in `rule_data`
+        and parsed JSON dict in `parsed_rule_data`. Legacy contract
+        (`contracts/policy_update.py`) carries dict directly in `rule_data`.
+        """
+        parsed = getattr(event, "parsed_rule_data", None)
+        if isinstance(parsed, dict):
+            return parsed
+
+        rule_data = getattr(event, "rule_data", None)
+        if isinstance(rule_data, dict):
+            return rule_data
+        if isinstance(rule_data, (bytes, bytearray)):
+            try:
+                decoded = json.loads(bytes(rule_data).decode("utf-8"))
+                if isinstance(decoded, dict):
+                    return decoded
+            except Exception:
+                return rule_data
+        return rule_data
+
+    @staticmethod
+    def _rule_data_for_record(rule_data: Any) -> Dict[str, Any]:
+        """Ensure persisted policy records remain JSON-serializable."""
+        if isinstance(rule_data, dict):
+            return rule_data
+        return {"_unparsed_rule_data_type": type(rule_data).__name__}
     
     def _persist_overrides(self):
         """Persist overrides to Redis."""

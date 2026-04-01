@@ -35,6 +35,7 @@ type PolicyOutboxStatsProvider interface {
 	GetCommitPathStats() (CommitPathStats, bool)
 	GetPolicyAckConsumerStats() (PolicyAckConsumerStats, bool)
 	GetPolicyAckCausalStats() (PolicyAckCausalStats, bool)
+	NotifyPolicyOutboxDispatcher()
 }
 
 type PolicyRuntimeTraceProvider interface {
@@ -104,6 +105,9 @@ type PolicyAckConsumerStats struct {
 	WorkQueueWaits          uint64
 	SoftThrottleActivations uint64
 	LogsThrottled           uint64
+	PartitionAssignments    uint64
+	PartitionRevocations    uint64
+	PartitionsOwnedCurrent  uint64
 }
 
 type PolicyAckCausalStats struct {
@@ -129,6 +133,14 @@ type PolicyAckCausalStats struct {
 	PublishToAckCount          uint64
 	PublishToAckSumMs          float64
 	PublishToAckP95Ms          float64
+	PublishToAppliedBuckets    []utils.HistogramBucket
+	PublishToAppliedCount      uint64
+	PublishToAppliedSumMs      float64
+	PublishToAppliedP95Ms      float64
+	AppliedToAckBuckets        []utils.HistogramBucket
+	AppliedToAckCount          uint64
+	AppliedToAckSumMs          float64
+	AppliedToAckP95Ms          float64
 }
 
 // Server provides read-only API access to backend state
@@ -139,17 +151,18 @@ type Server struct {
 	httpServer *http.Server
 
 	// Backend components
-	storage      cockroach.Adapter
-	stateStore   state.StateStore
-	mempool      *mempool.Mempool
-	engine       *consapi.ConsensusEngine
-	p2pRouter    *p2p.Router
-	kafkaProd    *kafka.Producer
-	kafkaCons    *kafka.Consumer
-	redisClient  *redis.Client
-	redisMetrics *redisTelemetry
-	outboxStats  PolicyOutboxStatsProvider
-	traceStats   PolicyRuntimeTraceProvider
+	storage         cockroach.Adapter
+	stateStore      state.StateStore
+	mempool         *mempool.Mempool
+	engine          *consapi.ConsensusEngine
+	p2pRouter       *p2p.Router
+	kafkaProd       *kafka.Producer
+	kafkaCons       *kafka.Consumer
+	redisClient     *redis.Client
+	redisMetrics    *redisTelemetry
+	outboxStats     PolicyOutboxStatsProvider
+	traceStats      PolicyRuntimeTraceProvider
+	controlSafeMode *atomic.Bool
 
 	nodeAliases   map[string]string
 	nodeAliasList []string
@@ -201,8 +214,10 @@ type Server struct {
 	threatFallbackReason  atomic.Value
 
 	controlMutationsSafeMode            atomic.Bool
+	controlMutationsKillSwitch          atomic.Bool
 	controlBreakers                     *controlBreakerRegistry
 	controlMutationBlockedSafeMode      atomic.Uint64
+	controlMutationBlockedKillSwitch    atomic.Uint64
 	controlMutationBlockedConsensus     atomic.Uint64
 	controlMutationBlockedTenantScope   atomic.Uint64
 	controlMutationTimeoutTotal         atomic.Uint64
@@ -213,6 +228,14 @@ type Server struct {
 	controlMutationLimiter              *RateLimiter
 	controlMutationLastActionMu         sync.Mutex
 	controlMutationLastActionByTarget   map[string]time.Time
+	controlGateStateMu                  sync.Mutex
+	controlGateLastSampleAt             time.Time
+	controlGateLastPublishedRows        int64
+	controlGateLastAckedRows            int64
+	controlGateLastOldestPendingAgeMs   int64
+	controlGateContinuousPassSince      time.Time
+	controlGateLastIntegrityTotal       uint64
+	controlGateLastTxMismatchTotal      uint64
 }
 
 type rateLimitKey struct {
@@ -286,20 +309,21 @@ type dashboardCacheEntry struct {
 
 // Dependencies holds server dependencies
 type Dependencies struct {
-	Config        *config.APIConfig
-	Logger        *utils.Logger
-	AuditLogger   *utils.AuditLogger
-	Storage       cockroach.Adapter
-	StateStore    state.StateStore
-	Mempool       *mempool.Mempool
-	Engine        *consapi.ConsensusEngine
-	P2PRouter     *p2p.Router
-	KafkaProd     *kafka.Producer
-	KafkaCons     *kafka.Consumer
-	OutboxStats   PolicyOutboxStatsProvider
-	TraceStats    PolicyRuntimeTraceProvider
-	NodeAliases   map[string]string
-	NodeAliasList []string
+	Config          *config.APIConfig
+	Logger          *utils.Logger
+	AuditLogger     *utils.AuditLogger
+	Storage         cockroach.Adapter
+	StateStore      state.StateStore
+	Mempool         *mempool.Mempool
+	Engine          *consapi.ConsensusEngine
+	P2PRouter       *p2p.Router
+	KafkaProd       *kafka.Producer
+	KafkaCons       *kafka.Consumer
+	OutboxStats     PolicyOutboxStatsProvider
+	TraceStats      PolicyRuntimeTraceProvider
+	ControlSafeMode *atomic.Bool
+	NodeAliases     map[string]string
+	NodeAliasList   []string
 }
 
 // NewServer creates a new API server
@@ -341,12 +365,16 @@ func NewServer(deps Dependencies) (*Server, error) {
 		kafkaCons:        deps.KafkaCons,
 		outboxStats:      deps.OutboxStats,
 		traceStats:       deps.TraceStats,
+		controlSafeMode:  deps.ControlSafeMode,
 		stopCh:           make(chan struct{}),
 		processStartTime: time.Now().Unix(),
 		routeMetrics:     make(map[requestMetricKey]*routeMetric),
 		dashboardMetrics: make(map[string]*dashboardSectionMetric),
 	}
 	s.controlMutationsSafeMode.Store(deps.Config.ControlMutationsSafeMode)
+	if deps.ControlSafeMode != nil {
+		deps.ControlSafeMode.Store(deps.Config.ControlMutationsSafeMode)
+	}
 	if deps.Config.ControlAPIBreakerEnabled {
 		s.controlBreakers = newControlBreakerRegistry(deps.Config.ControlAPIBreakerErrorThreshold, deps.Config.ControlAPIBreakerCooldown)
 	}
@@ -1208,6 +1236,16 @@ func (s *Server) normalizeRoutePath(path string) string {
 		return basePath + "/state/{key}"
 	case strings.HasPrefix(trimmed, "/policies/acks/"):
 		return basePath + "/policies/acks/{id}"
+	case strings.HasSuffix(trimmed, ":revoke") && strings.HasPrefix(trimmed, "/policies/"):
+		return basePath + "/policies/{id}:revoke"
+	case strings.HasSuffix(trimmed, ":approve") && strings.HasPrefix(trimmed, "/policies/"):
+		return basePath + "/policies/{id}:approve"
+	case strings.HasSuffix(trimmed, ":reject") && strings.HasPrefix(trimmed, "/policies/"):
+		return basePath + "/policies/{id}:reject"
+	case strings.HasSuffix(trimmed, "/coverage") && strings.HasPrefix(trimmed, "/policies/"):
+		return basePath + "/policies/{id}/coverage"
+	case strings.HasPrefix(trimmed, "/policies/"):
+		return basePath + "/policies/{id}"
 	case trimmed == "/control/outbox/backlog":
 		return basePath + "/control/outbox/backlog"
 	case strings.HasSuffix(trimmed, ":retry") && strings.HasPrefix(trimmed, "/control/outbox/"):
@@ -1216,6 +1254,8 @@ func (s *Server) normalizeRoutePath(path string) string {
 		return basePath + "/control/outbox/{id}:requeue"
 	case strings.HasSuffix(trimmed, ":mark-terminal") && strings.HasPrefix(trimmed, "/control/outbox/"):
 		return basePath + "/control/outbox/{id}:mark-terminal"
+	case strings.HasSuffix(trimmed, ":revoke") && strings.HasPrefix(trimmed, "/control/outbox/"):
+		return basePath + "/control/outbox/{id}:revoke"
 	case strings.HasPrefix(trimmed, "/control/outbox/"):
 		return basePath + "/control/outbox/{id}"
 	case strings.HasPrefix(trimmed, "/control/trace/"):

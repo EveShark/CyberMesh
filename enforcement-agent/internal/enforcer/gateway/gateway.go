@@ -249,10 +249,23 @@ func validateGatewayProfile(gatewayNS string, spec policy.PolicySpec) error {
 		return fmt.Errorf("gateway: direction must be egress, got %s", spec.Target.Direction)
 	}
 
-	// v1: require explicit namespace scoping for the gateway segment.
+	// Gateway enforcement always lands in the gateway namespace, but the control-plane
+	// scope may still be namespace, tenant, or region for routing and audit purposes.
 	scope := strings.ToLower(strings.TrimSpace(spec.Target.Scope))
-	if scope != "" && scope != "namespace" {
-		return fmt.Errorf("gateway: scope must be namespace (or empty), got %s", spec.Target.Scope)
+	if scope != "" && scope != "namespace" && scope != "tenant" && scope != "region" {
+		return fmt.Errorf("gateway: scope must be namespace, tenant, region, or empty, got %s", spec.Target.Scope)
+	}
+	if scope == "tenant" && effectivePolicyTenant(spec) == "" {
+		return errors.New("gateway: tenant scope requires tenant metadata")
+	}
+	if scope == "region" {
+		region := strings.ToLower(strings.TrimSpace(spec.Region))
+		if region == "" {
+			region = strings.ToLower(strings.TrimSpace(spec.Target.Region))
+		}
+		if region == "" {
+			return errors.New("gateway: region scope requires region metadata")
+		}
 	}
 
 	ns := strings.ToLower(strings.TrimSpace(spec.Target.Namespace))

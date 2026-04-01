@@ -238,7 +238,7 @@ func (a *adapter) LoadLastCommitted(ctx context.Context) (uint64, []byte, []byte
 func (a *adapter) GetCommittedBlockHash(ctx context.Context, height uint64) ([]byte, bool, error) {
 	stop := a.recordQuery("get_committed_block_hash")
 	defer stop()
-	row := a.stmtGetCommitted.QueryRowContext(ctx, height)
+	row := a.stmtGetCommitted.QueryRowContext(ctx, int64(height))
 	var hash []byte
 	if err := row.Scan(&hash); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

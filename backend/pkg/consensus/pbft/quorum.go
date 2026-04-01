@@ -14,11 +14,12 @@ import (
 
 // QuorumVerifier handles quorum certificate verification
 type QuorumVerifier struct {
-	validatorSet ValidatorSet
-	encoder      MessageEncoder
-	config       *QuorumConfig
-	audit        AuditLogger
-	logger       Logger
+	validatorSet  ValidatorSet
+	encoder       MessageEncoder
+	config        *QuorumConfig
+	audit         AuditLogger
+	logger        Logger
+	storeEvidence func(*messages.Evidence) error
 
 	// QC cache for performance
 	qcCache *expirable.LRU[BlockHash, bool]
@@ -34,6 +35,7 @@ type QuorumConfig struct {
 	StrictValidation    bool
 	RequireUniqueVoters bool
 	AllowSelfVoting     bool
+	StoreEvidence       func(*messages.Evidence) error
 }
 
 // DefaultQuorumConfig returns secure defaults
@@ -70,12 +72,13 @@ func NewQuorumVerifier(
 	}
 
 	return &QuorumVerifier{
-		validatorSet: validatorSet,
-		encoder:      encoder,
-		config:       config,
-		audit:        audit,
-		logger:       logger,
-		qcCache:      cache,
+		validatorSet:  validatorSet,
+		encoder:       encoder,
+		config:        config,
+		audit:         audit,
+		logger:        logger,
+		storeEvidence: config.StoreEvidence,
+		qcCache:       cache,
 	}
 }
 
@@ -167,6 +170,11 @@ func (qv *QuorumVerifier) verifyQCInternal(ctx context.Context, qc QC) error {
 					"offender": fmt.Sprintf("%x", sig.KeyID[:]),
 					"view":     qc.GetView(),
 				})
+				if qv.storeEvidence != nil {
+					if err := qv.storeEvidence(evidence); err != nil {
+						qv.logger.ErrorContext(ctx, "failed to store duplicate signer evidence", "error", err)
+					}
+				}
 			}
 
 			return fmt.Errorf("QC contains duplicate signature from validator %x", sig.KeyID[:8])

@@ -5,7 +5,14 @@ param(
 $ErrorActionPreference = "Stop"
 
 if (-not $ArtifactsDir) {
-    $ArtifactsDir = Join-Path (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)) "bin"
+    $scriptRoot = if ($PSScriptRoot) {
+        $PSScriptRoot
+    } elseif ($PSCommandPath) {
+        Split-Path -Parent $PSCommandPath
+    } else {
+        Split-Path -Parent $MyInvocation.MyCommand.Path
+    }
+    $ArtifactsDir = Join-Path (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $scriptRoot))) "bin"
 }
 
 $ArtifactsDir = [System.IO.Path]::GetFullPath($ArtifactsDir)

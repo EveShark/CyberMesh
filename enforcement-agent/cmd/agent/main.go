@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -69,6 +70,13 @@ func main() {
 	if err != nil {
 		logger.Fatal("failed to load trusted keys", zap.Error(err))
 	}
+	var fastTrust *policy.TrustedKeys
+	if cfg.FastMitigation.Enabled {
+		fastTrust, err = policy.LoadTrustedKeys(cfg.FastMitigation.TrustedKeysDir)
+		if err != nil {
+			logger.Fatal("failed to load fast mitigation trusted keys", zap.Error(err))
+		}
+	}
 
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
@@ -124,6 +132,12 @@ func main() {
 			Binary:             cfg.IPTablesBinary,
 			NamespaceSetPrefix: cfg.SelectorNamespacePrefix,
 			NodeSetPrefix:      cfg.SelectorNodePrefix,
+			KubeConfigPath:     cfg.KubeConfigPath,
+			Context:            cfg.KubeContext,
+			KubeNamespace:      cfg.KubeNamespace,
+			QPS:                cfg.KubeQPS,
+			Burst:              cfg.KubeBurst,
+			NodeName:           cfg.NodeName,
 		},
 		NFTables: nftables.Config{
 			Binary:             cfg.NFTBinary,
@@ -147,11 +161,17 @@ func main() {
 		HistoryRetention: cfg.StateHistoryRetention,
 		EnableChecksum:   cfg.StateChecksum,
 		LockTimeout:      cfg.StateLockTimeout,
+		PersistMinGap:    cfg.StatePersistMinGap,
 	})
+	stateLoadedOK := true
 	if err := store.Load(); err != nil {
 		logger.Warn("failed to load persisted policy state", zap.Error(err))
+		stateLoadedOK = false
 	}
 	recorder.SetActivePolicies(store.ActiveCount())
+	if err := maybeFastForwardPolicyBacklog(ctx, cfg, store, stateLoadedOK, logger); err != nil {
+		logger.Fatal("failed to fast-forward stale policy backlog", zap.Error(err))
+	}
 
 	rateCoord, cleanup := buildRateCoordinator(ctx, cfg, store, logger)
 	if cleanup != nil {
@@ -171,6 +191,7 @@ func main() {
 		FastPathMinConfidence: cfg.FastPathMinConfidence,
 		FastPathSignals:       cfg.FastPathSignalsRequired,
 		AckPublisher:          ackPublisher,
+		AckEnqueueTimeout:     cfg.Ack.EnqueueTimeout,
 		ControllerInstanceID:  controllerInstanceID(cfg.Ack.ClientID),
 		ReplayWindow:          cfg.Security.ReplayWindow,
 		ReplayFutureSkew:      cfg.Security.ReplayFutureSkew,
@@ -186,6 +207,8 @@ func main() {
 		Brokers:         cfg.Kafka.Brokers,
 		GroupID:         cfg.Kafka.GroupID,
 		Topic:           cfg.Kafka.Topic,
+		HandlerWorkers:  cfg.Kafka.HandlerWorkers,
+		HandlerQueue:    cfg.Kafka.HandlerQueue,
 		ProtocolVersion: cfg.Kafka.ProtocolVersion,
 		TLS:             cfg.Kafka.TLS,
 		TLSCAPath:       cfg.Kafka.TLSCAPath,
@@ -203,12 +226,61 @@ func main() {
 	}
 	defer consumer.Close()
 
+	var fastConsumer *kafka.Consumer
+	var fastRejectSink controller.FastRejectSink = noopFastRejectSinkShim{}
+	if cfg.FastMitigation.Enabled {
+		rejectCfg, err := controller.BuildFastRejectSaramaConfig(
+			cfg.Kafka.ProtocolVersion,
+			cfg.Kafka.TLS,
+			cfg.Kafka.TLSCAPath,
+			cfg.Kafka.TLSCertPath,
+			cfg.Kafka.TLSKeyPath,
+			cfg.Kafka.SASLEnabled,
+			cfg.Kafka.SASLMechanism,
+			cfg.Kafka.SASLUsername,
+			cfg.Kafka.SASLPassword,
+		)
+		if err != nil {
+			logger.Fatal("failed to build fast mitigation reject producer config", zap.Error(err))
+		}
+		fastRejectSink, err = controller.NewKafkaFastRejectSink(rejectCfg, cfg.Kafka.Brokers, cfg.FastMitigation.RejectTopic, cfg.FastMitigation.GroupID, logger)
+		if err != nil {
+			logger.Fatal("failed to create fast mitigation reject sink", zap.Error(err))
+		}
+		defer fastRejectSink.Close()
+		fastConsumer, err = createKafkaConsumerWithRetry(ctx, logger, kafka.Config{
+			Brokers:         cfg.Kafka.Brokers,
+			GroupID:         cfg.FastMitigation.GroupID,
+			Topic:           cfg.FastMitigation.Topic,
+			HandlerWorkers:  cfg.Kafka.HandlerWorkers,
+			HandlerQueue:    cfg.Kafka.HandlerQueue,
+			ProtocolVersion: cfg.Kafka.ProtocolVersion,
+			TLS:             cfg.Kafka.TLS,
+			TLSCAPath:       cfg.Kafka.TLSCAPath,
+			TLSCertPath:     cfg.Kafka.TLSCertPath,
+			TLSKeyPath:      cfg.Kafka.TLSKeyPath,
+			SASLEnabled:     cfg.Kafka.SASLEnabled,
+			SASLMechanism:   cfg.Kafka.SASLMechanism,
+			SASLUsername:    cfg.Kafka.SASLUsername,
+			SASLPassword:    cfg.Kafka.SASLPassword,
+			Metrics:         recorder,
+			Logger:          logger,
+		}, controller.NewFastHandler(fastTrust, ctrl, recorder, fastRejectSink, logger))
+		if err != nil {
+			logger.Fatal("failed to create fast mitigation consumer after retries", zap.Error(err))
+		}
+		defer fastConsumer.Close()
+	}
+
 	reconciler := reconciler.New(store, backend, cfg.ReconcileInterval, cfg.ReconcilerMaxBackoff, ledgerProvider, cfg.LedgerDriftGrace, killSwitch, logger, recorder)
 	reconciler.RunOnce(ctx)
 	go reconciler.Run(ctx)
 
 	sched := scheduler.New(store, backend, cfg.ExpirationCheckFreq, cfg.SchedulerMaxBackoff, killSwitch, logger, recorder)
 	go sched.Run(ctx)
+	if cfg.StateFlushInterval > 0 {
+		go runStateFlushLoop(ctx, cfg.StateFlushInterval, store, logger)
+	}
 
 	metricsServer := buildHTTPServer(cfg.MetricsAddr, registry, backend, store, ctrl, killSwitch, ackStatus, recorder, logger)
 	go func() {
@@ -223,13 +295,46 @@ func main() {
 			cancel()
 		}
 	}()
+	if fastConsumer != nil {
+		go func() {
+			if err := fastConsumer.Run(ctx); err != nil {
+				logger.Error("fast mitigation consumer stopped", zap.Error(err))
+				cancel()
+			}
+		}()
+	}
 
 	<-ctx.Done()
+	if err := store.Flush(); err != nil {
+		logger.Warn("state flush on shutdown failed", zap.Error(err))
+	}
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer shutdownCancel()
 	metricsServer.Shutdown(shutdownCtx) //nolint:errcheck
 	logger.Info("agent shutdown complete")
 }
+
+func runStateFlushLoop(ctx context.Context, interval time.Duration, store *state.Store, logger *zap.Logger) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := store.Flush(); err != nil && logger != nil {
+				logger.Warn("state flush failed", zap.Error(err))
+			}
+		}
+	}
+}
+
+type noopFastRejectSinkShim struct{}
+
+func (noopFastRejectSinkShim) PublishReject(context.Context, *sarama.ConsumerMessage, error) error {
+	return nil
+}
+func (noopFastRejectSinkShim) Close() error { return nil }
 
 func buildRateCoordinator(ctx context.Context, cfg config.Config, store *state.Store, logger *zap.Logger) (ratelimit.Coordinator, func()) {
 	backend := cfg.RateLimiter.Backend
@@ -313,6 +418,236 @@ func createKafkaConsumerWithRetry(ctx context.Context, logger *zap.Logger, cfg k
 			}
 		}
 	}
+}
+
+type policyBacklogCommitter func(context.Context, config.Config) (int, int64, error)
+
+const (
+	policyBacklogTokenStatePending = "pending"
+	policyBacklogTokenStateApplied = "applied"
+)
+
+func maybeFastForwardPolicyBacklog(ctx context.Context, cfg config.Config, store *state.Store, stateLoadedOK bool, logger *zap.Logger) error {
+	return maybeFastForwardPolicyBacklogWithCommitter(ctx, cfg, store, stateLoadedOK, logger, commitPolicyBacklogOffsets)
+}
+
+func maybeFastForwardPolicyBacklogWithCommitter(ctx context.Context, cfg config.Config, store *state.Store, stateLoadedOK bool, logger *zap.Logger, commit policyBacklogCommitter) error {
+	if !cfg.Kafka.SkipStaleBacklogOnEmptyState {
+		return nil
+	}
+	if !stateLoadedOK {
+		if logger != nil {
+			logger.Warn("skipping stale backlog fast-forward because persisted state did not load cleanly")
+		}
+		return nil
+	}
+	if cfg.Kafka.ConsumptionMode != "fanout_per_node" {
+		if logger != nil {
+			logger.Warn("skipping stale backlog fast-forward because consumption mode is not node-scoped fanout",
+				zap.String("mode", cfg.Kafka.ConsumptionMode))
+		}
+		return nil
+	}
+	if cfg.Kafka.SkipStaleBacklogToken == "" {
+		if logger != nil {
+			logger.Warn("skipping stale backlog fast-forward because no reset token was provided")
+		}
+		return nil
+	}
+	if store == nil || store.ActiveCount() != 0 {
+		return nil
+	}
+	tokenPath := policyBacklogFastForwardTokenPath(cfg.StatePath)
+	tokenState, applied, err := readPolicyBacklogFastForwardTokenState(tokenPath, cfg.Kafka.SkipStaleBacklogToken)
+	if err != nil {
+		return fmt.Errorf("check stale backlog fast-forward token: %w", err)
+	}
+	if applied {
+		if logger != nil {
+			logger.Info("stale backlog fast-forward token already applied; skipping",
+				zap.String("group_id", cfg.Kafka.GroupID),
+				zap.String("topic", cfg.Kafka.Topic))
+		}
+		return nil
+	}
+	if tokenState == policyBacklogTokenStatePending {
+		if logger != nil {
+			logger.Warn("stale backlog fast-forward token is pending from a prior incomplete attempt; skipping automatic retry",
+				zap.String("group_id", cfg.Kafka.GroupID),
+				zap.String("topic", cfg.Kafka.Topic))
+		}
+		return nil
+	}
+	if err := writePolicyBacklogFastForwardTokenState(tokenPath, policyBacklogTokenStatePending, cfg.Kafka.SkipStaleBacklogToken); err != nil {
+		return fmt.Errorf("persist stale backlog fast-forward pending token: %w", err)
+	}
+	partitions, totalSkipped, err := commit(ctx, cfg)
+	if err != nil {
+		if clearErr := clearPolicyBacklogFastForwardTokenState(tokenPath, cfg.Kafka.SkipStaleBacklogToken, policyBacklogTokenStatePending); clearErr != nil && logger != nil {
+			logger.Warn("failed to clear pending stale backlog fast-forward token after commit error",
+				zap.Error(clearErr),
+				zap.String("group_id", cfg.Kafka.GroupID),
+				zap.String("topic", cfg.Kafka.Topic))
+		}
+		return err
+	}
+	if err := writePolicyBacklogFastForwardTokenState(tokenPath, policyBacklogTokenStateApplied, cfg.Kafka.SkipStaleBacklogToken); err != nil {
+		if logger != nil {
+			logger.Error("stale backlog fast-forward completed but applied token could not be persisted; continuing startup",
+				zap.Error(err),
+				zap.String("group_id", cfg.Kafka.GroupID),
+				zap.String("topic", cfg.Kafka.Topic))
+		}
+	}
+	if logger != nil {
+		logger.Warn("fast-forwarded stale policy backlog because local enforcement state is empty",
+			zap.String("group_id", cfg.Kafka.GroupID),
+			zap.String("topic", cfg.Kafka.Topic),
+			zap.Int("partitions", partitions),
+			zap.Int64("approx_next_offset_total", totalSkipped))
+	}
+	return nil
+}
+
+func commitPolicyBacklogOffsets(ctx context.Context, cfg config.Config) (int, int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, 0, err
+	}
+	saramaCfg := sarama.NewConfig()
+	versionStr := cfg.Kafka.ProtocolVersion
+	if versionStr == "" {
+		versionStr = "3.6.0"
+	}
+	ver, err := sarama.ParseKafkaVersion(versionStr)
+	if err != nil {
+		return 0, 0, fmt.Errorf("parse kafka version %q: %w", versionStr, err)
+	}
+	saramaCfg.Version = ver
+	saramaCfg.Net.DialTimeout = 10 * time.Second
+	saramaCfg.Net.ReadTimeout = 10 * time.Second
+	saramaCfg.Net.WriteTimeout = 10 * time.Second
+
+	if cfg.Kafka.TLS {
+		tlsConfig, err := kafkaTLSConfig(cfg)
+		if err != nil {
+			return 0, 0, fmt.Errorf("build kafka tls config: %w", err)
+		}
+		saramaCfg.Net.TLS.Enable = true
+		saramaCfg.Net.TLS.Config = tlsConfig
+	}
+	if cfg.Kafka.SASLEnabled {
+		saramaCfg.Net.SASL.Enable = true
+		saramaCfg.Net.SASL.Mechanism = sarama.SASLTypePlaintext
+		if cfg.Kafka.SASLMechanism == "SCRAM-SHA-256" {
+			saramaCfg.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA256
+		} else if cfg.Kafka.SASLMechanism == "SCRAM-SHA-512" {
+			saramaCfg.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
+		}
+		saramaCfg.Net.SASL.User = cfg.Kafka.SASLUsername
+		saramaCfg.Net.SASL.Password = cfg.Kafka.SASLPassword
+	}
+
+	client, err := sarama.NewClient(cfg.Kafka.Brokers, saramaCfg)
+	if err != nil {
+		return 0, 0, fmt.Errorf("create kafka client: %w", err)
+	}
+	defer client.Close()
+
+	partitions, err := client.Partitions(cfg.Kafka.Topic)
+	if err != nil {
+		return 0, 0, fmt.Errorf("list topic partitions: %w", err)
+	}
+	offsetManager, err := sarama.NewOffsetManagerFromClient(cfg.Kafka.GroupID, client)
+	if err != nil {
+		return 0, 0, fmt.Errorf("create offset manager: %w", err)
+	}
+	defer offsetManager.Close()
+	totalSkipped := int64(0)
+	for _, partition := range partitions {
+		if err := ctx.Err(); err != nil {
+			return 0, 0, err
+		}
+		nextOffset, err := client.GetOffset(cfg.Kafka.Topic, partition, sarama.OffsetNewest)
+		if err != nil {
+			return 0, 0, fmt.Errorf("get latest offset for partition %d: %w", partition, err)
+		}
+		pom, err := offsetManager.ManagePartition(cfg.Kafka.Topic, partition)
+		if err != nil {
+			return 0, 0, fmt.Errorf("manage offsets for partition %d: %w", partition, err)
+		}
+		pom.MarkOffset(nextOffset, "skip_stale_backlog_on_empty_state")
+		if err := pom.Close(); err != nil {
+			return 0, 0, fmt.Errorf("commit offset for partition %d: %w", partition, err)
+		}
+		totalSkipped += nextOffset
+	}
+	return len(partitions), totalSkipped, nil
+}
+
+func policyBacklogFastForwardTokenPath(statePath string) string {
+	if strings.TrimSpace(statePath) == "" {
+		return ""
+	}
+	return statePath + ".skip_stale_backlog.token"
+}
+
+func readPolicyBacklogFastForwardTokenState(path string, token string) (string, bool, error) {
+	if path == "" || strings.TrimSpace(token) == "" {
+		return "", false, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	line := strings.TrimSpace(string(data))
+	if line == "" {
+		return "", false, nil
+	}
+	state, recordedToken, ok := strings.Cut(line, ":")
+	if !ok {
+		if line == token {
+			return policyBacklogTokenStateApplied, true, nil
+		}
+		return "", false, nil
+	}
+	if recordedToken != token {
+		return "", false, nil
+	}
+	return state, state == policyBacklogTokenStateApplied, nil
+}
+
+func writePolicyBacklogFastForwardTokenState(path string, state string, token string) error {
+	if path == "" || strings.TrimSpace(token) == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(state+":"+token+"\n"), 0o600)
+}
+
+func clearPolicyBacklogFastForwardTokenState(path string, token string, expectedState string) error {
+	if path == "" || strings.TrimSpace(token) == "" {
+		return nil
+	}
+	state, applied, err := readPolicyBacklogFastForwardTokenState(path, token)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if applied || state != expectedState {
+		return nil
+	}
+	err = os.Remove(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 type ackRuntimeStatus struct {
@@ -640,6 +975,16 @@ func buildAckPublisher(ctx context.Context, cfg config.Config, recorder *metrics
 	return buildAckPublisherKafkaGo(ctx, cfg, recorder, logger, status)
 }
 
+func ackInnerRetryMax(configured int) int {
+	// ACK delivery durability is provided by the local queue + retrier. Keep the
+	// inner Kafka publisher to single-attempt behavior to avoid long head-of-line
+	// blocking on one failing record.
+	if configured <= 0 {
+		return 1
+	}
+	return 1
+}
+
 func buildAckPublisherSarama(ctx context.Context, cfg config.Config, recorder *metrics.Recorder, logger *zap.Logger, status *ackRuntimeStatus) (ack.Publisher, *ackRuntimeStatus, func()) {
 	saramaCfg := sarama.NewConfig()
 	versionStr := cfg.Kafka.ProtocolVersion
@@ -704,7 +1049,7 @@ func buildAckPublisherSarama(ctx context.Context, cfg config.Config, recorder *m
 	basePublisher, err := ack.NewKafkaPublisher(ack.Options{
 		Producer:     producer,
 		Topic:        cfg.Ack.Topic,
-		RetryMax:     cfg.Ack.RetryMax,
+		RetryMax:     ackInnerRetryMax(cfg.Ack.RetryMax),
 		RetryBackoff: cfg.Ack.RetryBackoff,
 		Logger:       logger,
 		Metrics:      recorder,
@@ -730,11 +1075,12 @@ func buildAckPublisherSarama(ctx context.Context, cfg config.Config, recorder *m
 		}
 	}
 	retrier, err := ack.NewRetryingPublisher(ack.RetrierOptions{
-		Queue:    queue,
-		Backend:  basePublisher,
-		Metrics:  recorder,
-		Logger:   logger,
-		Interval: cfg.Ack.RetryBackoff,
+		Queue:           queue,
+		Backend:         basePublisher,
+		Metrics:         recorder,
+		Logger:          logger,
+		Interval:        cfg.Ack.RetryBackoff,
+		MaxHeadAttempts: cfg.Ack.Retrier.MaxHeadAttempts,
 	})
 	if err != nil {
 		queue.Close()
@@ -859,7 +1205,7 @@ func buildAckPublisherKafkaGo(ctx context.Context, cfg config.Config, recorder *
 	basePublisher, err := ack.NewKafkaGoPublisher(ack.KafkaGoOptions{
 		Writer:       kafkaGoWriter{w: writer},
 		Topic:        cfg.Ack.Topic,
-		RetryMax:     cfg.Ack.RetryMax,
+		RetryMax:     ackInnerRetryMax(cfg.Ack.RetryMax),
 		RetryBackoff: cfg.Ack.RetryBackoff,
 		Logger:       logger,
 		Metrics:      recorder,
@@ -885,11 +1231,12 @@ func buildAckPublisherKafkaGo(ctx context.Context, cfg config.Config, recorder *
 	}
 
 	retrier, err := ack.NewRetryingPublisher(ack.RetrierOptions{
-		Queue:    queue,
-		Backend:  basePublisher,
-		Metrics:  recorder,
-		Logger:   logger,
-		Interval: cfg.Ack.RetryBackoff,
+		Queue:           queue,
+		Backend:         basePublisher,
+		Metrics:         recorder,
+		Logger:          logger,
+		Interval:        cfg.Ack.RetryBackoff,
+		MaxHeadAttempts: cfg.Ack.Retrier.MaxHeadAttempts,
 	})
 	if err != nil {
 		queue.Close()

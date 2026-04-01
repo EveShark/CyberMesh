@@ -28,6 +28,56 @@ type proposalWire struct {
 	Signature  Signature              `cbor:"10,keyasint"`
 }
 
+// EncodeProposalWire serializes a proposal through the canonical wire format so
+// interface-backed block payloads round-trip safely.
+func EncodeProposalWire(enc cbor.EncMode, p *Proposal) ([]byte, error) {
+	if enc == nil {
+		return nil, fmt.Errorf("cbor encoder not initialized")
+	}
+	pw, err := newProposalWire(p)
+	if err != nil {
+		return nil, err
+	}
+	return enc.Marshal(pw)
+}
+
+// DecodeProposalWire reconstructs a proposal from the canonical wire format.
+func DecodeProposalWire(dec cbor.DecMode, data []byte) (*Proposal, error) {
+	if dec == nil {
+		return nil, fmt.Errorf("cbor decoder not initialized")
+	}
+	var pw proposalWire
+	if err := dec.Unmarshal(data, &pw); err != nil {
+		return nil, err
+	}
+	return pw.toProposal()
+}
+
+// DecodeProposalWireMetadataOnly reconstructs only the proposal metadata and
+// intentionally drops the embedded block payload. This is used as a backward-
+// compatibility fallback for legacy persisted proposals whose block payloads do
+// not round-trip under the canonical wire codec.
+func DecodeProposalWireMetadataOnly(dec cbor.DecMode, data []byte) (*Proposal, error) {
+	if dec == nil {
+		return nil, fmt.Errorf("cbor decoder not initialized")
+	}
+	var pw proposalWire
+	if err := dec.Unmarshal(data, &pw); err != nil {
+		return nil, err
+	}
+	return &Proposal{
+		View:       pw.View,
+		Height:     pw.Height,
+		Round:      pw.Round,
+		BlockHash:  pw.BlockHash,
+		ParentHash: pw.ParentHash,
+		ProposerID: pw.ProposerID,
+		Timestamp:  pw.Timestamp,
+		JustifyQC:  pw.JustifyQC,
+		Signature:  pw.Signature,
+	}, nil
+}
+
 func newProposalWire(p *Proposal) (*proposalWire, error) {
 	var payload *block.AppBlockPayload
 	if p.Block != nil {
@@ -589,7 +639,9 @@ func (e *Encoder) VerifyQC(ctx context.Context, qc *QC) error {
 		}
 		e.mu.RUnlock()
 
-		if err := e.crypto.VerifyWithContext(ctx, voteBytes, sig.Bytes, publicKey, false); err != nil {
+		// QC signatures are historical consensus artifacts and must remain verifiable
+		// beyond the replay-protection freshness window.
+		if err := e.crypto.VerifyWithContext(ctx, voteBytes, sig.Bytes, publicKey, true); err != nil {
 			return fmt.Errorf("QC signature %d invalid for validator %x: %w", idx, sig.KeyID[:8], err)
 		}
 

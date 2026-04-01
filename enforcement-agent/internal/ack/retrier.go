@@ -10,13 +10,14 @@ import (
 
 // RetryingPublisher wraps a Publisher with a durable queue.
 type RetryingPublisher struct {
-	queue    Queue
-	backend  Publisher
-	metrics  RetrierMetrics
-	logger   *zap.Logger
-	interval time.Duration
-	stopCh   chan struct{}
-	stopped  chan struct{}
+	queue           Queue
+	backend         Publisher
+	metrics         RetrierMetrics
+	logger          *zap.Logger
+	interval        time.Duration
+	maxHeadAttempts int
+	stopCh          chan struct{}
+	stopped         chan struct{}
 }
 
 // RetrierMetrics exposes queue observability hooks.
@@ -29,11 +30,12 @@ type RetrierMetrics interface {
 
 // RetrierOptions configure RetryingPublisher.
 type RetrierOptions struct {
-	Queue    Queue
-	Backend  Publisher
-	Metrics  RetrierMetrics
-	Logger   *zap.Logger
-	Interval time.Duration
+	Queue           Queue
+	Backend         Publisher
+	Metrics         RetrierMetrics
+	Logger          *zap.Logger
+	Interval        time.Duration
+	MaxHeadAttempts int
 }
 
 // NewRetryingPublisher constructs wrapper.
@@ -48,14 +50,19 @@ func NewRetryingPublisher(opts RetrierOptions) (*RetryingPublisher, error) {
 	if interval <= 0 {
 		interval = 250 * time.Millisecond
 	}
+	maxHeadAttempts := opts.MaxHeadAttempts
+	if maxHeadAttempts <= 0 {
+		maxHeadAttempts = 3
+	}
 	r := &RetryingPublisher{
-		queue:    opts.Queue,
-		backend:  opts.Backend,
-		metrics:  opts.Metrics,
-		logger:   opts.Logger,
-		interval: interval,
-		stopCh:   make(chan struct{}),
-		stopped:  make(chan struct{}),
+		queue:           opts.Queue,
+		backend:         opts.Backend,
+		metrics:         opts.Metrics,
+		logger:          opts.Logger,
+		interval:        interval,
+		maxHeadAttempts: maxHeadAttempts,
+		stopCh:          make(chan struct{}),
+		stopped:         make(chan struct{}),
 	}
 	go r.loop()
 	return r, nil
@@ -116,6 +123,11 @@ func (r *RetryingPublisher) drain(ctx context.Context) {
 		attempts  int
 	)
 	for {
+		select {
+		case <-r.stopCh:
+			return
+		default:
+		}
 		id, payload, err := r.queue.Peek(ctx)
 		if errors.Is(err, ErrQueueEmpty) {
 			r.observeDepth(ctx)
@@ -142,7 +154,19 @@ func (r *RetryingPublisher) drain(ctx context.Context) {
 			if r.metrics != nil {
 				r.metrics.ObserveAckQueueFailure()
 			}
-			time.Sleep(r.interval)
+			if attempts >= r.maxHeadAttempts {
+				if rotateErr := r.rotateHead(ctx, id, payload); rotateErr != nil {
+					if r.logger != nil {
+						r.logger.Error("ack retrier: rotate head failed", zap.Error(rotateErr), zap.Uint64("queue_id", id), zap.String("policy_id", payload.Event.Spec.ID))
+					}
+					r.sleepOrStop()
+					continue
+				}
+				currentID = 0
+				attempts = 0
+				continue
+			}
+			r.sleepOrStop()
 			continue
 		}
 		if err := r.queue.Delete(ctx, id); err != nil {
@@ -164,6 +188,28 @@ func (r *RetryingPublisher) drain(ctx context.Context) {
 		}
 		currentID = 0
 		attempts = 0
+	}
+}
+
+func (r *RetryingPublisher) rotateHead(ctx context.Context, id uint64, payload Payload) error {
+	if _, err := r.queue.Enqueue(ctx, payload); err != nil {
+		return err
+	}
+	if err := r.queue.Delete(ctx, id); err != nil {
+		return err
+	}
+	r.observeDepth(ctx)
+	return nil
+}
+
+func (r *RetryingPublisher) sleepOrStop() {
+	timer := time.NewTimer(r.interval)
+	defer timer.Stop()
+	select {
+	case <-r.stopCh:
+		return
+	case <-timer.C:
+		return
 	}
 }
 

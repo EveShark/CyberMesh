@@ -33,8 +33,11 @@ type Recorder struct {
 	kafkaErrors         *prometheus.CounterVec
 	kafkaPartitions     *prometheus.GaugeVec
 	kafkaPartitionEvent *prometheus.CounterVec
+	kafkaQueueSaturated prometheus.Counter
+	kafkaDispatchWait   prometheus.Histogram
 	publishToConsume    prometheus.Histogram
 	consumeToApply      *prometheus.HistogramVec
+	consumeToDone       *prometheus.HistogramVec
 	applyPersist        *prometheus.HistogramVec
 	applyToAckEnqueue   *prometheus.HistogramVec
 	offsetMark          prometheus.Histogram
@@ -147,6 +150,15 @@ func NewRecorder(reg prometheus.Registerer) *Recorder {
 			Name: "policy_consumer_partition_events_total",
 			Help: "Kafka partition assignment lifecycle events grouped by partition and event",
 		}, []string{"partition", "event"}),
+		kafkaQueueSaturated: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "policy_consumer_queue_saturated_total",
+			Help: "Number of times consumer worker queues were saturated and dispatch had to wait",
+		}),
+		kafkaDispatchWait: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "policy_consumer_dispatch_wait_seconds",
+			Help:    "Latency waiting to dispatch a consumed message to a worker",
+			Buckets: prometheus.DefBuckets,
+		}),
 		publishToConsume: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "policy_publish_to_consume_seconds",
 			Help:    "Latency from Kafka publish timestamp to enforcement consume time",
@@ -155,6 +167,11 @@ func NewRecorder(reg prometheus.Registerer) *Recorder {
 		consumeToApply: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "policy_consume_to_apply_seconds",
 			Help:    "Latency from enforcement consume to policy apply result",
+			Buckets: prometheus.DefBuckets,
+		}, []string{"result"}),
+		consumeToDone: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "policy_consume_to_done_seconds",
+			Help:    "Latency from enforcement consume to handler completion",
 			Buckets: prometheus.DefBuckets,
 		}, []string{"result"}),
 		applyPersist: prometheus.NewHistogramVec(prometheus.HistogramOpts{
@@ -267,8 +284,11 @@ func NewRecorder(reg prometheus.Registerer) *Recorder {
 		r.kafkaErrors,
 		r.kafkaPartitions,
 		r.kafkaPartitionEvent,
+		r.kafkaQueueSaturated,
+		r.kafkaDispatchWait,
 		r.publishToConsume,
 		r.consumeToApply,
+		r.consumeToDone,
 		r.applyPersist,
 		r.applyToAckEnqueue,
 		r.offsetMark,
@@ -455,6 +475,22 @@ func (r *Recorder) ObservePartitionRevoked(partition int32) {
 	}
 }
 
+// ObserveKafkaQueueSaturated increments consumer dispatch saturation counter.
+func (r *Recorder) ObserveKafkaQueueSaturated() {
+	if r == nil || r.kafkaQueueSaturated == nil {
+		return
+	}
+	r.kafkaQueueSaturated.Inc()
+}
+
+// ObserveKafkaDispatchWait records dispatch wait latency before worker enqueue.
+func (r *Recorder) ObserveKafkaDispatchWait(d time.Duration) {
+	if r == nil || r.kafkaDispatchWait == nil || d < 0 {
+		return
+	}
+	r.kafkaDispatchWait.Observe(d.Seconds())
+}
+
 // ObservePublishToConsume records Kafka publish-to-consume latency.
 func (r *Recorder) ObservePublishToConsume(seconds float64) {
 	if r == nil || r.publishToConsume == nil || seconds < 0 {
@@ -472,6 +508,17 @@ func (r *Recorder) ObserveConsumeToApply(result string, d time.Duration) {
 		result = "unknown"
 	}
 	r.consumeToApply.WithLabelValues(result).Observe(d.Seconds())
+}
+
+// ObserveConsumeToDone records end-to-end handler latency from consume to return.
+func (r *Recorder) ObserveConsumeToDone(result string, d time.Duration) {
+	if r == nil || r.consumeToDone == nil || d < 0 {
+		return
+	}
+	if result == "" {
+		result = "unknown"
+	}
+	r.consumeToDone.WithLabelValues(result).Observe(d.Seconds())
 }
 
 // ObserveApplyPersist records local state persistence latency after apply.
@@ -681,6 +728,9 @@ func (r *Recorder) KafkaPartitionGauge() *prometheus.GaugeVec { return r.kafkaPa
 
 // KafkaPartitionEventCounter exposes partition lifecycle counters (used in tests).
 func (r *Recorder) KafkaPartitionEventCounter() *prometheus.CounterVec { return r.kafkaPartitionEvent }
+
+// KafkaQueueSaturatedCounter exposes queue saturation counter for tests.
+func (r *Recorder) KafkaQueueSaturatedCounter() prometheus.Counter { return r.kafkaQueueSaturated }
 
 // AppliedCounter exposes the total applied counter (used in tests).
 func (r *Recorder) AppliedCounter() prometheus.Counter { return r.applied }

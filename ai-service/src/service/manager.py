@@ -15,12 +15,16 @@ Security:
 """
 import math
 import os
+import sys
 import threading
 import time
 from collections import deque
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Optional, Dict, Any, Callable, List, Tuple
+from uuid import uuid4
+import ipaddress
 
 from ..config import Settings
 from ..config.settings import FeedbackConfig
@@ -36,6 +40,24 @@ from .crypto_setup import (
 )
 from .handlers import MessageHandlers
 from .publisher import MessagePublisher
+from .policy_aggregation import PolicyAggregationManager
+from ..utils.validators import validate_uuid
+
+
+def _load_pcap_request_pb2():
+    proto_path = os.getenv("TELEMETRY_PROTO_PATH", "").strip()
+    candidates = []
+    if proto_path:
+        candidates.append(Path(proto_path))
+    candidates.append(Path(__file__).resolve().parents[3] / "telemetry-layer" / "proto" / "gen" / "python")
+    for path in candidates:
+        if path.exists():
+            path_str = str(path)
+            if path_str not in sys.path:
+                sys.path.insert(0, path_str)
+            break
+    from telemetry_pcap_request_v1_pb2 import PcapRequestV1  # type: ignore
+    return PcapRequestV1
 
 
 class ServiceState(Enum):
@@ -112,6 +134,7 @@ class ServiceManager:
         self.detection_loop = None
         self.rate_limiter = None
         self.sentinel_adapter = None
+        self.policy_aggregator = None
         
         # State tracking
         self._start_time: Optional[datetime] = None
@@ -675,6 +698,168 @@ class ServiceManager:
                 extra={"error": str(e)}
             )
             raise
+
+    def request_policy_revoke(
+        self,
+        policy_id: str,
+        *,
+        reason_code: Optional[str] = None,
+        reason_text: Optional[str] = None,
+        requested_by: Optional[str] = None,
+        requires_ack: bool = True,
+        rollback_policy_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Publish a revoke/remove request for an existing enforcement policy."""
+        if not self._running:
+            raise ServiceError("Cannot revoke policy: service not running")
+        if self.publisher is None:
+            raise ServiceError("Cannot revoke policy: publisher not initialized")
+
+        validate_uuid(policy_id, "policy_id")
+        if rollback_policy_id:
+            validate_uuid(rollback_policy_id, "rollback_policy_id")
+
+        payload: Dict[str, Any] = {
+            "schema_version": 1,
+            "policy_id": policy_id,
+            "rule_type": "block",
+            "action": "remove",
+            "guardrails": {
+                "requires_ack": bool(requires_ack),
+            },
+            "metadata": {
+                "source_service": "ai-service",
+                "requested_at_ms": int(time.time() * 1000),
+            },
+        }
+
+        audit: Dict[str, Any] = {}
+        if reason_code:
+            audit["reason_code"] = str(reason_code).strip()
+        if reason_text:
+            audit["reason_text"] = str(reason_text).strip()
+        if requested_by:
+            requested_by = str(requested_by).strip()
+            if requested_by:
+                audit["requested_by"] = requested_by
+                payload["metadata"]["requested_by"] = requested_by
+        if audit:
+            payload["audit"] = audit
+        if rollback_policy_id:
+            payload["rollback_policy_id"] = rollback_policy_id
+
+        self.publisher.publish_policy_violation(
+            policy_id=policy_id,
+            rule_type="block",
+            enforcement_action="remove",
+            payload=payload,
+        )
+
+        return {
+            "accepted": True,
+            "policy_id": policy_id,
+            "action": "remove",
+            "requires_ack": bool(requires_ack),
+        }
+
+    def request_packet_capture(
+        self,
+        *,
+        tenant_id: str,
+        sensor_id: str,
+        requester: Optional[str] = None,
+        reason: Optional[str] = None,
+        src_ip: Optional[str] = None,
+        dst_ip: Optional[str] = None,
+        src_port: Optional[int] = None,
+        dst_port: Optional[int] = None,
+        proto: Optional[int] = None,
+        duration_ms: Optional[int] = None,
+        max_bytes: Optional[int] = None,
+        request_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Publish a typed PCAP request to telemetry."""
+        if not self._running:
+            raise ServiceError("Cannot request pcap: service not running")
+        if self.producer is None:
+            raise ServiceError("Cannot request pcap: producer not initialized")
+
+        tenant_id = str(tenant_id or "").strip()
+        sensor_id = str(sensor_id or "").strip()
+        requester = str(requester or "ai-service-ops").strip()
+        reason = str(reason or "manual_capture").strip()
+        if not tenant_id:
+            raise ValueError("tenant_id required")
+        if not sensor_id:
+            raise ValueError("sensor_id required")
+        if not requester:
+            raise ValueError("requester required")
+
+        req_id = str(request_id or uuid4()).strip()
+        validate_uuid(req_id, "request_id")
+
+        duration_val = int(duration_ms if duration_ms is not None else os.getenv("AI_PCAP_DEFAULT_DURATION_MS", "5000"))
+        max_duration = int(os.getenv("AI_PCAP_MAX_DURATION_MS", "30000"))
+        if duration_val <= 0:
+            raise ValueError("duration_ms must be positive")
+        if max_duration > 0 and duration_val > max_duration:
+            raise ValueError("duration_ms exceeds max")
+
+        max_bytes_val = int(max_bytes if max_bytes is not None else os.getenv("AI_PCAP_DEFAULT_MAX_BYTES", "1048576"))
+        cap_bytes = int(os.getenv("AI_PCAP_MAX_BYTES", "10485760"))
+        if max_bytes_val < 0:
+            raise ValueError("max_bytes must be non-negative")
+        if cap_bytes > 0 and max_bytes_val > cap_bytes:
+            raise ValueError("max_bytes exceeds max")
+
+        src_ip = str(src_ip or "").strip()
+        dst_ip = str(dst_ip or "").strip()
+        if src_ip:
+            ipaddress.ip_address(src_ip)
+        if dst_ip:
+            ipaddress.ip_address(dst_ip)
+
+        src_port_val = int(src_port or 0)
+        dst_port_val = int(dst_port or 0)
+        for name, value in (("src_port", src_port_val), ("dst_port", dst_port_val)):
+            if value < 0 or value > 65535:
+                raise ValueError(f"{name} must be between 0 and 65535")
+
+        proto_val = int(proto or 0)
+        if proto_val not in (0, 6, 17):
+            raise ValueError("proto must be one of 0, 6, 17")
+
+        if not any((src_ip, dst_ip, src_port_val, dst_port_val, proto_val)):
+            raise ValueError("at least one packet selector is required")
+
+        PcapRequestV1 = _load_pcap_request_pb2()
+        msg = PcapRequestV1(
+            schema="pcap.request.v1",
+            ts=int(time.time()),
+            tenant_id=tenant_id,
+            request_id=req_id,
+            requester=requester,
+            reason=reason,
+            src_ip=src_ip,
+            dst_ip=dst_ip,
+            src_port=src_port_val,
+            dst_port=dst_port_val,
+            proto=proto_val,
+            duration_ms=duration_val,
+            max_bytes=max_bytes_val,
+            sensor_id=sensor_id,
+        )
+
+        self.producer.send_pcap_request(msg.SerializeToString(), key=req_id)
+        return {
+            "accepted": True,
+            "request_id": req_id,
+            "topic": self.settings.kafka_topics.pcap_request if self.settings else "pcap.request.v1",
+            "tenant_id": tenant_id,
+            "sensor_id": sensor_id,
+            "duration_ms": duration_val,
+            "max_bytes": max_bytes_val,
+        }
     
     def register_handler(self, message_type: str, handler: Callable) -> None:
         """
@@ -1388,6 +1573,9 @@ class ServiceManager:
         policy_cfg = getattr(settings, "policy_publishing", None)
         if policy_cfg is not None:
             detection_config['POLICY_PUBLISHING'] = policy_cfg
+            self.policy_aggregator = PolicyAggregationManager(policy_cfg)
+        else:
+            self.policy_aggregator = None
 
         # Align sampling configuration with calibration requirements to avoid
         # starving the feedback loop of training samples. When persistence is
@@ -1446,6 +1634,7 @@ class ServiceManager:
             metrics=self.ml_metrics,
             event_recorder=self.record_detection_event,
             engine_metrics_callback=self.record_engine_metrics,
+            policy_aggregator=self.policy_aggregator,
         )
         
         self.logger.info(
@@ -1476,6 +1665,7 @@ class ServiceManager:
             logger=self.logger,
             tracker=tracker,
             event_recorder=self.record_detection_event,
+            policy_aggregator=self.policy_aggregator,
         )
 
     def record_engine_metrics(self, engines: List[Dict[str, Any]], variants: List[Dict[str, Any]]) -> None:

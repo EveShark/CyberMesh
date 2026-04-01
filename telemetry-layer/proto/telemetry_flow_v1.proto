@@ -32,6 +32,10 @@ message FlowV1 {
   int64 pkts_bwd = 13;
   int64 duration_ms = 14;
 
+  // Optional lineage identifiers from the telemetry ingress boundary.
+  string trace_id = 57;
+  string source_event_id = 58;
+
   // Identity information (optional).
   Identity identity = 15;
 

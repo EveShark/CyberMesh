@@ -31,6 +31,13 @@ func (s *engineState) GetCurrentHeight() uint64 {
 func (s *engineState) GetLastCommittedQC() *messages.QC { return nil }
 func (s *engineState) GetHighestQC() *messages.QC       { return nil }
 
+func (s *engineState) AllowRestartBootstrap(parentHash messages.BlockHash, proposalHeight uint64) bool {
+	if s == nil || s.e == nil || s.e.hotstuff == nil {
+		return false
+	}
+	return s.e.hotstuff.CanRestartBootstrap(parentHash, proposalHeight)
+}
+
 func (s *engineState) HasSeenMessage(hash [32]byte) bool {
 	_, ok := s.seen.Load(string(hash[:]))
 	return ok

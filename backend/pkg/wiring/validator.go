@@ -1,6 +1,7 @@
 package wiring
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -10,6 +11,8 @@ import (
 	"backend/pkg/utils"
 )
 
+var errAlreadyCommittedBlock = errors.New("block already committed")
+
 // validateBlock performs basic block validation before committing
 func (s *Service) validateBlock(b api.Block) error {
 	s.mu.Lock()
@@ -18,9 +21,20 @@ func (s *Service) validateBlock(b api.Block) error {
 	initialCatchup := false
 	shouldMarkSynced := false
 	commitSynced := s.commitStateSynced
+	lastCommittedHeight := s.lastCommittedHeight
+	lastCommittedHash := s.lastParent
 
 	if b.GetHeight() < expectedHeight {
 		s.mu.Unlock()
+		blockHash := b.GetHash()
+		if b.GetHeight() == lastCommittedHeight && blockHash == lastCommittedHash {
+			if s.log != nil {
+				s.log.Info("commit callback received already-committed block",
+					utils.ZapUint64("height", b.GetHeight()),
+					utils.ZapString("hash", fmt.Sprintf("%x", blockHash[:8])))
+			}
+			return errAlreadyCommittedBlock
+		}
 		return fmt.Errorf("invalid block height: got %d, expected %d",
 			b.GetHeight(), expectedHeight)
 	}

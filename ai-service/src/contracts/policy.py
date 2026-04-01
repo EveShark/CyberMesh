@@ -17,7 +17,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 from ..utils.validators import (
     validate_timestamp,
-    validate_uuid4,
+    validate_uuid,
     validate_size,
     validate_required_string,
 )
@@ -53,7 +53,7 @@ class PolicyUpdateEvent:
     
     # Valid policy actions. "drop"/"reject"/"rate_limit" are emitted by
     # runtime block policies from AI/backend and must be accepted here.
-    VALID_ACTIONS = {"add", "remove", "update", "enable", "disable", "drop", "reject", "rate_limit"}
+    VALID_ACTIONS = {"add", "apply", "remove", "update", "enable", "disable", "drop", "reject", "rate_limit"}
     
     # Valid rule types
     VALID_RULE_TYPES = {
@@ -410,9 +410,16 @@ class PolicyUpdateEvent:
         action = rule_data.get("action")
         if not isinstance(action, str) or not action:
             raise ContractError("block policy action is required")
+        action = action.strip().lower()
 
         if rule_data.get("rule_type") not in (None, "block"):
             raise ContractError("block policy rule_type field must be 'block'")
+
+        if action == "remove":
+            rollback_policy_id = rule_data.get("rollback_policy_id")
+            if rollback_policy_id not in (None, ""):
+                validate_uuid(rollback_policy_id, "rollback_policy_id")
+            return
 
         target = rule_data.get("target")
         if not isinstance(target, dict):
@@ -493,8 +500,8 @@ class PolicyUpdateEvent:
             raise ContractError("block policy target.direction must be 'ingress' or 'egress'")
 
         scope = target.get("scope")
-        if scope and scope not in {"cluster", "namespace", "node"}:
-            raise ContractError("block policy target.scope must be cluster|namespace|node")
+        if scope and scope not in {"cluster", "namespace", "node", "tenant", "region"}:
+            raise ContractError("block policy target.scope must be cluster|namespace|node|tenant|region")
 
         criteria = rule_data.get("criteria")
         if criteria is not None:
@@ -749,8 +756,7 @@ class PolicyMessage:
         payload_bytes: bytes,
     ):
         try:
-            if not validate_uuid4(policy_id):
-                raise ContractError("policy_id must be a valid UUIDv4 string")
+            validate_uuid(policy_id, "policy_id")
 
             validate_required_string(action, "action", max_length=64)
             validate_timestamp(timestamp)

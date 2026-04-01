@@ -131,7 +131,13 @@ func (p *AppBlockPayload) ToAppBlock() (*AppBlock, error) {
 	// Validate transaction root consistency
 	computedRoot := computeTxRootForPayload(txs)
 	if computedRoot != p.TxRoot {
-		return nil, fmt.Errorf("transaction root mismatch: expected %x, got %x", p.TxRoot, computedRoot)
+		var zeroRoot types.BlockHash
+		// Backward compatibility: older persisted empty proposals used a zero tx root.
+		if len(txs) == 0 && p.TxRoot == zeroRoot && computedRoot == types.BlockHash(state.HashBytes(nil)) {
+			p.TxRoot = computedRoot
+		} else {
+			return nil, fmt.Errorf("transaction root mismatch: expected %x, got %x", p.TxRoot, computedRoot)
+		}
 	}
 
 	blk := &AppBlock{

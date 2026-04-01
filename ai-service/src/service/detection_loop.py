@@ -12,6 +12,8 @@ import time
 from typing import Optional, Dict, Any, Callable, List, TYPE_CHECKING
 
 from .policy_emitter import PolicyContext, build_policy_candidate
+from .fast_mitigation import decide_fast_mitigation
+from .policy_aggregation import PolicyAggregationManager
 from ..utils.metrics import get_metrics_collector
 
 if TYPE_CHECKING:  # pragma: no cover - avoid runtime dependency cycle
@@ -72,6 +74,7 @@ class DetectionLoop:
         metrics=None,
         event_recorder: Optional[Callable[..., None]] = None,
         engine_metrics_callback: Optional[Callable[[List[Dict[str, Any]], List[Dict[str, Any]]], None]] = None,
+        policy_aggregator: Optional[PolicyAggregationManager] = None,
     ):
         """
         Initialize detection loop.
@@ -152,6 +155,9 @@ class DetectionLoop:
         self._rng = random.Random()
 
         self._policy_cfg = config.get('POLICY_PUBLISHING')
+        self._policy_aggregator = policy_aggregator
+        if self._policy_aggregator is None and self._policy_cfg is not None:
+            self._policy_aggregator = PolicyAggregationManager(self._policy_cfg)
         
         self.logger.info(
             f"DetectionLoop initialized: interval={self._interval}s, "
@@ -887,17 +893,15 @@ class DetectionLoop:
         if cfg is None:
             return
 
-        decision = build_policy_candidate(
-            PolicyContext(
-                anomaly_id=anomaly_id,
-                anomaly_type=anomaly_type,
-                severity=severity,
-                confidence=confidence,
-                network_context=network_context,
-                metadata=metadata,
-            ),
-            cfg,
+        context = PolicyContext(
+            anomaly_id=anomaly_id,
+            anomaly_type=anomaly_type,
+            severity=severity,
+            confidence=confidence,
+            network_context=network_context,
+            metadata=metadata,
         )
+        decision = build_policy_candidate(context, cfg)
 
         if decision.candidate is None:
             reason = decision.reason or "unknown"
@@ -911,6 +915,54 @@ class DetectionLoop:
             return
 
         candidate = decision.candidate
+        aggregation = None
+        if self._policy_aggregator is not None:
+            aggregation = self._policy_aggregator.admit(candidate=candidate, context=context)
+        if aggregation is not None and not aggregation.publish:
+            reason = aggregation.reason or "aggregation_suppressed"
+            with self._metrics_lock:
+                self._metrics["policy_skipped"] = self._metrics.get("policy_skipped", 0) + 1
+                reasons = self._metrics.get("policy_skip_reasons")
+                if reasons is None:
+                    reasons = {}
+                    self._metrics["policy_skip_reasons"] = reasons
+                reasons[reason] = reasons.get(reason, 0) + 1
+            return
+        if aggregation is not None and aggregation.policy_id and aggregation.policy_id != candidate.policy_id:
+            decision = build_policy_candidate(
+                context,
+                cfg,
+                policy_id_override=aggregation.policy_id,
+                aggregation_metadata={
+                    "mode": aggregation.mode,
+                    "reason": aggregation.reason,
+                    "aggregation_key": aggregation.aggregation_key,
+                    "signal_count": aggregation.signal_count,
+                    "refresh_count": aggregation.refresh_count,
+                },
+            )
+            if decision.candidate is None:
+                with self._metrics_lock:
+                    self._metrics["policy_skipped"] = self._metrics.get("policy_skipped", 0) + 1
+                return
+            candidate = decision.candidate
+        aggregation_mode = str(
+            (((candidate.payload.get("metadata") or {}).get("aggregation") or {}).get("mode"))
+            or (aggregation.mode if aggregation is not None else "publish_new")
+        )
+        signal_count = int(
+            (((candidate.payload.get("metadata") or {}).get("aggregation") or {}).get("signal_count"))
+            or (aggregation.signal_count if aggregation is not None else 1)
+        )
+
+        fast_mitigation = decide_fast_mitigation(
+            candidate=candidate,
+            context=context,
+            config=cfg,
+            aggregation_mode=aggregation_mode,
+            signal_count=signal_count,
+        )
+
         self._increment_metric("policy_candidates")
         if _policy_stage_markers_enabled():
             trace_id = (
@@ -933,6 +985,33 @@ class DetectionLoop:
 
         publish_start = time.monotonic()
         try:
+            publish_fast = getattr(self.publisher, "publish_fast_mitigation_async", None)
+            if not callable(publish_fast):
+                publish_fast = getattr(self.publisher, "publish_fast_mitigation", None)
+            if fast_mitigation.publish and callable(publish_fast):
+                try:
+                    fast_accepted = publish_fast(
+                        mitigation_id=str(fast_mitigation.mitigation_id),
+                        policy_id=candidate.policy_id,
+                        rule_type=candidate.rule_type,
+                        enforcement_action=candidate.action,
+                        payload=fast_mitigation.payload,
+                    )
+                    if fast_accepted is False:
+                        self._increment_metric("fast_mitigation_dispatch_rejected")
+                    else:
+                        self._increment_metric("fast_mitigation_dispatch_requested")
+                except Exception:
+                    self._increment_metric("fast_mitigation_failed")
+                    self.logger.warning(
+                        "Fast mitigation publish failed; durable policy path continues",
+                        exc_info=True,
+                        extra={
+                            "policy_id": candidate.policy_id,
+                            "anomaly_id": anomaly_id,
+                            "reason": fast_mitigation.reason,
+                        },
+                    )
             self.publisher.publish_policy_violation(
                 policy_id=candidate.policy_id,
                 rule_type=candidate.rule_type,
@@ -973,15 +1052,15 @@ class DetectionLoop:
             if tracker is not None:
                 ttl_seconds = getattr(self._policy_cfg, "ttl_seconds", None) if self._policy_cfg is not None else None
                 requires_ack = getattr(self._policy_cfg, "requires_ack", None) if self._policy_cfg is not None else None
-                fast_path = bool(getattr(self._policy_cfg, "canary_scope", False)) if self._policy_cfg is not None else None
-
                 try:
                     tracker.record_policy_dispatched(
                         anomaly_id=anomaly_id,
                         policy_id=candidate.policy_id,
+                        mitigation_id=str(fast_mitigation.mitigation_id) if fast_mitigation.publish and fast_mitigation.mitigation_id else None,
+                        dispatch_mode=aggregation_mode,
                         ttl_seconds=int(ttl_seconds) if ttl_seconds is not None else None,
                         requires_ack=requires_ack,
-                        fast_path=fast_path,
+                        fast_path=bool(fast_mitigation.publish),
                         timestamp=time.time(),
                     )
                 except Exception as tracker_err:  # pragma: no cover - defensive

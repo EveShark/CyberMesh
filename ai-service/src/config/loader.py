@@ -142,11 +142,13 @@ def _load_kafka_topics() -> KafkaTopicsConfig:
         ai_anomalies=_get_env("TOPIC_AI_ANOMALIES", "ai.anomalies.v1"),
         ai_evidence=_get_env("TOPIC_AI_EVIDENCE", "ai.evidence.v1"),
         ai_policy=_get_env("TOPIC_AI_POLICY", "ai.policy.v1"),
+        control_fast_mitigation=_get_env("TOPIC_CONTROL_FAST_MITIGATION", "control.fast_mitigation.v1"),
         control_commits=_get_env("TOPIC_CONTROL_COMMITS", "control.commits.v1"),
         control_reputation=_get_env("TOPIC_CONTROL_REPUTATION", "control.reputation.v1"),
         control_policy=_get_env("TOPIC_CONTROL_POLICY", "control.policy.v2"),
         control_policy_ack=_get_env("TOPIC_CONTROL_POLICY_ACK", "control.enforcement_ack.v1"),
         control_evidence=_get_env("TOPIC_CONTROL_EVIDENCE", "control.evidence.v1"),
+        pcap_request=_get_env("TOPIC_PCAP_REQUEST", "pcap.request.v1"),
         dlq=_get_env("TOPIC_DLQ", "ai.dlq.v1"),
     )
 
@@ -259,6 +261,21 @@ def _load_policy_publishing() -> "PolicyPublishingConfig":
         max_policies_per_minute=_get_int_env("POLICY_PUBLISHING_MAX_POLICIES_PER_MINUTE", 120),
         cidr_max_prefix_len=_get_int_env("POLICY_PUBLISHING_CIDR_MAX_PREFIX", 24),
         max_targets=_get_int_env("POLICY_PUBLISHING_MAX_TARGETS", 32),
+        aggregation_enabled=_get_bool_env("POLICY_PUBLISHING_AGGREGATION_ENABLED", True),
+        aggregation_window_seconds=_get_int_env("POLICY_PUBLISHING_AGGREGATION_WINDOW_SECONDS", 300),
+        aggregation_cooldown_seconds=_get_int_env("POLICY_PUBLISHING_AGGREGATION_COOLDOWN_SECONDS", 120),
+        aggregation_min_signals=_get_int_env("POLICY_PUBLISHING_AGGREGATION_MIN_SIGNALS", 1),
+        aggregation_escalation_window_seconds=_get_int_env(
+            "POLICY_PUBLISHING_AGGREGATION_ESCALATION_WINDOW_SECONDS", 300
+        ),
+        aggregation_refresh_margin_seconds=_get_int_env(
+            "POLICY_PUBLISHING_AGGREGATION_REFRESH_MARGIN_SECONDS", 60
+        ),
+        aggregation_emergency_severity=_get_int_env("POLICY_PUBLISHING_AGGREGATION_EMERGENCY_SEVERITY", 10),
+        aggregation_emergency_confidence=_get_float_env(
+            "POLICY_PUBLISHING_AGGREGATION_EMERGENCY_CONFIDENCE", 0.995
+        ),
+        aggregation_max_keys=_get_int_env("POLICY_PUBLISHING_AGGREGATION_MAX_KEYS", 50000),
     )
     return config
 

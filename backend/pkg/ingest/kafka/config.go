@@ -210,9 +210,11 @@ func BuildSaramaConfig(ctx context.Context, cm *utils.ConfigManager, log *utils.
 	cfg.Producer.Retry.Max = cm.GetInt("KAFKA_PRODUCER_RETRIES", 3)
 	cfg.Producer.Return.Successes = true
 	cfg.Producer.Return.Errors = true
+	cfg.Producer.Timeout = cm.GetDuration("KAFKA_PRODUCER_TIMEOUT", 5*time.Second)
 	if cm.GetBool("KAFKA_CONTROL_LOW_LATENCY", true) {
 		cfg.Producer.Flush.Frequency = cm.GetDuration("KAFKA_PRODUCER_FLUSH_FREQUENCY", 20*time.Millisecond)
-		cfg.Producer.Flush.Messages = cm.GetInt("KAFKA_PRODUCER_FLUSH_MESSAGES", 1)
+		// Small micro-batches preserve low latency while avoiding single-message flush bottlenecks under bursts.
+		cfg.Producer.Flush.Messages = cm.GetInt("KAFKA_PRODUCER_FLUSH_MESSAGES", 16)
 		cfg.Producer.Flush.Bytes = cm.GetInt("KAFKA_PRODUCER_FLUSH_BYTES", 0)
 	}
 

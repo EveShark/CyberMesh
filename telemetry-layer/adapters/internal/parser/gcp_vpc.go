@@ -71,6 +71,17 @@ func ParseGCPVPC(line []byte) ([]model.Record, error) {
 		payload.Get("src_vpc.subnetwork_name").String(),
 		payload.Get("dest_vpc.subnetwork_name").String(),
 	)
+	rec.SourceEventID = firstNonEmpty(
+		root.Get("insertId").String(),
+		root.Get("operation.id").String(),
+		payload.Get("source_event_id").String(),
+		payload.Get("event_id").String(),
+	)
+	rec.TraceID = firstNonEmpty(
+		root.Get("trace").String(),
+		root.Get("operation.id").String(),
+		payload.Get("trace_id").String(),
+	)
 	rec.Verdict = strings.ToUpper(payload.Get("reporter").String())
 	if rec.SrcIP == "" || rec.DstIP == "" || rec.TenantID == "" {
 		return nil, errors.New("missing required fields")

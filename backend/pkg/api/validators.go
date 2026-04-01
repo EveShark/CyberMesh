@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"strings"
 
@@ -47,6 +48,23 @@ func (s *Server) handleValidatorList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	validators := s.engine.ListValidators()
+	if db, err := s.getDB(); err == nil {
+		syncCtx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
+		defer cancel()
+		if syncErr := syncValidatorSnapshots(syncCtx, db, validators); syncErr != nil {
+			s.logger.WarnContext(syncCtx, "failed to persist validator snapshots", utils.ZapError(syncErr))
+		}
+		if s.p2pRouter != nil {
+			snapshots, ttl := s.p2pRouter.SnapshotPeerState()
+			var latest uint64
+			if s.stateStore != nil {
+				latest = s.stateStore.Latest()
+			}
+			if syncErr := syncP2PStateSnapshots(syncCtx, db, snapshots, ttl, latest); syncErr != nil {
+				s.logger.WarnContext(syncCtx, "failed to persist p2p state snapshots", utils.ZapError(syncErr))
+			}
+		}
+	}
 	responses := make([]ValidatorResponse, 0, len(validators))
 
 	for _, info := range validators {
@@ -107,6 +125,13 @@ func (s *Server) handleValidatorByID(w http.ResponseWriter, r *http.Request, id 
 	if err != nil || info == nil {
 		writeErrorFromUtils(w, r, NewValidatorNotFoundError(id))
 		return
+	}
+	if db, dbErr := s.getDB(); dbErr == nil {
+		syncCtx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
+		defer cancel()
+		if syncErr := syncValidatorSnapshots(syncCtx, db, []types.ValidatorInfo{*info}); syncErr != nil {
+			s.logger.WarnContext(syncCtx, "failed to persist validator snapshot", utils.ZapError(syncErr))
+		}
 	}
 
 	response := validatorInfoToResponse(*info)

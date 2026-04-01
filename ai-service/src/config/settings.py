@@ -132,6 +132,15 @@ class PolicyPublishingConfig:
     max_policies_per_minute: int = 120
     cidr_max_prefix_len: int = 24
     max_targets: int = 32
+    aggregation_enabled: bool = True
+    aggregation_window_seconds: int = 300
+    aggregation_cooldown_seconds: int = 120
+    aggregation_min_signals: int = 1
+    aggregation_escalation_window_seconds: int = 300
+    aggregation_refresh_margin_seconds: int = 60
+    aggregation_emergency_severity: int = 10
+    aggregation_emergency_confidence: float = 0.995
+    aggregation_max_keys: int = 50000
 
     def validate(self):
         if not (1 <= self.severity_threshold <= 10):
@@ -169,6 +178,22 @@ class PolicyPublishingConfig:
 
         if self.max_targets <= 0:
             raise ValueError("max_targets must be positive")
+        if self.aggregation_window_seconds <= 0:
+            raise ValueError("aggregation_window_seconds must be positive")
+        if self.aggregation_cooldown_seconds <= 0:
+            raise ValueError("aggregation_cooldown_seconds must be positive")
+        if self.aggregation_min_signals <= 0:
+            raise ValueError("aggregation_min_signals must be positive")
+        if self.aggregation_escalation_window_seconds <= 0:
+            raise ValueError("aggregation_escalation_window_seconds must be positive")
+        if self.aggregation_refresh_margin_seconds < 0:
+            raise ValueError("aggregation_refresh_margin_seconds must be non-negative")
+        if not (1 <= self.aggregation_emergency_severity <= 10):
+            raise ValueError("aggregation_emergency_severity must be between 1 and 10")
+        if not (0.0 <= self.aggregation_emergency_confidence <= 1.0):
+            raise ValueError("aggregation_emergency_confidence must be within [0, 1]")
+        if self.aggregation_max_keys <= 0:
+            raise ValueError("aggregation_max_keys must be positive")
 
 @dataclass(frozen=True)
 class CircuitBreakerConfig:

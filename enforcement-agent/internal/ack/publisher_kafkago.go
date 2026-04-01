@@ -71,14 +71,12 @@ func NewKafkaGoPublisher(opts KafkaGoOptions) (*KafkaGoPublisher, error) {
 func (p *KafkaGoPublisher) Publish(ctx context.Context, payload Payload) error {
 	var lastErr error
 	backoff := p.retryBackoff
+	ackEventID := newAckEventID()
 	for attempt := 0; attempt < p.retryMax; attempt++ {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		ackTime := payload.AckedAt
-		if ackTime.IsZero() {
-			ackTime = time.Now().UTC()
-		}
+		appliedTime, ackTime := canonicalAckTimes(payload.AppliedAt, payload.AckedAt)
 		ackEvent := &pb.PolicyAckEvent{
 			PolicyId:           payload.Event.Spec.ID,
 			ScopeIdentifier:    payload.Scope,
@@ -87,11 +85,18 @@ func (p *KafkaGoPublisher) Publish(ctx context.Context, payload Payload) error {
 			Result:             string(payload.Result),
 			Reason:             payload.Reason,
 			ErrorCode:          payload.ErrorCode,
-			AppliedAt:          payload.AppliedAt.Unix(),
-			AppliedAtMs:        payload.AppliedAt.UnixMilli(),
+			AppliedAt:          appliedTime.Unix(),
+			AppliedAtMs:        appliedTime.UnixMilli(),
 			AckedAt:            ackTime.Unix(),
 			AckedAtMs:          ackTime.UnixMilli(),
 			QcReference:        effectiveQCRef(payload),
+			TraceId:            extractTraceID(payload.Event.Spec),
+			SourceEventId:      extractSourceEventID(payload.Event.Spec),
+			SentinelEventId:    extractSentinelEventID(payload.Event.Spec),
+			AckEventId:         ackEventID,
+			RequestId:          extractRequestID(payload.Event.Spec),
+			CommandId:          extractCommandID(payload.Event.Spec),
+			WorkflowId:         extractWorkflowID(payload.Event.Spec),
 			ControllerInstance: payload.Controller,
 			FastPath:           payload.FastPath,
 			RuleHash:           append([]byte(nil), payload.RuleHash...),
@@ -135,7 +140,12 @@ func (p *KafkaGoPublisher) Publish(ctx context.Context, payload Payload) error {
 		if p.metrics != nil {
 			p.metrics.ObserveAckRetry()
 		}
-		time.Sleep(backoff)
+		if attempt+1 >= p.retryMax {
+			continue
+		}
+		if !waitForRetryBackoff(ctx, backoff) {
+			return ctx.Err()
+		}
 		backoff *= 2
 	}
 	p.logError("publish ack", payload.Event.Spec.ID, lastErr)

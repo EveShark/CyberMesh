@@ -25,6 +25,18 @@ func ParseAzureNSGFlowTuples(line []byte) ([]model.Record, error) {
 		tenantID = extractSubscription(resourceID)
 	}
 	sourceID := extractNSG(resourceID)
+	sourceEventID := firstNonEmpty(
+		root.Get("eventDataId").String(),
+		root.Get("records.0.eventDataId").String(),
+		root.Get("operationId").String(),
+		root.Get("records.0.operationId").String(),
+	)
+	traceID := firstNonEmpty(
+		root.Get("correlationId").String(),
+		root.Get("records.0.correlationId").String(),
+		root.Get("operationId").String(),
+		root.Get("records.0.operationId").String(),
+	)
 	paths := []string{
 		"records.#.properties.flows.#.flows.#.flowTuples.#",
 		"records.#.properties.flows.#.flows.#.flowTuples",
@@ -41,14 +53,14 @@ func ParseAzureNSGFlowTuples(line []byte) ([]model.Record, error) {
 		found = true
 		if tuples.IsArray() {
 			tuples.ForEach(func(_, v gjson.Result) bool {
-				rec, err := parseAzureTuple(v.String(), tenantID, sourceID)
+				rec, err := parseAzureTuple(v.String(), tenantID, sourceID, traceID, sourceEventID)
 				if err == nil {
 					records = append(records, rec)
 				}
 				return true
 			})
 		} else {
-			rec, err := parseAzureTuple(tuples.String(), tenantID, sourceID)
+			rec, err := parseAzureTuple(tuples.String(), tenantID, sourceID, traceID, sourceEventID)
 			if err == nil {
 				records = append(records, rec)
 			}
@@ -63,7 +75,7 @@ func ParseAzureNSGFlowTuples(line []byte) ([]model.Record, error) {
 	return records, nil
 }
 
-func parseAzureTuple(value string, tenantID string, sourceID string) (model.Record, error) {
+func parseAzureTuple(value string, tenantID string, sourceID string, traceID string, sourceEventID string) (model.Record, error) {
 	parts := strings.Split(value, ",")
 	if len(parts) < 8 {
 		return model.Record{}, errors.New("invalid tuple")
@@ -72,6 +84,8 @@ func parseAzureTuple(value string, tenantID string, sourceID string) (model.Reco
 		SourceType: "azure_nsg",
 		SourceID:   sourceID,
 		TenantID:   tenantID,
+		TraceID:    traceID,
+		SourceEventID: sourceEventID,
 		Timestamp:  parseInt64(parts[0]),
 		SrcIP:      parts[1],
 		DstIP:      parts[2],

@@ -68,8 +68,14 @@ func RecordFromMappedJSON(line []byte, spec MappingSpec) (Record, error) {
 		switch key {
 		case "ts", "timestamp":
 			rec.Timestamp = toInt64(val)
+		case "source_event_ts_ms":
+			rec.SourceEventTsMs = normalizeEventTsMs(toInt64(val))
 		case "tenant_id":
 			rec.TenantID = toString(val)
+		case "trace_id":
+			rec.TraceID = toString(val)
+		case "source_event_id":
+			rec.SourceEventID = toString(val)
 		case "src_ip":
 			rec.SrcIP = toString(val)
 		case "dst_ip":
@@ -327,6 +333,26 @@ func toInt64(value any) int64 {
 	default:
 		return 0
 	}
+}
+
+func normalizeEventTsMs(v int64) int64 {
+	if v <= 0 {
+		return 0
+	}
+	// ns -> ms
+	if v >= 1_000_000_000_000_000_000 {
+		return v / 1_000_000
+	}
+	// us -> ms
+	if v >= 1_000_000_000_000_000 {
+		return v / 1_000
+	}
+	// ms
+	if v >= 1_000_000_000_000 {
+		return v
+	}
+	// s -> ms
+	return v * 1000
 }
 
 func toFloat(value any) float64 {

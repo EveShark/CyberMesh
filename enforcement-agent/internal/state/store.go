@@ -18,6 +18,7 @@ import (
 const (
 	defaultHistoryRetention = 10 * time.Minute
 	defaultLockTimeout      = 3 * time.Second
+	staleLockMinAge         = 30 * time.Second
 )
 
 const (
@@ -27,7 +28,7 @@ const (
 	namespaceScopePrefix = "namespace:"
 	nodeScopePrefix      = "node:"
 	clusterScopeKey      = "cluster"
-	snapshotVersion      = 5
+	snapshotVersion      = 7
 )
 
 // Record tracks a policy along with metadata for TTL management.
@@ -40,6 +41,12 @@ type Record struct {
 	Rollback         time.Time         `json:"rollback_deadline"`
 	FastPathDeadline time.Time         `json:"fast_path_deadline"`
 	PendingConsensus bool              `json:"pending_consensus"`
+	MitigationID     string            `json:"mitigation_id,omitempty"`
+	Provisional      bool              `json:"provisional,omitempty"`
+	PromotionState   string            `json:"promotion_state,omitempty"`
+	RenewalCount     int               `json:"renewal_count,omitempty"`
+	PromotedAt       time.Time         `json:"promoted_at,omitempty"`
+	RevokedAt        time.Time         `json:"revoked_at,omitempty"`
 	Reason           string            `json:"-"`
 }
 
@@ -54,7 +61,11 @@ type Store struct {
 	historyRetention time.Duration
 	checksumEnabled  bool
 	lockTimeout      time.Duration
+	persistMinGap    time.Duration
+	lastPersistAt    time.Time
+	dirty            bool
 	lastApplied      map[string]time.Time
+	scopeWatermarks  map[string]time.Time
 }
 
 // Options configure Store construction.
@@ -63,6 +74,7 @@ type Options struct {
 	HistoryRetention time.Duration
 	EnableChecksum   bool
 	LockTimeout      time.Duration
+	PersistMinGap    time.Duration
 }
 
 // NewStore constructs a store optionally backed by on-disk persistence.
@@ -89,9 +101,11 @@ func NewStore(opts Options) *Store {
 		history:          make(map[string][]time.Time),
 		pending:          make(map[string][]byte),
 		lastApplied:      make(map[string]time.Time),
+		scopeWatermarks:  make(map[string]time.Time),
 		historyRetention: retention,
 		checksumEnabled:  opts.EnableChecksum,
 		lockTimeout:      lockTimeout,
+		persistMinGap:    opts.PersistMinGap,
 	}
 }
 
@@ -174,6 +188,16 @@ func (s *Store) Load() error {
 	} else {
 		s.lastApplied = lastApplied
 	}
+	if len(snap.ScopeWatermarks) > 0 {
+		clone := make(map[string]time.Time, len(snap.ScopeWatermarks))
+		for scopeKey, ts := range snap.ScopeWatermarks {
+			clone[scopeKey] = ts
+		}
+		s.scopeWatermarks = clone
+	} else {
+		s.scopeWatermarks = make(map[string]time.Time)
+	}
+	s.dirty = false
 	s.mu.Unlock()
 	return nil
 }
@@ -196,31 +220,54 @@ func (s *Store) Upsert(spec policy.PolicySpec, appliedAt time.Time) error {
 		PreConsensus: deadline(appliedAt, spec.Guardrails.PreConsensusTTLSeconds),
 		Rollback:     deadline(appliedAt, spec.Guardrails.RollbackIfNoCommitAfter),
 	}
+	if existing, ok := s.records[spec.ID]; ok {
+		rec.PendingConsensus = existing.PendingConsensus
+		rec.FastPathDeadline = existing.FastPathDeadline
+		rec.MitigationID = existing.MitigationID
+		rec.Provisional = existing.Provisional
+		rec.PromotionState = existing.PromotionState
+		rec.RenewalCount = existing.RenewalCount
+		rec.PromotedAt = existing.PromotedAt
+		rec.RevokedAt = existing.RevokedAt
+	}
 	if spec.Guardrails.FastPathTTLSeconds != nil {
 		rec.FastPathDeadline = appliedAt.Add(time.Duration(*spec.Guardrails.FastPathTTLSeconds) * time.Second)
 	}
-	rec.PendingConsensus = false
 	s.records[spec.ID] = rec
 
+	recorded := map[string]struct{}{globalScope: {}}
 	s.recordHistoryLocked(globalScope, appliedAt)
 	if tenant := normalizedTenant(spec); tenant != "" {
-		s.recordHistoryLocked(tenantScopePrefix+tenant, appliedAt)
+		key := tenantScopePrefix + tenant
+		s.recordHistoryLocked(key, appliedAt)
+		recorded[key] = struct{}{}
 	}
 	if region := normalizedRegion(spec); region != "" {
-		s.recordHistoryLocked(regionScopePrefix+region, appliedAt)
+		key := regionScopePrefix + region
+		s.recordHistoryLocked(key, appliedAt)
+		recorded[key] = struct{}{}
 	}
 	if ns := normalizedNamespace(spec); ns != "" {
-		s.recordHistoryLocked(namespaceScopePrefix+ns, appliedAt)
+		key := namespaceScopePrefix + ns
+		s.recordHistoryLocked(key, appliedAt)
+		recorded[key] = struct{}{}
 	}
 	if strings.EqualFold(spec.Target.Scope, "cluster") {
 		s.recordHistoryLocked(clusterScopeKey, appliedAt)
+		recorded[clusterScopeKey] = struct{}{}
 	}
 	if node := normalizedNode(spec); node != "" {
-		s.recordHistoryLocked(nodeScopePrefix+node, appliedAt)
+		key := nodeScopePrefix + node
+		s.recordHistoryLocked(key, appliedAt)
+		recorded[key] = struct{}{}
+	}
+	if rateScope := policy.RateScope(spec); rateScope != "" {
+		if _, ok := recorded[rateScope]; !ok {
+			s.recordHistoryLocked(rateScope, appliedAt)
+		}
 	}
 	s.lastApplied[spec.ID] = appliedAt
-
-	return s.persistLocked()
+	return s.markDirtyAndMaybePersistLocked(time.Now().UTC())
 }
 
 // Remove deletes a policy by ID and persists the resulting state.
@@ -228,7 +275,7 @@ func (s *Store) Remove(policyID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.records, policyID)
-	return s.persistLocked()
+	return s.markDirtyAndMaybePersistLocked(time.Now().UTC())
 }
 
 // MarkPendingConsensus sets pending status for a fast-path policy.
@@ -244,7 +291,37 @@ func (s *Store) MarkPendingConsensus(policyID string, deadline time.Time) error 
 		rec.FastPathDeadline = deadline
 	}
 	s.records[policyID] = rec
-	return s.persistLocked()
+	return s.markDirtyAndMaybePersistLocked(time.Now().UTC())
+}
+
+// MarkProvisional marks a policy as provisional fast-path state.
+func (s *Store) MarkProvisional(policyID, mitigationID string, deadline time.Time, appliedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.records[policyID]
+	if !ok {
+		return fmt.Errorf("state store: mark provisional: policy %s not found", policyID)
+	}
+	wasPendingProvisional := rec.PendingConsensus && rec.Provisional
+	rec.PendingConsensus = true
+	rec.Provisional = true
+	rec.PromotionState = "provisional"
+	rec.MitigationID = strings.TrimSpace(mitigationID)
+	if wasPendingProvisional {
+		rec.RenewalCount++
+	} else {
+		rec.RenewalCount = 0
+	}
+	rec.PromotedAt = time.Time{}
+	rec.RevokedAt = time.Time{}
+	if !deadline.IsZero() {
+		rec.FastPathDeadline = deadline
+	}
+	if !appliedAt.IsZero() {
+		rec.AppliedAt = appliedAt
+	}
+	s.records[policyID] = rec
+	return s.markDirtyAndMaybePersistLocked(time.Now().UTC())
 }
 
 // ClearPendingConsensus removes pending state for policy.
@@ -257,8 +334,27 @@ func (s *Store) ClearPendingConsensus(policyID string) error {
 	}
 	rec.PendingConsensus = false
 	rec.FastPathDeadline = time.Time{}
+	rec.RenewalCount = 0
 	s.records[policyID] = rec
-	return s.persistLocked()
+	return s.markDirtyAndMaybePersistLocked(time.Now().UTC())
+}
+
+// MarkPromoted records durable promotion of a provisional policy.
+func (s *Store) MarkPromoted(policyID string, promotedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.records[policyID]
+	if !ok {
+		return nil
+	}
+	rec.PendingConsensus = false
+	rec.Provisional = false
+	rec.PromotionState = "promoted"
+	rec.RenewalCount = 0
+	rec.PromotedAt = promotedAt
+	rec.FastPathDeadline = time.Time{}
+	s.records[policyID] = rec
+	return s.markDirtyAndMaybePersistLocked(time.Now().UTC())
 }
 
 // PendingFastPath returns policies awaiting consensus.
@@ -302,7 +398,7 @@ func (s *Store) SavePendingApproval(key string, payload []byte) error {
 	} else {
 		s.pending[key] = append([]byte(nil), payload...)
 	}
-	return s.persistLocked()
+	return s.markDirtyAndMaybePersistLocked(time.Now().UTC())
 }
 
 // PendingApproval retrieves serialized approval payload.
@@ -321,7 +417,7 @@ func (s *Store) RemovePendingApproval(key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.pending, key)
-	return s.persistLocked()
+	return s.markDirtyAndMaybePersistLocked(time.Now().UTC())
 }
 
 // PendingApprovalKeys returns all stored approval identifiers.
@@ -347,6 +443,36 @@ func (s *Store) LastAppliedWithin(policyID string, window time.Duration, now tim
 		return false
 	}
 	return now.Sub(last) < window
+}
+
+// IsScopeEventStale reports whether eventAt is older than the latest accepted
+// timestamp for the provided scope key.
+func (s *Store) IsScopeEventStale(scopeKey string, eventAt time.Time) (bool, time.Time) {
+	scopeKey = strings.TrimSpace(scopeKey)
+	if scopeKey == "" || eventAt.IsZero() {
+		return false, time.Time{}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	last := s.scopeWatermarks[scopeKey]
+	if last.IsZero() {
+		return false, time.Time{}
+	}
+	return eventAt.Before(last), last
+}
+
+// AdvanceScopeWatermark records the latest accepted timestamp for scopeKey.
+// This fast path is intentionally in-memory only.
+func (s *Store) AdvanceScopeWatermark(scopeKey string, eventAt time.Time) {
+	scopeKey = strings.TrimSpace(scopeKey)
+	if scopeKey == "" || eventAt.IsZero() {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if eventAt.After(s.scopeWatermarks[scopeKey]) {
+		s.scopeWatermarks[scopeKey] = eventAt
+	}
 }
 
 // ReconcileLedger aligns the in-memory store with policies provided by ledger snapshot.
@@ -395,21 +521,36 @@ func (s *Store) ReconcileLedger(ledger map[string]policy.PolicySpec, appliedAt t
 		s.records[id] = rec
 		added = append(added, spec)
 
+		recorded := map[string]struct{}{globalScope: {}}
 		s.recordHistoryLocked(globalScope, appliedAt)
 		if tenant := normalizedTenant(spec); tenant != "" {
-			s.recordHistoryLocked(tenantScopePrefix+tenant, appliedAt)
+			key := tenantScopePrefix + tenant
+			s.recordHistoryLocked(key, appliedAt)
+			recorded[key] = struct{}{}
 		}
 		if region := normalizedRegion(spec); region != "" {
-			s.recordHistoryLocked(regionScopePrefix+region, appliedAt)
+			key := regionScopePrefix + region
+			s.recordHistoryLocked(key, appliedAt)
+			recorded[key] = struct{}{}
 		}
 		if ns := normalizedNamespace(spec); ns != "" {
-			s.recordHistoryLocked(namespaceScopePrefix+ns, appliedAt)
+			key := namespaceScopePrefix + ns
+			s.recordHistoryLocked(key, appliedAt)
+			recorded[key] = struct{}{}
 		}
 		if strings.EqualFold(spec.Target.Scope, "cluster") {
 			s.recordHistoryLocked(clusterScopeKey, appliedAt)
+			recorded[clusterScopeKey] = struct{}{}
 		}
 		if node := normalizedNode(spec); node != "" {
-			s.recordHistoryLocked(nodeScopePrefix+node, appliedAt)
+			key := nodeScopePrefix + node
+			s.recordHistoryLocked(key, appliedAt)
+			recorded[key] = struct{}{}
+		}
+		if rateScope := policy.RateScope(spec); rateScope != "" {
+			if _, ok := recorded[rateScope]; !ok {
+				s.recordHistoryLocked(rateScope, appliedAt)
+			}
 		}
 		s.lastApplied[spec.ID] = appliedAt
 	}
@@ -418,7 +559,7 @@ func (s *Store) ReconcileLedger(ledger map[string]policy.PolicySpec, appliedAt t
 		return nil, nil, nil
 	}
 
-	if err := s.persistLocked(); err != nil {
+	if err := s.markDirtyAndMaybePersistLocked(time.Now().UTC()); err != nil {
 		return nil, nil, err
 	}
 	return removed, added, nil
@@ -462,6 +603,11 @@ func (s *Store) Expired(now time.Time) []Record {
 
 	var expired []Record
 	for _, rec := range s.records {
+		if rec.PendingConsensus && !rec.FastPathDeadline.IsZero() && now.After(rec.FastPathDeadline) {
+			rec.Reason = "fast_path_ttl"
+			expired = append(expired, rec)
+			continue
+		}
 		if !rec.ExpiresAt.IsZero() && now.After(rec.ExpiresAt) {
 			rec.Reason = "ttl_expired"
 			expired = append(expired, rec)
@@ -536,7 +682,21 @@ func normalizedNode(spec policy.PolicySpec) string {
 	return ""
 }
 
-func (s *Store) persistLocked() error {
+func (s *Store) markDirtyAndMaybePersistLocked(now time.Time) error {
+	if s.persistPath == "" {
+		return nil
+	}
+	s.dirty = true
+	// Latency-first path: when a persist gap is configured, writes are coalesced
+	// and persisted by the background flush loop instead of inline on the
+	// consumer/apply hot path.
+	if s.persistMinGap > 0 {
+		return nil
+	}
+	return s.persistNowLocked(now)
+}
+
+func (s *Store) persistNowLocked(now time.Time) error {
 	if s.persistPath == "" {
 		return nil
 	}
@@ -563,6 +723,10 @@ func (s *Store) persistLocked() error {
 	for id, ts := range s.lastApplied {
 		lastAppliedCopy[id] = ts
 	}
+	scopeWatermarksCopy := make(map[string]time.Time, len(s.scopeWatermarks))
+	for scopeKey, ts := range s.scopeWatermarks {
+		scopeWatermarksCopy[scopeKey] = ts
+	}
 
 	snap := snapshot{
 		Version:          snapshotVersion,
@@ -571,6 +735,7 @@ func (s *Store) persistLocked() error {
 		RateHistory:      histCopy,
 		PendingApprovals: pendingCopy,
 		LastApplied:      lastAppliedCopy,
+		ScopeWatermarks:  scopeWatermarksCopy,
 		CreatedAt:        time.Now().UTC(),
 	}
 	if s.checksumEnabled {
@@ -594,7 +759,19 @@ func (s *Store) persistLocked() error {
 	if err := os.Rename(tmp, s.persistPath); err != nil {
 		return fmt.Errorf("state store: rename snapshot: %w", err)
 	}
+	s.dirty = false
+	s.lastPersistAt = now
 	return nil
+}
+
+// Flush forces persistence of any pending in-memory mutations to disk.
+func (s *Store) Flush() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.dirty {
+		return nil
+	}
+	return s.persistNowLocked(time.Now().UTC())
 }
 
 type snapshot struct {
@@ -604,6 +781,7 @@ type snapshot struct {
 	RateHistory      map[string][]time.Time `json:"rate_history,omitempty"`
 	PendingApprovals map[string][]byte      `json:"pending_approvals,omitempty"`
 	LastApplied      map[string]time.Time   `json:"last_applied,omitempty"`
+	ScopeWatermarks  map[string]time.Time   `json:"scope_watermarks,omitempty"`
 	CreatedAt        time.Time              `json:"created_at"`
 	Checksum         string                 `json:"checksum,omitempty"`
 }
@@ -634,6 +812,7 @@ func (s *Store) acquireLock() (func(), error) {
 	for {
 		file, err := os.OpenFile(s.lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err == nil {
+			_, _ = file.WriteString(fmt.Sprintf("pid=%d started_at=%s\n", os.Getpid(), time.Now().UTC().Format(time.RFC3339Nano)))
 			return func() {
 				_ = file.Close()
 				_ = os.Remove(s.lockPath)
@@ -642,11 +821,40 @@ func (s *Store) acquireLock() (func(), error) {
 		if !errors.Is(err, os.ErrExist) {
 			return nil, fmt.Errorf("state store: lock file: %w", err)
 		}
+		if stale, staleErr := s.tryClearStaleLock(); staleErr != nil {
+			return nil, staleErr
+		} else if stale {
+			continue
+		}
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("state store: lock timeout after %s", s.lockTimeout)
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
+}
+
+func (s *Store) tryClearStaleLock() (bool, error) {
+	if s.lockPath == "" {
+		return false, nil
+	}
+	info, err := os.Stat(s.lockPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("state store: stat lock file: %w", err)
+	}
+	staleAfter := s.lockTimeout * 4
+	if staleAfter < staleLockMinAge {
+		staleAfter = staleLockMinAge
+	}
+	if time.Since(info.ModTime()) < staleAfter {
+		return false, nil
+	}
+	if err := os.Remove(s.lockPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("state store: remove stale lock file: %w", err)
+	}
+	return true, nil
 }
 
 func pruneHistory(history []time.Time, now time.Time, horizon time.Duration) []time.Time {

@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"backend/pkg/control/policyoutbox"
 	"backend/pkg/storage/cockroach"
 	"backend/pkg/utils"
 )
@@ -148,6 +149,8 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 
 	nowTime := time.Now()
 	now := nowTime.Unix()
+	dbIntegrityTotal := uint64(0)
+	dbTxLocationMismatchTotal := uint64(0)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
@@ -216,6 +219,10 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 			Metrics() cockroach.MetricsSnapshot
 		}); ok {
 			snap := metricsProvider.Metrics()
+			dbTxLocationMismatchTotal = snap.TxLocationMismatchTotal
+			for _, count := range snap.PersistIntegrityKindTotals {
+				dbIntegrityTotal += count
+			}
 			if snap.QueryCount > 0 {
 				fmt.Fprintf(w, "# HELP cockroach_query_latency_seconds Histogram of CockroachDB query latency in seconds.\n")
 				fmt.Fprintf(w, "# TYPE cockroach_query_latency_seconds histogram\n")
@@ -680,6 +687,15 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 			fmt.Fprintf(w, "# HELP control_policy_ack_logs_throttled_total Total ACK consumer logs suppressed by throttling.\n")
 			fmt.Fprintf(w, "# TYPE control_policy_ack_logs_throttled_total counter\n")
 			fmt.Fprintf(w, "control_policy_ack_logs_throttled_total %d\n", ackStats.LogsThrottled)
+			fmt.Fprintf(w, "# HELP control_policy_ack_partition_assignments_total Total partition assignments observed by ACK consumer group sessions.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_ack_partition_assignments_total counter\n")
+			fmt.Fprintf(w, "control_policy_ack_partition_assignments_total %d\n", ackStats.PartitionAssignments)
+			fmt.Fprintf(w, "# HELP control_policy_ack_partition_revocations_total Total partition revocations observed by ACK consumer group sessions.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_ack_partition_revocations_total counter\n")
+			fmt.Fprintf(w, "control_policy_ack_partition_revocations_total %d\n", ackStats.PartitionRevocations)
+			fmt.Fprintf(w, "# HELP control_policy_ack_partitions_owned_current Current number of ACK topic partitions owned by this consumer instance.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_ack_partitions_owned_current gauge\n")
+			fmt.Fprintf(w, "control_policy_ack_partitions_owned_current %d\n", ackStats.PartitionsOwnedCurrent)
 		}
 		if causal, ok := s.outboxStats.GetPolicyAckCausalStats(); ok {
 			fmt.Fprintf(w, "# HELP control_policy_causal_skew_corrections_total Total causal latency corrections due to clock skew.\n")
@@ -736,6 +752,22 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 				fmt.Fprintf(w, "# TYPE control_policy_causal_publish_to_ack_latency_p95_seconds gauge\n")
 				fmt.Fprintf(w, "control_policy_causal_publish_to_ack_latency_p95_seconds %.6f\n", causal.PublishToAckP95Ms/1000.0)
 			}
+			if causal.PublishToAppliedCount > 0 {
+				fmt.Fprintf(w, "# HELP control_policy_causal_published_to_applied_latency_seconds Histogram of corrected published-to-applied causal latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_causal_published_to_applied_latency_seconds histogram\n")
+				writePrometheusHistogram(w, "control_policy_causal_published_to_applied_latency_seconds", causal.PublishToAppliedBuckets, causal.PublishToAppliedCount, causal.PublishToAppliedSumMs)
+				fmt.Fprintf(w, "# HELP control_policy_causal_published_to_applied_latency_p95_seconds 95th percentile corrected published-to-applied latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_causal_published_to_applied_latency_p95_seconds gauge\n")
+				fmt.Fprintf(w, "control_policy_causal_published_to_applied_latency_p95_seconds %.6f\n", causal.PublishToAppliedP95Ms/1000.0)
+			}
+			if causal.AppliedToAckCount > 0 {
+				fmt.Fprintf(w, "# HELP control_policy_causal_applied_to_acked_latency_seconds Histogram of corrected applied-to-acked causal latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_causal_applied_to_acked_latency_seconds histogram\n")
+				writePrometheusHistogram(w, "control_policy_causal_applied_to_acked_latency_seconds", causal.AppliedToAckBuckets, causal.AppliedToAckCount, causal.AppliedToAckSumMs)
+				fmt.Fprintf(w, "# HELP control_policy_causal_applied_to_acked_latency_p95_seconds 95th percentile corrected applied-to-acked latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_causal_applied_to_acked_latency_p95_seconds gauge\n")
+				fmt.Fprintf(w, "control_policy_causal_applied_to_acked_latency_p95_seconds %.6f\n", causal.AppliedToAckP95Ms/1000.0)
+			}
 		}
 
 		if outbox, ok := s.outboxStats.GetPolicyOutboxDispatcherStats(); ok {
@@ -761,6 +793,9 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 			fmt.Fprintf(w, "# HELP control_policy_outbox_dispatcher_ticks_total Total dispatcher loop ticks.\n")
 			fmt.Fprintf(w, "# TYPE control_policy_outbox_dispatcher_ticks_total counter\n")
 			fmt.Fprintf(w, "control_policy_outbox_dispatcher_ticks_total %d\n", outbox.TicksTotal)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_wake_signals_total Total coalesced JIT wake signals delivered to dispatcher.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_wake_signals_total counter\n")
+			fmt.Fprintf(w, "control_policy_outbox_wake_signals_total %d\n", outbox.WakeSignalsTotal)
 			fmt.Fprintf(w, "# HELP control_policy_outbox_rows_claimed_total Total rows claimed by dispatcher.\n")
 			fmt.Fprintf(w, "# TYPE control_policy_outbox_rows_claimed_total counter\n")
 			fmt.Fprintf(w, "control_policy_outbox_rows_claimed_total %d\n", outbox.RowsClaimedTotal)
@@ -884,6 +919,14 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 				fmt.Fprintf(w, "# TYPE control_policy_outbox_claim_latency_p95_seconds gauge\n")
 				fmt.Fprintf(w, "control_policy_outbox_claim_latency_p95_seconds %.6f\n", outbox.ClaimLatencyP95Ms/1000.0)
 			}
+			if outbox.OutboxCreatedToClaimedCount > 0 {
+				fmt.Fprintf(w, "# HELP control_policy_outbox_created_to_claimed_latency_seconds Histogram of outbox row created-to-claimed latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_outbox_created_to_claimed_latency_seconds histogram\n")
+				writePrometheusHistogram(w, "control_policy_outbox_created_to_claimed_latency_seconds", outbox.OutboxCreatedToClaimedBuckets, outbox.OutboxCreatedToClaimedCount, outbox.OutboxCreatedToClaimedSumMs)
+				fmt.Fprintf(w, "# HELP control_policy_outbox_created_to_claimed_latency_p95_seconds 95th percentile outbox row created-to-claimed latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_outbox_created_to_claimed_latency_p95_seconds gauge\n")
+				fmt.Fprintf(w, "control_policy_outbox_created_to_claimed_latency_p95_seconds %.6f\n", outbox.OutboxCreatedToClaimedP95Ms/1000.0)
+			}
 			if outbox.MarkLatencyCount > 0 {
 				fmt.Fprintf(w, "# HELP control_policy_outbox_mark_latency_seconds Histogram of outbox state-mark latency in seconds.\n")
 				fmt.Fprintf(w, "# TYPE control_policy_outbox_mark_latency_seconds histogram\n")
@@ -967,11 +1010,49 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 			fmt.Fprintf(w, "# HELP control_policy_ack_closure_ratio Ratio of acked rows over publish-complete rows.\n")
 			fmt.Fprintf(w, "# TYPE control_policy_ack_closure_ratio gauge\n")
 			fmt.Fprintf(w, "control_policy_ack_closure_ratio %.6f\n", ackRatio)
+			if causal, ok := s.outboxStats.GetPolicyAckCausalStats(); ok {
+				if outbox, ok := s.outboxStats.GetPolicyOutboxDispatcherStats(); ok {
+					gates := s.evaluateControlPolicyGates(nowTime, backlog, outbox, causal, ackRatio, dbIntegrityTotal, dbTxLocationMismatchTotal)
+					fmt.Fprintf(w, "# HELP control_policy_gate_published_pending_lt_500 Gate 1: published-pending rows below 500 and stable.\n")
+					fmt.Fprintf(w, "# TYPE control_policy_gate_published_pending_lt_500 gauge\n")
+					fmt.Fprintf(w, "control_policy_gate_published_pending_lt_500 %.0f\n", boolToFloat(gates.PublishedPendingLT500))
+					fmt.Fprintf(w, "# HELP control_policy_gate_backlog_drain_rate_gt5rps Gate 2: backlog draining faster than 5 rows/second.\n")
+					fmt.Fprintf(w, "# TYPE control_policy_gate_backlog_drain_rate_gt5rps gauge\n")
+					fmt.Fprintf(w, "control_policy_gate_backlog_drain_rate_gt5rps %.0f\n", boolToFloat(gates.DrainRateGT5))
+					fmt.Fprintf(w, "# HELP control_policy_backlog_drain_rate_rows_per_second Current backlog drain rate in rows per second.\n")
+					fmt.Fprintf(w, "# TYPE control_policy_backlog_drain_rate_rows_per_second gauge\n")
+					fmt.Fprintf(w, "control_policy_backlog_drain_rate_rows_per_second %.6f\n", gates.DrainRateRowsPerSecond)
+					fmt.Fprintf(w, "# HELP control_policy_gate_outbox_created_to_claimed_p95_lt_2s Gate 3: outbox created-to-claimed p95 below 2s.\n")
+					fmt.Fprintf(w, "# TYPE control_policy_gate_outbox_created_to_claimed_p95_lt_2s gauge\n")
+					fmt.Fprintf(w, "control_policy_gate_outbox_created_to_claimed_p95_lt_2s %.0f\n", boolToFloat(gates.OutboxCreatedToClaimedP95LT2s))
+					fmt.Fprintf(w, "# HELP control_policy_gate_published_to_applied_p95_lt_5s Gate 4: published-to-applied p95 below 5s.\n")
+					fmt.Fprintf(w, "# TYPE control_policy_gate_published_to_applied_p95_lt_5s gauge\n")
+					fmt.Fprintf(w, "control_policy_gate_published_to_applied_p95_lt_5s %.0f\n", boolToFloat(gates.PublishedToAppliedP95LT5s))
+					fmt.Fprintf(w, "# HELP control_policy_gate_applied_to_acked_p95_lt_10s Gate 5: applied-to-acked p95 below 10s.\n")
+					fmt.Fprintf(w, "# TYPE control_policy_gate_applied_to_acked_p95_lt_10s gauge\n")
+					fmt.Fprintf(w, "control_policy_gate_applied_to_acked_p95_lt_10s %.0f\n", boolToFloat(gates.AppliedToAckedP95LT10s))
+					fmt.Fprintf(w, "# HELP control_policy_gate_ack_over_published_gt_0_9 Gate 6: ack-over-published ratio above 0.9.\n")
+					fmt.Fprintf(w, "# TYPE control_policy_gate_ack_over_published_gt_0_9 gauge\n")
+					fmt.Fprintf(w, "control_policy_gate_ack_over_published_gt_0_9 %.0f\n", boolToFloat(gates.AckOverPublishedGT09))
+					fmt.Fprintf(w, "# HELP control_policy_gate_no_integrity_mismatch_regression Gate 7: no integrity/mismatch regression signals.\n")
+					fmt.Fprintf(w, "# TYPE control_policy_gate_no_integrity_mismatch_regression gauge\n")
+					fmt.Fprintf(w, "control_policy_gate_no_integrity_mismatch_regression %.0f\n", boolToFloat(gates.NoIntegrityMismatchRegression))
+					fmt.Fprintf(w, "# HELP control_policy_gate_soak_windows_met Gate 8: short and long soak windows both satisfied.\n")
+					fmt.Fprintf(w, "# TYPE control_policy_gate_soak_windows_met gauge\n")
+					fmt.Fprintf(w, "control_policy_gate_soak_windows_met %.0f\n", boolToFloat(gates.SoakWindowsMet))
+					fmt.Fprintf(w, "# HELP control_policy_release_ready All control-policy gates satisfied.\n")
+					fmt.Fprintf(w, "# TYPE control_policy_release_ready gauge\n")
+					fmt.Fprintf(w, "control_policy_release_ready %.0f\n", boolToFloat(gates.ReleaseReady))
+				}
+			}
 		}
 	}
 	fmt.Fprintf(w, "# HELP control_mutation_blocked_safe_mode_total Total mutation requests blocked by safe mode.\n")
 	fmt.Fprintf(w, "# TYPE control_mutation_blocked_safe_mode_total counter\n")
 	fmt.Fprintf(w, "control_mutation_blocked_safe_mode_total %d\n", s.controlMutationBlockedSafeMode.Load())
+	fmt.Fprintf(w, "# HELP control_mutation_blocked_kill_switch_total Total mutation requests blocked by kill-switch.\n")
+	fmt.Fprintf(w, "# TYPE control_mutation_blocked_kill_switch_total counter\n")
+	fmt.Fprintf(w, "control_mutation_blocked_kill_switch_total %d\n", s.controlMutationBlockedKillSwitch.Load())
 	fmt.Fprintf(w, "# HELP control_mutation_blocked_consensus_gate_total Total mutation requests blocked by consensus health gate.\n")
 	fmt.Fprintf(w, "# TYPE control_mutation_blocked_consensus_gate_total counter\n")
 	fmt.Fprintf(w, "control_mutation_blocked_consensus_gate_total %d\n", s.controlMutationBlockedConsensus.Load())
@@ -995,10 +1076,17 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 	fmt.Fprintf(w, "control_mutation_timeout_total %d\n", s.controlMutationTimeoutTotal.Load())
 	fmt.Fprintf(w, "# HELP control_mutation_safe_mode_enabled Global control mutation safe mode state (1=enabled).\n")
 	fmt.Fprintf(w, "# TYPE control_mutation_safe_mode_enabled gauge\n")
-	if s.controlMutationsSafeMode.Load() {
+	if s.currentControlMutationSafeModeWithTimeout() {
 		fmt.Fprintf(w, "control_mutation_safe_mode_enabled 1\n")
 	} else {
 		fmt.Fprintf(w, "control_mutation_safe_mode_enabled 0\n")
+	}
+	fmt.Fprintf(w, "# HELP control_mutation_kill_switch_enabled Global control mutation kill-switch state (1=enabled).\n")
+	fmt.Fprintf(w, "# TYPE control_mutation_kill_switch_enabled gauge\n")
+	if s.currentControlMutationKillSwitchWithTimeout() {
+		fmt.Fprintf(w, "control_mutation_kill_switch_enabled 1\n")
+	} else {
+		fmt.Fprintf(w, "control_mutation_kill_switch_enabled 0\n")
 	}
 
 	// Consensus wiring/validation metrics
@@ -1268,6 +1356,101 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 	fmt.Fprintf(w, "# HELP api_build_info API build information\n")
 	fmt.Fprintf(w, "# TYPE api_build_info gauge\n")
 	fmt.Fprintf(w, "api_build_info{version=\"%s\",environment=\"%s\"} 1\n", apiVersion, s.config.Environment)
+}
+
+type controlPolicyGateSnapshot struct {
+	PublishedPendingLT500         bool
+	DrainRateGT5                  bool
+	DrainRateRowsPerSecond        float64
+	OutboxCreatedToClaimedP95LT2s bool
+	PublishedToAppliedP95LT5s     bool
+	AppliedToAckedP95LT10s        bool
+	AckOverPublishedGT09          bool
+	NoIntegrityMismatchRegression bool
+	SoakWindowsMet                bool
+	ReleaseReady                  bool
+}
+
+func (s *Server) evaluateControlPolicyGates(now time.Time, backlog policyoutbox.BacklogStats, outbox policyoutbox.DispatcherStats, causal PolicyAckCausalStats, ackRatio float64, dbIntegrityTotal uint64, dbTxLocationMismatchTotal uint64) controlPolicyGateSnapshot {
+	g := controlPolicyGateSnapshot{}
+	publishedPending := backlog.PublishedRows
+	g.PublishedPendingLT500 = publishedPending < 500 && backlog.OldestPendingAge <= 5*60*1000
+
+	g.OutboxCreatedToClaimedP95LT2s = outbox.OutboxCreatedToClaimedCount > 0 && outbox.OutboxCreatedToClaimedP95Ms <= 2000
+	g.PublishedToAppliedP95LT5s = causal.PublishToAppliedCount > 0 && causal.PublishToAppliedP95Ms <= 5000
+	g.AppliedToAckedP95LT10s = causal.AppliedToAckCount > 0 && causal.AppliedToAckP95Ms <= 10000
+	g.AckOverPublishedGT09 = ackRatio > 0.9
+
+	// No regression means no new terminal failures/fenced update spikes/correlation errors and no DB integrity+mismatch growth.
+	g.NoIntegrityMismatchRegression = outbox.TerminalFailedTotal == 0 && outbox.FencedUpdateFailures == 0 && causal.CorrelationErrors == 0
+
+	s.controlGateStateMu.Lock()
+	defer s.controlGateStateMu.Unlock()
+	if s.controlGateLastSampleAt.IsZero() {
+		s.controlGateLastSampleAt = now
+		s.controlGateLastPublishedRows = backlog.PublishedRows
+		s.controlGateLastAckedRows = backlog.AckedRows
+		s.controlGateLastOldestPendingAgeMs = backlog.OldestPendingAge
+		s.controlGateLastIntegrityTotal = dbIntegrityTotal
+		s.controlGateLastTxMismatchTotal = dbTxLocationMismatchTotal
+		g.DrainRateRowsPerSecond = 0
+		g.DrainRateGT5 = false
+		g.NoIntegrityMismatchRegression = false
+	} else {
+		elapsed := now.Sub(s.controlGateLastSampleAt).Seconds()
+		if elapsed > 0 {
+			prevBacklog := s.controlGateLastPublishedRows - s.controlGateLastAckedRows
+			currBacklog := backlog.PublishedRows - backlog.AckedRows
+			drained := float64(prevBacklog - currBacklog)
+			g.DrainRateRowsPerSecond = drained / elapsed
+			g.DrainRateGT5 = g.DrainRateRowsPerSecond > 5.0 && backlog.OldestPendingAge <= s.controlGateLastOldestPendingAgeMs
+		}
+		if dbIntegrityTotal > s.controlGateLastIntegrityTotal || dbTxLocationMismatchTotal > s.controlGateLastTxMismatchTotal {
+			g.NoIntegrityMismatchRegression = false
+		}
+		s.controlGateLastSampleAt = now
+		s.controlGateLastPublishedRows = backlog.PublishedRows
+		s.controlGateLastAckedRows = backlog.AckedRows
+		s.controlGateLastOldestPendingAgeMs = backlog.OldestPendingAge
+		s.controlGateLastIntegrityTotal = dbIntegrityTotal
+		s.controlGateLastTxMismatchTotal = dbTxLocationMismatchTotal
+	}
+
+	// Gate 8 requires sustained healthy behavior across two consecutive windows:
+	// 15 minutes load + 30 minutes steady-state = 45 minutes continuous pass.
+	soakPrereq := g.PublishedPendingLT500 &&
+		g.DrainRateGT5 &&
+		g.OutboxCreatedToClaimedP95LT2s &&
+		g.PublishedToAppliedP95LT5s &&
+		g.AppliedToAckedP95LT10s &&
+		g.AckOverPublishedGT09 &&
+		g.NoIntegrityMismatchRegression
+	if soakPrereq {
+		if s.controlGateContinuousPassSince.IsZero() {
+			s.controlGateContinuousPassSince = now
+		}
+		g.SoakWindowsMet = now.Sub(s.controlGateContinuousPassSince) >= 45*time.Minute
+	} else {
+		s.controlGateContinuousPassSince = time.Time{}
+		g.SoakWindowsMet = false
+	}
+
+	g.ReleaseReady = g.PublishedPendingLT500 &&
+		g.DrainRateGT5 &&
+		g.OutboxCreatedToClaimedP95LT2s &&
+		g.PublishedToAppliedP95LT5s &&
+		g.AppliedToAckedP95LT10s &&
+		g.AckOverPublishedGT09 &&
+		g.NoIntegrityMismatchRegression &&
+		g.SoakWindowsMet
+	return g
+}
+
+func boolToFloat(v bool) float64 {
+	if v {
+		return 1
+	}
+	return 0
 }
 
 func sanitizeLabelValue(value string) string {

@@ -31,11 +31,13 @@ class SentinelMetricsCollector:
         self._lock = threading.RLock()
         self._operations: Dict[Tuple[str, str], int] = {}
         self._latencies: Dict[Tuple[str, str], _Histogram] = {}
+        self._counters: Dict[str, int] = {}
 
     def reset(self) -> None:
         with self._lock:
             self._operations.clear()
             self._latencies.clear()
+            self._counters.clear()
 
     def record_operation(self, operation: str, duration_seconds: float, status: str = "ok") -> None:
         key = (operation, status)
@@ -46,6 +48,12 @@ class SentinelMetricsCollector:
                 hist = _Histogram(_DEFAULT_BUCKETS)
                 self._latencies[key] = hist
             hist.observe(duration_seconds)
+
+    def inc_counter(self, name: str, value: int = 1) -> None:
+        if not name:
+            return
+        with self._lock:
+            self._counters[name] = self._counters.get(name, 0) + int(value)
 
     def render_prometheus(self) -> str:
         with self._lock:
@@ -79,6 +87,15 @@ class SentinelMetricsCollector:
                 lines.append(
                     f'sentinel_service_operation_latency_seconds_count{{operation="{operation}",status="{status}"}} {hist.count}'
                 )
+            counter_help = {
+                "lineage_missing_source_event_id_total": "Total messages where source_event_id was missing and fallback was applied",
+                "lineage_missing_trace_id_total": "Total messages where trace_id was missing and a derived trace_id was applied",
+                "lineage_invalid_trace_id_normalized_total": "Total messages where trace_id was present but invalid and was normalized",
+            }
+            for name in sorted(self._counters):
+                lines.append(f"# HELP {name} {counter_help.get(name, 'Sentinel lineage counter')}")
+                lines.append(f"# TYPE {name} counter")
+                lines.append(f"{name} {self._counters[name]}")
 
         return "\n".join(lines) + "\n"
 

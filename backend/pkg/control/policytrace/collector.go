@@ -10,6 +10,7 @@ type Marker struct {
 	Stage       string
 	PolicyID    string
 	TraceID     string
+	Reason      string
 	TimestampMs int64
 	Height      uint64
 	View        uint64

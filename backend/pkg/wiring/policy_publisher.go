@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"backend/pkg/control/policyoutbox"
+	"backend/pkg/control/policytrace"
 	"backend/pkg/ingest/kafka"
 	"backend/pkg/utils"
 	pb "backend/proto"
@@ -53,6 +54,8 @@ type policyPublisher struct {
 	scopeRouting        bool
 	clusterShardingMode string
 	clusterShardBuckets int
+	clusterShardLanes   int
+	trace               *policytrace.Collector
 	dlqSuccesses        atomic.Uint64
 	dlqFailures         atomic.Uint64
 }
@@ -70,7 +73,7 @@ type policyDLQRecord struct {
 	GuardrailStage string    `json:"guardrail_stage,omitempty"`
 }
 
-func newPolicyPublisher(producer *kafka.Producer, cfgMgr *utils.ConfigManager, topic string, logger *utils.Logger, audit *utils.AuditLogger) (*policyPublisher, error) {
+func newPolicyPublisher(producer *kafka.Producer, cfgMgr *utils.ConfigManager, topic string, logger *utils.Logger, audit *utils.AuditLogger, trace *policytrace.Collector) (*policyPublisher, error) {
 	if producer == nil || topic == "" {
 		return nil, nil
 	}
@@ -106,9 +109,11 @@ func newPolicyPublisher(producer *kafka.Producer, cfgMgr *utils.ConfigManager, t
 	normalizedRouting, unknownMode := policyoutbox.NormalizeRoutingOptions(policyoutbox.RoutingOptions{
 		ClusterShardingMode: rawClusterShardingMode,
 		ClusterShardBuckets: cfgMgr.GetInt("CONTROL_POLICY_CLUSTER_SHARD_BUCKETS", 1),
+		ClusterShardLanes:   cfgMgr.GetInt("CONTROL_POLICY_CLUSTER_SHARD_LANES", 1),
 	})
 	clusterShardingMode := normalizedRouting.ClusterShardingMode
 	clusterShardBuckets := normalizedRouting.ClusterShardBuckets
+	clusterShardLanes := normalizedRouting.ClusterShardLanes
 	if unknownMode {
 		if logger != nil {
 			logger.Warn("Unsupported CONTROL_POLICY_CLUSTER_SHARDING_MODE; disabling cluster sharding",
@@ -151,6 +156,8 @@ func newPolicyPublisher(producer *kafka.Producer, cfgMgr *utils.ConfigManager, t
 		scopeRouting:        scopeRouting,
 		clusterShardingMode: clusterShardingMode,
 		clusterShardBuckets: clusterShardBuckets,
+		clusterShardLanes:   clusterShardLanes,
+		trace:               trace,
 	}
 
 	// Optional: when set, any policy payload that targets this namespace is treated as a
@@ -192,7 +199,9 @@ func (p *policyPublisher) Publish(ctx context.Context, height uint64, ts int64, 
 	}
 
 	for _, raw := range payloads {
+		dedupeToken := ""
 		if key := buildPolicyDedupKey(raw); key != "" {
+			dedupeToken = key
 			if _, exists := seen[key]; exists {
 				if p.logger != nil {
 					p.logger.DebugContext(ctx, "Duplicate policy payload skipped",
@@ -208,7 +217,10 @@ func (p *policyPublisher) Publish(ctx context.Context, height uint64, ts int64, 
 			p.guardrailReject(ctx, policyID, height, reason, err, raw)
 			continue
 		}
-		if p.alreadyPublishedRecently(policyID, blockTime) {
+		if dedupeToken == "" {
+			dedupeToken = policyID
+		}
+		if p.alreadyPublishedRecently(dedupeToken, blockTime) {
 			if p.logger != nil {
 				p.logger.InfoContext(ctx, "Skipping duplicate policy publish within dedupe window",
 					utils.ZapString("policy_id", policyID),
@@ -242,7 +254,7 @@ func (p *policyPublisher) Publish(ctx context.Context, height uint64, ts int64, 
 				"expiration_height": evt.GetExpirationHeight(),
 			})
 		}
-		p.markPublished(policyID, blockTime)
+		p.markPublished(dedupeToken, blockTime)
 	}
 }
 
@@ -270,6 +282,7 @@ func (p *policyPublisher) PublishFromOutbox(ctx context.Context, height uint64, 
 		_, routingKey, _ = policyoutbox.DeriveScopeIdentifierWithOptions(raw, policyoutbox.RoutingOptions{
 			ClusterShardingMode: p.clusterShardingMode,
 			ClusterShardBuckets: p.clusterShardBuckets,
+			ClusterShardLanes:   p.clusterShardLanes,
 		})
 	}
 
@@ -290,28 +303,28 @@ func (p *policyPublisher) PublishFromOutbox(ctx context.Context, height uint64, 
 	return policyID, partition, offset, nil
 }
 
-func (p *policyPublisher) alreadyPublishedRecently(policyID string, now time.Time) bool {
-	if p == nil || p.dedupeWindow <= 0 || policyID == "" {
+func (p *policyPublisher) alreadyPublishedRecently(key string, now time.Time) bool {
+	if p == nil || p.dedupeWindow <= 0 || key == "" {
 		return false
 	}
 	p.publishMu.Lock()
 	defer p.publishMu.Unlock()
 	p.prunePublishedLocked(now)
-	last, ok := p.publishedAt[policyID]
+	last, ok := p.publishedAt[key]
 	if !ok {
 		return false
 	}
 	return now.Sub(last) <= p.dedupeWindow
 }
 
-func (p *policyPublisher) markPublished(policyID string, now time.Time) {
-	if p == nil || p.dedupeWindow <= 0 || policyID == "" {
+func (p *policyPublisher) markPublished(key string, now time.Time) {
+	if p == nil || p.dedupeWindow <= 0 || key == "" {
 		return
 	}
 	p.publishMu.Lock()
 	defer p.publishMu.Unlock()
 	p.prunePublishedLocked(now)
-	p.publishedAt[policyID] = now
+	p.publishedAt[key] = now
 }
 
 func (p *policyPublisher) prunePublishedLocked(now time.Time) {
@@ -349,7 +362,11 @@ func buildPolicyDedupKey(raw []byte) string {
 	builder := strings.Builder{}
 	builder.WriteString(strings.ToLower(strings.TrimSpace(params.RuleType)))
 	builder.WriteString("|")
+	builder.WriteString(strings.ToLower(strings.TrimSpace(params.ControlAction)))
+	builder.WriteString("|")
 	builder.WriteString(strings.ToLower(strings.TrimSpace(params.Action)))
+	builder.WriteString("|")
+	builder.WriteString(strings.TrimSpace(params.RollbackPolicyID))
 	builder.WriteString("|")
 
 	scope := strings.ToLower(strings.TrimSpace(params.Target.Scope))
@@ -375,8 +392,9 @@ func buildPolicyDedupKey(raw []byte) string {
 	}
 	builder.WriteString(fmt.Sprintf("%d|", ttl))
 
-	if params.Guardrails.Allowlist != nil {
-		allow := append([]string(nil), params.Guardrails.Allowlist...)
+	allowEntries := params.Guardrails.Allowlist.Entries()
+	if allowEntries != nil {
+		allow := append([]string(nil), allowEntries...)
 		sort.Strings(allow)
 		builder.WriteString(strings.Join(allow, ","))
 	}
@@ -408,6 +426,12 @@ func (p *policyPublisher) prepareEvent(height uint64, blockTime time.Time, raw [
 	if _, err := uuid.Parse(policyID); err != nil {
 		return nil, policyID, "policy_id_invalid", err
 	}
+	rollbackPolicyID := strings.TrimSpace(payload.RollbackPolicyID)
+	if rollbackPolicyID != "" {
+		if _, err := uuid.Parse(rollbackPolicyID); err != nil {
+			return nil, policyID, "rollback_policy_id_invalid", err
+		}
+	}
 
 	if payload.SchemaVersion <= 0 {
 		return nil, policyID, "schema_version_invalid", nil
@@ -422,10 +446,48 @@ func (p *policyPublisher) prepareEvent(height uint64, blockTime time.Time, raw [
 		return nil, policyID, "action_missing", nil
 	}
 	normalizedAction := strings.ToLower(action)
-	if normalizedAction != "drop" && normalizedAction != "reject" {
+	if normalizedAction != "drop" && normalizedAction != "reject" && normalizedAction != "remove" {
 		return nil, policyID, "action_invalid", fmt.Errorf("action: %s", payload.Action)
 	}
 	action = normalizedAction
+
+	controlAction := "add"
+	if action == "remove" {
+		controlAction = "remove"
+	}
+	if rawControlAction := strings.ToLower(strings.TrimSpace(payload.ControlAction)); rawControlAction != "" {
+		switch rawControlAction {
+		case "add", "remove":
+			if rawControlAction != controlAction {
+				return nil, policyID, "control_action_invalid", fmt.Errorf("control_action: %s", payload.ControlAction)
+			}
+		case "approve", "reject":
+			if action == "remove" {
+				return nil, policyID, "control_action_invalid", fmt.Errorf("control_action: %s", payload.ControlAction)
+			}
+			controlAction = rawControlAction
+		default:
+			return nil, policyID, "control_action_invalid", fmt.Errorf("control_action: %s", payload.ControlAction)
+		}
+	}
+
+	if action == "remove" {
+		hash := sha256.Sum256(raw)
+		evt := &pb.PolicyUpdateEvent{
+			PolicyId:         policyID,
+			Action:           controlAction,
+			RuleType:         ruleType,
+			RuleData:         raw,
+			RuleHash:         hash[:],
+			RequiresAck:      payload.Guardrails.RequiresAck,
+			RollbackPolicyId: rollbackPolicyID,
+			Timestamp:        blockTime.Unix(),
+			EffectiveHeight:  int64(height),
+			ExpirationHeight: 0,
+		}
+
+		return evt, policyID, "", nil
+	}
 
 	direction := strings.TrimSpace(payload.Target.Direction)
 	if direction != "" {
@@ -438,7 +500,7 @@ func (p *policyPublisher) prepareEvent(height uint64, blockTime time.Time, raw [
 	scope := strings.TrimSpace(payload.Target.Scope)
 	if scope != "" {
 		scope = strings.ToLower(scope)
-		if scope != "cluster" && scope != "namespace" && scope != "node" {
+		if scope != "cluster" && scope != "namespace" && scope != "node" && scope != "tenant" && scope != "region" {
 			return nil, policyID, "scope_invalid", fmt.Errorf("scope: %s", payload.Target.Scope)
 		}
 	}
@@ -452,7 +514,7 @@ func (p *policyPublisher) prepareEvent(height uint64, blockTime time.Time, raw [
 				if direction != "egress" {
 					return nil, policyID, "gateway_policy_direction_invalid", fmt.Errorf("direction: %s", payload.Target.Direction)
 				}
-				if scope != "" && scope != "namespace" {
+				if scope != "" && scope != "namespace" && scope != "tenant" && scope != "region" {
 					return nil, policyID, "gateway_policy_scope_invalid", fmt.Errorf("scope: %s", payload.Target.Scope)
 				}
 			}
@@ -520,15 +582,16 @@ func (p *policyPublisher) prepareEvent(height uint64, blockTime time.Time, raw [
 		}
 	}
 
-	if payload.Guardrails.Allowlist != nil {
-		if len(payload.Guardrails.Allowlist) == 0 {
+	allowlistEntries := payload.Guardrails.Allowlist.Entries()
+	if allowlistEntries != nil {
+		if len(allowlistEntries) == 0 {
 			return nil, policyID, "allowlist_empty", nil
 		}
-		allowPrefixes, err := parseAllowlistPrefixes(payload.Guardrails.Allowlist)
+		allowlistSpec, err := parseAllowlist(allowlistEntries)
 		if err != nil {
 			return nil, policyID, "allowlist_invalid", err
 		}
-		if err := ensureTargetsOutsideAllowlist(allowPrefixes, payload.Target); err != nil {
+		if err := ensureTargetsOutsideAllowlist(allowlistSpec, payload.Target); err != nil {
 			return nil, policyID, "target_overlaps_allowlist", err
 		}
 	}
@@ -543,13 +606,14 @@ func (p *policyPublisher) prepareEvent(height uint64, blockTime time.Time, raw [
 
 	evt := &pb.PolicyUpdateEvent{
 		PolicyId: policyID,
-		Action:   action,
+		Action:   controlAction,
 		RuleType: ruleType,
 		RuleData: raw,
 		RuleHash: hash[:],
 		// RequiresAck is an execution/telemetry concern (did an agent apply it),
 		// not the same thing as manual-approval staging.
 		RequiresAck:      payload.Guardrails.RequiresAck,
+		RollbackPolicyId: rollbackPolicyID,
 		Timestamp:        blockTime.Unix(),
 		EffectiveHeight:  int64(height),
 		ExpirationHeight: expirationHeight,
@@ -588,6 +652,19 @@ func (p *policyPublisher) guardrailReject(ctx context.Context, policyID string, 
 			entry["error"] = err.Error()
 		}
 		_ = p.audit.Warn("policy_guardrail_reject", entry)
+	}
+	if p.trace != nil && policyID != "" {
+		traceID := extractTraceIDForGuardrail(payload)
+		if traceID == "" {
+			traceID = "synthetic:policy:" + policyID
+		}
+		p.trace.Record(policytrace.Marker{
+			Stage:       "t_guardrail_rejected",
+			PolicyID:    policyID,
+			TraceID:     traceID,
+			Reason:      reason,
+			TimestampMs: time.Now().UnixMilli(),
+		})
 	}
 
 	if p.dlqEnabled {
@@ -680,12 +757,14 @@ func (p *policyPublisher) emitDLQ(ctx context.Context, policyID, reason string, 
 }
 
 type policyParams struct {
-	SchemaVersion int              `json:"schema_version"`
-	PolicyID      string           `json:"policy_id"`
-	RuleType      string           `json:"rule_type"`
-	Action        string           `json:"action"`
-	Target        policyTarget     `json:"target"`
-	Guardrails    policyGuardrails `json:"guardrails"`
+	SchemaVersion    int              `json:"schema_version"`
+	PolicyID         string           `json:"policy_id"`
+	RollbackPolicyID string           `json:"rollback_policy_id"`
+	ControlAction    string           `json:"control_action"`
+	RuleType         string           `json:"rule_type"`
+	Action           string           `json:"action"`
+	Target           policyTarget     `json:"target"`
+	Guardrails       policyGuardrails `json:"guardrails"`
 }
 
 type policyTarget struct {
@@ -701,19 +780,150 @@ type policyTarget struct {
 }
 
 type policyGuardrails struct {
-	TTLSeconds              *int     `json:"ttl_seconds"`
-	CIDRMaxPrefixLen        *int     `json:"cidr_max_prefix_len"`
-	ApprovalRequired        bool     `json:"approval_required"`
-	RequiresAck             bool     `json:"requires_ack"`
-	FastPathEnabled         bool     `json:"fast_path_enabled"`
-	FastPathCanary          bool     `json:"fast_path_canary_scope"`
-	FastPathTTLSeconds      *int64   `json:"fast_path_ttl_seconds"`
-	FastPathSignalsRequired *int64   `json:"fast_path_signals_required"`
-	FastPathConfidenceMin   *float64 `json:"fast_path_confidence_min"`
-	DryRun                  bool     `json:"dry_run"`
-	CanaryScope             bool     `json:"canary_scope"`
-	MaxTargets              *int     `json:"max_targets"`
-	Allowlist               []string `json:"allowlist"`
+	TTLSeconds              *int            `json:"ttl_seconds"`
+	CIDRMaxPrefixLen        *int            `json:"cidr_max_prefix_len"`
+	ApprovalRequired        bool            `json:"approval_required"`
+	RequiresAck             bool            `json:"requires_ack"`
+	FastPathEnabled         bool            `json:"fast_path_enabled"`
+	FastPathCanary          bool            `json:"fast_path_canary_scope"`
+	FastPathTTLSeconds      *int64          `json:"fast_path_ttl_seconds"`
+	FastPathSignalsRequired *int64          `json:"fast_path_signals_required"`
+	FastPathConfidenceMin   *float64        `json:"fast_path_confidence_min"`
+	DryRun                  bool            `json:"dry_run"`
+	CanaryScope             bool            `json:"canary_scope"`
+	MaxTargets              *int            `json:"max_targets"`
+	Allowlist               policyAllowlist `json:"allowlist"`
+}
+
+type policyAllowlist struct {
+	IPs        []string
+	CIDRs      []string
+	Namespaces []string
+}
+
+func (a *policyAllowlist) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 || string(data) == "null" {
+		*a = policyAllowlist{}
+		return nil
+	}
+
+	var flat []string
+	if err := json.Unmarshal(data, &flat); err == nil {
+		normalized, err := normalizeFlatAllowlist(flat)
+		if err != nil {
+			return err
+		}
+		*a = normalized
+		return nil
+	}
+
+	var obj struct {
+		IPs        []string `json:"ips"`
+		CIDRs      []string `json:"cidrs"`
+		Namespaces []string `json:"namespaces"`
+	}
+	if err := json.Unmarshal(data, &obj); err != nil {
+		return fmt.Errorf("allowlist must be list or object: %w", err)
+	}
+	*a = policyAllowlist{
+		IPs:        sanitizeStringSlice(obj.IPs),
+		CIDRs:      sanitizeStringSlice(obj.CIDRs),
+		Namespaces: sanitizeStringSlice(obj.Namespaces),
+	}
+	return nil
+}
+
+func (a policyAllowlist) Entries() []string {
+	total := len(a.IPs) + len(a.CIDRs) + len(a.Namespaces)
+	if total == 0 {
+		return nil
+	}
+	out := make([]string, 0, total)
+	out = append(out, a.IPs...)
+	out = append(out, a.CIDRs...)
+	for _, ns := range a.Namespaces {
+		out = append(out, "ns:"+ns)
+	}
+	return out
+}
+
+func normalizeFlatAllowlist(entries []string) (policyAllowlist, error) {
+	var out policyAllowlist
+	for _, raw := range entries {
+		entry := strings.TrimSpace(raw)
+		if entry == "" {
+			return policyAllowlist{}, fmt.Errorf("empty allowlist entry")
+		}
+		if strings.HasPrefix(strings.ToLower(entry), "ns:") {
+			ns := strings.TrimSpace(entry[3:])
+			if ns == "" {
+				return policyAllowlist{}, fmt.Errorf("empty allowlist namespace entry")
+			}
+			out.Namespaces = append(out.Namespaces, ns)
+			continue
+		}
+		if strings.Contains(entry, "/") {
+			out.CIDRs = append(out.CIDRs, entry)
+			continue
+		}
+		out.IPs = append(out.IPs, entry)
+	}
+	return out, nil
+}
+
+func sanitizeStringSlice(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+func extractTraceIDForGuardrail(payload []byte) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	var obj map[string]interface{}
+	if err := json.Unmarshal(payload, &obj); err != nil {
+		return ""
+	}
+
+	if traceID := extractTraceIDFromMap(obj); traceID != "" {
+		return traceID
+	}
+	if params, ok := obj["params"].(map[string]interface{}); ok {
+		return extractTraceIDFromMap(params)
+	}
+	return ""
+}
+
+func extractTraceIDFromMap(obj map[string]interface{}) string {
+	if obj == nil {
+		return ""
+	}
+	if traceID, ok := obj["trace_id"].(string); ok && strings.TrimSpace(traceID) != "" {
+		return strings.TrimSpace(traceID)
+	}
+	if metadata, ok := obj["metadata"].(map[string]interface{}); ok {
+		if traceID, ok := metadata["trace_id"].(string); ok && strings.TrimSpace(traceID) != "" {
+			return strings.TrimSpace(traceID)
+		}
+	}
+	if traceObj, ok := obj["trace"].(map[string]interface{}); ok {
+		if traceID, ok := traceObj["trace_id"].(string); ok && strings.TrimSpace(traceID) != "" {
+			return strings.TrimSpace(traceID)
+		}
+		if traceID, ok := traceObj["id"].(string); ok && strings.TrimSpace(traceID) != "" {
+			return strings.TrimSpace(traceID)
+		}
+	}
+	return ""
 }
 
 type policyRateLimiter struct {
@@ -722,21 +932,35 @@ type policyRateLimiter struct {
 	windows map[int64]int
 }
 
-func parseAllowlistPrefixes(entries []string) ([]netip.Prefix, error) {
+type parsedAllowlist struct {
+	prefixes   []netip.Prefix
+	namespaces map[string]struct{}
+}
+
+func parseAllowlist(entries []string) (parsedAllowlist, error) {
 	prefixes := make([]netip.Prefix, 0, len(entries))
+	namespaces := make(map[string]struct{})
 	for _, raw := range entries {
 		entry := strings.TrimSpace(raw)
 		if entry == "" {
-			return nil, fmt.Errorf("empty allowlist entry")
+			return parsedAllowlist{}, fmt.Errorf("empty allowlist entry")
+		}
+		if strings.HasPrefix(strings.ToLower(entry), "ns:") {
+			ns := strings.ToLower(strings.TrimSpace(entry[3:]))
+			if ns == "" {
+				return parsedAllowlist{}, fmt.Errorf("empty allowlist namespace entry")
+			}
+			namespaces[ns] = struct{}{}
+			continue
 		}
 		if strings.Contains(entry, "/") {
 			prefix, err := netip.ParsePrefix(entry)
 			if err != nil {
-				return nil, fmt.Errorf("invalid allowlist entry %q: %w", entry, err)
+				return parsedAllowlist{}, fmt.Errorf("invalid allowlist entry %q: %w", entry, err)
 			}
 			prefix = prefix.Masked()
 			if prefix.Addr().Is6() && prefix.Bits() < minIPv6Prefix {
-				return nil, fmt.Errorf("invalid allowlist entry %q: ipv6 prefix /%d too broad (min /%d)", entry, prefix.Bits(), minIPv6Prefix)
+				return parsedAllowlist{}, fmt.Errorf("invalid allowlist entry %q: ipv6 prefix /%d too broad (min /%d)", entry, prefix.Bits(), minIPv6Prefix)
 			}
 			prefixes = append(prefixes, prefix)
 			continue
@@ -744,20 +968,20 @@ func parseAllowlistPrefixes(entries []string) ([]netip.Prefix, error) {
 
 		addr, err := netip.ParseAddr(entry)
 		if err != nil {
-			return nil, fmt.Errorf("invalid allowlist entry %q: %w", entry, err)
+			return parsedAllowlist{}, fmt.Errorf("invalid allowlist entry %q: %w", entry, err)
 		}
 		prefixes = append(prefixes, netip.PrefixFrom(addr, addr.BitLen()))
 	}
-	return prefixes, nil
+	return parsedAllowlist{prefixes: prefixes, namespaces: namespaces}, nil
 }
 
-func ensureTargetsOutsideAllowlist(allow []netip.Prefix, target policyTarget) error {
+func ensureTargetsOutsideAllowlist(allow parsedAllowlist, target policyTarget) error {
 	for _, ipStr := range target.IPs {
 		addr, err := netip.ParseAddr(strings.TrimSpace(ipStr))
 		if err != nil {
 			return fmt.Errorf("invalid ip target %q: %w", ipStr, err)
 		}
-		for _, prefix := range allow {
+		for _, prefix := range allow.prefixes {
 			if prefix.Contains(addr) {
 				return fmt.Errorf("target ip %s is within allowlist %s", ipStr, prefix.String())
 			}
@@ -770,9 +994,20 @@ func ensureTargetsOutsideAllowlist(allow []netip.Prefix, target policyTarget) er
 			return fmt.Errorf("invalid cidr target %q: %w", cidrStr, err)
 		}
 		prefix = prefix.Masked()
-		for _, allowPrefix := range allow {
+		for _, allowPrefix := range allow.prefixes {
 			if allowPrefix.Overlaps(prefix) {
 				return fmt.Errorf("target cidr %s overlaps allowlist %s", cidrStr, allowPrefix.String())
+			}
+		}
+	}
+	if len(allow.namespaces) > 0 {
+		rawNS, ok := target.Selectors["namespace"]
+		if ok {
+			if targetNS, ok := rawNS.(string); ok {
+				ns := strings.ToLower(strings.TrimSpace(targetNS))
+				if _, exists := allow.namespaces[ns]; exists {
+					return fmt.Errorf("target namespace %s is in allowlist", targetNS)
+				}
 			}
 		}
 	}

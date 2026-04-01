@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict
 
@@ -24,10 +25,44 @@ from sentinel.utils.error_codes import (
 )
 
 from .config import KafkaWorkerConfig
+from .id_utils import derive_trace_id, is_valid_trace_id
 
 
 def _hash_event_id(topic: str, payload: bytes) -> str:
     return f"kafka:{topic}:{hashlib.sha256(payload).hexdigest()}"
+
+
+_SENTINEL_EVENT_NAMESPACE = uuid.UUID("6ba7b811-9dad-11d1-80b4-00c04fd430c8")
+
+_SOURCE_TYPE_LABELS = {
+    1: "k8s_cilium",
+    2: "bare_metal_ebpf",
+    3: "gateway_sensor",
+    4: "gcp_vpc",
+    5: "aws_vpc",
+    6: "azure_nsg",
+    7: "pcap",
+    8: "zeek",
+    9: "suricata",
+}
+
+
+def _first_non_empty(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _derive_legacy_source_event_id(topic: str, payload: Dict[str, Any], raw_bytes: bytes) -> str:
+    source_event_id = _first_non_empty(payload.get("source_event_id"))
+    if source_event_id:
+        return source_event_id
+    flow_id = _first_non_empty(payload.get("flow_id"))
+    if flow_id:
+        return flow_id
+    return _hash_event_id(topic, raw_bytes)
 
 
 def _load_json(value: bytes) -> Dict[str, Any]:
@@ -69,6 +104,8 @@ def _decode_proto_flow_v1(value: bytes) -> Dict[str, Any]:
         "ts": int(msg.ts or 0),
         "tenant_id": msg.tenant_id or "",
         "flow_id": msg.flow_id or "",
+        "trace_id": getattr(msg, "trace_id", "") or "",
+        "source_event_id": getattr(msg, "source_event_id", "") or "",
         "src_ip": msg.src_ip or "",
         "dst_ip": msg.dst_ip or "",
         "src_port": int(msg.src_port or 0),
@@ -168,14 +205,29 @@ def _to_flow_event(topic: str, payload: Dict[str, Any], raw_bytes: bytes) -> Can
         raise ValueError(format_error(ERR_INVALID_FIELDS, detail))
 
     source = f"kafka:{topic}"
-    event_id = str(payload.get("flow_id") or _hash_event_id(topic, raw_bytes))
+    source_event_id = _derive_legacy_source_event_id(topic, payload, raw_bytes)
+    event_id = _derive_sentinel_event_id(
+        tenant_id=tenant_id,
+        source=source,
+        modality="network_flow",
+        source_event_id=source_event_id,
+    )
     event_ts = float(payload.get("ts") or time.time())
-    labels = _ensure_trace_labels(_derive_labels_for_flow(payload), event_id=event_id, timestamp_s=event_ts, payload=payload)
+    labels = _ensure_trace_labels(
+        _derive_labels_for_flow(payload),
+        event_id=event_id,
+        timestamp_s=event_ts,
+        payload=payload,
+        source_event_id=source_event_id,
+    )
     raw_context = {
         "_source_topic": topic,
         "_source_schema": payload.get("schema", ""),
         "_decoded_duration_ms": payload.get("duration_ms"),
         "_decoded_timing_known": payload.get("timing_known"),
+        "flow_id": payload.get("flow_id", ""),
+        "source_id": payload.get("source_id", ""),
+        "source_type": _coerce_source_type_label(payload.get("source_type")),
     }
     return build_flow_event(
         features=features,
@@ -256,24 +308,80 @@ def _normalize_event_ts_ms(value: Any) -> int:
     return int(parsed * 1000.0)
 
 
-def _ensure_trace_labels(labels: Dict[str, str], *, event_id: str, timestamp_s: float, payload: Dict[str, Any] | None = None) -> Dict[str, str]:
+def _coerce_source_type_label(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip().lower()
+    try:
+        numeric = int(value)
+    except (TypeError, ValueError):
+        return ""
+    return _SOURCE_TYPE_LABELS.get(numeric, "")
+
+
+def _ensure_trace_labels(
+    labels: Dict[str, str],
+    *,
+    event_id: str,
+    timestamp_s: float,
+    payload: Dict[str, Any] | None = None,
+    source_event_id: str = "",
+) -> Dict[str, str]:
     out = dict(labels or {})
-    out.setdefault("trace_id", event_id)
-    out.setdefault("source_event_id", event_id)
     payload = payload or {}
+    flow_id = _first_non_empty(payload.get("flow_id"))
+    resolved_source_event_id = _first_non_empty(source_event_id, payload.get("source_event_id"), event_id)
+    trace_id = derive_trace_id(
+        payload.get("trace_id"),
+        out.get("trace_id"),
+        resolved_source_event_id,
+        flow_id,
+        event_id,
+    )
+    out.setdefault("trace_id", trace_id)
+    out.setdefault("source_event_id", resolved_source_event_id or event_id)
     source_event_ts_ms = _normalize_event_ts_ms(payload.get("source_event_ts_ms"))
     telemetry_ingest_ts_ms = _normalize_event_ts_ms(payload.get("telemetry_ingest_ts_ms"))
     out.setdefault("source_event_ts_ms", str(source_event_ts_ms or int(float(timestamp_s) * 1000.0)))
     if telemetry_ingest_ts_ms > 0:
         out.setdefault("telemetry_ingest_ts_ms", str(telemetry_ingest_ts_ms))
+    if flow_id:
+        out.setdefault("flow_id", flow_id)
+    source_id = _first_non_empty(payload.get("source_id"))
+    if source_id:
+        out.setdefault("source_id", source_id)
+    source_type = _coerce_source_type_label(payload.get("source_type"))
+    if source_type:
+        out.setdefault("source_type", source_type)
+    sensor_id = _first_non_empty(payload.get("sensor_id"))
+    if sensor_id:
+        out.setdefault("sensor_id", sensor_id)
     return out
+
+
+def _derive_sentinel_event_id(*, tenant_id: str, source: str, modality: str, source_event_id: str) -> str:
+    seed = "|".join(
+        (
+            str(tenant_id or "").strip(),
+            str(source or "").strip(),
+            str(modality or "").strip(),
+            str(source_event_id or "").strip(),
+        )
+    )
+    return str(uuid.uuid5(_SENTINEL_EVENT_NAMESPACE, seed))
 
 
 def _to_deepflow_event(topic: str, payload: Dict[str, Any], raw_bytes: bytes) -> CanonicalEvent:
     tenant_id = str(payload.get("tenant_id") or "").strip()
     if not tenant_id:
         raise ValueError(format_error(ERR_MISSING_TENANT, "missing tenant_id"))
-    event_id = str(payload.get("flow_id") or _hash_event_id(topic, raw_bytes))
+    source = f"kafka:{topic}"
+    source_event_id = _derive_legacy_source_event_id(topic, payload, raw_bytes)
+    event_id = _derive_sentinel_event_id(
+        tenant_id=tenant_id,
+        source=source,
+        modality="scan_findings",
+        source_event_id=source_event_id,
+    )
     event_ts = float(payload.get("ts") or time.time())
     severity = str(payload.get("severity") or "medium")
     signature = str(payload.get("signature") or payload.get("alert_type") or "deepflow_alert")
@@ -298,15 +406,22 @@ def _to_deepflow_event(topic: str, payload: Dict[str, Any], raw_bytes: bytes) ->
         "_source_schema": payload.get("schema", ""),
         "flow_id": payload.get("flow_id", ""),
         "sensor_id": payload.get("sensor_id", ""),
+        "source_type": _coerce_source_type_label(payload.get("source_type")),
     }
     return build_scan_findings_event(
         features=features,
         raw_context=raw_context,
         tenant_id=tenant_id,
-        source=f"kafka:{topic}",
+        source=source,
         event_id=event_id,
         timestamp=event_ts,
-        labels=_ensure_trace_labels({}, event_id=event_id, timestamp_s=event_ts, payload=payload),
+        labels=_ensure_trace_labels(
+            {},
+            event_id=event_id,
+            timestamp_s=event_ts,
+            payload=payload,
+            source_event_id=source_event_id,
+        ),
     )
 
 

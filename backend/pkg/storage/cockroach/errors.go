@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strings"
 
 	"github.com/jackc/pgconn"
 	"github.com/lib/pq"
@@ -64,6 +65,15 @@ func IsRetryable(err error) bool {
 		}
 		// Temporary() is deprecated in newer Go; keep backward-compatible check.
 		return netErr.Temporary()
+	}
+
+	// Fallback for wrapped driver errors that lose concrete pg error typing.
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "sqlstate 40001") ||
+		strings.Contains(msg, "restart transaction") ||
+		strings.Contains(msg, "retry_serializable") ||
+		strings.Contains(msg, "transactionretrywithprotorefresherror") {
+		return true
 	}
 
 	// Default fail-closed for retry classification: unknown errors are non-retryable.

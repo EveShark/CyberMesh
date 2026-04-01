@@ -116,7 +116,17 @@ func (s *validatorSet) IsActive(id ctypes.ValidatorID) bool {
 func (s *validatorSet) IsActiveInView(id ctypes.ValidatorID, _ uint64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.applyInactivityLocked(id, time.Now())
+	entry, ok := s.activity[id]
+	if !ok || entry == nil {
+		return false
+	}
+	if v := s.index[id]; v != nil {
+		v.IsActive = entry.active
+		if !entry.lastSeen.IsZero() {
+			v.LastSeen = entry.lastSeen
+		}
+	}
+	return entry.active
 }
 
 func (s *validatorSet) MarkActive(id ctypes.ValidatorID, when time.Time) {
@@ -450,6 +460,23 @@ func main() {
 		log.Fatalf("consensus engine start failed: %v", err)
 	}
 
+	if shouldRunConsensusSelfTest(cfgMgr) {
+		targetNode := strings.TrimSpace(cfgMgr.GetString("CONSENSUS_SELF_TEST_TARGET_NODE_ID", ""))
+		status := consensusEngine.GetStatus()
+		localNodeID := fmt.Sprintf("%x", status.NodeID[:])
+		if targetNode == "" || strings.EqualFold(targetNode, localNodeID) {
+			if err := consensusEngine.InjectDuplicateSignerQCSelfTest(ctx); err != nil {
+				log.Fatalf("duplicate-signer self-test failed: %v", err)
+			}
+			logger.Warn("duplicate-signer consensus self-test completed",
+				utils.ZapString("node_id", localNodeID))
+		} else {
+			logger.Info("skipping duplicate-signer consensus self-test on non-target node",
+				utils.ZapString("node_id", localNodeID),
+				utils.ZapString("target_node_id", targetNode))
+		}
+	}
+
 	// START SERVICE BEFORE GENESIS - Proposer needs to run regardless of genesis completion
 	if err := service.Start(ctx); err != nil {
 		log.Fatalf("service start failed: %v", err)
@@ -497,6 +524,25 @@ func main() {
 	}
 
 	fmt.Println("Shutdown complete.")
+}
+
+func shouldRunConsensusSelfTest(cfgMgr *utils.ConfigManager) bool {
+	if cfgMgr == nil {
+		return false
+	}
+	if !cfgMgr.GetBool("CONSENSUS_SELF_TESTS_ENABLED", false) {
+		return false
+	}
+	if !cfgMgr.GetBool("CONSENSUS_SELF_TEST_DUPLICATE_SIGNER_QC", false) {
+		return false
+	}
+	env := strings.ToLower(strings.TrimSpace(cfgMgr.GetString("ENVIRONMENT", "")))
+	switch env {
+	case "production", "prod", "staging":
+		return false
+	default:
+		return true
+	}
 }
 
 func computeGenesisConfigHash(engineConfig *api.EngineConfig, cfgMgr *utils.ConfigManager, validators []ctypes.ValidatorInfo) [32]byte {
@@ -973,6 +1019,7 @@ func buildWiringConfig(
 		BlockTimeout:        cfgMgr.GetDuration("CONSENSUS_BLOCK_TIMEOUT", 5*time.Second),
 		GenesisGracePeriod:  cfgMgr.GetDuration("CONSENSUS_GENESIS_GRACE_PERIOD", 60*time.Second),
 		AllowSoloProposal:   cfgMgr.GetBool("CONSENSUS_ALLOW_SOLO_PROPOSAL", false),
+		RequireActivePeers:  cfgMgr.GetBool("CONSENSUS_REQUIRE_ACTIVE_PEERS_FOR_PROPOSAL", false),
 		StateRetainVersions: uint64(cfgMgr.GetInt("STATE_RETAIN_VERSIONS", 100)),
 		EnablePersistence:   false,
 		EnableKafka:         enableKafka,
@@ -1039,10 +1086,10 @@ func buildWiringConfig(
 		wiringCfg.KafkaProducerCfg = kafka.ProducerConfig{
 			Brokers: wiringCfg.KafkaConsumerCfg.Brokers,
 			Topics: kafka.ProducerTopics{
-				Commits:    cfgMgr.GetString("CONTROL_COMMITS_TOPIC", "control.commits.v1"),
-				Reputation: cfgMgr.GetString("CONTROL_REPUTATION_TOPIC", ""),
-				Policy:     cfgMgr.GetString("CONTROL_POLICY_TOPIC", ""),
-				Evidence:   cfgMgr.GetString("CONTROL_EVIDENCE_TOPIC", ""),
+				Commits:    getTopicConfig(cfgMgr, logger, "CONTROL_COMMITS_TOPIC", "TOPIC_CONTROL_COMMITS", "control.commits.v1"),
+				Reputation: getTopicConfig(cfgMgr, logger, "CONTROL_REPUTATION_TOPIC", "TOPIC_CONTROL_REPUTATION", ""),
+				Policy:     getTopicConfig(cfgMgr, logger, "CONTROL_POLICY_TOPIC", "TOPIC_CONTROL_POLICY", ""),
+				Evidence:   getTopicConfig(cfgMgr, logger, "CONTROL_EVIDENCE_TOPIC", "TOPIC_CONTROL_EVIDENCE", ""),
 				PolicyDLQ:  cfgMgr.GetString("CONTROL_POLICY_DLQ_TOPIC", ""),
 			},
 		}
@@ -1068,14 +1115,14 @@ func buildWiringConfig(
 			Performance: cockroach.AdapterPerformanceConfig{
 				TxBatchEnabled:         cfgMgr.GetBool("DB_TX_UPSERT_BATCH_ENABLED", true),
 				TxBatchEnabledSet:      true,
-				TxBatchSize:            cfgMgr.GetInt("DB_TX_UPSERT_BATCH_SIZE", 128),
+				TxBatchSize:            cfgMgr.GetInt("DB_TX_UPSERT_BATCH_SIZE", 64),
 				TxBatchAdaptive:        cfgMgr.GetBool("DB_TX_UPSERT_BATCH_ADAPTIVE", true),
 				TxBatchAdaptiveSet:     true,
 				TxBatchMinSize:         cfgMgr.GetInt("DB_TX_UPSERT_BATCH_MIN_SIZE", 32),
 				TxBatchScaleStep:       cfgMgr.GetInt("DB_TX_UPSERT_BATCH_SCALE_STEP", 16),
 				OutboxBatchEnabled:     cfgMgr.GetBool("DB_OUTBOX_UPSERT_BATCH_ENABLED", true),
 				OutboxBatchEnabledSet:  true,
-				OutboxBatchSize:        cfgMgr.GetInt("DB_OUTBOX_UPSERT_BATCH_SIZE", 128),
+				OutboxBatchSize:        cfgMgr.GetInt("DB_OUTBOX_UPSERT_BATCH_SIZE", 64),
 				OutboxBatchAdaptive:    cfgMgr.GetBool("DB_OUTBOX_UPSERT_BATCH_ADAPTIVE", true),
 				OutboxBatchAdaptiveSet: true,
 				OutboxBatchMinSize:     cfgMgr.GetInt("DB_OUTBOX_UPSERT_BATCH_MIN_SIZE", 32),
@@ -1088,12 +1135,16 @@ func buildWiringConfig(
 				CanaryMinSamples:       cfgMgr.GetInt("DB_TX_UPSERT_CANARY_MIN_SAMPLES", 20),
 				CanaryMaxErrorRate:     cfgMgr.GetFloat64("DB_TX_UPSERT_CANARY_MAX_ERROR_RATE", 0.20),
 				CanaryFallbackCooldown: cfgMgr.GetDuration("DB_TX_UPSERT_CANARY_FALLBACK_COOLDOWN", 5*time.Minute),
-				PersistTxRetryMax:      cfgMgr.GetInt("DB_PERSIST_TX_RETRY_MAX", 2),
-				PersistTxRetryBaseMS:   cfgMgr.GetInt("DB_PERSIST_TX_RETRY_BASE_MS", 40),
-				PersistTxRetryMaxMS:    cfgMgr.GetInt("DB_PERSIST_TX_RETRY_MAX_MS", 500),
+				PersistTxRetryMax:      cfgMgr.GetInt("DB_PERSIST_TX_RETRY_MAX", 4),
+				PersistTxRetryBaseMS:   cfgMgr.GetInt("DB_PERSIST_TX_RETRY_BASE_MS", 50),
+				PersistTxRetryMaxMS:    cfgMgr.GetInt("DB_PERSIST_TX_RETRY_MAX_MS", 1000),
 				TxVerifyUseTx:          cfgMgr.GetBool("DB_TX_VERIFY_USE_TX", true),
 				TxVerifyUseTxSet:       true,
 				TxVerifyChunkSize:      cfgMgr.GetInt("DB_TX_VERIFY_CHUNK_SIZE", 1024),
+				OutboxDispatchShards:   cfgMgr.GetInt("CONTROL_POLICY_OUTBOX_DISPATCH_SHARDS", 0),
+				OutboxDispatchMode:     cfgMgr.GetString("CONTROL_POLICY_OUTBOX_DISPATCH_SHARD_MODE", "target_hash_v1"),
+				ClusterShardingMode:    cfgMgr.GetString("CONTROL_POLICY_CLUSTER_SHARDING_MODE", "off"),
+				ClusterShardBuckets:    cfgMgr.GetInt("CONTROL_POLICY_CLUSTER_SHARD_BUCKETS", 1),
 			},
 		}
 		dbAdapter, err := cockroach.NewAdapter(ctx, adapterCfg)
@@ -1109,6 +1160,7 @@ func buildWiringConfig(
 			RetryMax:        cfgMgr.GetInt("PERSIST_RETRY_MAX", 3),
 			RetryBackoffMS:  cfgMgr.GetInt("PERSIST_RETRY_BACKOFF_MS", 100),
 			MaxBackoffMS:    cfgMgr.GetInt("PERSIST_MAX_BACKOFF_MS", 5000),
+			AttemptTimeout:  cfgMgr.GetDuration("PERSIST_ATTEMPT_TIMEOUT", 25*time.Second),
 			WorkerCount:     cfgMgr.GetInt("PERSIST_WORKERS", 1),
 			ShutdownTimeout: cfgMgr.GetDuration("PERSIST_SHUTDOWN_TIMEOUT", 30*time.Second),
 		}
@@ -1185,4 +1237,25 @@ func buildWiringConfig(
 	}
 
 	return wiringCfg, dbConn, adapter, p2pRouter, nil
+}
+
+func getTopicConfig(cfgMgr *utils.ConfigManager, logger *utils.Logger, primaryKey, legacyKey, defaultValue string) string {
+	if cfgMgr == nil {
+		return defaultValue
+	}
+	if value := cfgMgr.GetString(primaryKey, ""); value != "" {
+		return value
+	}
+	if legacyKey != "" {
+		if legacyValue := cfgMgr.GetString(legacyKey, ""); legacyValue != "" {
+			if logger != nil {
+				logger.Warn("Using legacy Kafka topic environment variable",
+					utils.ZapString("legacy_key", legacyKey),
+					utils.ZapString("preferred_key", primaryKey),
+					utils.ZapString("topic", legacyValue))
+			}
+			return legacyValue
+		}
+	}
+	return defaultValue
 }

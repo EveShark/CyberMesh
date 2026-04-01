@@ -302,12 +302,22 @@ class DetectionPipeline:
             try:
                 if flows:
                     f = flows[0] or {}
+
                     def _get(k: str, *alts, default=None):
-                        for key in (k,)+alts:
+                        for key in (k,) + alts:
                             if key in f and f[key] is not None:
                                 return f[key]
                         return default
+
+                    # Preserve all non-empty flow metadata so downstream anomaly/policy
+                    # publishers keep tenant and lineage context instead of shrinking the
+                    # context down to only transport fields.
                     net_ctx = {
+                        str(key): value
+                        for key, value in f.items()
+                        if isinstance(key, str) and value not in (None, "", [], {})
+                    }
+                    net_ctx.update({
                         'src_ip': _get('src_ip', 'src', 'source'),
                         'dst_ip': _get('dst_ip', 'dst', 'destination'),
                         'src_port': _get('src_port', 'sport', 'source_port', default=0),
@@ -316,7 +326,12 @@ class DetectionPipeline:
                         'flow_id': _get('flow_id', 'id', default=''),
                         'source_event_ts_ms': _get('source_event_ts_ms', default=0),
                         'telemetry_ingest_ts_ms': _get('telemetry_ingest_ts_ms', default=0),
-                    }
+                    })
+
+                    source_event_id = _get('source_event_id', 'source_id', 'id', 'flow_id', default='')
+                    if source_event_id and not net_ctx.get('source_event_id'):
+                        net_ctx['source_event_id'] = source_event_id
+
                     decision.metadata['network_context'] = net_ctx
             except Exception:
                 # Best-effort only; do not fail pipeline on context extraction

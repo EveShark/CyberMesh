@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -899,6 +900,11 @@ func (hs *HotStuff) CreateProposal(ctx context.Context, block types.Block) (*mes
 		justifyQC := hs.pacemaker.GetHighestQC()
 		proposalHeight := hs.pacemaker.GetCurrentHeight()
 
+		justifyQC, err = hs.sanitizeJustifyQC(ctx, justifyQC)
+		if err != nil {
+			return nil, fmt.Errorf("failed to sanitize highest QC: %w", err)
+		}
+
 		hs.mu.RLock()
 		hotStuffView := hs.currentView
 		hotStuffHeight := hs.currentHeight
@@ -917,6 +923,12 @@ func (hs *HotStuff) CreateProposal(ctx context.Context, block types.Block) (*mes
 		if proposalHeight < hotStuffHeight {
 			proposalHeight = hotStuffHeight
 		}
+		if justifyQC != nil {
+			minHeight := justifyQC.GetHeight() + 1
+			if proposalHeight < minHeight {
+				proposalHeight = minHeight
+			}
+		}
 
 		var justifyQCMsg *messages.QC
 		if justifyQC != nil {
@@ -929,6 +941,10 @@ func (hs *HotStuff) CreateProposal(ctx context.Context, block types.Block) (*mes
 		var parentHash [32]byte
 		if justifyQCMsg != nil {
 			parentHash = justifyQCMsg.BlockHash
+		} else if proposalHeight > 1 {
+			if committedHash, ok := hs.storage.GetCommittedBlockHash(proposalHeight - 1); ok {
+				parentHash = committedHash
+			}
 		}
 
 		hs.logger.InfoContext(ctx, "[CREATE_PROPOSAL] fetched height from pacemaker",
@@ -991,6 +1007,167 @@ func (hs *HotStuff) CreateProposal(ctx context.Context, block types.Block) (*mes
 	}
 
 	return nil, fmt.Errorf("create proposal aborted: view sync timeout after %d attempts (pacemaker=%d hotstuff=%d)", createProposalMaxSyncRetries, lastPacemakerView, lastHotStuffView)
+}
+
+func (hs *HotStuff) sanitizeJustifyQC(ctx context.Context, qc types.QC) (types.QC, error) {
+	if qc == nil {
+		return nil, nil
+	}
+	if err := hs.validator.ValidateQC(ctx, qc); err == nil {
+		return qc, nil
+	}
+
+	hs.logger.WarnContext(ctx, "highest qc failed validation; attempting repair from votes",
+		"view", qc.GetView(),
+		"height", qc.GetHeight(),
+		"block_hash", func() string {
+			hash := qc.GetBlockHash()
+			return fmt.Sprintf("%x", hash[:8])
+		}())
+
+	rebuilt, err := hs.rebuildQCFromVotes(ctx, qc)
+	if err != nil {
+		return nil, fmt.Errorf("rebuild qc from votes: %w", err)
+	}
+	if err := hs.validator.ValidateQC(ctx, rebuilt); err != nil {
+		return nil, fmt.Errorf("rebuilt qc still invalid: %w", err)
+	}
+
+	if err := hs.storage.StoreQC(rebuilt); err != nil {
+		hs.logger.WarnContext(ctx, "failed to persist repaired qc",
+			"view", rebuilt.GetView(),
+			"height", rebuilt.GetHeight(),
+			"error", err)
+	}
+
+	hs.logger.InfoContext(ctx, "repaired highest qc from persisted votes",
+		"view", rebuilt.GetView(),
+		"height", rebuilt.GetHeight(),
+		"block_hash", func() string {
+			hash := rebuilt.GetBlockHash()
+			return fmt.Sprintf("%x", hash[:8])
+		}(),
+		"signature_count", len(rebuilt.GetSignatures()))
+	return rebuilt, nil
+}
+
+func (hs *HotStuff) rebuildQCFromVotes(ctx context.Context, qc types.QC) (types.QC, error) {
+	if qc == nil {
+		return nil, fmt.Errorf("qc is nil")
+	}
+
+	votesByValidator := make(map[types.ValidatorID]*messages.Vote)
+	discardedVotes := 0
+	discardedByReason := make(map[string]int)
+	discardedSamples := make([]string, 0, 3)
+	for _, vote := range hs.storage.GetVotesByView(qc.GetView()) {
+		if vote == nil {
+			continue
+		}
+		if vote.View != qc.GetView() || vote.Height != qc.GetHeight() || vote.BlockHash != qc.GetBlockHash() {
+			continue
+		}
+		if err := hs.verifyPersistedVoteForQCRepair(ctx, vote); err != nil {
+			discardedVotes++
+			reason := classifyQCRepairVoteError(err)
+			discardedByReason[reason]++
+			if len(discardedSamples) < cap(discardedSamples) {
+				discardedSamples = append(discardedSamples, fmt.Sprintf("voter=%x reason=%s", vote.VoterID[:8], reason))
+			}
+			continue
+		}
+		id := types.ValidatorID(vote.VoterID)
+		if existing, ok := votesByValidator[id]; !ok || vote.Timestamp.Before(existing.Timestamp) {
+			votesByValidator[id] = vote
+		}
+	}
+	if !hs.quorum.HasQuorum(votesByValidator) {
+		return nil, fmt.Errorf("have %d valid matching votes after discarding %d invalid votes, quorum requires %d",
+			len(votesByValidator), discardedVotes, hs.quorum.GetQuorumThreshold())
+	}
+	if discardedVotes > 0 {
+		hs.logger.WarnContext(ctx, "discarded invalid persisted votes during qc repair",
+			"view", qc.GetView(),
+			"height", qc.GetHeight(),
+			"discarded", discardedVotes,
+			"reason_counts", discardedByReason,
+			"samples", discardedSamples)
+	}
+
+	rebuilt, err := hs.quorum.AggregateVotes(ctx, votesByValidator, hs.crypto.GetKeyID())
+	if err != nil {
+		return nil, err
+	}
+
+	sigs := append([]types.Signature(nil), rebuilt.GetSignatures()...)
+	sort.SliceStable(sigs, func(i, j int) bool {
+		return strings.Compare(fmt.Sprintf("%x", sigs[i].KeyID[:]), fmt.Sprintf("%x", sigs[j].KeyID[:])) < 0
+	})
+
+	switch typed := rebuilt.(type) {
+	case *QuorumCertificate:
+		typed.Signatures = sigs
+		typed.Timestamp = latestVoteTimestamp(votesByValidator)
+		return typed, nil
+	case *messages.QC:
+		typed.Signatures = sigs
+		typed.Timestamp = latestVoteTimestamp(votesByValidator)
+		return typed, nil
+	default:
+		return rebuilt, nil
+	}
+}
+
+func classifyQCRepairVoteError(err error) string {
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	switch {
+	case strings.Contains(msg, "not in validator set"):
+		return "validator_not_in_set"
+	case strings.Contains(msg, "not active in view"):
+		return "validator_inactive_in_view"
+	case strings.Contains(msg, "signature key") && strings.Contains(msg, "does not match voter"):
+		return "signature_key_mismatch"
+	case strings.Contains(msg, "load public key"):
+		return "public_key_load_failed"
+	case strings.Contains(msg, "verify signature"):
+		return "signature_verify_failed"
+	default:
+		return "other"
+	}
+}
+
+func (hs *HotStuff) verifyPersistedVoteForQCRepair(ctx context.Context, vote *messages.Vote) error {
+	if vote == nil {
+		return fmt.Errorf("vote is nil")
+	}
+	if vote.Signature.KeyID != vote.VoterID {
+		return fmt.Errorf("signature key %x does not match voter %x", vote.Signature.KeyID[:8], vote.VoterID[:8])
+	}
+	if !hs.validatorSet.IsValidator(vote.VoterID) {
+		return fmt.Errorf("voter %x is not in validator set", vote.VoterID[:8])
+	}
+	if !hs.validatorSet.IsActiveInView(vote.VoterID, vote.View) {
+		return fmt.Errorf("voter %x is not active in view %d", vote.VoterID[:8], vote.View)
+	}
+	publicKey, err := hs.crypto.GetPublicKey(vote.VoterID)
+	if err != nil {
+		return fmt.Errorf("load public key for voter %x: %w", vote.VoterID[:8], err)
+	}
+	// Persisted votes can legitimately be older than replay freshness windows.
+	if err := hs.crypto.VerifyWithContext(ctx, vote.SignBytes(), vote.Signature.Bytes, publicKey, true); err != nil {
+		return fmt.Errorf("verify signature for voter %x: %w", vote.VoterID[:8], err)
+	}
+	return nil
+}
+
+func latestVoteTimestamp(votes map[types.ValidatorID]*messages.Vote) time.Time {
+	var latest time.Time
+	for _, vote := range votes {
+		if vote != nil && vote.Timestamp.After(latest) {
+			latest = vote.Timestamp
+		}
+	}
+	return latest
 }
 
 // convertToMessageQC converts any implementation of types.QC to the wire-format messages.QC.
@@ -1085,6 +1262,12 @@ func (hs *HotStuff) GetLockedQC() types.QC {
 	hs.mu.RLock()
 	defer hs.mu.RUnlock()
 	return hs.lockedQC
+}
+
+// CanRestartBootstrap reports whether the next proposal may omit JustifyQC while
+// re-establishing consensus from a durable committed tip.
+func (hs *HotStuff) CanRestartBootstrap(parentHash types.BlockHash, proposalHeight uint64) bool {
+	return hs.storage.AllowRestartBootstrap(parentHash, proposalHeight)
 }
 
 // AdvanceView advances the consensus to a new view

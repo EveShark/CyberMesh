@@ -286,6 +286,16 @@ func (s *State) Snapshot() map[peer.ID]PeerState {
 	return out
 }
 
+// QuarantineTTL returns the configured quarantine TTL for snapshot consumers.
+func (s *State) QuarantineTTL() time.Duration {
+	if s == nil {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.quarantineTTL
+}
+
 // GetPeerCount returns the number of tracked peers
 func (s *State) GetPeerCount() int {
 	s.mu.RLock()

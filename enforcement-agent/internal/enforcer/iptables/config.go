@@ -17,6 +17,12 @@ type Config struct {
 	Logger             Logger
 	NamespaceSetPrefix string
 	NodeSetPrefix      string
+	KubeConfigPath     string
+	Context            string
+	KubeNamespace      string
+	QPS                float32
+	Burst              int
+	NodeName           string
 }
 
 // Logger is the subset of zap.Logger we rely on to keep the package decoupled in tests.

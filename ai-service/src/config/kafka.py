@@ -9,11 +9,13 @@ class KafkaTopicsConfig:
     ai_anomalies: str
     ai_evidence: str
     ai_policy: str
+    control_fast_mitigation: str
     control_commits: str
     control_reputation: str
     control_policy: str
     control_policy_ack: str
     control_evidence: str
+    pcap_request: str
     dlq: str
     
     def validate(self):
@@ -22,11 +24,13 @@ class KafkaTopicsConfig:
             self.ai_anomalies,
             self.ai_evidence,
             self.ai_policy,
+            self.control_fast_mitigation,
             self.control_commits,
             self.control_reputation,
             self.control_policy,
             self.control_policy_ack,
             self.control_evidence,
+            self.pcap_request,
             self.dlq
         ]
         
@@ -281,10 +285,13 @@ def load_kafka_config(environment: str) -> tuple[KafkaTopicsConfig, KafkaProduce
         ai_anomalies=_get_env("TOPIC_AI_ANOMALIES", "ai.anomalies.v1"),
         ai_evidence=_get_env("TOPIC_AI_EVIDENCE", "ai.evidence.v1"),
         ai_policy=_get_env("TOPIC_AI_POLICY", "ai.policy.v1"),
+        control_fast_mitigation=_get_env("TOPIC_CONTROL_FAST_MITIGATION", "control.fast_mitigation.v1"),
         control_commits=_get_env("TOPIC_CONTROL_COMMITS", "control.commits.v1"),
         control_reputation=_get_env("TOPIC_CONTROL_REPUTATION", "control.reputation.v1"),
         control_policy=_get_env("TOPIC_CONTROL_POLICY", "control.policy.v2"),
+        control_policy_ack=_get_env("TOPIC_CONTROL_POLICY_ACK", "control.enforcement_ack.v1"),
         control_evidence=_get_env("TOPIC_CONTROL_EVIDENCE", "control.evidence.v1"),
+        pcap_request=_get_env("TOPIC_PCAP_REQUEST", "pcap.request.v1"),
         dlq=_get_env("TOPIC_DLQ", "ai.dlq.v1")
     )
     

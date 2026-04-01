@@ -6,6 +6,50 @@ It is not deployed as a pod, sidecar, or cluster service. Operators install the
 binary locally or on a bastion host and it talks to the existing backend REST
 API.
 
+## Documentation
+
+Start here:
+
+- [Overview](./docs/overview.md)
+- [Interactive Mode](./docs/interactive.md)
+- [Command Reference](./docs/reference.md)
+- [Recipes](./docs/recipes.md)
+
+Recommended reading order for new operators:
+
+1. install the CLI
+2. read the overview
+3. skim the interactive guide
+4. use the command reference as needed
+
+## Quick Start
+
+After install, the fastest sanity check is:
+
+```powershell
+kubectl-cybermesh doctor
+kubectl-cybermesh version --verbose
+kubectl-cybermesh --no-interactive control
+kubectl-cybermesh --tenant default --no-interactive workflows get <workflow_id>
+```
+
+If you want the connected policy/workflow views:
+
+```powershell
+kubectl-cybermesh --interactive policies get <policy_id>
+kubectl-cybermesh --interactive workflows get <workflow_id>
+kubectl-cybermesh --interactive audit get --workflow-id <workflow_id>
+```
+
+If you want the read-only operator screens:
+
+```powershell
+kubectl-cybermesh --interactive control
+kubectl-cybermesh --interactive backlog
+kubectl-cybermesh --interactive leases
+kubectl-cybermesh --interactive validators
+```
+
 ## Build
 
 Windows:
@@ -331,20 +375,21 @@ Read operations:
 
 ```powershell
 kubectl cybermesh version
+kubectl cybermesh
 kubectl cybermesh policies list --limit 20
 kubectl cybermesh policies get <policy_id>
 kubectl cybermesh policies coverage <policy_id>
 kubectl cybermesh workflows list --limit 20
 kubectl cybermesh workflows get <workflow_id>
-kubectl cybermesh audit get --workflow-id incident-safe --limit 20
-kubectl cybermesh audit export --workflow-id incident-safe --limit 100
+kubectl cybermesh audit get --workflow-id <workflow_id> --limit 20
+kubectl cybermesh audit export --workflow-id <workflow_id> --limit 100
 kubectl cybermesh control
 kubectl cybermesh validators
 kubectl cybermesh consensus
 kubectl cybermesh trace policy <policy_id>
 kubectl cybermesh trace policy <policy_id> --interactive
-kubectl cybermesh trace workflow incident-safe --interactive
-kubectl cybermesh monitor --workflow-id incident-safe
+kubectl cybermesh trace workflow <workflow_id> --interactive
+kubectl cybermesh monitor --workflow-id <workflow_id>
 kubectl cybermesh outbox get --policy-id <policy_id>
 kubectl cybermesh ack get --policy-id <policy_id>
 ```
@@ -361,11 +406,23 @@ kubectl cybermesh kill-switch enable --reason-code operator.freeze --reason-text
 kubectl cybermesh kill-switch disable --reason-code operator.freeze --reason-text "maintenance done" --yes
 ```
 
+On a real terminal, mutation commands can prompt for missing reason fields once
+`--yes` is already present. JSON mode and non-interactive shells still require
+fully explicit flags.
+
 JSON output:
 
 ```powershell
-kubectl cybermesh -o json outbox get --workflow-id incident-42
+kubectl cybermesh -o json outbox get --workflow-id <workflow_id>
 ```
+
+Modern read views:
+
+- `policies get`, `workflows get`, `audit get`, `backlog`, `control`, `ack get`,
+  `validators`, and `trace` now render summary-first operator views in table mode.
+- `-o json` keeps the raw machine-readable API payload shape.
+- On a real terminal, `backlog`, `control`, `ack get`, `validators`, and `trace`
+  can open interactive read views.
 
 Shell completions:
 

@@ -100,6 +100,14 @@ type Router struct {
 	peerObservations     map[peer.ID]observedPeerStat
 }
 
+// SnapshotPeerState exposes a copy of the live peer state for read-side projections.
+func (r *Router) SnapshotPeerState() (map[peer.ID]PeerState, time.Duration) {
+	if r == nil || r.state == nil {
+		return nil, 0
+	}
+	return r.state.Snapshot(), r.state.QuarantineTTL()
+}
+
 // RouterStats summarizes live network telemetry for API exposure.
 type RouterStats struct {
 	PeerCount       int

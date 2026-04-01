@@ -35,6 +35,8 @@ func toProtoFlow(agg model.FlowAggregate) *telemetrypb.FlowV1 {
 		PktsFwd:             agg.PktsFwd,
 		PktsBwd:             agg.PktsBwd,
 		DurationMs:          agg.DurationMS,
+		TraceId:             agg.TraceID,
+		SourceEventId:       agg.SourceEventID,
 		Verdict:             agg.Verdict,
 		MetricsKnown:        agg.MetricsKnown,
 		SourceType:          mapSourceType(agg.SourceType),

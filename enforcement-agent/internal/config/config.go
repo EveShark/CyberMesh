@@ -12,19 +12,30 @@ import (
 // Config holds runtime configuration for the enforcement agent.
 type Config struct {
 	Kafka struct {
-		Brokers         []string
-		Topic           string
-		GroupID         string
-		ConsumptionMode string
-		ProtocolVersion string
-		TLS             bool
-		TLSCAPath       string
-		TLSCertPath     string
-		TLSKeyPath      string
-		SASLEnabled     bool
-		SASLMechanism   string
-		SASLUsername    string
-		SASLPassword    string
+		Brokers                      []string
+		Topic                        string
+		GroupID                      string
+		ConsumptionMode              string
+		HandlerWorkers               int
+		HandlerQueue                 int
+		SkipStaleBacklogOnEmptyState bool
+		SkipStaleBacklogToken        string
+		ProtocolVersion              string
+		TLS                          bool
+		TLSCAPath                    string
+		TLSCertPath                  string
+		TLSKeyPath                   string
+		SASLEnabled                  bool
+		SASLMechanism                string
+		SASLUsername                 string
+		SASLPassword                 string
+	}
+	FastMitigation struct {
+		Enabled        bool
+		Topic          string
+		GroupID        string
+		TrustedKeysDir string
+		RejectTopic    string
 	}
 
 	RateLimiter struct {
@@ -37,17 +48,21 @@ type Config struct {
 	}
 
 	Ack struct {
-		Enabled       bool
-		PublisherImpl string
-		Topic         string
-		Brokers       []string
-		ClientID      string
-		Idempotent    bool
-		RetryMax      int
-		RetryBackoff  time.Duration
-		QueuePath     string
-		QueueMaxSize  int
-		Batch         struct {
+		Enabled        bool
+		PublisherImpl  string
+		Topic          string
+		Brokers        []string
+		ClientID       string
+		Idempotent     bool
+		EnqueueTimeout time.Duration
+		RetryMax       int
+		RetryBackoff   time.Duration
+		Retrier        struct {
+			MaxHeadAttempts int
+		}
+		QueuePath    string
+		QueueMaxSize int
+		Batch        struct {
 			Enabled  bool
 			MaxSize  int
 			Interval time.Duration
@@ -66,6 +81,8 @@ type Config struct {
 	StatePath             string
 	StateHistoryRetention time.Duration
 	StateLockTimeout      time.Duration
+	StatePersistMinGap    time.Duration
+	StateFlushInterval    time.Duration
 	StateChecksum         bool
 	LedgerSnapshotPath    string
 	LedgerDriftGrace      time.Duration
@@ -151,6 +168,16 @@ func Load() (Config, error) {
 	cfg.Kafka.Topic = envWithDefault("CONTROL_POLICY_TOPIC", defaultTopic)
 	cfg.Kafka.GroupID = envWithDefault("CONTROL_POLICY_GROUP", defaultGroupID)
 	cfg.Kafka.ConsumptionMode = strings.ToLower(strings.TrimSpace(envWithDefault("CONTROL_POLICY_CONSUMPTION_MODE", defaultConsumptionMode)))
+	cfg.Kafka.HandlerWorkers = int(parseIntEnv("CONTROL_POLICY_HANDLER_WORKERS", 8))
+	if cfg.Kafka.HandlerWorkers <= 0 {
+		cfg.Kafka.HandlerWorkers = 8
+	}
+	cfg.Kafka.HandlerQueue = int(parseIntEnv("CONTROL_POLICY_HANDLER_QUEUE", 256))
+	if cfg.Kafka.HandlerQueue <= 0 {
+		cfg.Kafka.HandlerQueue = 256
+	}
+	cfg.Kafka.SkipStaleBacklogOnEmptyState = parseBoolEnv("CONTROL_POLICY_SKIP_STALE_BACKLOG_ON_EMPTY_STATE", false)
+	cfg.Kafka.SkipStaleBacklogToken = strings.TrimSpace(os.Getenv("CONTROL_POLICY_SKIP_STALE_BACKLOG_TOKEN"))
 	switch cfg.Kafka.ConsumptionMode {
 	case consumptionModeSharedGroup:
 	case consumptionModeFanoutPerNode:
@@ -172,6 +199,12 @@ func Load() (Config, error) {
 	cfg.Kafka.SASLMechanism = strings.TrimSpace(os.Getenv("KAFKA_SASL_MECHANISM"))
 	cfg.Kafka.SASLUsername = strings.TrimSpace(os.Getenv("KAFKA_SASL_USERNAME"))
 	cfg.Kafka.SASLPassword = strings.TrimSpace(os.Getenv("KAFKA_SASL_PASSWORD"))
+
+	cfg.FastMitigation.Enabled = parseBoolEnv("FAST_MITIGATION_ENABLED", false)
+	cfg.FastMitigation.Topic = envWithDefault("FAST_MITIGATION_TOPIC", "control.fast_mitigation.v1")
+	cfg.FastMitigation.GroupID = envWithDefault("FAST_MITIGATION_GROUP", cfg.Kafka.GroupID+"-fast")
+	cfg.FastMitigation.TrustedKeysDir = strings.TrimSpace(os.Getenv("FAST_MITIGATION_TRUSTED_KEYS"))
+	cfg.FastMitigation.RejectTopic = strings.TrimSpace(envWithDefault("FAST_MITIGATION_REJECT_TOPIC", "control.fast_mitigation.reject.v1"))
 
 	// State path is needed early so other subsystems (e.g. ACK queue) can derive defaults.
 	cfg.StatePath = strings.TrimSpace(os.Getenv("ENFORCEMENT_STATE_PATH"))
@@ -210,6 +243,10 @@ func Load() (Config, error) {
 		cfg.Ack.ClientID = "policy-ack-publisher"
 	}
 	cfg.Ack.Idempotent = parseBoolEnv("ACK_IDEMPOTENT", true)
+	cfg.Ack.EnqueueTimeout = parseDurationEnv("ACK_ENQUEUE_TIMEOUT", 500*time.Millisecond)
+	if cfg.Ack.EnqueueTimeout <= 0 {
+		cfg.Ack.EnqueueTimeout = 500 * time.Millisecond
+	}
 	cfg.Ack.RetryMax = int(parseIntEnv("ACK_RETRY_MAX", 5))
 	if cfg.Ack.RetryMax <= 0 {
 		cfg.Ack.RetryMax = 5
@@ -219,6 +256,12 @@ func Load() (Config, error) {
 		backoff = 500 * time.Millisecond
 	}
 	cfg.Ack.RetryBackoff = backoff
+	// Keep head-of-line retries low by default; the durable queue retrier will
+	// revisit failed records and should not pin the queue head for long.
+	cfg.Ack.Retrier.MaxHeadAttempts = int(parseIntEnv("ACK_RETRIER_MAX_HEAD_ATTEMPTS", 1))
+	if cfg.Ack.Retrier.MaxHeadAttempts <= 0 {
+		cfg.Ack.Retrier.MaxHeadAttempts = 1
+	}
 	cfg.Ack.QueuePath = strings.TrimSpace(os.Getenv("ACK_QUEUE_PATH"))
 	if cfg.Ack.QueuePath == "" && cfg.StatePath != "" {
 		cfg.Ack.QueuePath = filepath.Join(filepath.Dir(cfg.StatePath), "ack-queue.db")
@@ -243,12 +286,31 @@ func Load() (Config, error) {
 	if cfg.TrustedKeysDir == "" {
 		return cfg, fmt.Errorf("CONTROL_POLICY_TRUSTED_KEYS is required")
 	}
+	if cfg.FastMitigation.Enabled && cfg.FastMitigation.TrustedKeysDir == "" {
+		cfg.FastMitigation.TrustedKeysDir = cfg.TrustedKeysDir
+	}
+	if cfg.FastMitigation.Enabled && cfg.FastMitigation.TrustedKeysDir == "" {
+		return cfg, fmt.Errorf("FAST_MITIGATION_TRUSTED_KEYS is required when FAST_MITIGATION_ENABLED=true")
+	}
+	if cfg.FastMitigation.Enabled && cfg.Kafka.ConsumptionMode == consumptionModeFanoutPerNode {
+		if cfg.FastMitigation.GroupID == "" || !strings.Contains(cfg.FastMitigation.GroupID, cfg.NodeName) {
+			return cfg, fmt.Errorf("FAST_MITIGATION_GROUP must include NODE_NAME when CONTROL_POLICY_CONSUMPTION_MODE=%s", consumptionModeFanoutPerNode)
+		}
+	}
 
 	cfg.EnforcementBackend = strings.ToLower(envWithDefault("ENFORCEMENT_BACKEND", "iptables"))
 	cfg.DryRun = parseBool(os.Getenv("ENFORCEMENT_DRY_RUN"))
 	cfg.KillSwitchEnabled = parseBoolEnv("ENFORCEMENT_KILL_SWITCH_ENABLED", false)
 	if cfg.StatePath == "" {
 		return cfg, fmt.Errorf("ENFORCEMENT_STATE_PATH is required")
+	}
+	if cfg.Kafka.SkipStaleBacklogOnEmptyState {
+		if cfg.Kafka.ConsumptionMode != consumptionModeFanoutPerNode {
+			return cfg, fmt.Errorf("CONTROL_POLICY_SKIP_STALE_BACKLOG_ON_EMPTY_STATE requires CONTROL_POLICY_CONSUMPTION_MODE=%s", consumptionModeFanoutPerNode)
+		}
+		if cfg.Kafka.SkipStaleBacklogToken == "" {
+			return cfg, fmt.Errorf("CONTROL_POLICY_SKIP_STALE_BACKLOG_TOKEN is required when CONTROL_POLICY_SKIP_STALE_BACKLOG_ON_EMPTY_STATE=true")
+		}
 	}
 	cfg.IPTablesBinary = envWithDefault("ENFORCER_IPTABLES_BIN", "iptables")
 	cfg.NFTBinary = envWithDefault("ENFORCER_NFT_BIN", "nft")
@@ -300,6 +362,14 @@ func Load() (Config, error) {
 
 	cfg.StateHistoryRetention = parseDurationEnv("ENFORCEMENT_STATE_HISTORY_RETENTION", 10*time.Minute)
 	cfg.StateLockTimeout = parseDurationEnv("ENFORCEMENT_STATE_LOCK_TIMEOUT", 3*time.Second)
+	cfg.StatePersistMinGap = parseDurationEnv("ENFORCEMENT_STATE_PERSIST_MIN_GAP", 0)
+	cfg.StateFlushInterval = parseDurationEnv("ENFORCEMENT_STATE_FLUSH_INTERVAL", 500*time.Millisecond)
+	if cfg.StatePersistMinGap < 0 {
+		cfg.StatePersistMinGap = 0
+	}
+	if cfg.StateFlushInterval < 0 {
+		cfg.StateFlushInterval = 0
+	}
 	cfg.StateChecksum = parseBoolEnv("ENFORCEMENT_STATE_CHECKSUM", true)
 	cfg.LedgerSnapshotPath = strings.TrimSpace(os.Getenv("LEDGER_SNAPSHOT_PATH"))
 	if cfg.LedgerSnapshotPath != "" {

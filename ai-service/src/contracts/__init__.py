@@ -17,6 +17,7 @@ Consumer Messages (Backend → AI):
 
 from .anomaly import AnomalyMessage
 from .evidence import EvidenceMessage
+from .fast_mitigation import FastMitigationMessage
 from .commit import CommitEvent, BackendValidatorTrustStore
 from .policy import PolicyUpdateEvent, PolicyMessage
 from .policy_ack import PolicyAckEvent
@@ -29,6 +30,7 @@ __all__ = [
     # AI -> Backend (producers)
     "AnomalyMessage",
     "EvidenceMessage",
+    "FastMitigationMessage",
     "PolicyMessage",
     # Backend -> AI (consumers)
     "CommitEvent",

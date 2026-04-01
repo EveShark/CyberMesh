@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,7 @@ import (
 	ctypes "backend/pkg/consensus/types"
 	"backend/pkg/control/policyack"
 	"backend/pkg/control/policyoutbox"
+	"backend/pkg/control/policystate"
 	"backend/pkg/control/policytrace"
 	"backend/pkg/ingest/kafka"
 	"backend/pkg/mempool"
@@ -27,6 +29,8 @@ import (
 	"backend/pkg/utils"
 	"github.com/IBM/sarama"
 )
+
+const controlRuntimeStateKeyMutationsSafeMode = "control_mutations_safe_mode"
 
 type Config struct {
 	BuildInterval       time.Duration
@@ -40,6 +44,7 @@ type Config struct {
 	BlockTimeout        time.Duration
 	GenesisGracePeriod  time.Duration
 	AllowSoloProposal   bool
+	RequireActivePeers  bool
 	StateRetainVersions uint64
 
 	// Persistence configuration
@@ -103,6 +108,7 @@ type Service struct {
 	policyOutboxStore           *policyoutbox.Store
 	policyAckCons               *policyack.Consumer
 	policyTraceCollector        *policytrace.Collector
+	controlDispatchSafeMode     atomic.Bool
 
 	// API server (optional)
 	apiServer *apiserver.Server
@@ -167,6 +173,37 @@ type Service struct {
 
 	// test hook for persistence writer ownership decision.
 	persistStatusFn func() (ctypes.ValidatorID, bool)
+}
+
+func hasConfiguredControlProducerTopic(topics kafka.ProducerTopics) bool {
+	return topics.Commits != "" || topics.Policy != ""
+}
+
+func parseOutboxOwnerCount(consensusNodes string) int {
+	parts := strings.Split(consensusNodes, ",")
+	n := 0
+	for _, p := range parts {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		n++
+	}
+	if n <= 0 {
+		return 1
+	}
+	return n
+}
+
+func parseOutboxOwnerIndex(nodeID string) int {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return 0
+	}
+	id, err := strconv.Atoi(nodeID)
+	if err != nil || id <= 0 {
+		return 0
+	}
+	return id - 1
 }
 
 func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, builder *block.Builder, store state.StateStore, log *utils.Logger) (*Service, error) {
@@ -412,6 +449,11 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 	var dbHandle *sql.DB
 	if provider, ok := cfg.DBAdapter.(interface{ GetDB() *sql.DB }); ok {
 		dbHandle = provider.GetDB()
+		if dbHandle != nil {
+			if err := policystate.Prime(context.Background(), dbHandle); err != nil {
+				log.Warn("policy state projection prime failed", utils.ZapError(err))
+			}
+		}
 	}
 
 	if cfg.DBAdapter != nil {
@@ -427,8 +469,8 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 	// Initialize Kafka producer if enabled (must be before persistence worker)
 	var kafkaProducer *kafka.Producer
 	if cfg.EnableKafka {
-		// Only set up producer when a commits topic is configured
-		if cfg.KafkaProducerCfg.Topics.Commits != "" {
+		// Set up the shared control producer when any publishable control topic is configured.
+		if hasConfiguredControlProducerTopic(cfg.KafkaProducerCfg.Topics) {
 			if cfg.ConfigManager == nil {
 				return nil, fmt.Errorf("kafka producer requires config manager")
 			}
@@ -496,7 +538,7 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 				s.kafkaProducer = kafkaProducer
 
 				if cfg.KafkaProducerCfg.Topics.Policy != "" {
-					pp, err := newPolicyPublisher(kafkaProducer, cfg.ConfigManager, cfg.KafkaProducerCfg.Topics.Policy, log, cfg.AuditLogger)
+					pp, err := newPolicyPublisher(kafkaProducer, cfg.ConfigManager, cfg.KafkaProducerCfg.Topics.Policy, log, cfg.AuditLogger, s.policyTraceCollector)
 					if err != nil {
 						kafkaProducer.Close()
 						return nil, fmt.Errorf("failed to initialize policy publisher: %w", err)
@@ -525,33 +567,63 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 							return nil, fmt.Errorf("policy outbox schema invariant failed: %w", err)
 						}
 
+						holderID := strings.TrimSpace(cfg.ConfigManager.GetString("NODE_ID", "backend-node"))
 						outboxCfg := policyoutbox.Config{
 							Enabled:             true,
 							LeaseKey:            strings.TrimSpace(cfg.ConfigManager.GetString("CONTROL_POLICY_OUTBOX_LEASE_KEY", "control.policy.dispatcher")),
 							PolicyTopic:         cfg.KafkaProducerCfg.Topics.Policy,
 							ScopeRoutingEnabled: cfg.ConfigManager.GetBool("CONTROL_POLICY_SCOPE_ROUTING_ENABLED", false),
+							DispatchOwnerCount:  parseOutboxOwnerCount(cfg.ConfigManager.GetString("CONSENSUS_NODES", "")),
+							DispatchOwnerIndex:  parseOutboxOwnerIndex(holderID),
+							DispatchSafeMode:    &s.controlDispatchSafeMode,
+							RefreshSafeMode: func(ctx context.Context) (bool, error) {
+								type dbProvider interface {
+									GetDB() *sql.DB
+								}
+								provider, ok := cfg.DBAdapter.(dbProvider)
+								if !ok || provider.GetDB() == nil {
+									return s.controlDispatchSafeMode.Load(), nil
+								}
+								db := provider.GetDB()
+								var enabled bool
+								err := db.QueryRowContext(ctx, `
+									SELECT enabled
+									FROM control_runtime_state
+									WHERE state_key = $1
+								`, controlRuntimeStateKeyMutationsSafeMode).Scan(&enabled)
+								if err == sql.ErrNoRows {
+									return s.controlDispatchSafeMode.Load(), nil
+								}
+								if err != nil {
+									return s.controlDispatchSafeMode.Load(), err
+								}
+								return enabled, nil
+							},
 							ClusterShardingMode: strings.ToLower(strings.TrimSpace(cfg.ConfigManager.GetString("CONTROL_POLICY_CLUSTER_SHARDING_MODE", "off"))),
 							ClusterShardBuckets: cfg.ConfigManager.GetInt("CONTROL_POLICY_CLUSTER_SHARD_BUCKETS", 1),
+							DispatchShardCount:  cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_DISPATCH_SHARDS", 0),
+							DispatchShardCompat: cfg.ConfigManager.GetBool("CONTROL_POLICY_OUTBOX_DISPATCH_SHARD_COMPAT", true),
+							MaxLeaseShards:      cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_MAX_LEASE_SHARDS", 0),
 							LeaseTTL:            cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_LEASE_TTL", 10*time.Second),
+							LeaseAcquireTimeout: cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_LEASE_ACQUIRE_TIMEOUT", 0),
+							ClaimTimeout:        cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_CLAIM_TIMEOUT", 0),
 							ReclaimAfter:        cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_RECLAIM_AFTER", 30*time.Second),
-							PollInterval:        cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_POLL_INTERVAL", 500*time.Millisecond),
-							DrainMaxDuration:    cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_DRAIN_MAX_DURATION", 2*time.Second),
+							PollInterval:        cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_POLL_INTERVAL", 250*time.Millisecond),
+							DrainMaxDuration:    cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_DRAIN_MAX_DURATION", 8*time.Second),
 							BatchSize:           cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_BATCH_SIZE", 100),
 							BatchSizeMin:        cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_BATCH_SIZE_MIN", 25),
 							BatchSizeMax:        cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_BATCH_SIZE_MAX", 400),
 							AdaptiveBatch:       cfg.ConfigManager.GetBool("CONTROL_POLICY_OUTBOX_ADAPTIVE_BATCH", true),
-							MaxInFlight:         cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_MAX_IN_FLIGHT", 8),
-							MarkWorkers:         cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_MARK_WORKERS", 4),
+							MaxInFlight:         cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_MAX_IN_FLIGHT", 16),
+							MarkWorkers:         cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_MARK_WORKERS", 8),
 							InternalQueue:       cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_INTERNAL_QUEUE_SIZE", 256),
-							DrainMaxBatches:     cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_DRAIN_BATCHES", 4),
+							DrainMaxBatches:     cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_DRAIN_BATCHES", 8),
 							MaxRetries:          cfg.ConfigManager.GetInt("CONTROL_POLICY_OUTBOX_MAX_RETRIES", 8),
 							RetryInitialBack:    cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_RETRY_INITIAL", 250*time.Millisecond),
 							RetryMaxBack:        cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_RETRY_MAX", 30*time.Second),
 							RetryJitterRatio:    cfg.ConfigManager.GetFloat64("CONTROL_POLICY_OUTBOX_RETRY_JITTER_RATIO", 0.2),
 							LogThrottle:         cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_LOG_THROTTLE", 5*time.Second),
 						}
-
-						holderID := strings.TrimSpace(cfg.ConfigManager.GetString("NODE_ID", "backend-node"))
 						dispatcher, err := policyoutbox.NewDispatcher(outboxCfg, outboxStore, pp, log, cfg.AuditLogger, holderID, s.policyTraceCollector)
 						if err != nil {
 							kafkaProducer.Close()
@@ -569,11 +641,21 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 					}
 				}
 			}
+		} else if log != nil {
+			log.Warn("Kafka producer disabled: no control commits or policy topic configured")
 		}
 	}
 
 	// Initialize persistence worker if enabled
 	if cfg.EnablePersistence && cfg.DBAdapter != nil {
+		if s.policyOutboxDispatcher != nil {
+			cfg.PersistenceWorker.OnPersisted = func(ctx context.Context, height uint64, txCount int) {
+				// JIT wake-up: notify outbox dispatcher immediately after durable commit.
+				// Poll ticker remains as fallback if the signal is dropped/coalesced.
+				s.policyOutboxDispatcher.Notify()
+			}
+		}
+
 		// Wire Kafka producer as onSuccess callback
 		// Fix: Gap 2 - Updated to pass anomaly IDs for COMMITTED state tracking
 		if kafkaProducer != nil {
@@ -710,6 +792,21 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 				}
 				return nil, fmt.Errorf("policy ack store init failed: %w", err)
 			}
+			schemaCheckTimeout := cfg.ConfigManager.GetDuration("CONTROL_POLICY_ACK_SCHEMA_CHECK_TIMEOUT", 10*time.Second)
+			if schemaCheckTimeout <= 0 {
+				schemaCheckTimeout = 10 * time.Second
+			}
+			schemaCtx, cancel := context.WithTimeout(context.Background(), schemaCheckTimeout)
+			defer cancel()
+			if err := store.EnsureSchema(schemaCtx); err != nil {
+				if kafkaProducer != nil {
+					kafkaProducer.Close()
+				}
+				if s.kafkaConsumer != nil {
+					_ = s.kafkaConsumer.Stop()
+				}
+				return nil, fmt.Errorf("policy ack schema check failed: %w", err)
+			}
 
 			var trust *policyack.TrustedKeys
 			if ackCfg.TrustedKeysDir != "" {
@@ -800,21 +897,23 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 
 	// Initialize API server if enabled
 	if cfg.EnableAPI && cfg.APIConfig != nil {
+		s.controlDispatchSafeMode.Store(cfg.APIConfig.ControlMutationsSafeMode)
 		apiDeps := apiserver.Dependencies{
-			Config:        cfg.APIConfig,
-			Logger:        log,
-			AuditLogger:   cfg.AuditLogger,
-			Storage:       cfg.DBAdapter,
-			StateStore:    store,
-			Mempool:       mp,
-			Engine:        eng,
-			P2PRouter:     cfg.P2PRouter,
-			KafkaProd:     s.kafkaProducer,
-			KafkaCons:     s.kafkaConsumer,
-			OutboxStats:   s,
-			TraceStats:    s,
-			NodeAliases:   cfg.APIConfig.NodeAliasMap,
-			NodeAliasList: cfg.APIConfig.NodeAliasList,
+			Config:          cfg.APIConfig,
+			Logger:          log,
+			AuditLogger:     cfg.AuditLogger,
+			Storage:         cfg.DBAdapter,
+			StateStore:      store,
+			Mempool:         mp,
+			Engine:          eng,
+			P2PRouter:       cfg.P2PRouter,
+			KafkaProd:       s.kafkaProducer,
+			KafkaCons:       s.kafkaConsumer,
+			OutboxStats:     s,
+			TraceStats:      s,
+			ControlSafeMode: &s.controlDispatchSafeMode,
+			NodeAliases:     cfg.APIConfig.NodeAliasMap,
+			NodeAliasList:   cfg.APIConfig.NodeAliasList,
 		}
 
 		apiSrv, err := apiserver.NewServer(apiDeps)
@@ -905,6 +1004,25 @@ func (s *Service) Start(ctx context.Context) error {
 		}
 	}
 
+	// Bootstrap the replay filter from durable storage before Kafka consumption starts.
+	// This closes the restart window where already-committed transactions could be
+	// re-admitted and proposed again before the periodic refresh loop runs.
+	if s.replayFilterEnabled && s.replayRefreshEnabled && s.persistWorker != nil {
+		bootstrapCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		err := s.bootstrapReplayFilterFromDB(bootstrapCtx)
+		cancel()
+		if err != nil {
+			if s.persistWorker != nil {
+				_ = s.persistWorker.Stop()
+			}
+			return fmt.Errorf("failed to bootstrap replay filter from storage: %w", err)
+		}
+		if s.log != nil {
+			s.log.InfoContext(ctx, "Replay filter bootstrapped from storage",
+				utils.ZapUint64("entries", uint64(s.replayFilterSize())))
+		}
+	}
+
 	// Start Kafka consumer if configured
 	if s.kafkaConsumer != nil {
 		if err := s.kafkaConsumer.Start(); err != nil {
@@ -971,6 +1089,13 @@ func (s *Service) Start(ctx context.Context) error {
 		}
 	}
 
+	// Register proposal callback so every validator temporarily holds tx hashes
+	// from accepted proposals, preventing rapid re-proposal across view changes
+	// before commit cleanup runs.
+	s.eng.RegisterProposalCallback(func(pctx context.Context, proposal interface{}) error {
+		s.recordObservedProposalTxHold(proposal, time.Now())
+		return nil
+	})
 	// Register commit callback
 	s.eng.RegisterCommitCallback(func(cctx context.Context, b api.Block, qc api.QC) error {
 		return s.onCommit(cctx, b, qc)
@@ -1083,6 +1208,16 @@ func (s *Service) GetPolicyOutboxDispatcherStats() (policyoutbox.DispatcherStats
 	return dispatcher.Stats(), true
 }
 
+func (s *Service) NotifyPolicyOutboxDispatcher() {
+	s.mu.Lock()
+	dispatcher := s.policyOutboxDispatcher
+	s.mu.Unlock()
+	if dispatcher == nil {
+		return
+	}
+	dispatcher.Notify()
+}
+
 // GetPolicyOutboxBacklogStats returns current outbox backlog stats for API metrics.
 func (s *Service) GetPolicyOutboxBacklogStats(ctx context.Context) (policyoutbox.BacklogStats, bool) {
 	s.mu.Lock()
@@ -1186,6 +1321,9 @@ func (s *Service) GetPolicyAckConsumerStats() (apiserver.PolicyAckConsumerStats,
 		WorkQueueWaits:          stats.WorkQueueWaits,
 		SoftThrottleActivations: stats.SoftThrottleActivations,
 		LogsThrottled:           stats.LogsThrottled,
+		PartitionAssignments:    stats.PartitionAssignments,
+		PartitionRevocations:    stats.PartitionRevocations,
+		PartitionsOwnedCurrent:  stats.PartitionsOwnedCurrent,
 	}, true
 }
 
@@ -1221,6 +1359,14 @@ func (s *Service) GetPolicyAckCausalStats() (apiserver.PolicyAckCausalStats, boo
 		PublishToAckCount:          stats.PublishToAckCount,
 		PublishToAckSumMs:          stats.PublishToAckSumMs,
 		PublishToAckP95Ms:          stats.PublishToAckP95Ms,
+		PublishToAppliedBuckets:    stats.PublishToAppliedBuckets,
+		PublishToAppliedCount:      stats.PublishToAppliedCount,
+		PublishToAppliedSumMs:      stats.PublishToAppliedSumMs,
+		PublishToAppliedP95Ms:      stats.PublishToAppliedP95Ms,
+		AppliedToAckBuckets:        stats.AppliedToAckBuckets,
+		AppliedToAckCount:          stats.AppliedToAckCount,
+		AppliedToAckSumMs:          stats.AppliedToAckSumMs,
+		AppliedToAckP95Ms:          stats.AppliedToAckP95Ms,
 	}, true
 }
 

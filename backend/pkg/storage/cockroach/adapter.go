@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,8 +19,12 @@ import (
 
 	"backend/pkg/block"
 	"backend/pkg/consensus/types"
+	"backend/pkg/control/lifecycleaudit"
+	"backend/pkg/control/policyoutbox"
+	"backend/pkg/control/policystate"
 	"backend/pkg/state"
 	"backend/pkg/utils"
+	"github.com/google/uuid"
 	"github.com/jackc/pgconn"
 	"github.com/lib/pq"
 )
@@ -124,19 +129,20 @@ func isUniqueViolation(err error, constraint string) bool {
 
 // adapter implements the Adapter interface
 type adapter struct {
-	db                *sql.DB
-	logger            *utils.Logger
-	auditLogger       *utils.AuditLogger
-	metrics           *dbMetrics
-	txMismatchSeenMu  sync.Mutex
-	txMismatchSeen    map[[32]byte]time.Time
-	txMismatchSeenTTL time.Duration
-	txMismatchSeenMax int
-	perf              adapterPerformanceConfig
-	txBatchCanary     *batchCanaryState
-	outboxBatchCanary *batchCanaryState
-	batchTuner        *batchTunerState
-	sqlTpl            sqlTemplateCache
+	db                  *sql.DB
+	logger              *utils.Logger
+	auditLogger         *utils.AuditLogger
+	metrics             *dbMetrics
+	anomalyStoreEnabled bool
+	txMismatchSeenMu    sync.Mutex
+	txMismatchSeen      map[[32]byte]time.Time
+	txMismatchSeenTTL   time.Duration
+	txMismatchSeenMax   int
+	perf                adapterPerformanceConfig
+	txBatchCanary       *batchCanaryState
+	outboxBatchCanary   *batchCanaryState
+	batchTuner          *batchTunerState
+	sqlTpl              sqlTemplateCache
 
 	// Prepared statements for queries
 	stmtGetBlock    *sql.Stmt
@@ -169,10 +175,39 @@ type adapter struct {
 }
 
 type sqlTemplateCache struct {
-	txInsert     sync.Map // map[int]string
-	txVerify     sync.Map // map[int]string
-	outboxInsert sync.Map // map[int]string
-	outboxVerify sync.Map // map[int]string
+	txInsert         sync.Map // map[int]string
+	txVerify         sync.Map // map[int]string
+	anomalyUpsert    sync.Map // map[int]string
+	outboxInsert     sync.Map // map[int]string
+	outboxVerify     sync.Map // map[int]string
+	outboxActive     sync.Map // map[int]string
+	outboxActiveRows sync.Map // map[int]string
+}
+
+type activeSemanticOutboxRow struct {
+	SemanticKey string
+	PolicyID    string
+	RuleHash    []byte
+	Status      string
+}
+
+type outboxPrepared struct {
+	blockHeight     uint64
+	blockTS         int64
+	txIndex         int
+	policyID        string
+	ruleHash        [32]byte
+	semanticKey     string
+	dispatchShard   string
+	payload         []byte
+	requestID       string
+	commandID       string
+	workflowID      string
+	traceID         string
+	aiEventTsMs     int64
+	sourceEventID   string
+	sourceEventTsMs int64
+	sentinelEventID string
 }
 
 type batchTunerState struct {
@@ -223,9 +258,16 @@ func PersistAttemptFromContext(ctx context.Context) int {
 }
 
 const (
-	txUpsertBatchSize     = 128
-	outboxUpsertBatchSize = 128
-	maxUpsertBatchSize    = 1024
+	txUpsertBatchSize      = 64
+	outboxUpsertBatchSize  = 64
+	anomalyUpsertBatchSize = 64
+	maxUpsertBatchSize     = 1024
+	// Keep a small commit reserve so optional anomaly writes do not consume the
+	// remaining transaction deadline and fail-close durable policy persistence.
+	anomalyPersistCommitReserve = 1500 * time.Millisecond
+	// Keep a commit reserve for optional lifecycle audit journal writes so
+	// best-effort audit work cannot consume the remaining durable commit budget.
+	lifecycleAuditCommitReserve = 1200 * time.Millisecond
 )
 
 // AdapterPerformanceConfig controls persistence hot-path batching and guardrails.
@@ -258,6 +300,10 @@ type AdapterPerformanceConfig struct {
 	TxVerifyUseTx          bool
 	TxVerifyUseTxSet       bool
 	TxVerifyChunkSize      int
+	OutboxDispatchShards   int
+	OutboxDispatchMode     string
+	ClusterShardingMode    string
+	ClusterShardBuckets    int
 }
 
 type adapterPerformanceConfig struct {
@@ -282,6 +328,10 @@ type adapterPerformanceConfig struct {
 	persistTxRetryCap      time.Duration
 	txVerifyUseTx          bool
 	txVerifyChunkSize      int
+	outboxDispatchShards   int
+	outboxDispatchMode     string
+	clusterShardingMode    string
+	clusterShardBuckets    int
 }
 
 // AdapterConfig holds configuration for the adapter
@@ -317,14 +367,43 @@ func NewAdapter(ctx context.Context, cfg *AdapterConfig) (Adapter, error) {
 		return nil, fmt.Errorf("failed to prepare statements: %w", err)
 	}
 
+	a.anomalyStoreEnabled = a.detectTableExists(ctx, "anomalies")
+
 	if a.logger != nil {
 		a.logger.InfoContext(ctx, "CockroachDB adapter initialized")
 		if !a.perf.txStoreFullPayload {
 			a.logger.WarnContext(ctx, "transaction payload persistence is in minimal mode; full tx JSON is not stored in transactions.payload")
 		}
+		if !a.anomalyStoreEnabled {
+			a.logger.WarnContext(ctx, "anomaly persistence is disabled because the anomalies table is unavailable")
+		}
 	}
 
 	return a, nil
+}
+
+func (a *adapter) detectTableExists(ctx context.Context, tableName string) bool {
+	if a == nil || a.db == nil || strings.TrimSpace(tableName) == "" {
+		return false
+	}
+	var exists bool
+	err := a.db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.tables
+			WHERE table_schema = current_schema()
+			  AND table_name = $1
+		)
+	`, tableName).Scan(&exists)
+	if err != nil {
+		if a.logger != nil {
+			a.logger.WarnContext(ctx, "failed to detect table support",
+				utils.ZapString("table", tableName),
+				utils.ZapError(err))
+		}
+		return false
+	}
+	return exists
 }
 
 func sanitizePerformanceConfig(cfg AdapterPerformanceConfig) adapterPerformanceConfig {
@@ -345,11 +424,15 @@ func sanitizePerformanceConfig(cfg AdapterPerformanceConfig) adapterPerformanceC
 		canaryMinSamples:       20,
 		canaryMaxErrorRate:     0.20,
 		canaryFallbackCooldown: 5 * time.Minute,
-		persistTxRetryMax:      2,
-		persistTxRetryBase:     40 * time.Millisecond,
-		persistTxRetryCap:      500 * time.Millisecond,
+		persistTxRetryMax:      4,
+		persistTxRetryBase:     50 * time.Millisecond,
+		persistTxRetryCap:      time.Second,
 		txVerifyUseTx:          true,
 		txVerifyChunkSize:      maxUpsertBatchSize,
+		outboxDispatchShards:   1,
+		outboxDispatchMode:     policyoutbox.DispatchShardTargetHashV1,
+		clusterShardingMode:    "off",
+		clusterShardBuckets:    1,
 	}
 
 	if cfg.TxBatchSize > 0 {
@@ -424,6 +507,18 @@ func sanitizePerformanceConfig(cfg AdapterPerformanceConfig) adapterPerformanceC
 	if cfg.TxVerifyChunkSize > 0 {
 		perf.txVerifyChunkSize = cfg.TxVerifyChunkSize
 	}
+	if cfg.OutboxDispatchShards > 0 {
+		perf.outboxDispatchShards = cfg.OutboxDispatchShards
+	}
+	if strings.TrimSpace(cfg.OutboxDispatchMode) != "" {
+		perf.outboxDispatchMode = strings.ToLower(strings.TrimSpace(cfg.OutboxDispatchMode))
+	}
+	if strings.TrimSpace(cfg.ClusterShardingMode) != "" {
+		perf.clusterShardingMode = strings.ToLower(strings.TrimSpace(cfg.ClusterShardingMode))
+	}
+	if cfg.ClusterShardBuckets > 0 {
+		perf.clusterShardBuckets = cfg.ClusterShardBuckets
+	}
 	if perf.persistTxRetryMax < 1 {
 		perf.persistTxRetryMax = 1
 	}
@@ -438,6 +533,16 @@ func sanitizePerformanceConfig(cfg AdapterPerformanceConfig) adapterPerformanceC
 	}
 	if perf.txVerifyChunkSize > maxUpsertBatchSize {
 		perf.txVerifyChunkSize = maxUpsertBatchSize
+	}
+	if perf.clusterShardBuckets < 1 {
+		perf.clusterShardBuckets = 1
+	}
+	if perf.outboxDispatchShards <= 0 {
+		if perf.clusterShardBuckets > 1 {
+			perf.outboxDispatchShards = perf.clusterShardBuckets
+		} else {
+			perf.outboxDispatchShards = 1
+		}
 	}
 	if perf.canaryWindowSize < 1 {
 		perf.canaryWindowSize = 1
@@ -820,8 +925,8 @@ func (a *adapter) prepareStatements(ctx context.Context) error {
 
 	a.stmtGetCommitted, err = a.db.PrepareContext(ctx, `
 		SELECT block_hash
-		FROM consensus_metadata
-		WHERE key = 'committed_' || $1::TEXT
+		FROM blocks
+		WHERE height = $1
 	`)
 	if err != nil {
 		return fmt.Errorf("prepare get committed hash: %w", err)
@@ -868,6 +973,7 @@ func (a *adapter) PersistBlock(ctx context.Context, blk *block.AppBlock, receipt
 	defer stop()
 	persistStart := time.Now()
 	txBodyStart := time.Time{}
+	persistAttempt := PersistAttemptFromContext(ctx)
 	defer func() {
 		if a.metrics == nil {
 			if a.logger != nil && blk != nil {
@@ -875,10 +981,13 @@ func (a *adapter) PersistBlock(ctx context.Context, blk *block.AppBlock, receipt
 				if total >= 2*time.Second {
 					a.logger.Warn("persist attempt summary",
 						utils.ZapUint64("height", blk.GetHeight()),
-						utils.ZapInt("attempt", PersistAttemptFromContext(ctx)),
+						utils.ZapInt("attempt", persistAttempt),
 						utils.ZapFloat64("total_ms", float64(total)/float64(time.Millisecond)),
 						utils.ZapString("result", map[bool]string{true: "error", false: "ok"}[retErr != nil]))
 				}
+			}
+			if retErr != nil && blk != nil {
+				a.logPolicyStageMarkers(collectPolicyStageMarkers(blk), blk.GetHeight(), "t_outbox_row_materialize_failed", time.Now().UnixMilli(), persistAttempt)
 			}
 			return
 		}
@@ -900,11 +1009,14 @@ func (a *adapter) PersistBlock(ctx context.Context, blk *block.AppBlock, receipt
 				}
 				a.logger.Warn("persist attempt summary",
 					utils.ZapUint64("height", blk.GetHeight()),
-					utils.ZapInt("attempt", PersistAttemptFromContext(ctx)),
+					utils.ZapInt("attempt", persistAttempt),
 					utils.ZapFloat64("total_ms", float64(total)/float64(time.Millisecond)),
 					utils.ZapString("result", result),
 					utils.ZapString("class", class))
 			}
+		}
+		if retErr != nil && blk != nil {
+			a.logPolicyStageMarkers(collectPolicyStageMarkers(blk), blk.GetHeight(), "t_outbox_row_materialize_failed", time.Now().UnixMilli(), persistAttempt)
 		}
 	}()
 	if blk == nil {
@@ -931,11 +1043,19 @@ func (a *adapter) PersistBlock(ctx context.Context, blk *block.AppBlock, receipt
 		if attempt > 0 {
 			delay := retryBackoff(attempt-1, a.perf.persistTxRetryBase, a.perf.persistTxRetryCap)
 			delay = withRetryJitter(delay)
+			if !canRunPersistInternalRetry(ctx, delay) {
+				retErr = txErr
+				return retErr
+			}
 			if a.metrics != nil {
 				a.metrics.observePersistStage("persist_internal_retry_delay", delay)
 			}
 			if !waitForContext(ctx, delay) {
-				retErr = fmt.Errorf("persist internal retry canceled: %w", ctx.Err())
+				if txErr != nil && IsRetryable(txErr) {
+					retErr = txErr
+				} else {
+					retErr = fmt.Errorf("persist internal retry canceled: %w", ctx.Err())
+				}
 				return retErr
 			}
 		}
@@ -979,6 +1099,7 @@ func (a *adapter) persistBlockOnce(ctx context.Context, blk *block.AppBlock, rec
 	defer tx.Rollback() // Safe to call even after commit
 	persistAttempt := PersistAttemptFromContext(ctx)
 	policyMarkers := collectPolicyStageMarkers(blk)
+	policyIDs := collectPolicyIDsFromMarkers(policyMarkers)
 	a.logPolicyStageMarkers(policyMarkers, blk.GetHeight(), "t_db_tx_begin", time.Now().UnixMilli(), persistAttempt)
 
 	// 1. UPSERT block
@@ -1067,6 +1188,8 @@ func (a *adapter) persistBlockOnce(ctx context.Context, blk *block.AppBlock, rec
 		a.metrics.observePersistStage("commit", time.Since(stageStart))
 	}
 	a.logPolicyStageMarkers(policyMarkers, blk.GetHeight(), "t_db_tx_commit_done", time.Now().UnixMilli(), persistAttempt)
+	a.logPolicyStageMarkers(policyMarkers, blk.GetHeight(), "t_outbox_row_durable", time.Now().UnixMilli(), persistAttempt)
+	a.refreshPolicyStateAsync(policyIDs, blk.GetHeight(), persistAttempt)
 
 	// Success audit
 	if a.auditLogger != nil {
@@ -1125,6 +1248,19 @@ func waitForContext(ctx context.Context, delay time.Duration) bool {
 	case <-ctx.Done():
 		return false
 	}
+}
+
+func canRunPersistInternalRetry(ctx context.Context, delay time.Duration) bool {
+	if ctx == nil || ctx.Err() != nil {
+		return false
+	}
+	deadline, hasDeadline := ctx.Deadline()
+	if !hasDeadline {
+		return true
+	}
+	// Keep a small execution budget for the retrying SQL transaction body itself.
+	const minRetryExecBudget = 100 * time.Millisecond
+	return time.Until(deadline) > delay+minRetryExecBudget
 }
 
 func withRetryJitter(base time.Duration) time.Duration {
@@ -1244,6 +1380,29 @@ type persistedTxRecord struct {
 	submittedAt  time.Time
 }
 
+type persistedAnomalyRecord struct {
+	anomalyID       string
+	threatType      string
+	severityValue   float64
+	confidence      float64
+	title           string
+	description     string
+	source          string
+	modelVersion    string
+	flowKey         string
+	flowID          string
+	sensorID        string
+	validatorID     string
+	scopeIdentifier string
+	sourceEventID   string
+	sourceEventTsMs int64
+	sentinelEventID string
+	blockHeight     uint64
+	txHash          string
+	detectedAt      int64
+	rawPayload      []byte
+}
+
 type existingTxRecord struct {
 	contentHash [32]byte
 	producerID  []byte
@@ -1261,6 +1420,31 @@ type policyOutboxInput struct {
 	txIndex     int
 	txTS        int64
 	payload     []byte
+}
+
+type persistedAnomalyPayload struct {
+	AnomalyID          string                 `json:"anomaly_id"`
+	ThreatType         string                 `json:"threat_type"`
+	Severity           float64                `json:"severity"`
+	Confidence         float64                `json:"confidence"`
+	DetectionTimestamp int64                  `json:"detection_timestamp"`
+	SourceToken        string                 `json:"source_token"`
+	TargetToken        string                 `json:"target_token"`
+	FlowKey            string                 `json:"flow_key"`
+	ModelVersion       string                 `json:"model_version"`
+	Description        string                 `json:"description"`
+	Title              string                 `json:"title"`
+	SourceEventID      string                 `json:"source_event_id"`
+	SourceEventTsMs    int64                  `json:"source_event_ts_ms"`
+	SentinelEventID    string                 `json:"sentinel_event_id"`
+	Metadata           map[string]interface{} `json:"metadata"`
+	Trace              map[string]interface{} `json:"trace"`
+}
+
+type policySemanticFingerprintContext struct {
+	inMetadata bool
+	inTrace    bool
+	atRoot     bool
 }
 
 func (a *adapter) txInsertTemplate(rows int) string {
@@ -1339,23 +1523,85 @@ func (a *adapter) outboxInsertTemplate(rows int) string {
 	q.Grow(rows * 90)
 	q.WriteString(`
 			INSERT INTO control_policy_outbox (
-				block_height, block_ts, tx_index, policy_id, rule_hash, payload, trace_id, ai_event_ts_ms, source_event_id, source_event_ts_ms, status, next_retry_at, created_at, updated_at
+				block_height, block_ts, tx_index, policy_id, rule_hash, semantic_key, dispatch_shard, payload, request_id, command_id, workflow_id, trace_id, ai_event_ts_ms, source_event_id, source_event_ts_ms, sentinel_event_id, status, next_retry_at, created_at, updated_at
 			) VALUES
 	`)
 	for i := 0; i < rows; i++ {
 		if i > 0 {
 			q.WriteString(",")
 		}
-		base := i * 10
-		fmt.Fprintf(&q, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,NULLIF($%d,''),NULLIF($%d,0),'pending',NOW(),NOW(),NOW())",
-			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10)
+		base := i * 16
+		fmt.Fprintf(&q, "($%d,$%d,$%d,$%d,$%d,NULLIF($%d,''),NULLIF($%d,''),$%d,NULLIF($%d,''),NULLIF($%d,''),NULLIF($%d,''),$%d,$%d,NULLIF($%d,''),NULLIF($%d,0),NULLIF($%d,''),'pending',NOW(),NOW(),NOW())",
+			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10, base+11, base+12, base+13, base+14, base+15, base+16)
 	}
 	q.WriteString(`
-			ON CONFLICT (block_height, tx_index) DO NOTHING
-			RETURNING block_height, tx_index
+			ON CONFLICT DO NOTHING
+			RETURNING id::STRING, block_height, tx_index
 	`)
 	sql := q.String()
 	a.sqlTpl.outboxInsert.Store(rows, sql)
+	return sql
+}
+
+func (a *adapter) outboxActiveTemplate(rows int) string {
+	if rows < 1 {
+		rows = 1
+	}
+	if cached, ok := a.sqlTpl.outboxActive.Load(rows); ok {
+		if s, ok := cached.(string); ok && s != "" {
+			return s
+		}
+	}
+	var q strings.Builder
+	q.Grow(rows * 16)
+	q.WriteString(`
+			SELECT semantic_key
+			FROM control_policy_outbox
+			WHERE semantic_key IN (
+	`)
+	for i := 0; i < rows; i++ {
+		if i > 0 {
+			q.WriteString(",")
+		}
+		fmt.Fprintf(&q, "$%d", i+1)
+	}
+	q.WriteString(`
+			)
+			  AND status IN ('pending', 'retry', 'publishing', 'published')
+	`)
+	sql := q.String()
+	a.sqlTpl.outboxActive.Store(rows, sql)
+	return sql
+}
+
+func (a *adapter) outboxActiveRowsTemplate(rows int) string {
+	if rows < 1 {
+		rows = 1
+	}
+	if cached, ok := a.sqlTpl.outboxActiveRows.Load(rows); ok {
+		if s, ok := cached.(string); ok && s != "" {
+			return s
+		}
+	}
+	var q strings.Builder
+	q.Grow(rows * 32)
+	q.WriteString(`
+			SELECT semantic_key, policy_id, rule_hash, status
+			FROM control_policy_outbox
+			WHERE semantic_key IN (
+	`)
+	for i := 0; i < rows; i++ {
+		if i > 0 {
+			q.WriteString(",")
+		}
+		fmt.Fprintf(&q, "$%d", i+1)
+	}
+	q.WriteString(`
+			)
+			  AND status IN ('pending', 'retry', 'publishing', 'published')
+	`)
+	sql := q.String()
+	a.sqlTpl.outboxActiveRows.Store(rows, sql)
 	return sql
 }
 
@@ -1387,6 +1633,69 @@ func (a *adapter) outboxVerifyTemplate(rows int) string {
 	return sql
 }
 
+func (a *adapter) anomalyUpsertTemplate(rows int) string {
+	if rows <= 0 {
+		rows = 1
+	}
+	if rows > maxUpsertBatchSize {
+		rows = maxUpsertBatchSize
+	}
+	if cached, ok := a.sqlTpl.anomalyUpsert.Load(rows); ok {
+		return cached.(string)
+	}
+
+	const colsPerRow = 20
+	var q strings.Builder
+	q.WriteString(`
+		INSERT INTO anomalies (
+			anomaly_id, threat_type, severity_value, confidence, title, description,
+			source, model_version, flow_key, flow_id, sensor_id, validator_id, scope_identifier, source_event_id, source_event_ts_ms,
+			sentinel_event_id, block_height, tx_hash, detected_at, raw_payload,
+			created_at, updated_at
+		) VALUES
+	`)
+	for i := 0; i < rows; i++ {
+		if i > 0 {
+			q.WriteByte(',')
+		}
+		base := i*colsPerRow + 1
+		q.WriteString(fmt.Sprintf(`
+			($%d, $%d, $%d, $%d, NULLIF($%d, ''), NULLIF($%d, ''), $%d, NULLIF($%d, ''),
+			 NULLIF($%d, ''), NULLIF($%d, ''), NULLIF($%d, ''), NULLIF($%d, ''), NULLIF($%d, ''), NULLIF($%d, ''), NULLIF($%d, 0), NULLIF($%d, ''),
+			 $%d, $%d, $%d, $%d, NOW(), NOW())`,
+			base, base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9,
+			base+10, base+11, base+12, base+13, base+14, base+15, base+16, base+17, base+18, base+19,
+		))
+	}
+	q.WriteString(`
+		ON CONFLICT (anomaly_id) DO UPDATE SET
+			threat_type = EXCLUDED.threat_type,
+			severity_value = EXCLUDED.severity_value,
+			confidence = EXCLUDED.confidence,
+			title = EXCLUDED.title,
+			description = EXCLUDED.description,
+			source = EXCLUDED.source,
+			model_version = EXCLUDED.model_version,
+			flow_key = EXCLUDED.flow_key,
+			flow_id = EXCLUDED.flow_id,
+			sensor_id = EXCLUDED.sensor_id,
+			validator_id = EXCLUDED.validator_id,
+			scope_identifier = EXCLUDED.scope_identifier,
+			source_event_id = EXCLUDED.source_event_id,
+			source_event_ts_ms = EXCLUDED.source_event_ts_ms,
+			sentinel_event_id = EXCLUDED.sentinel_event_id,
+			block_height = EXCLUDED.block_height,
+			tx_hash = EXCLUDED.tx_hash,
+			detected_at = EXCLUDED.detected_at,
+			raw_payload = EXCLUDED.raw_payload,
+			updated_at = NOW()
+	`)
+
+	sql := q.String()
+	a.sqlTpl.anomalyUpsert.Store(rows, sql)
+	return sql
+}
+
 func (a *adapter) marshalStoredTxPayload(stateTx state.Transaction) ([]byte, error) {
 	if a == nil || a.perf.txStoreFullPayload {
 		return json.Marshal(stateTx)
@@ -1402,6 +1711,430 @@ func (a *adapter) marshalStoredTxPayload(stateTx state.Transaction) ([]byte, err
 	buf = append(buf, []byte(strconv.FormatInt(stateTx.Timestamp(), 10))...)
 	buf = append(buf, []byte(`}`)...)
 	return buf, nil
+}
+
+func parsePersistedAnomaly(payload []byte, txHash [32]byte, blockHeight uint64, defaultTimestamp int64) (persistedAnomalyRecord, bool, error) {
+	if len(payload) == 0 {
+		return persistedAnomalyRecord{}, false, nil
+	}
+
+	var raw map[string]interface{}
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return persistedAnomalyRecord{}, false, err
+	}
+
+	doc := raw
+	if nested, ok := raw["payload"].(map[string]interface{}); ok && len(nested) > 0 {
+		doc = nested
+	}
+
+	schemaVersion := extractString(doc, "schema_version")
+	eventID := extractString(doc, "event_id")
+	anomalyID := extractString(doc, "anomaly_id")
+	if anomalyID == "" {
+		anomalyID = extractString(doc, "id")
+	}
+	if anomalyID == "" {
+		anomalyID = deterministicAnomalyIDFromEventID(eventID)
+	}
+	threatType := extractString(doc, "threat_type")
+	if threatType == "" {
+		threatType = extractString(doc, "type")
+	}
+	sourceToken := extractString(doc, "source_token")
+	targetToken := extractString(doc, "target_token")
+	flowKey := extractString(doc, "flow_key")
+	if flowKey == "" {
+		flowKey = extractString(doc, "flow_id")
+	}
+	source := extractString(doc, "source")
+	modelVersion := extractString(doc, "model_version")
+	if modelVersion == "" {
+		modelVersion = schemaVersion
+	}
+	title := extractString(doc, "title")
+	description := extractString(doc, "description")
+	detectedAt := extractInt64(doc, "detection_timestamp")
+	if detectedAt <= 0 {
+		detectedAt = extractInt64(doc, "ts")
+	}
+	severityValue := extractFloat64(doc, "severity")
+	confidence := extractFloat64(doc, "confidence")
+
+	if anomalyID == "" &&
+		threatType == "" &&
+		sourceToken == "" &&
+		flowKey == "" &&
+		targetToken == "" &&
+		source == "" {
+		return persistedAnomalyRecord{}, false, nil
+	}
+
+	sourceEventID := extractString(doc, "source_event_id")
+	sourceEventTsMs := extractInt64(doc, "source_event_ts_ms")
+	sentinelEventID := extractString(doc, "sentinel_event_id")
+	metadata, _ := doc["metadata"].(map[string]interface{})
+	labels, _ := doc["labels"].(map[string]interface{})
+	analysis, _ := doc["analysis"].(map[string]interface{})
+	input, _ := doc["input"].(map[string]interface{})
+	if metadata != nil {
+		if sourceEventID == "" {
+			sourceEventID = extractString(metadata, "source_event_id")
+		}
+		if sourceEventID == "" {
+			sourceEventID = extractString(metadata, "telemetry_event_id")
+		}
+		if sourceEventTsMs <= 0 {
+			sourceEventTsMs = extractInt64(metadata, "source_event_ts_ms")
+		}
+		if sourceEventTsMs <= 0 {
+			sourceEventTsMs = extractInt64(metadata, "telemetry_event_ts_ms")
+		}
+		if sentinelEventID == "" {
+			sentinelEventID = extractString(metadata, "sentinel_event_id")
+		}
+	}
+	trace, _ := doc["trace"].(map[string]interface{})
+	if trace != nil {
+		if sourceEventID == "" {
+			sourceEventID = extractString(trace, "source_event_id")
+		}
+		if sourceEventTsMs <= 0 {
+			sourceEventTsMs = extractInt64(trace, "source_event_ts_ms")
+		}
+		if sentinelEventID == "" {
+			sentinelEventID = extractString(trace, "sentinel_event_id")
+		}
+	}
+	if sourceEventID == "" {
+		sourceEventID = extractString(labels, "source_event_id")
+	}
+	if sourceEventID == "" {
+		sourceEventID = extractString(input, "id")
+	}
+	if sourceEventTsMs > 0 {
+		if normalized, _, valid := utils.NormalizeUnixMillis(sourceEventTsMs); valid {
+			sourceEventTsMs = normalized
+		} else {
+			sourceEventTsMs = 0
+		}
+	}
+	if sourceEventTsMs <= 0 {
+		if seconds := extractFloat64(input, "timestamp"); seconds > 0 {
+			sourceEventTsMs = int64(seconds * 1000)
+		}
+	}
+	if sentinelEventID == "" {
+		sentinelEventID = eventID
+	}
+	flowID := flowKey
+	if flowID == "" {
+		flowID = extractString(labels, "flow_id")
+	}
+	if flowKey == "" {
+		flowKey = flowID
+	}
+	sensorID := extractRootString(payload, "sensor_id")
+	if sensorID == "" {
+		sensorID = extractString(metadata, "sensor_id")
+	}
+	if sensorID == "" {
+		sensorID = extractString(trace, "sensor_id")
+	}
+	if sensorID == "" {
+		sensorID = extractString(labels, "source_id")
+	}
+	validatorID := extractRootString(payload, "validator_id")
+	if validatorID == "" {
+		validatorID = extractString(metadata, "validator_id")
+	}
+	if validatorID == "" {
+		validatorID = extractString(trace, "validator_id")
+	}
+	scopeIdentifier := extractRootString(payload, "scope_identifier")
+	if scopeIdentifier == "" {
+		scopeIdentifier = extractString(metadata, "scope_identifier")
+	}
+	if scopeIdentifier == "" {
+		scopeIdentifier = extractString(trace, "scope_identifier")
+	}
+	if scopeIdentifier == "" {
+		scopeIdentifier = extractString(doc, "tenant_id")
+	}
+
+	if threatType == "" {
+		if modality := strings.TrimSpace(extractString(input, "modality")); modality == "network_flow" {
+			threatType = "network_intrusion"
+		}
+	}
+	if threatType == "" {
+		if level := strings.TrimSpace(extractString(analysis, "threat_level")); level != "" {
+			if idx := strings.LastIndex(level, "."); idx >= 0 && idx < len(level)-1 {
+				level = level[idx+1:]
+			}
+			threatType = strings.ToLower(level)
+		}
+	}
+	if threatType == "" && schemaVersion != "" {
+		threatType = strings.ReplaceAll(strings.TrimSpace(schemaVersion), ".", "_")
+	}
+
+	if detectedAt <= 0 {
+		detectedAt = defaultTimestamp
+	}
+
+	source = strings.TrimSpace(source)
+	if source == "" {
+		source = strings.TrimSpace(sourceToken)
+	}
+	if source == "" {
+		source = strings.TrimSpace(flowKey)
+	}
+	if source == "" {
+		source = strings.TrimSpace(targetToken)
+	}
+	if source == "" {
+		source = "ai-service"
+	}
+
+	if title == "" {
+		title = formatPersistedThreatTitle(threatType)
+	}
+	if description == "" {
+		description = buildPersistedAnomalyDescription(threatType, confidence, modelVersion)
+	}
+
+	if anomalyID == "" {
+		anomalyID = hex.EncodeToString(txHash[:])
+	}
+
+	return persistedAnomalyRecord{
+		anomalyID:       anomalyID,
+		threatType:      strings.TrimSpace(threatType),
+		severityValue:   severityValue,
+		confidence:      confidence,
+		title:           title,
+		description:     description,
+		source:          source,
+		modelVersion:    strings.TrimSpace(modelVersion),
+		flowKey:         strings.TrimSpace(flowKey),
+		flowID:          flowID,
+		sensorID:        sensorID,
+		validatorID:     validatorID,
+		scopeIdentifier: scopeIdentifier,
+		sourceEventID:   sourceEventID,
+		sourceEventTsMs: sourceEventTsMs,
+		sentinelEventID: sentinelEventID,
+		blockHeight:     blockHeight,
+		txHash:          hex.EncodeToString(txHash[:]),
+		detectedAt:      detectedAt,
+		rawPayload:      append([]byte(nil), payload...),
+	}, true, nil
+}
+
+func extractFloat64(m map[string]interface{}, key string) float64 {
+	if m == nil {
+		return 0
+	}
+	v, ok := m[key]
+	if !ok || v == nil {
+		return 0
+	}
+	switch n := v.(type) {
+	case float64:
+		if math.IsNaN(n) || math.IsInf(n, 0) {
+			return 0
+		}
+		return n
+	case float32:
+		f := float64(n)
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return 0
+		}
+		return f
+	case int:
+		return float64(n)
+	case int64:
+		return float64(n)
+	case json.Number:
+		if f, err := n.Float64(); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+			return f
+		}
+	}
+	return 0
+}
+
+func formatPersistedThreatTitle(threatType string) string {
+	clean := strings.TrimSpace(strings.ReplaceAll(threatType, "_", " "))
+	if clean == "" {
+		return "Threat Detected"
+	}
+	parts := strings.Fields(clean)
+	for i, part := range parts {
+		lower := strings.ToLower(part)
+		if lower == "" {
+			continue
+		}
+		parts[i] = strings.ToUpper(lower[:1]) + lower[1:]
+	}
+	return strings.Join(parts, " ")
+}
+
+func deterministicAnomalyIDFromEventID(eventID string) string {
+	eventID = strings.TrimSpace(eventID)
+	if eventID == "" {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(eventID))
+	raw := make([]byte, 16)
+	copy(raw, digest[:16])
+	raw[6] = (raw[6] & 0x0f) | 0x40
+	raw[8] = (raw[8] & 0x3f) | 0x80
+	return uuid.UUID(raw).String()
+}
+
+func buildPersistedAnomalyDescription(threatType string, confidence float64, modelVersion string) string {
+	title := formatPersistedThreatTitle(threatType)
+	var builder strings.Builder
+	builder.WriteString(title)
+	builder.WriteString(" detection")
+	if confidence > 0 {
+		fmt.Fprintf(&builder, " (confidence %.1f%%)", confidence*100)
+	}
+	if strings.TrimSpace(modelVersion) != "" {
+		fmt.Fprintf(&builder, " using model %s", strings.TrimSpace(modelVersion))
+	}
+	return builder.String()
+}
+
+func (a *adapter) upsertAnomalies(ctx context.Context, tx *sql.Tx, rows []persistedAnomalyRecord) error {
+	if a == nil || tx == nil || !a.anomalyStoreEnabled || len(rows) == 0 {
+		return nil
+	}
+	prepared := make([]persistedAnomalyRecord, 0, len(rows))
+	for _, row := range rows {
+		if strings.TrimSpace(row.anomalyID) != "" {
+			prepared = append(prepared, row)
+		}
+	}
+	if len(prepared) == 0 {
+		return nil
+	}
+
+	chunkSize := anomalyUpsertBatchSize
+	if chunkSize < 1 {
+		chunkSize = 1
+	}
+	if chunkSize > maxUpsertBatchSize {
+		chunkSize = maxUpsertBatchSize
+	}
+
+	for start := 0; start < len(prepared); start += chunkSize {
+		end := start + chunkSize
+		if end > len(prepared) {
+			end = len(prepared)
+		}
+		chunk := prepared[start:end]
+
+		args := make([]interface{}, 0, len(chunk)*20)
+		for _, row := range chunk {
+			args = append(args,
+				row.anomalyID,
+				row.threatType,
+				row.severityValue,
+				row.confidence,
+				row.title,
+				row.description,
+				row.source,
+				row.modelVersion,
+				row.flowKey,
+				row.flowID,
+				row.sensorID,
+				row.validatorID,
+				row.scopeIdentifier,
+				row.sourceEventID,
+				row.sourceEventTsMs,
+				row.sentinelEventID,
+				row.blockHeight,
+				row.txHash,
+				row.detectedAt,
+				row.rawPayload,
+			)
+		}
+
+		if _, err := tx.ExecContext(ctx, a.anomalyUpsertTemplate(len(chunk)), args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func estimateAnomalyPersistBudget(rowCount int) time.Duration {
+	if rowCount <= 0 {
+		return 0
+	}
+	// Conservative wall-time estimate for batched anomaly writes.
+	// Base accounts for planning/network overhead; per-row covers payload cost.
+	budget := 400*time.Millisecond + time.Duration(rowCount)*12*time.Millisecond
+	if budget > 10*time.Second {
+		budget = 10 * time.Second
+	}
+	return budget
+}
+
+func shouldSkipAnomalyPersistForDeadline(ctx context.Context, rowCount int) bool {
+	if rowCount <= 0 {
+		return false
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return false
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return true
+	}
+	required := estimateAnomalyPersistBudget(rowCount) + anomalyPersistCommitReserve
+	return remaining < required
+}
+
+func estimateLifecycleAuditBudget(eventCount int) time.Duration {
+	if eventCount <= 0 {
+		return 0
+	}
+	// Conservative estimate for batched lifecycle journal insert.
+	budget := 80*time.Millisecond + time.Duration(eventCount)*6*time.Millisecond
+	if budget > 3*time.Second {
+		budget = 3 * time.Second
+	}
+	return budget
+}
+
+func shouldSkipLifecycleAuditForDeadline(ctx context.Context, eventCount int) bool {
+	if eventCount <= 0 {
+		return false
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return false
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return true
+	}
+	required := estimateLifecycleAuditBudget(eventCount) + lifecycleAuditCommitReserve
+	return remaining < required
+}
+
+func extractRootString(payload []byte, key string) string {
+	if len(payload) == 0 || strings.TrimSpace(key) == "" {
+		return ""
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return ""
+	}
+	return extractString(raw, key)
 }
 
 func (a *adapter) txBatchRuntime() (enabled bool, chunkSize int, mode string) {
@@ -1638,6 +2371,9 @@ func (a *adapter) upsertTransactions(ctx context.Context, tx *sql.Tx, blk *block
 
 	records := make([]persistedTxRecord, 0, len(transactions))
 	policyRows := make([]policyOutboxInput, 0, len(transactions))
+	anomalyRows := make([]persistedAnomalyRecord, 0, len(transactions))
+	eventTxCount := 0
+	anomalyParseFailures := 0
 	seenTxHash := make(map[[32]byte]persistedTxRecord, len(transactions))
 	prepareStart := time.Now()
 	blockTS := blk.GetTimestamp().Unix()
@@ -1743,7 +2479,31 @@ func (a *adapter) upsertTransactions(ctx context.Context, tx *sql.Tx, blk *block
 			})
 			policyRowCount++
 		}
+		if a.anomalyStoreEnabled && stateTx.Type() == state.TxEvent {
+			eventTxCount++
+			if eventTx, ok := stateTx.(*state.EventTx); ok && len(eventTx.Data) > 0 {
+				if anomaly, recognized, anomalyErr := parsePersistedAnomaly(eventTx.Data, txHash, blk.GetHeight(), eventTx.Timestamp()); anomalyErr != nil {
+					anomalyParseFailures++
+					if a.logger != nil {
+						a.logger.WarnContext(ctx, "failed to parse event tx for anomaly persistence",
+							utils.ZapUint64("height", blk.GetHeight()),
+							utils.ZapInt("tx_index", i),
+							utils.ZapString("tx_hash", hex.EncodeToString(txHash[:])),
+							utils.ZapError(anomalyErr))
+					}
+				} else if recognized {
+					anomalyRows = append(anomalyRows, anomaly)
+				}
+			}
+		}
 		records = append(records, rec)
+	}
+	if a.logger != nil && a.anomalyStoreEnabled && eventTxCount > 0 {
+		a.logger.InfoContext(ctx, "anomaly persistence scan completed",
+			utils.ZapUint64("height", blk.GetHeight()),
+			utils.ZapInt("event_tx_count", eventTxCount),
+			utils.ZapInt("recognized_anomaly_rows", len(anomalyRows)),
+			utils.ZapInt("parse_failures", anomalyParseFailures))
 	}
 	if a.metrics != nil {
 		a.metrics.observePersistStage("upsert_transactions_prepare", time.Since(prepareStart))
@@ -1789,42 +2549,57 @@ func (a *adapter) upsertTransactions(ctx context.Context, tx *sql.Tx, blk *block
 			a.metrics.observePersistStage("upsert_transactions_insert_query", insertQueryDur)
 		}
 		if err != nil {
-			return fmt.Errorf("failed to batch insert transactions at height %d: %w", blk.GetHeight(), err)
-		}
-		insertScanStart := time.Now()
-		for insertRows.Next() {
-			var b []byte
-			if scanErr := insertRows.Scan(&b); scanErr != nil {
+			if IsRetryable(err) && len(chunk) > 1 {
+				if a.logger != nil {
+					a.logger.WarnContext(ctx, "batch tx insert timed out/retryable; splitting chunk for fallback",
+						utils.ZapUint64("height", blk.GetHeight()),
+						utils.ZapInt("chunk_size", len(chunk)),
+						utils.ZapError(err))
+				}
+				fallbackInserted, fallbackErr := a.insertTxChunkAdaptive(ctx, tx, chunk)
+				if fallbackErr != nil {
+					return fmt.Errorf("failed to batch insert transactions at height %d: %w", blk.GetHeight(), fallbackErr)
+				}
+				inserted = fallbackInserted
+			} else {
+				return fmt.Errorf("failed to batch insert transactions at height %d: %w", blk.GetHeight(), err)
+			}
+		} else {
+			insertScanStart := time.Now()
+			for insertRows.Next() {
+				var b []byte
+				if scanErr := insertRows.Scan(&b); scanErr != nil {
+					insertRows.Close()
+					if a.metrics != nil {
+						a.metrics.observePersistStage("upsert_transactions_insert_scan", time.Since(insertScanStart))
+					}
+					return fmt.Errorf("failed scanning inserted tx hash: %w", scanErr)
+				}
+				if len(b) != 32 {
+					insertRows.Close()
+					if a.metrics != nil {
+						a.metrics.observePersistStage("upsert_transactions_insert_scan", time.Since(insertScanStart))
+					}
+					return fmt.Errorf("%w: inserted tx hash invalid length", ErrIntegrityViolation)
+				}
+				var h [32]byte
+				copy(h[:], b)
+				inserted[h] = struct{}{}
+			}
+			if err := insertRows.Err(); err != nil {
 				insertRows.Close()
 				if a.metrics != nil {
 					a.metrics.observePersistStage("upsert_transactions_insert_scan", time.Since(insertScanStart))
 				}
-				return fmt.Errorf("failed scanning inserted tx hash: %w", scanErr)
+				return fmt.Errorf("failed reading inserted tx hashes: %w", err)
 			}
-			if len(b) != 32 {
-				insertRows.Close()
-				if a.metrics != nil {
-					a.metrics.observePersistStage("upsert_transactions_insert_scan", time.Since(insertScanStart))
-				}
-				return fmt.Errorf("%w: inserted tx hash invalid length", ErrIntegrityViolation)
-			}
-			var h [32]byte
-			copy(h[:], b)
-			inserted[h] = struct{}{}
-		}
-		if err := insertRows.Err(); err != nil {
 			insertRows.Close()
+			insertScanDur := time.Since(insertScanStart)
 			if a.metrics != nil {
-				a.metrics.observePersistStage("upsert_transactions_insert_scan", time.Since(insertScanStart))
+				a.metrics.observePersistStage("upsert_transactions_insert_scan", insertScanDur)
 			}
-			return fmt.Errorf("failed reading inserted tx hashes: %w", err)
+			insertTotal += insertQueryDur + insertScanDur
 		}
-		insertRows.Close()
-		insertScanDur := time.Since(insertScanStart)
-		if a.metrics != nil {
-			a.metrics.observePersistStage("upsert_transactions_insert_scan", insertScanDur)
-		}
-		insertTotal += insertQueryDur + insertScanDur
 
 		conflictListBuildStart := time.Now()
 		conflicts := make([]persistedTxRecord, 0, len(chunk))
@@ -1874,7 +2649,23 @@ func (a *adapter) upsertTransactions(ctx context.Context, tx *sql.Tx, blk *block
 		if outboxBatchEnabled {
 			if err := a.upsertPolicyOutboxBatch(ctx, tx, policyRows, outboxChunkSize, persistAttempt); err != nil {
 				outboxErr = err
-				return fmt.Errorf("upsert policy outbox: %w", err)
+				if IsRetryable(err) {
+					if a.logger != nil {
+						a.logger.WarnContext(ctx, "outbox batch upsert failed with retryable error; falling back to single-row upsert",
+							utils.ZapUint64("height", blk.GetHeight()),
+							utils.ZapInt("policy_rows", len(policyRows)),
+							utils.ZapError(err))
+					}
+					outboxErr = nil
+					for _, row := range policyRows {
+						if singleErr := a.upsertPolicyOutbox(ctx, tx, row.blockHeight, row.blockTS, row.txTS, row.txIndex, row.payload, persistAttempt); singleErr != nil {
+							outboxErr = singleErr
+							return fmt.Errorf("upsert policy outbox: %w", singleErr)
+						}
+					}
+				} else {
+					return fmt.Errorf("upsert policy outbox: %w", err)
+				}
 			}
 		} else {
 			for _, row := range policyRows {
@@ -1888,7 +2679,106 @@ func (a *adapter) upsertTransactions(ctx context.Context, tx *sql.Tx, blk *block
 			a.metrics.observePersistStage("upsert_transactions_outbox_batch", time.Since(outboxStart))
 		}
 	}
+	if len(anomalyRows) > 0 {
+		if a.logger != nil {
+			a.logger.InfoContext(ctx, "persisting anomaly rows",
+				utils.ZapUint64("height", blk.GetHeight()),
+				utils.ZapInt("anomaly_row_count", len(anomalyRows)))
+		}
+		if shouldSkipAnomalyPersistForDeadline(ctx, len(anomalyRows)) {
+			if a.logger != nil {
+				deadline, _ := ctx.Deadline()
+				a.logger.WarnContext(ctx, "skipping anomaly persistence to preserve durable policy commit budget",
+					utils.ZapUint64("height", blk.GetHeight()),
+					utils.ZapInt("anomaly_row_count", len(anomalyRows)),
+					utils.ZapDuration("estimated_budget", estimateAnomalyPersistBudget(len(anomalyRows))),
+					utils.ZapDuration("remaining", time.Until(deadline)))
+			}
+			if a.auditLogger != nil {
+				_ = a.auditLogger.Warn("anomaly_persist_skipped_due_to_deadline_budget", map[string]interface{}{
+					"height":          blk.GetHeight(),
+					"anomaly_rows":    len(anomalyRows),
+					"estimated_ms":    estimateAnomalyPersistBudget(len(anomalyRows)).Milliseconds(),
+					"commit_reserve":  anomalyPersistCommitReserve.Milliseconds(),
+					"persist_attempt": persistAttempt,
+				})
+			}
+			return nil
+		}
+		if err := a.upsertAnomalies(ctx, tx, anomalyRows); err != nil {
+			return fmt.Errorf("upsert anomalies: %w", err)
+		}
+	}
 	return nil
+}
+
+func (a *adapter) insertTxChunkAdaptive(ctx context.Context, tx *sql.Tx, chunk []persistedTxRecord) (map[[32]byte]struct{}, error) {
+	inserted := make(map[[32]byte]struct{}, len(chunk))
+	if len(chunk) == 0 {
+		return inserted, nil
+	}
+
+	args := make([]interface{}, 0, len(chunk)*15)
+	for _, rec := range chunk {
+		args = append(args,
+			rec.txHash[:],
+			rec.blockHeight,
+			rec.txIndex,
+			rec.txType,
+			rec.producerID,
+			rec.nonce,
+			rec.contentHash[:],
+			rec.algorithm,
+			rec.publicKey,
+			rec.signature,
+			rec.payloadJSON,
+			rec.custodyChain,
+			rec.status,
+			rec.errorMsg,
+			rec.submittedAt,
+		)
+	}
+
+	rows, err := tx.QueryContext(ctx, a.txInsertTemplate(len(chunk)), args...)
+	if err != nil {
+		if IsRetryable(err) && len(chunk) > 1 {
+			mid := len(chunk) / 2
+			left, leftErr := a.insertTxChunkAdaptive(ctx, tx, chunk[:mid])
+			if leftErr != nil {
+				return nil, leftErr
+			}
+			right, rightErr := a.insertTxChunkAdaptive(ctx, tx, chunk[mid:])
+			if rightErr != nil {
+				return nil, rightErr
+			}
+			for h := range left {
+				inserted[h] = struct{}{}
+			}
+			for h := range right {
+				inserted[h] = struct{}{}
+			}
+			return inserted, nil
+		}
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var b []byte
+		if scanErr := rows.Scan(&b); scanErr != nil {
+			return nil, fmt.Errorf("failed scanning inserted tx hash: %w", scanErr)
+		}
+		if len(b) != 32 {
+			return nil, fmt.Errorf("%w: inserted tx hash invalid length", ErrIntegrityViolation)
+		}
+		var h [32]byte
+		copy(h[:], b)
+		inserted[h] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed reading inserted tx hashes: %w", err)
+	}
+	return inserted, nil
 }
 
 func (a *adapter) verifyTxConflicts(ctx context.Context, tx *sql.Tx, blk *block.AppBlock, conflicts []persistedTxRecord) error {
@@ -2081,6 +2971,27 @@ func (a *adapter) verifyTxConflicts(ctx context.Context, tx *sql.Tx, blk *block.
 					a.metrics.observePersistDiagnosticSignal("verify_location_mismatch_entered")
 					a.metrics.observeTxLocationMismatch("upsert_transactions_verify_conflicts", kind)
 					a.metrics.observePersistIntegrityKind("location_mismatch_" + kind)
+				}
+				// Tolerate exact replay conflicts only when the tx is already anchored in an older block.
+				// This prevents stale/replayed transactions from fail-closing new block persistence while
+				// preserving fail-closed behavior for same-height or backward-location conflicts.
+				if ex.blockHeight < rec.blockHeight {
+					if a.metrics != nil {
+						a.metrics.observePersistDiagnosticSignal("verify_location_mismatch_replay_tolerated")
+					}
+					if a.logger != nil {
+						a.logger.Warn("transaction replay already anchored in prior block; keeping existing location",
+							utils.ZapString("tx_hash", fmt.Sprintf("%x", rec.txHash[:])),
+							utils.ZapUint64("incoming_block_height", rec.blockHeight),
+							utils.ZapInt("incoming_tx_index", rec.txIndex),
+							utils.ZapUint64("existing_block_height", ex.blockHeight),
+							utils.ZapInt("existing_tx_index", ex.txIndex),
+							utils.ZapString("mismatch_kind", kind))
+					}
+					if a.metrics != nil {
+						a.metrics.observePersistStage("upsert_transactions_verify_location_mismatch", time.Since(locationMismatchStart))
+					}
+					continue
 				}
 				if a.auditLogger != nil {
 					auditStart := time.Now()
@@ -2296,18 +3207,18 @@ func (a *adapter) loadBlockLocationDetails(ctx context.Context, tx *sql.Tx, heig
 	return fmt.Sprintf("%x", hashRaw), fmt.Sprintf("%x", proposerRaw)
 }
 
-func parsePolicyTrace(raw []byte) (string, int64, string, int64) {
+func parsePolicyTrace(raw []byte) (string, int64, string, int64, string) {
 	var payload map[string]interface{}
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return "", 0, "", 0
+		return "", 0, "", 0, ""
 	}
 
-	traceID, aiEventTsMs, sourceEventID, sourceEventTsMs := extractTraceFields(payload)
+	traceID, aiEventTsMs, sourceEventID, sourceEventTsMs, sentinelEventID := extractTraceFields(payload)
 
 	// Some publishers wrap effective policy payload under "params".
-	if (traceID == "" || aiEventTsMs <= 0 || sourceEventID == "" || sourceEventTsMs <= 0) && payload != nil {
+	if (traceID == "" || aiEventTsMs <= 0 || sourceEventID == "" || sourceEventTsMs <= 0 || sentinelEventID == "") && payload != nil {
 		if params, ok := payload["params"].(map[string]interface{}); ok {
-			pTraceID, pAiTs, pSourceID, pSourceTs := extractTraceFields(params)
+			pTraceID, pAiTs, pSourceID, pSourceTs, pSentinelEventID := extractTraceFields(params)
 			if traceID == "" {
 				traceID = pTraceID
 			}
@@ -2319,6 +3230,9 @@ func parsePolicyTrace(raw []byte) (string, int64, string, int64) {
 			}
 			if sourceEventTsMs <= 0 {
 				sourceEventTsMs = pSourceTs
+			}
+			if sentinelEventID == "" {
+				sentinelEventID = pSentinelEventID
 			}
 		}
 	}
@@ -2337,17 +3251,60 @@ func parsePolicyTrace(raw []byte) (string, int64, string, int64) {
 			sourceEventTsMs = 0
 		}
 	}
-	return traceID, aiEventTsMs, sourceEventID, sourceEventTsMs
+	return traceID, aiEventTsMs, sourceEventID, sourceEventTsMs, sentinelEventID
 }
 
-func extractTraceFields(payload map[string]interface{}) (string, int64, string, int64) {
+func parsePolicyRequestID(raw []byte) string {
+	var payload map[string]interface{}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return ""
+	}
+	requestID := extractRequestIDField(payload)
+	if requestID == "" && payload != nil {
+		if params, ok := payload["params"].(map[string]interface{}); ok {
+			requestID = extractRequestIDField(params)
+		}
+	}
+	return requestID
+}
+
+func parsePolicyCommandID(raw []byte) string {
+	var payload map[string]interface{}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return ""
+	}
+	commandID := extractCommandIDField(payload)
+	if commandID == "" && payload != nil {
+		if params, ok := payload["params"].(map[string]interface{}); ok {
+			commandID = extractCommandIDField(params)
+		}
+	}
+	return commandID
+}
+
+func parsePolicyWorkflowID(raw []byte) string {
+	var payload map[string]interface{}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return ""
+	}
+	workflowID := extractWorkflowIDField(payload)
+	if workflowID == "" && payload != nil {
+		if params, ok := payload["params"].(map[string]interface{}); ok {
+			workflowID = extractWorkflowIDField(params)
+		}
+	}
+	return workflowID
+}
+
+func extractTraceFields(payload map[string]interface{}) (string, int64, string, int64, string) {
 	if payload == nil {
-		return "", 0, "", 0
+		return "", 0, "", 0, ""
 	}
 	var traceID string
 	topLevelTraceID := extractString(payload, "trace_id")
 	qcRef := extractString(payload, "qc_reference")
 	sourceEventID := extractString(payload, "source_event_id")
+	sentinelEventID := extractString(payload, "sentinel_event_id")
 
 	var aiEventTsMs int64
 	var sourceEventTsMs int64
@@ -2367,6 +3324,9 @@ func extractTraceFields(payload map[string]interface{}) (string, int64, string, 
 		if sourceEventTsMs <= 0 {
 			sourceEventTsMs = extractInt64(metadata, "telemetry_event_ts_ms")
 		}
+		if sentinelEventID == "" {
+			sentinelEventID = extractString(metadata, "sentinel_event_id")
+		}
 	}
 
 	if trace, ok := payload["trace"].(map[string]interface{}); ok {
@@ -2382,6 +3342,9 @@ func extractTraceFields(payload map[string]interface{}) (string, int64, string, 
 		if sourceEventTsMs <= 0 {
 			sourceEventTsMs = extractInt64(trace, "source_event_ts_ms")
 		}
+		if sentinelEventID == "" {
+			sentinelEventID = extractString(trace, "sentinel_event_id")
+		}
 	}
 	if traceID == "" {
 		traceID = topLevelTraceID
@@ -2392,7 +3355,61 @@ func extractTraceFields(payload map[string]interface{}) (string, int64, string, 
 	if traceID == "" {
 		traceID = qcRef
 	}
-	return strings.TrimSpace(traceID), aiEventTsMs, strings.TrimSpace(sourceEventID), sourceEventTsMs
+	return strings.TrimSpace(traceID), aiEventTsMs, strings.TrimSpace(sourceEventID), sourceEventTsMs, strings.TrimSpace(sentinelEventID)
+}
+
+func extractRequestIDField(payload map[string]interface{}) string {
+	if payload == nil {
+		return ""
+	}
+	requestID := extractString(payload, "request_id")
+	if requestID == "" {
+		if metadata, ok := payload["metadata"].(map[string]interface{}); ok {
+			requestID = extractString(metadata, "request_id")
+		}
+	}
+	if requestID == "" {
+		if trace, ok := payload["trace"].(map[string]interface{}); ok {
+			requestID = extractString(trace, "request_id")
+		}
+	}
+	return strings.TrimSpace(requestID)
+}
+
+func extractCommandIDField(payload map[string]interface{}) string {
+	if payload == nil {
+		return ""
+	}
+	commandID := extractString(payload, "command_id")
+	if commandID == "" {
+		if metadata, ok := payload["metadata"].(map[string]interface{}); ok {
+			commandID = extractString(metadata, "command_id")
+		}
+	}
+	if commandID == "" {
+		if trace, ok := payload["trace"].(map[string]interface{}); ok {
+			commandID = extractString(trace, "command_id")
+		}
+	}
+	return strings.TrimSpace(commandID)
+}
+
+func extractWorkflowIDField(payload map[string]interface{}) string {
+	if payload == nil {
+		return ""
+	}
+	workflowID := extractString(payload, "workflow_id")
+	if workflowID == "" {
+		if metadata, ok := payload["metadata"].(map[string]interface{}); ok {
+			workflowID = extractString(metadata, "workflow_id")
+		}
+	}
+	if workflowID == "" {
+		if trace, ok := payload["trace"].(map[string]interface{}); ok {
+			workflowID = extractString(trace, "workflow_id")
+		}
+	}
+	return strings.TrimSpace(workflowID)
 }
 
 func extractString(m map[string]interface{}, key string) string {
@@ -2442,49 +3459,381 @@ func extractInt64(m map[string]interface{}, key string) int64 {
 	return 0
 }
 
+func policyOutboxSemanticFingerprint(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var payload any
+	if err := dec.Decode(&payload); err != nil {
+		return ""
+	}
+	var b strings.Builder
+	writePolicyFingerprintJSON(&b, payload, policySemanticFingerprintContext{atRoot: true})
+	return b.String()
+}
+
+func (a *adapter) derivePolicyOutboxDispatchShard(raw []byte) string {
+	shards := 1
+	dispatchMode := policyoutbox.DispatchShardTargetHashV1
+	mode := "off"
+	buckets := 1
+	if a != nil {
+		if a.perf.outboxDispatchShards > 0 {
+			shards = a.perf.outboxDispatchShards
+		}
+		if strings.TrimSpace(a.perf.outboxDispatchMode) != "" {
+			dispatchMode = a.perf.outboxDispatchMode
+		}
+		if strings.TrimSpace(a.perf.clusterShardingMode) != "" {
+			mode = a.perf.clusterShardingMode
+		}
+		if a.perf.clusterShardBuckets > 0 {
+			buckets = a.perf.clusterShardBuckets
+		}
+	}
+	return policyoutbox.DeriveDispatchShard(raw, shards, policyoutbox.RoutingOptions{
+		ClusterShardingMode: mode,
+		ClusterShardBuckets: buckets,
+		DispatchShardMode:   dispatchMode,
+	})
+}
+
+func writePolicyFingerprintJSON(b *strings.Builder, v any, ctx policySemanticFingerprintContext) {
+	switch val := v.(type) {
+	case nil:
+		b.WriteString("null")
+	case bool:
+		if val {
+			b.WriteString("true")
+		} else {
+			b.WriteString("false")
+		}
+	case string:
+		enc, _ := json.Marshal(val)
+		b.Write(enc)
+	case json.Number:
+		b.WriteString(val.String())
+	case float64:
+		enc, _ := json.Marshal(val)
+		b.Write(enc)
+	case int:
+		b.WriteString(strconv.Itoa(val))
+	case int64:
+		b.WriteString(strconv.FormatInt(val, 10))
+	case []interface{}:
+		b.WriteByte('[')
+		for i, item := range val {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			writePolicyFingerprintJSON(b, item, ctx)
+		}
+		b.WriteByte(']')
+	case map[string]interface{}:
+		keys := make([]string, 0, len(val))
+		for k := range val {
+			if skipPolicyFingerprintKey(k, ctx) {
+				continue
+			}
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		b.WriteByte('{')
+		for i, k := range keys {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			keyJSON, _ := json.Marshal(k)
+			b.Write(keyJSON)
+			b.WriteByte(':')
+			childCtx := policySemanticFingerprintContext{
+				inMetadata: ctx.inMetadata,
+				inTrace:    ctx.inTrace,
+				atRoot:     false,
+			}
+			if k == "metadata" {
+				childCtx.inMetadata = true
+			}
+			if k == "trace" {
+				childCtx.inTrace = true
+			}
+			writePolicyFingerprintJSON(b, val[k], childCtx)
+		}
+		b.WriteByte('}')
+	default:
+		enc, _ := json.Marshal(val)
+		b.Write(enc)
+	}
+}
+
+func skipPolicyFingerprintKey(key string, ctx policySemanticFingerprintContext) bool {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return true
+	}
+	switch key {
+	case "policy_id":
+		return true
+	case "trace_id":
+		return ctx.atRoot || ctx.inMetadata || ctx.inTrace
+	case "ai_event_ts_ms", "ai_event_timestamp_ms", "source_event_ts_ms", "telemetry_event_ts_ms":
+		return ctx.atRoot || ctx.inMetadata || ctx.inTrace
+	case "source_event_id", "telemetry_event_id", "sentinel_event_id":
+		return ctx.atRoot || ctx.inMetadata || ctx.inTrace
+	case "request_id":
+		return ctx.atRoot || ctx.inMetadata || ctx.inTrace
+	case "command_id":
+		return ctx.atRoot || ctx.inMetadata || ctx.inTrace
+	case "workflow_id":
+		return ctx.atRoot || ctx.inMetadata || ctx.inTrace
+	}
+	return false
+}
+
+func coalescePolicyOutboxInputs(rows []policyOutboxInput) []policyOutboxInput {
+	if len(rows) <= 1 {
+		return rows
+	}
+	sortedRows := append([]policyOutboxInput(nil), rows...)
+	sort.SliceStable(sortedRows, func(i, j int) bool {
+		if sortedRows[i].blockHeight != sortedRows[j].blockHeight {
+			return sortedRows[i].blockHeight < sortedRows[j].blockHeight
+		}
+		return sortedRows[i].txIndex < sortedRows[j].txIndex
+	})
+	coalesced := make([]policyOutboxInput, 0, len(rows))
+	seen := make(map[uint64]map[string]struct{}, len(rows))
+	for _, row := range sortedRows {
+		fp := policyOutboxSemanticFingerprint(row.payload)
+		if fp == "" {
+			coalesced = append(coalesced, row)
+			continue
+		}
+		blockSeen := seen[row.blockHeight]
+		if blockSeen == nil {
+			blockSeen = make(map[string]struct{})
+			seen[row.blockHeight] = blockSeen
+		}
+		if _, exists := blockSeen[fp]; exists {
+			continue
+		}
+		blockSeen[fp] = struct{}{}
+		coalesced = append(coalesced, row)
+	}
+	return coalesced
+}
+
+func boundedPhaseTimeoutFromP95(ctx context.Context, p95Ms float64, fallback, minBudget, maxBudget, reserve time.Duration) time.Duration {
+	target := fallback
+	if target <= 0 {
+		target = minBudget
+	}
+	if p95Ms > 0 && !math.IsNaN(p95Ms) && !math.IsInf(p95Ms, 0) {
+		adaptive := time.Duration((p95Ms*1.5)+100) * time.Millisecond
+		if adaptive > target {
+			target = adaptive
+		}
+	}
+	if target < minBudget {
+		target = minBudget
+	}
+	if maxBudget > 0 && target > maxBudget {
+		target = maxBudget
+	}
+	if ctx != nil {
+		if dl, ok := ctx.Deadline(); ok {
+			remaining := time.Until(dl) - reserve
+			if remaining <= 0 {
+				remaining = minBudget
+			}
+			if target > remaining {
+				target = remaining
+			}
+		}
+	}
+	if target < minBudget {
+		target = minBudget
+	}
+	if maxBudget > 0 && target > maxBudget {
+		target = maxBudget
+	}
+	return target
+}
+
+func (a *adapter) outboxUpsertBudget(ctx context.Context, rows int) time.Duration {
+	fallback := 1500 * time.Millisecond
+	if rows > 128 {
+		fallback = 2 * time.Second
+	}
+	p95Ms := 0.0
+	if a != nil && a.metrics != nil {
+		p95Ms = a.metrics.persistStageQuantile("upsert_transactions_outbox_batch", 0.95)
+	}
+	return boundedPhaseTimeoutFromP95(ctx, p95Ms, fallback, 500*time.Millisecond, 5*time.Second, 100*time.Millisecond)
+}
+
+func (a *adapter) outboxConflictVerifyBudget(ctx context.Context, rows int) time.Duration {
+	fallback := time.Second
+	if rows > 128 {
+		fallback = 1500 * time.Millisecond
+	}
+	p95Ms := 0.0
+	if a != nil && a.metrics != nil {
+		p95Ms = a.metrics.persistStageQuantile("upsert_transactions_verify_query", 0.95)
+	}
+	return boundedPhaseTimeoutFromP95(ctx, p95Ms, fallback, 400*time.Millisecond, 4*time.Second, 80*time.Millisecond)
+}
+
+func (a *adapter) semanticLookupBudget(ctx context.Context, keys int) time.Duration {
+	fallback := 900 * time.Millisecond
+	if keys > 128 {
+		fallback = 1200 * time.Millisecond
+	}
+	p95Ms := 0.0
+	if a != nil && a.metrics != nil {
+		p95Ms = a.metrics.persistStageQuantile("upsert_policy_outbox_semantic_lookup", 0.95)
+	}
+	return boundedPhaseTimeoutFromP95(ctx, p95Ms, fallback, 300*time.Millisecond, 3*time.Second, 80*time.Millisecond)
+}
+
 func (a *adapter) upsertPolicyOutbox(ctx context.Context, tx *sql.Tx, blockHeight uint64, blockTS int64, txTS int64, txIndex int, payload []byte, persistAttempt int) error {
 	if len(payload) == 0 {
 		return fmt.Errorf("%w: empty policy payload", ErrInvalidData)
 	}
 
 	ruleHash := sha256.Sum256(payload)
+	semanticKey := policyOutboxSemanticFingerprint(payload)
+	dispatchShard := a.derivePolicyOutboxDispatchShard(payload)
 	policyID := parsePolicyID(payload)
 	if policyID == "" {
 		policyID = "invalid:" + hex.EncodeToString(ruleHash[:8])
 	}
-	traceID, aiEventTsMs, sourceEventID, sourceEventTsMs := parsePolicyTrace(payload)
+	traceID, aiEventTsMs, sourceEventID, sourceEventTsMs, sentinelEventID := parsePolicyTrace(payload)
+	requestID := parsePolicyRequestID(payload)
+	commandID := parsePolicyCommandID(payload)
+	workflowID := parsePolicyWorkflowID(payload)
 	if aiEventTsMs <= 0 && txTS > 0 {
 		aiEventTsMs = txTS * 1000
 	}
 	if traceID == "" {
 		traceID = fmt.Sprintf("trace:%s:%s", policyID, hex.EncodeToString(ruleHash[:8]))
 	}
-
-	res, err := tx.ExecContext(ctx, `
+	var createdOutboxID string
+	insertCtx, insertCancel := context.WithTimeout(ctx, a.outboxUpsertBudget(ctx, 1))
+	err := tx.QueryRowContext(insertCtx, `
 		INSERT INTO control_policy_outbox (
-			block_height, block_ts, tx_index, policy_id, rule_hash, payload, trace_id, ai_event_ts_ms, source_event_id, source_event_ts_ms, status, next_retry_at, created_at, updated_at
+			block_height, block_ts, tx_index, policy_id, rule_hash, semantic_key, dispatch_shard, payload, request_id, command_id, workflow_id, trace_id, ai_event_ts_ms, source_event_id, source_event_ts_ms, sentinel_event_id, status, next_retry_at, created_at, updated_at
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), NULLIF($10, 0), 'pending', NOW(), NOW(), NOW()
+			$1, $2, $3, $4, $5, NULLIF($6, ''), NULLIF($7, ''), $8, NULLIF($9, ''), NULLIF($10, ''), NULLIF($11, ''), $12, $13, NULLIF($14, ''), NULLIF($15, 0), NULLIF($16, ''), 'pending', NOW(), NOW(), NOW()
 		)
-		ON CONFLICT (block_height, tx_index) DO NOTHING
-	`, blockHeight, blockTS, txIndex, policyID, ruleHash[:], payload, traceID, aiEventTsMs, sourceEventID, sourceEventTsMs)
-	if err != nil {
+		ON CONFLICT DO NOTHING
+		RETURNING id::STRING
+	`, blockHeight, blockTS, txIndex, policyID, ruleHash[:], semanticKey, dispatchShard, payload, requestID, commandID, workflowID, traceID, aiEventTsMs, sourceEventID, sourceEventTsMs, sentinelEventID).Scan(&createdOutboxID)
+	insertCancel()
+	if err == sql.ErrNoRows {
+		createdOutboxID = ""
+	} else if err != nil {
+		if a.metrics != nil && isTimeoutOrCanceledError(err) {
+			a.metrics.observePersistDiagnosticSignal("outbox_upsert_timeout")
+		}
 		return err
 	}
-	if rows, _ := res.RowsAffected(); rows > 0 {
+	if createdOutboxID != "" {
 		a.logPolicyStage(policyID, traceID, "t_outbox_row_created", time.Now().UnixMilli(), blockHeight, txIndex, persistAttempt)
+		if shouldSkipLifecycleAuditForDeadline(ctx, 1) {
+			if a.logger != nil {
+				deadline, _ := ctx.Deadline()
+				a.logger.WarnContext(ctx, "skipping lifecycle audit for created outbox row to preserve durable commit budget",
+					utils.ZapString("policy_id", policyID),
+					utils.ZapString("trace_id", traceID),
+					utils.ZapDuration("estimated_budget", estimateLifecycleAuditBudget(1)),
+					utils.ZapDuration("remaining", time.Until(deadline)))
+			}
+			if a.auditLogger != nil {
+				_ = a.auditLogger.Warn("lifecycle_audit_skipped_due_to_deadline_budget", map[string]interface{}{
+					"height":          blockHeight,
+					"tx_index":        txIndex,
+					"event_count":     1,
+					"estimated_ms":    estimateLifecycleAuditBudget(1).Milliseconds(),
+					"commit_reserve":  lifecycleAuditCommitReserve.Milliseconds(),
+					"persist_attempt": persistAttempt,
+				})
+			}
+			return nil
+		}
+		if _, auditErr := lifecycleaudit.InsertOutboxEvent(ctx, tx, lifecycleaudit.OutboxEvent{
+			ActionType:  lifecycleaudit.ActionPolicyCreated,
+			OutboxID:    createdOutboxID,
+			PolicyID:    policyID,
+			WorkflowID:  workflowID,
+			RequestID:   requestID,
+			ReasonCode:  "auto.policy_created",
+			ReasonText:  "durable outbox row created",
+			AfterStatus: "pending",
+		}); auditErr != nil {
+			if !lifecycleaudit.IsBestEffortErr(auditErr) {
+				return fmt.Errorf("insert lifecycle audit for created outbox row: %w", auditErr)
+			}
+			if a.logger != nil {
+				a.logger.WarnContext(ctx, "policy lifecycle audit degraded to best-effort for created outbox row",
+					utils.ZapError(auditErr),
+					utils.ZapString("policy_id", policyID),
+					utils.ZapString("trace_id", traceID))
+			}
+		}
 		return nil
 	}
 	var existingPolicyID string
 	var existingRuleHash []byte
-	err = tx.QueryRowContext(ctx, `
+	verifyCtx, verifyCancel := context.WithTimeout(ctx, a.outboxConflictVerifyBudget(ctx, 1))
+	err = tx.QueryRowContext(verifyCtx, `
 		SELECT policy_id, rule_hash
 		FROM control_policy_outbox
 		WHERE block_height = $1
 		  AND tx_index = $2
 	`, blockHeight, txIndex).Scan(&existingPolicyID, &existingRuleHash)
+	verifyCancel()
 	if err != nil {
+		if a.metrics != nil && isTimeoutOrCanceledError(err) {
+			a.metrics.observePersistDiagnosticSignal("outbox_conflict_verify_timeout")
+		}
 		if err == sql.ErrNoRows {
+			if semanticKey != "" {
+				activeRows, activeErr := a.lookupActivePolicyOutboxSemanticRows(ctx, tx, []string{semanticKey})
+				if activeErr != nil {
+					return fmt.Errorf("lookup active semantic outbox rows after conflict: %w", activeErr)
+				}
+				if activeRow, ok := activeRows[semanticKey]; ok {
+					refreshed, refreshErr := a.refreshActivePolicyOutboxRow(ctx, tx, activeRow, outboxPrepared{
+						blockHeight:     blockHeight,
+						blockTS:         blockTS,
+						txIndex:         txIndex,
+						policyID:        policyID,
+						ruleHash:        ruleHash,
+						semanticKey:     semanticKey,
+						dispatchShard:   dispatchShard,
+						payload:         payload,
+						requestID:       requestID,
+						commandID:       commandID,
+						workflowID:      workflowID,
+						traceID:         traceID,
+						aiEventTsMs:     aiEventTsMs,
+						sourceEventID:   sourceEventID,
+						sourceEventTsMs: sourceEventTsMs,
+						sentinelEventID: sentinelEventID,
+					}, persistAttempt)
+					if refreshErr != nil {
+						return refreshErr
+					}
+					if refreshed {
+						return nil
+					}
+					a.logPolicyStage(policyID, traceID, "t_outbox_row_reused", time.Now().UnixMilli(), blockHeight, txIndex, persistAttempt)
+					return nil
+				}
+			}
 			return fmt.Errorf("%w: missing outbox row after tx-identity conflict at height %d index %d", ErrIntegrityViolation, blockHeight, txIndex)
 		}
 		return fmt.Errorf("verify existing outbox row: %w", err)
@@ -2508,29 +3857,23 @@ func (a *adapter) upsertPolicyOutboxBatch(ctx context.Context, tx *sql.Tx, rows 
 	if chunkSize > maxUpsertBatchSize {
 		chunkSize = maxUpsertBatchSize
 	}
-	type outboxPrepared struct {
-		blockHeight     uint64
-		blockTS         int64
-		txIndex         int
-		policyID        string
-		ruleHash        [32]byte
-		payload         []byte
-		traceID         string
-		aiEventTsMs     int64
-		sourceEventID   string
-		sourceEventTsMs int64
-	}
+	rows = coalescePolicyOutboxInputs(rows)
 	prepared := make([]outboxPrepared, 0, len(rows))
 	for _, row := range rows {
 		if len(row.payload) == 0 {
 			return fmt.Errorf("%w: empty policy payload", ErrInvalidData)
 		}
 		ruleHash := sha256.Sum256(row.payload)
+		semanticKey := policyOutboxSemanticFingerprint(row.payload)
+		dispatchShard := a.derivePolicyOutboxDispatchShard(row.payload)
 		policyID := parsePolicyID(row.payload)
 		if policyID == "" {
 			policyID = "invalid:" + hex.EncodeToString(ruleHash[:8])
 		}
-		traceID, aiEventTsMs, sourceEventID, sourceEventTsMs := parsePolicyTrace(row.payload)
+		traceID, aiEventTsMs, sourceEventID, sourceEventTsMs, sentinelEventID := parsePolicyTrace(row.payload)
+		requestID := parsePolicyRequestID(row.payload)
+		commandID := parsePolicyCommandID(row.payload)
+		workflowID := parsePolicyWorkflowID(row.payload)
 		if aiEventTsMs <= 0 && row.txTS > 0 {
 			aiEventTsMs = row.txTS * 1000
 		}
@@ -2543,11 +3886,17 @@ func (a *adapter) upsertPolicyOutboxBatch(ctx context.Context, tx *sql.Tx, rows 
 			txIndex:         row.txIndex,
 			policyID:        policyID,
 			ruleHash:        ruleHash,
+			semanticKey:     semanticKey,
+			dispatchShard:   dispatchShard,
 			payload:         row.payload,
+			requestID:       requestID,
+			commandID:       commandID,
+			workflowID:      workflowID,
 			traceID:         traceID,
 			aiEventTsMs:     aiEventTsMs,
 			sourceEventID:   sourceEventID,
 			sourceEventTsMs: sourceEventTsMs,
+			sentinelEventID: sentinelEventID,
 		})
 	}
 
@@ -2560,7 +3909,6 @@ func (a *adapter) upsertPolicyOutboxBatch(ctx context.Context, tx *sql.Tx, rows 
 		ruleHash []byte
 	}
 	conflictsAll := make([]outboxPrepared, 0, len(prepared))
-
 	for start := 0; start < len(prepared); start += chunkSize {
 		end := start + chunkSize
 		if end > len(prepared) {
@@ -2568,104 +3916,401 @@ func (a *adapter) upsertPolicyOutboxBatch(ctx context.Context, tx *sql.Tx, rows 
 		}
 		chunk := prepared[start:end]
 
-		args := make([]interface{}, 0, len(chunk)*10)
+		args := make([]interface{}, 0, len(chunk)*16)
+		filteredChunk := make([]outboxPrepared, 0, len(chunk))
 		for _, row := range chunk {
+			filteredChunk = append(filteredChunk, row)
 			args = append(args,
 				row.blockHeight,
 				row.blockTS,
 				row.txIndex,
 				row.policyID,
 				row.ruleHash[:],
+				row.semanticKey,
+				row.dispatchShard,
 				row.payload,
+				row.requestID,
+				row.commandID,
+				row.workflowID,
 				row.traceID,
 				row.aiEventTsMs,
 				row.sourceEventID,
 				row.sourceEventTsMs,
+				row.sentinelEventID,
 			)
 		}
+		if len(filteredChunk) == 0 {
+			continue
+		}
 
-		inserted := make(map[outboxKey]struct{}, len(chunk))
-		rowsInserted, err := tx.QueryContext(ctx, a.outboxInsertTemplate(len(chunk)), args...)
+		inserted := make(map[outboxKey]string, len(filteredChunk))
+		insertCtx, insertCancel := context.WithTimeout(ctx, a.outboxUpsertBudget(ctx, len(filteredChunk)))
+		rowsInserted, err := tx.QueryContext(insertCtx, a.outboxInsertTemplate(len(filteredChunk)), args...)
 		if err != nil {
+			insertCancel()
+			if a.metrics != nil && isTimeoutOrCanceledError(err) {
+				a.metrics.observePersistDiagnosticSignal("outbox_upsert_timeout")
+			}
 			return err
 		}
 		for rowsInserted.Next() {
+			var outboxID string
 			var h uint64
 			var i int
-			if scanErr := rowsInserted.Scan(&h, &i); scanErr != nil {
+			if scanErr := rowsInserted.Scan(&outboxID, &h, &i); scanErr != nil {
 				rowsInserted.Close()
 				return fmt.Errorf("scan inserted outbox rows: %w", scanErr)
 			}
-			inserted[outboxKey{blockHeight: h, txIndex: i}] = struct{}{}
+			inserted[outboxKey{blockHeight: h, txIndex: i}] = outboxID
 		}
 		if err := rowsInserted.Err(); err != nil {
 			rowsInserted.Close()
+			insertCancel()
 			return fmt.Errorf("read inserted outbox rows: %w", err)
 		}
 		rowsInserted.Close()
+		insertCancel()
 
-		conflicts := make([]outboxPrepared, 0, len(chunk))
+		conflicts := make([]outboxPrepared, 0, len(filteredChunk))
+		lifecycleEvents := make([]lifecycleaudit.OutboxEvent, 0, len(filteredChunk))
 		nowMs := time.Now().UnixMilli()
-		for _, row := range chunk {
+		for _, row := range filteredChunk {
 			key := outboxKey{blockHeight: row.blockHeight, txIndex: row.txIndex}
-			if _, ok := inserted[key]; ok {
+			if outboxID, ok := inserted[key]; ok {
 				a.logPolicyStage(row.policyID, row.traceID, "t_outbox_row_created", nowMs, row.blockHeight, row.txIndex, persistAttempt)
+				lifecycleEvents = append(lifecycleEvents, lifecycleaudit.OutboxEvent{
+					ActionType:  lifecycleaudit.ActionPolicyCreated,
+					OutboxID:    outboxID,
+					PolicyID:    row.policyID,
+					WorkflowID:  row.workflowID,
+					RequestID:   row.requestID,
+					ReasonCode:  "auto.policy_created",
+					ReasonText:  "durable outbox row created",
+					AfterStatus: "pending",
+				})
 				continue
 			}
 			conflicts = append(conflicts, row)
 		}
+		if len(lifecycleEvents) > 0 {
+			if shouldSkipLifecycleAuditForDeadline(ctx, len(lifecycleEvents)) {
+				if a.logger != nil {
+					deadline, _ := ctx.Deadline()
+					a.logger.WarnContext(ctx, "skipping lifecycle audit for created outbox batch to preserve durable commit budget",
+						utils.ZapInt("batch_size", len(lifecycleEvents)),
+						utils.ZapDuration("estimated_budget", estimateLifecycleAuditBudget(len(lifecycleEvents))),
+						utils.ZapDuration("remaining", time.Until(deadline)))
+				}
+				if a.auditLogger != nil {
+					_ = a.auditLogger.Warn("lifecycle_audit_skipped_due_to_deadline_budget", map[string]interface{}{
+						"height":          chunk[0].blockHeight,
+						"event_count":     len(lifecycleEvents),
+						"estimated_ms":    estimateLifecycleAuditBudget(len(lifecycleEvents)).Milliseconds(),
+						"commit_reserve":  lifecycleAuditCommitReserve.Milliseconds(),
+						"persist_attempt": persistAttempt,
+					})
+				}
+			} else if err := lifecycleaudit.InsertOutboxEvents(ctx, tx, lifecycleEvents); err != nil {
+				if !lifecycleaudit.IsBestEffortErr(err) {
+					return fmt.Errorf("insert lifecycle audit for created outbox rows: %w", err)
+				}
+				if a.logger != nil {
+					a.logger.WarnContext(ctx, "policy lifecycle audit degraded to best-effort for created outbox batch",
+						utils.ZapError(err),
+						utils.ZapInt("batch_size", len(lifecycleEvents)))
+				}
+			}
+		}
 		conflictsAll = append(conflictsAll, conflicts...)
 	}
-	if len(conflictsAll) == 0 {
-		return nil
-	}
-	verifyChunkSize := maxUpsertBatchSize
-	for start := 0; start < len(conflictsAll); start += verifyChunkSize {
-		end := start + verifyChunkSize
-		if end > len(conflictsAll) {
-			end = len(conflictsAll)
-		}
-		chunk := conflictsAll[start:end]
-		verifyArgs := make([]interface{}, 0, len(chunk)*2)
-		for _, row := range chunk {
-			verifyArgs = append(verifyArgs, row.blockHeight, row.txIndex)
-		}
-		existing := make(map[outboxKey]existingOutbox, len(chunk))
-		verifyRows, err := tx.QueryContext(ctx, a.outboxVerifyTemplate(len(chunk)), verifyArgs...)
-		if err != nil {
-			return fmt.Errorf("verify existing outbox row: %w", err)
-		}
-		for verifyRows.Next() {
-			var h uint64
-			var idx int
-			var pid string
-			var rh []byte
-			if scanErr := verifyRows.Scan(&h, &idx, &pid, &rh); scanErr != nil {
+	if len(conflictsAll) > 0 {
+		verifyChunkSize := maxUpsertBatchSize
+		for start := 0; start < len(conflictsAll); start += verifyChunkSize {
+			end := start + verifyChunkSize
+			if end > len(conflictsAll) {
+				end = len(conflictsAll)
+			}
+			chunk := conflictsAll[start:end]
+			verifyArgs := make([]interface{}, 0, len(chunk)*2)
+			for _, row := range chunk {
+				verifyArgs = append(verifyArgs, row.blockHeight, row.txIndex)
+			}
+			existing := make(map[outboxKey]existingOutbox, len(chunk))
+			verifyCtx, verifyCancel := context.WithTimeout(ctx, a.outboxConflictVerifyBudget(ctx, len(chunk)))
+			verifyRows, err := tx.QueryContext(verifyCtx, a.outboxVerifyTemplate(len(chunk)), verifyArgs...)
+			if err != nil {
+				verifyCancel()
+				if a.metrics != nil && isTimeoutOrCanceledError(err) {
+					a.metrics.observePersistDiagnosticSignal("outbox_conflict_verify_timeout")
+				}
+				return fmt.Errorf("verify existing outbox row: %w", err)
+			}
+			for verifyRows.Next() {
+				var h uint64
+				var idx int
+				var pid string
+				var rh []byte
+				if scanErr := verifyRows.Scan(&h, &idx, &pid, &rh); scanErr != nil {
+					verifyRows.Close()
+					verifyCancel()
+					return fmt.Errorf("scan existing outbox row: %w", scanErr)
+				}
+				existing[outboxKey{blockHeight: h, txIndex: idx}] = existingOutbox{policyID: strings.TrimSpace(pid), ruleHash: rh}
+			}
+			if err := verifyRows.Err(); err != nil {
 				verifyRows.Close()
-				return fmt.Errorf("scan existing outbox row: %w", scanErr)
+				verifyCancel()
+				return fmt.Errorf("read existing outbox rows: %w", err)
 			}
-			existing[outboxKey{blockHeight: h, txIndex: idx}] = existingOutbox{policyID: strings.TrimSpace(pid), ruleHash: rh}
-		}
-		if err := verifyRows.Err(); err != nil {
 			verifyRows.Close()
-			return fmt.Errorf("read existing outbox rows: %w", err)
-		}
-		verifyRows.Close()
-		for _, row := range chunk {
-			key := outboxKey{blockHeight: row.blockHeight, txIndex: row.txIndex}
-			ex, ok := existing[key]
-			if !ok {
+			verifyCancel()
+			for _, row := range chunk {
+				key := outboxKey{blockHeight: row.blockHeight, txIndex: row.txIndex}
+				ex, ok := existing[key]
+				if ok {
+					if ex.policyID != row.policyID {
+						return fmt.Errorf("%w: outbox policy_id mismatch at height %d index %d", ErrIntegrityViolation, row.blockHeight, row.txIndex)
+					}
+					if !bytes.Equal(ex.ruleHash, row.ruleHash[:]) {
+						return fmt.Errorf("%w: outbox rule_hash mismatch at height %d index %d", ErrIntegrityViolation, row.blockHeight, row.txIndex)
+					}
+				}
+			}
+
+			missingSemanticKeys := make([]string, 0, len(chunk))
+			missingSemanticSeen := make(map[string]struct{}, len(chunk))
+			for _, row := range chunk {
+				key := outboxKey{blockHeight: row.blockHeight, txIndex: row.txIndex}
+				if _, ok := existing[key]; ok {
+					continue
+				}
+				semanticKey := strings.TrimSpace(row.semanticKey)
+				if semanticKey == "" {
+					continue
+				}
+				if _, seen := missingSemanticSeen[semanticKey]; seen {
+					continue
+				}
+				missingSemanticSeen[semanticKey] = struct{}{}
+				missingSemanticKeys = append(missingSemanticKeys, semanticKey)
+			}
+			activeMissingSemantic := make(map[string]activeSemanticOutboxRow)
+			if len(missingSemanticKeys) > 0 {
+				activeRows, activeErr := a.lookupActivePolicyOutboxSemanticRows(ctx, tx, missingSemanticKeys)
+				if activeErr != nil {
+					return fmt.Errorf("lookup active semantic outbox rows after batch conflict: %w", activeErr)
+				}
+				activeMissingSemantic = activeRows
+			}
+
+			for _, row := range chunk {
+				key := outboxKey{blockHeight: row.blockHeight, txIndex: row.txIndex}
+				if _, ok := existing[key]; ok {
+					continue
+				}
+				if row.semanticKey != "" {
+					if activeRow, present := activeMissingSemantic[row.semanticKey]; present {
+						refreshed, refreshErr := a.refreshActivePolicyOutboxRow(ctx, tx, activeRow, row, persistAttempt)
+						if refreshErr != nil {
+							return refreshErr
+						}
+						if refreshed {
+							continue
+						}
+						a.logPolicyStage(row.policyID, row.traceID, "t_outbox_row_reused", time.Now().UnixMilli(), row.blockHeight, row.txIndex, persistAttempt)
+						continue
+					}
+				}
 				return fmt.Errorf("%w: missing outbox row after tx-identity conflict at height %d index %d", ErrIntegrityViolation, row.blockHeight, row.txIndex)
-			}
-			if ex.policyID != row.policyID {
-				return fmt.Errorf("%w: outbox policy_id mismatch at height %d index %d", ErrIntegrityViolation, row.blockHeight, row.txIndex)
-			}
-			if !bytes.Equal(ex.ruleHash, row.ruleHash[:]) {
-				return fmt.Errorf("%w: outbox rule_hash mismatch at height %d index %d", ErrIntegrityViolation, row.blockHeight, row.txIndex)
 			}
 		}
 	}
 	return nil
+}
+
+func (a *adapter) lookupActivePolicyOutboxSemanticKeys(ctx context.Context, tx *sql.Tx, keys []string) (map[string]struct{}, error) {
+	rows, err := a.lookupActivePolicyOutboxSemanticRows(ctx, tx, keys)
+	if err != nil {
+		return nil, err
+	}
+	active := make(map[string]struct{})
+	for key := range rows {
+		active[key] = struct{}{}
+	}
+	return active, nil
+}
+
+func (a *adapter) lookupOutboxRowID(ctx context.Context, tx *sql.Tx, blockHeight uint64, txIndex int) (string, error) {
+	var id string
+	err := tx.QueryRowContext(ctx, `
+		SELECT id::STRING
+		FROM control_policy_outbox
+		WHERE block_height = $1
+		  AND tx_index = $2
+	`, blockHeight, txIndex).Scan(&id)
+	if err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+func (a *adapter) lookupActivePolicyOutboxSemanticRows(ctx context.Context, tx *sql.Tx, keys []string) (map[string]activeSemanticOutboxRow, error) {
+	active := make(map[string]activeSemanticOutboxRow)
+	if len(keys) == 0 {
+		return active, nil
+	}
+	start := time.Now()
+	args := make([]interface{}, 0, len(keys))
+	for _, key := range keys {
+		args = append(args, key)
+	}
+	lookupCtx, lookupCancel := context.WithTimeout(ctx, a.semanticLookupBudget(ctx, len(keys)))
+	rows, err := tx.QueryContext(lookupCtx, a.outboxActiveRowsTemplate(len(keys)), args...)
+	if err != nil {
+		lookupCancel()
+		if a.metrics != nil {
+			a.metrics.observePersistStage("upsert_policy_outbox_semantic_lookup", time.Since(start))
+			if isTimeoutOrCanceledError(err) {
+				a.metrics.observePersistDiagnosticSignal("outbox_semantic_lookup_timeout")
+			}
+		}
+		return nil, err
+	}
+	for rows.Next() {
+		var row activeSemanticOutboxRow
+		if scanErr := rows.Scan(&row.SemanticKey, &row.PolicyID, &row.RuleHash, &row.Status); scanErr != nil {
+			rows.Close()
+			lookupCancel()
+			return nil, fmt.Errorf("scan active semantic outbox row: %w", scanErr)
+		}
+		row.SemanticKey = strings.TrimSpace(row.SemanticKey)
+		row.PolicyID = strings.TrimSpace(row.PolicyID)
+		row.Status = strings.TrimSpace(strings.ToLower(row.Status))
+		if row.SemanticKey != "" {
+			active[row.SemanticKey] = row
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		lookupCancel()
+		if a.metrics != nil {
+			a.metrics.observePersistStage("upsert_policy_outbox_semantic_lookup", time.Since(start))
+			if isTimeoutOrCanceledError(err) {
+				a.metrics.observePersistDiagnosticSignal("outbox_semantic_lookup_timeout")
+			}
+		}
+		return nil, fmt.Errorf("read active semantic outbox rows: %w", err)
+	}
+	rows.Close()
+	lookupCancel()
+	if a.metrics != nil {
+		a.metrics.observePersistStage("upsert_policy_outbox_semantic_lookup", time.Since(start))
+	}
+	return active, nil
+}
+
+func (a *adapter) refreshActivePolicyOutboxRow(ctx context.Context, tx *sql.Tx, existing activeSemanticOutboxRow, incoming outboxPrepared, persistAttempt int) (bool, error) {
+	if strings.TrimSpace(incoming.semanticKey) == "" {
+		return false, nil
+	}
+	if existing.PolicyID == "" {
+		return false, nil
+	}
+	if bytes.Equal(existing.RuleHash, incoming.ruleHash[:]) {
+		return false, nil
+	}
+	if existing.Status == "publishing" {
+		return false, nil
+	}
+	res, err := tx.ExecContext(ctx, `
+		UPDATE control_policy_outbox
+		SET policy_id = $1,
+		    rule_hash = $2,
+		    payload = $3,
+		    request_id = NULLIF($4, ''),
+		    command_id = NULLIF($5, ''),
+		    workflow_id = NULLIF($6, ''),
+		    trace_id = $7,
+		    ai_event_ts_ms = $8,
+		    source_event_id = NULLIF($9, ''),
+		    source_event_ts_ms = NULLIF($10, 0),
+		    sentinel_event_id = NULLIF($11, ''),
+		    status = 'pending',
+		    retries = 0,
+		    next_retry_at = NOW(),
+		    last_error = NULL,
+		    lease_holder = NULL,
+		    lease_epoch = 0,
+		    kafka_topic = NULL,
+		    kafka_partition = NULL,
+		    kafka_offset = NULL,
+		    published_at = NULL,
+		    ack_result = NULL,
+		    ack_reason = NULL,
+		    ack_controller = NULL,
+		    acked_at = NULL,
+		    updated_at = NOW()
+		WHERE semantic_key = $12
+		  AND status IN ('pending', 'retry', 'published')
+	`, incoming.policyID, incoming.ruleHash[:], incoming.payload, incoming.requestID, incoming.commandID, incoming.workflowID, incoming.traceID, incoming.aiEventTsMs, incoming.sourceEventID, incoming.sourceEventTsMs, incoming.sentinelEventID, incoming.semanticKey)
+	if err != nil {
+		return false, fmt.Errorf("refresh active semantic outbox row: %w", err)
+	}
+	rows, rowsErr := res.RowsAffected()
+	if rowsErr != nil {
+		return false, fmt.Errorf("refresh active semantic outbox row rows affected: %w", rowsErr)
+	}
+	if rows == 0 {
+		return false, nil
+	}
+	a.logPolicyStage(incoming.policyID, incoming.traceID, "t_outbox_row_refreshed", time.Now().UnixMilli(), incoming.blockHeight, incoming.txIndex, persistAttempt)
+	return true, nil
+}
+
+func collectPolicyIDsFromMarkers(markers []policyStageMarker) []string {
+	if len(markers) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(markers))
+	seen := make(map[string]struct{}, len(markers))
+	for _, marker := range markers {
+		id := strings.TrimSpace(marker.policyID)
+		if id == "" || strings.HasPrefix(id, "invalid:") {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+func (a *adapter) refreshPolicyStateAsync(policyIDs []string, blockHeight uint64, persistAttempt int) {
+	if a == nil || a.db == nil || len(policyIDs) == 0 {
+		return
+	}
+	ids := append([]string(nil), policyIDs...)
+	go func() {
+		start := time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		err := policystate.RefreshMany(ctx, a.db, a.db, ids)
+		if a.metrics != nil {
+			a.metrics.observePersistStage("policy_state_refresh_async", time.Since(start))
+			if err != nil {
+				a.metrics.observePersistFailureClass("policy_state_refresh_async", err)
+			}
+		}
+		if err != nil && a.logger != nil {
+			a.logger.Warn("policy state async refresh failed",
+				utils.ZapError(err),
+				utils.ZapUint64("height", blockHeight),
+				utils.ZapInt("policy_count", len(ids)),
+				utils.ZapInt("persist_attempt", persistAttempt))
+		}
+	}()
 }
 
 func collectPolicyStageMarkers(blk *block.AppBlock) []policyStageMarker {
@@ -2687,7 +4332,7 @@ func collectPolicyStageMarkers(blk *block.AppBlock) []policyStageMarker {
 		if policyID == "" {
 			policyID = "invalid:" + hex.EncodeToString(ruleHash[:8])
 		}
-		traceID, _, _, _ := parsePolicyTrace(payload)
+		traceID, _, _, _, _ := parsePolicyTrace(payload)
 		if traceID == "" {
 			traceID = fmt.Sprintf("trace:%s:%s", policyID, hex.EncodeToString(ruleHash[:8]))
 		}
@@ -2751,7 +4396,7 @@ func (a *adapter) logPolicyStageFromPayload(payload []byte, stage string, tMs in
 		ruleHash := sha256.Sum256(payload)
 		policyID = "invalid:" + hex.EncodeToString(ruleHash[:8])
 	}
-	traceID, _, _, _ := parsePolicyTrace(payload)
+	traceID, _, _, _, _ := parsePolicyTrace(payload)
 	if traceID == "" {
 		ruleHash := sha256.Sum256(payload)
 		traceID = fmt.Sprintf("trace:%s:%s", policyID, hex.EncodeToString(ruleHash[:8]))
@@ -2899,7 +4544,11 @@ func (a *adapter) GetLatestHeight(ctx context.Context) (uint64, error) {
 
 	if err != nil {
 		if a.logger != nil {
-			a.logger.ErrorContext(ctx, "failed to get latest height", utils.ZapError(err))
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				a.logger.DebugContext(ctx, "latest height probe timed out", utils.ZapError(err))
+			} else {
+				a.logger.ErrorContext(ctx, "failed to get latest height", utils.ZapError(err))
+			}
 		}
 		return 0, fmt.Errorf("query latest height: %w", err)
 	}
@@ -3355,6 +5004,21 @@ func (m *dbMetrics) observePersistStage(label string, d time.Duration) {
 	}
 }
 
+func (m *dbMetrics) persistStageQuantile(label string, q float64) float64 {
+	if m == nil || label == "" {
+		return 0
+	}
+	val, ok := m.persistStages.Load(label)
+	if !ok {
+		return 0
+	}
+	sm, ok := val.(*stageMetric)
+	if !ok || sm.hist == nil {
+		return 0
+	}
+	return sm.hist.Quantile(q)
+}
+
 func (m *dbMetrics) observePersistFailureClass(stage string, err error) {
 	if m == nil || err == nil {
 		return
@@ -3678,6 +5342,24 @@ func classifyPersistError(err error) string {
 	default:
 		return "other"
 	}
+}
+
+func isTimeoutOrCanceledError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	state := extractSQLState(err)
+	if state == "57014" {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "context deadline exceeded") ||
+		strings.Contains(msg, "context canceled") ||
+		strings.Contains(msg, "query execution canceled") ||
+		strings.Contains(msg, "timeout")
 }
 
 func extractSQLState(err error) string {

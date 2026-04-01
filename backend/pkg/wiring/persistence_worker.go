@@ -1,17 +1,20 @@
 package wiring
 
 import (
+	"backend/pkg/consensus/messages"
+	ctypes "backend/pkg/consensus/types"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/fxamacker/cbor/v2"
 	"math/rand"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"backend/pkg/block"
-	ctypes "backend/pkg/consensus/types"
 	"backend/pkg/ingest/kafka"
 	"backend/pkg/state"
 	"backend/pkg/storage/cockroach"
@@ -19,13 +22,17 @@ import (
 	"github.com/google/uuid"
 )
 
-const maxCommitAnomalyIDs = 10000
+const (
+	maxCommitAnomalyIDs = 10000
+	maxAttemptTimeout   = 120 * time.Second
+)
 
 // PersistenceTask represents a block persistence task
 type PersistenceTask struct {
 	Block     *block.AppBlock
 	Receipts  []state.Receipt
 	StateRoot [32]byte
+	QCData    []byte
 	Attempt   int
 }
 
@@ -34,9 +41,37 @@ type persistenceTaskKey struct {
 	Hash   [32]byte
 }
 
+func encodeCommittedQC(qc ctypes.QC) ([]byte, error) {
+	if qc == nil {
+		return nil, nil
+	}
+	encMode, err := cbor.CanonicalEncOptions().EncMode()
+	if err != nil {
+		return nil, fmt.Errorf("init qc encoder: %w", err)
+	}
+	msgQC := &messages.QC{
+		View:         qc.GetView(),
+		Height:       qc.GetHeight(),
+		Round:        0,
+		BlockHash:    qc.GetBlockHash(),
+		Signatures:   append([]ctypes.Signature(nil), qc.GetSignatures()...),
+		Timestamp:    qc.GetTimestamp(),
+		AggregatorID: ctypes.ValidatorID{},
+	}
+	data, err := encMode.Marshal(msgQC)
+	if err != nil {
+		return nil, fmt.Errorf("marshal qc: %w", err)
+	}
+	return data, nil
+}
+
 // PersistenceSuccessCallback is called after successful block persistence
 // Used to trigger downstream actions like Kafka publishing
 type PersistenceSuccessCallback func(ctx context.Context, height uint64, hash [32]byte, stateRoot [32]byte, txCount int, ts int64, anomalyCount int, evidenceCount int, policyCount int, anomalyIDs []string, policyPayloads [][]byte)
+
+// PersistencePersistedCallback is called immediately after durable block persistence succeeds.
+// It is intended for low-latency wake signals (for example, outbox dispatcher notify).
+type PersistencePersistedCallback func(ctx context.Context, height uint64, txCount int)
 
 // PersistenceWorkerConfig holds configuration for the persistence worker
 type PersistenceWorkerConfig struct {
@@ -44,9 +79,11 @@ type PersistenceWorkerConfig struct {
 	RetryMax        int                        // Maximum retry attempts (default: 3)
 	RetryBackoffMS  int                        // Initial backoff in milliseconds (default: 100)
 	MaxBackoffMS    int                        // Maximum backoff in milliseconds (default: 5000)
+	AttemptTimeout  time.Duration              // Per-attempt DB persistence timeout (default: 25s)
 	WorkerCount     int                        // Number of concurrent workers (default: 1)
 	ShutdownTimeout time.Duration              // Graceful shutdown timeout (default: 30s)
 	OnSuccess       PersistenceSuccessCallback // Optional callback after successful persistence (for Kafka, etc.)
+	OnPersisted     PersistencePersistedCallback
 }
 
 // PersistenceWorker handles async block persistence with retry logic
@@ -70,6 +107,7 @@ type PersistenceWorker struct {
 	errorCount      uint64                     // Total errors
 	deduped         uint64                     // Duplicate enqueue requests coalesced
 	onSuccess       PersistenceSuccessCallback // Callback after successful persistence
+	onPersisted     PersistencePersistedCallback
 	inflight        map[persistenceTaskKey]struct{}
 	enqueueInFlight atomic.Int64
 
@@ -106,6 +144,12 @@ func NewPersistenceWorker(cfg PersistenceWorkerConfig, adapter cockroach.Adapter
 	if cfg.MaxBackoffMS <= 0 {
 		cfg.MaxBackoffMS = 5000
 	}
+	if cfg.AttemptTimeout <= 0 {
+		cfg.AttemptTimeout = 25 * time.Second
+	}
+	if cfg.AttemptTimeout > maxAttemptTimeout {
+		cfg.AttemptTimeout = maxAttemptTimeout
+	}
 	if cfg.WorkerCount <= 0 {
 		cfg.WorkerCount = 1
 	}
@@ -122,6 +166,7 @@ func NewPersistenceWorker(cfg PersistenceWorkerConfig, adapter cockroach.Adapter
 		stopCh:      make(chan struct{}),
 		running:     false,
 		onSuccess:   cfg.OnSuccess, // Store callback
+		onPersisted: cfg.OnPersisted,
 		inflight:    make(map[persistenceTaskKey]struct{}),
 	}
 
@@ -316,8 +361,9 @@ func (pw *PersistenceWorker) processTask(ctx context.Context, task *PersistenceT
 	maxBackoff := time.Duration(pw.cfg.MaxBackoffMS) * time.Millisecond
 
 	for attempt := task.Attempt; attempt < pw.cfg.RetryMax; attempt++ {
-		// Create timeout context for this attempt
-		attemptCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		// Create timeout context for this attempt. Timeout scales with block size
+		// to reduce false deadline failures before outbox materialization on burst blocks.
+		attemptCtx, cancel := context.WithTimeout(ctx, pw.effectiveAttemptTimeout(task, attempt))
 		attemptCtx = cockroach.WithPersistAttempt(attemptCtx, attempt+1)
 
 		err := pw.adapter.PersistBlock(attemptCtx, task.Block, task.Receipts, task.StateRoot)
@@ -330,7 +376,7 @@ func (pw *PersistenceWorker) processTask(ctx context.Context, task *PersistenceT
 			// Update consensus restart metadata only after durable block persistence.
 			// This prevents consensus_metadata from advancing ahead of the blocks table.
 			metaCtx, metaCancel := context.WithTimeout(ctx, 5*time.Second)
-			if merr := pw.adapter.SaveCommittedBlock(metaCtx, task.Block.GetHeight(), bh[:], nil); merr != nil {
+			if merr := pw.adapter.SaveCommittedBlock(metaCtx, task.Block.GetHeight(), bh[:], task.QCData); merr != nil {
 				if pw.logger != nil {
 					pw.logger.WarnContext(ctx, "failed to update consensus metadata after persistence",
 						utils.ZapError(merr),
@@ -345,6 +391,21 @@ func (pw *PersistenceWorker) processTask(ctx context.Context, task *PersistenceT
 				}
 			}
 			metaCancel()
+
+			if pw.onPersisted != nil {
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							if pw.logger != nil {
+								pw.logger.ErrorContext(ctx, "persistence persisted callback panic",
+									utils.ZapAny("panic", r),
+									utils.ZapUint64("height", task.Block.GetHeight()))
+							}
+						}
+					}()
+					pw.onPersisted(ctx, task.Block.GetHeight(), task.Block.GetTransactionCount())
+				}()
+			}
 
 			if pw.onSuccess != nil || pw.auditLogger != nil || pw.logger != nil {
 				go func() {
@@ -402,6 +463,7 @@ func (pw *PersistenceWorker) processTask(ctx context.Context, task *PersistenceT
 		// Fail closed on deterministic integrity/data violations.
 		if errors.Is(err, cockroach.ErrIntegrityViolation) || errors.Is(err, cockroach.ErrInvalidData) {
 			pw.incrementErrorCount()
+			pw.emitPolicyPersistFailure(ctx, task, attempt+1, err, "integrity")
 			if pw.auditLogger != nil {
 				bh := task.Block.GetHash()
 				_ = pw.auditLogger.Security("block_persist_integrity_violation", map[string]interface{}{
@@ -423,6 +485,7 @@ func (pw *PersistenceWorker) processTask(ctx context.Context, task *PersistenceT
 		// Retry only transient Cockroach/network errors.
 		if !cockroach.IsRetryable(err) {
 			pw.incrementErrorCount()
+			pw.emitPolicyPersistFailure(ctx, task, attempt+1, err, "non_retryable")
 			if pw.logger != nil {
 				pw.logger.ErrorContext(ctx, "non-retryable persistence failure",
 					utils.ZapError(err),
@@ -459,6 +522,7 @@ func (pw *PersistenceWorker) processTask(ctx context.Context, task *PersistenceT
 		} else {
 			// Final attempt failed
 			pw.incrementErrorCount()
+			pw.emitPolicyPersistFailure(ctx, task, attempt+1, err, "retry_exhausted")
 			if pw.auditLogger != nil {
 				bh := task.Block.GetHash()
 				_ = pw.auditLogger.Error("block_persist_failed_final", map[string]interface{}{
@@ -477,6 +541,53 @@ func (pw *PersistenceWorker) processTask(ctx context.Context, task *PersistenceT
 			return
 		}
 	}
+}
+
+func (pw *PersistenceWorker) effectiveAttemptTimeout(task *PersistenceTask, attempt int) time.Duration {
+	if pw == nil {
+		return 25 * time.Second
+	}
+	timeout := pw.cfg.AttemptTimeout
+	if timeout <= 0 {
+		timeout = 25 * time.Second
+	}
+	if task == nil || task.Block == nil {
+		if timeout > maxAttemptTimeout {
+			return maxAttemptTimeout
+		}
+		return timeout
+	}
+
+	txCount := task.Block.GetTransactionCount()
+	if txCount > 0 {
+		extraMs := txCount * 30
+		if extraMs > 45000 {
+			extraMs = 45000
+		}
+		timeout += time.Duration(extraMs) * time.Millisecond
+
+		policyCount := 0
+		for _, tx := range task.Block.Transactions() {
+			if tx != nil && tx.Type() == state.TxPolicy {
+				policyCount++
+			}
+		}
+		if policyCount > 0 {
+			policyExtraMs := policyCount * 120
+			if policyExtraMs > 60000 {
+				policyExtraMs = 60000
+			}
+			timeout += time.Duration(policyExtraMs) * time.Millisecond
+		}
+	}
+
+	if attempt >= pw.cfg.RetryMax-1 && pw.cfg.RetryMax > 1 {
+		timeout += 10 * time.Second
+	}
+	if timeout > maxAttemptTimeout {
+		timeout = maxAttemptTimeout
+	}
+	return timeout
 }
 
 // incrementTaskCount atomically increments task counter
@@ -695,6 +806,131 @@ func extractAnomalyID(data []byte, logger *utils.Logger) (string, bool) {
 	}
 
 	return id, true
+}
+
+func (pw *PersistenceWorker) emitPolicyPersistFailure(ctx context.Context, task *PersistenceTask, attempt int, err error, reason string) {
+	if pw == nil || task == nil || task.Block == nil {
+		return
+	}
+	ids := extractPolicyPersistIdentities(task.Block)
+	if len(ids) == 0 {
+		return
+	}
+	limit := len(ids)
+	if limit > 10 {
+		limit = 10
+	}
+	preview := make([]string, 0, limit)
+	for i := 0; i < limit; i++ {
+		preview = append(preview, ids[i].String())
+	}
+	if pw.logger != nil {
+		pw.logger.ErrorContext(ctx, "policy persistence materialization failed",
+			utils.ZapUint64("height", task.Block.GetHeight()),
+			utils.ZapInt("attempt", attempt),
+			utils.ZapString("reason", reason),
+			utils.ZapString("error", err.Error()),
+			utils.ZapInt("policy_count", len(ids)),
+			utils.ZapAny("policy_preview", preview))
+	}
+	if pw.auditLogger != nil {
+		_ = pw.auditLogger.Error("policy_persistence_materialization_failed", map[string]interface{}{
+			"height":        task.Block.GetHeight(),
+			"attempt":       attempt,
+			"reason":        reason,
+			"error":         err.Error(),
+			"policy_count":  len(ids),
+			"policy_sample": preview,
+		})
+	}
+}
+
+type policyPersistIdentity struct {
+	PolicyID string
+	TraceID  string
+}
+
+func (p policyPersistIdentity) String() string {
+	if p.TraceID == "" {
+		return p.PolicyID
+	}
+	return p.PolicyID + ":" + p.TraceID
+}
+
+func extractPolicyPersistIdentities(blk *block.AppBlock) []policyPersistIdentity {
+	if blk == nil {
+		return nil
+	}
+	txs := blk.Transactions()
+	if len(txs) == 0 {
+		return nil
+	}
+	ids := make([]policyPersistIdentity, 0, len(txs))
+	seen := make(map[string]struct{}, len(txs))
+	for _, tx := range txs {
+		if tx == nil || tx.Type() != state.TxPolicy {
+			continue
+		}
+		policyTx, ok := tx.(*state.PolicyTx)
+		if !ok || len(policyTx.Data) == 0 {
+			continue
+		}
+		policyID, traceID := parsePolicyIdentity(policyTx.Data)
+		if policyID == "" {
+			continue
+		}
+		key := policyID + "|" + traceID
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		ids = append(ids, policyPersistIdentity{
+			PolicyID: policyID,
+			TraceID:  traceID,
+		})
+	}
+	return ids
+}
+
+func parsePolicyIdentity(raw []byte) (string, string) {
+	if len(raw) == 0 {
+		return "", ""
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return "", ""
+	}
+	policyID := strings.TrimSpace(stringValueFromMap(root, "policy_id"))
+	traceID := strings.TrimSpace(stringValueFromMap(root, "trace_id"))
+	if traceID == "" {
+		if nested, ok := root["metadata"].(map[string]interface{}); ok {
+			traceID = strings.TrimSpace(stringValueFromMap(nested, "trace_id"))
+		}
+	}
+	if traceID == "" {
+		if nested, ok := root["trace"].(map[string]interface{}); ok {
+			traceID = strings.TrimSpace(stringValueFromMap(nested, "id"))
+		}
+	}
+	return policyID, traceID
+}
+
+func stringValueFromMap(m map[string]interface{}, key string) string {
+	if m == nil {
+		return ""
+	}
+	v, ok := m[key]
+	if !ok || v == nil {
+		return ""
+	}
+	switch t := v.(type) {
+	case string:
+		return t
+	case fmt.Stringer:
+		return t.String()
+	default:
+		return ""
+	}
 }
 
 func extractAnomalyIDFromJSON(data []byte) (string, error) {
