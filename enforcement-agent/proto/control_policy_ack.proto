@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package cybermesh.control.v1;
+
+option go_package = "backend/proto;pb";
+
+// PolicyAckEvent represents control.enforcement_ack.v1 produced by the enforcement agent
+message PolicyAckEvent {
+  string policy_id = 1;              // Policy unique identifier
+  string scope_identifier = 2;       // scope:<value> identifier used by controller
+  string tenant = 3;                 // Optional tenant identifier
+  string region = 4;                 // Optional region identifier
+  string result = 5;                 // "applied" | "failed"
+  string reason = 6;                 // Human readable reason
+  string error_code = 7;             // Machine readable error code
+  int64 applied_at = 8;              // Unix timestamp when apply finished (0 if not attempted)
+  int64 acked_at = 9;                // Unix timestamp when ACK emitted
+  string qc_reference = 10;          // Optional QC / approval reference id
+  string controller_instance = 11;   // Hostname or controller identifier
+  bool fast_path = 12;               // True if policy was evaluated for fast-path
+  bytes rule_hash = 13;              // Policy rule hash for idempotency
+  bytes producer_id = 14;            // Original backend producer id for traceability
+  int64 applied_at_ms = 15;          // Unix timestamp in milliseconds when apply finished (preferred when set)
+  int64 acked_at_ms = 16;            // Unix timestamp in milliseconds when ACK emitted (preferred when set)
+  string trace_id = 17;              // Optional propagated trace identifier
+  string source_event_id = 18;       // Optional original upstream source event identifier
+  string sentinel_event_id = 19;     // Optional Sentinel-owned analysis event identifier
+  string ack_event_id = 20;          // Optional immutable ACK event identifier
+  string request_id = 21;            // Optional originating API/plugin request identifier
+  string command_id = 22;            // Optional operator command identifier
+  string workflow_id = 23;           // Optional higher-level workflow identifier
+}
