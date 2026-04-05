@@ -80,6 +80,7 @@ type PersistenceWorkerConfig struct {
 	RetryBackoffMS  int                        // Initial backoff in milliseconds (default: 100)
 	MaxBackoffMS    int                        // Maximum backoff in milliseconds (default: 5000)
 	AttemptTimeout  time.Duration              // Per-attempt DB persistence timeout (default: 25s)
+	TotalBudget     time.Duration              // Total wall-clock budget per task across retries/backoff (default: 75s)
 	WorkerCount     int                        // Number of concurrent workers (default: 1)
 	ShutdownTimeout time.Duration              // Graceful shutdown timeout (default: 30s)
 	OnSuccess       PersistenceSuccessCallback // Optional callback after successful persistence (for Kafka, etc.)
@@ -118,6 +119,21 @@ type PersistenceWorker struct {
 	executeProposer             atomic.Uint64
 	executeNonProposer          atomic.Uint64
 	executeDroppedNonOwnerTotal atomic.Uint64
+	totalBudgetExhausted        atomic.Uint64
+	attemptTimeoutCapped        atomic.Uint64
+	onPersistedDelaySumMs       atomic.Uint64
+	onPersistedDelayCount       atomic.Uint64
+	metadataUpdateSumMs         atomic.Uint64
+	metadataUpdateCount         atomic.Uint64
+	metadataUpdateFailures      atomic.Uint64
+}
+
+type PersistenceWorkerTimingStats struct {
+	OnPersistedDelaySumMs  uint64
+	OnPersistedDelayCount  uint64
+	MetadataUpdateSumMs    uint64
+	MetadataUpdateCount    uint64
+	MetadataUpdateFailures uint64
 }
 
 // NewPersistenceWorker creates a new async persistence worker
@@ -149,6 +165,12 @@ func NewPersistenceWorker(cfg PersistenceWorkerConfig, adapter cockroach.Adapter
 	}
 	if cfg.AttemptTimeout > maxAttemptTimeout {
 		cfg.AttemptTimeout = maxAttemptTimeout
+	}
+	if cfg.TotalBudget <= 0 {
+		cfg.TotalBudget = 75 * time.Second
+	}
+	if cfg.TotalBudget > maxAttemptTimeout {
+		cfg.TotalBudget = maxAttemptTimeout
 	}
 	if cfg.WorkerCount <= 0 {
 		cfg.WorkerCount = 1
@@ -359,104 +381,50 @@ func (pw *PersistenceWorker) processTask(ctx context.Context, task *PersistenceT
 
 	backoff := time.Duration(pw.cfg.RetryBackoffMS) * time.Millisecond
 	maxBackoff := time.Duration(pw.cfg.MaxBackoffMS) * time.Millisecond
+	budgetDeadline := time.Time{}
+	if pw.cfg.TotalBudget > 0 {
+		budgetDeadline = time.Now().Add(pw.cfg.TotalBudget)
+	}
 
 	for attempt := task.Attempt; attempt < pw.cfg.RetryMax; attempt++ {
+		if !budgetDeadline.IsZero() && time.Until(budgetDeadline) <= 0 {
+			pw.totalBudgetExhausted.Add(1)
+			pw.incrementErrorCount()
+			errBudget := fmt.Errorf("persistence total budget exhausted")
+			pw.emitPolicyPersistFailure(ctx, task, attempt+1, errBudget, "total_budget_exhausted")
+			if pw.logger != nil {
+				pw.logger.ErrorContext(ctx, "persistence task total budget exhausted",
+					utils.ZapUint64("height", task.Block.GetHeight()),
+					utils.ZapInt("attempt", attempt+1),
+					utils.ZapDuration("total_budget", pw.cfg.TotalBudget))
+			}
+			return
+		}
+
 		// Create timeout context for this attempt. Timeout scales with block size
 		// to reduce false deadline failures before outbox materialization on burst blocks.
-		attemptCtx, cancel := context.WithTimeout(ctx, pw.effectiveAttemptTimeout(task, attempt))
+		attemptTimeout := pw.effectiveAttemptTimeout(task, attempt)
+		if !budgetDeadline.IsZero() {
+			if remaining := time.Until(budgetDeadline); remaining < attemptTimeout {
+				attemptTimeout = remaining
+				pw.attemptTimeoutCapped.Add(1)
+			}
+		}
+		if attemptTimeout <= 0 {
+			pw.totalBudgetExhausted.Add(1)
+			pw.incrementErrorCount()
+			errBudget := fmt.Errorf("persistence total budget exhausted")
+			pw.emitPolicyPersistFailure(ctx, task, attempt+1, errBudget, "total_budget_exhausted")
+			return
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
 		attemptCtx = cockroach.WithPersistAttempt(attemptCtx, attempt+1)
 
 		err := pw.adapter.PersistBlock(attemptCtx, task.Block, task.Receipts, task.StateRoot)
 		cancel()
 
 		if err == nil {
-			// Success - persistence completed
-			bh := task.Block.GetHash()
-
-			// Update consensus restart metadata only after durable block persistence.
-			// This prevents consensus_metadata from advancing ahead of the blocks table.
-			metaCtx, metaCancel := context.WithTimeout(ctx, 5*time.Second)
-			if merr := pw.adapter.SaveCommittedBlock(metaCtx, task.Block.GetHeight(), bh[:], task.QCData); merr != nil {
-				if pw.logger != nil {
-					pw.logger.WarnContext(ctx, "failed to update consensus metadata after persistence",
-						utils.ZapError(merr),
-						utils.ZapUint64("height", task.Block.GetHeight()))
-				}
-				if pw.auditLogger != nil {
-					_ = pw.auditLogger.Warn("consensus_metadata_update_failed", map[string]interface{}{
-						"height": task.Block.GetHeight(),
-						"hash":   fmt.Sprintf("%x", bh[:8]),
-						"error":  merr.Error(),
-					})
-				}
-			}
-			metaCancel()
-
-			if pw.onPersisted != nil {
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							if pw.logger != nil {
-								pw.logger.ErrorContext(ctx, "persistence persisted callback panic",
-									utils.ZapAny("panic", r),
-									utils.ZapUint64("height", task.Block.GetHeight()))
-							}
-						}
-					}()
-					pw.onPersisted(ctx, task.Block.GetHeight(), task.Block.GetTransactionCount())
-				}()
-			}
-
-			if pw.onSuccess != nil || pw.auditLogger != nil || pw.logger != nil {
-				go func() {
-					defer func() {
-						if r := recover(); r != nil {
-							if pw.logger != nil {
-								pw.logger.ErrorContext(ctx, "persistence success callback panic",
-									utils.ZapAny("panic", r),
-									utils.ZapUint64("height", task.Block.GetHeight()))
-							}
-						}
-					}()
-
-					meta := extractCommitMetadata(task.Block, pw.logger)
-
-					if pw.auditLogger != nil {
-						_ = pw.auditLogger.Info("block_persisted_async", map[string]interface{}{
-							"height":            task.Block.GetHeight(),
-							"hash":              fmt.Sprintf("%x", bh[:8]),
-							"attempts":          attempt + 1,
-							"state_root":        fmt.Sprintf("%x", task.StateRoot[:8]),
-							"anomaly_count":     meta.anomalyCount,
-							"evidence_count":    meta.evidenceCount,
-							"policy_count":      meta.policyCount,
-							"tracked_anomalies": len(meta.anomalyIDs),
-						})
-					}
-
-					if len(meta.anomalyIDs) == 0 && pw.logger != nil {
-						pw.logger.Debug("no anomaly ids extracted for commit metadata",
-							utils.ZapUint64("height", task.Block.GetHeight()),
-							utils.ZapInt("anomaly_count", meta.anomalyCount))
-					}
-
-					if pw.onSuccess == nil {
-						return
-					}
-
-					pw.onSuccess(ctx, task.Block.GetHeight(), bh, task.StateRoot, task.Block.GetTransactionCount(), task.Block.GetTimestamp().Unix(), meta.anomalyCount, meta.evidenceCount, meta.policyCount, meta.anomalyIDs, meta.policyPayloads)
-				}()
-			}
-
-			if pw.auditLogger != nil && pw.onSuccess == nil {
-				_ = pw.auditLogger.Info("block_persisted_async", map[string]interface{}{
-					"height":     task.Block.GetHeight(),
-					"hash":       fmt.Sprintf("%x", bh[:8]),
-					"attempts":   attempt + 1,
-					"state_root": fmt.Sprintf("%x", task.StateRoot[:8]),
-				})
-			}
-
+			pw.handlePersistSuccess(ctx, task, attempt+1)
 			return
 		}
 
@@ -497,8 +465,19 @@ func (pw *PersistenceWorker) processTask(ctx context.Context, task *PersistenceT
 
 		// Transient error, retry with backoff
 		if attempt < pw.cfg.RetryMax-1 {
+			retryDelay := withRetryJitter(backoff)
+			if !budgetDeadline.IsZero() {
+				if remaining := time.Until(budgetDeadline); remaining <= 0 {
+					pw.totalBudgetExhausted.Add(1)
+					pw.incrementErrorCount()
+					errBudget := fmt.Errorf("persistence total budget exhausted")
+					pw.emitPolicyPersistFailure(ctx, task, attempt+1, errBudget, "total_budget_exhausted")
+					return
+				} else if retryDelay > remaining {
+					retryDelay = remaining
+				}
+			}
 			if pw.logger != nil {
-				retryDelay := withRetryJitter(backoff)
 				pw.logger.WarnContext(ctx, "persistence failed, retrying",
 					utils.ZapError(err),
 					utils.ZapUint64("height", task.Block.GetHeight()),
@@ -508,7 +487,6 @@ func (pw *PersistenceWorker) processTask(ctx context.Context, task *PersistenceT
 					return
 				}
 			} else {
-				retryDelay := withRetryJitter(backoff)
 				if !waitForRetry(ctx, pw.stopCh, retryDelay) {
 					return
 				}
@@ -540,6 +518,105 @@ func (pw *PersistenceWorker) processTask(ctx context.Context, task *PersistenceT
 			}
 			return
 		}
+	}
+}
+
+func (pw *PersistenceWorker) handlePersistSuccess(ctx context.Context, task *PersistenceTask, attempts int) {
+	if pw == nil || task == nil || task.Block == nil {
+		return
+	}
+	bh := task.Block.GetHash()
+	persistedAt := time.Now()
+
+	// Notify latency-sensitive callbacks immediately after durable PersistBlock.
+	// Metadata update remains best-effort and should not delay dispatcher wake.
+	if pw.onPersisted != nil {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					if pw.logger != nil {
+						pw.logger.ErrorContext(ctx, "persistence persisted callback panic",
+							utils.ZapAny("panic", r),
+							utils.ZapUint64("height", task.Block.GetHeight()))
+					}
+				}
+			}()
+			pw.onPersistedDelaySumMs.Add(uint64(time.Since(persistedAt) / time.Millisecond))
+			pw.onPersistedDelayCount.Add(1)
+			pw.onPersisted(ctx, task.Block.GetHeight(), task.Block.GetTransactionCount())
+		}()
+	}
+
+	// Update consensus restart metadata after durability; failures are logged/audited.
+	metaStart := time.Now()
+	metaCtx, metaCancel := context.WithTimeout(ctx, 5*time.Second)
+	if merr := pw.adapter.SaveCommittedBlock(metaCtx, task.Block.GetHeight(), bh[:], task.QCData); merr != nil {
+		pw.metadataUpdateFailures.Add(1)
+		if pw.logger != nil {
+			pw.logger.WarnContext(ctx, "failed to update consensus metadata after persistence",
+				utils.ZapError(merr),
+				utils.ZapUint64("height", task.Block.GetHeight()))
+		}
+		if pw.auditLogger != nil {
+			_ = pw.auditLogger.Warn("consensus_metadata_update_failed", map[string]interface{}{
+				"height": task.Block.GetHeight(),
+				"hash":   fmt.Sprintf("%x", bh[:8]),
+				"error":  merr.Error(),
+			})
+		}
+	}
+	metaCancel()
+	pw.metadataUpdateSumMs.Add(uint64(time.Since(metaStart) / time.Millisecond))
+	pw.metadataUpdateCount.Add(1)
+
+	if pw.onSuccess != nil || pw.auditLogger != nil || pw.logger != nil {
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					if pw.logger != nil {
+						pw.logger.ErrorContext(ctx, "persistence success callback panic",
+							utils.ZapAny("panic", r),
+							utils.ZapUint64("height", task.Block.GetHeight()))
+					}
+				}
+			}()
+
+			meta := extractCommitMetadata(task.Block, pw.logger)
+
+			if pw.auditLogger != nil {
+				_ = pw.auditLogger.Info("block_persisted_async", map[string]interface{}{
+					"height":            task.Block.GetHeight(),
+					"hash":              fmt.Sprintf("%x", bh[:8]),
+					"attempts":          attempts,
+					"state_root":        fmt.Sprintf("%x", task.StateRoot[:8]),
+					"anomaly_count":     meta.anomalyCount,
+					"evidence_count":    meta.evidenceCount,
+					"policy_count":      meta.policyCount,
+					"tracked_anomalies": len(meta.anomalyIDs),
+				})
+			}
+
+			if len(meta.anomalyIDs) == 0 && pw.logger != nil {
+				pw.logger.Debug("no anomaly ids extracted for commit metadata",
+					utils.ZapUint64("height", task.Block.GetHeight()),
+					utils.ZapInt("anomaly_count", meta.anomalyCount))
+			}
+
+			if pw.onSuccess == nil {
+				return
+			}
+
+			pw.onSuccess(ctx, task.Block.GetHeight(), bh, task.StateRoot, task.Block.GetTransactionCount(), task.Block.GetTimestamp().Unix(), meta.anomalyCount, meta.evidenceCount, meta.policyCount, meta.anomalyIDs, meta.policyPayloads)
+		}()
+	}
+
+	if pw.auditLogger != nil && pw.onSuccess == nil {
+		_ = pw.auditLogger.Info("block_persisted_async", map[string]interface{}{
+			"height":     task.Block.GetHeight(),
+			"hash":       fmt.Sprintf("%x", bh[:8]),
+			"attempts":   attempts,
+			"state_root": fmt.Sprintf("%x", task.StateRoot[:8]),
+		})
 	}
 }
 
@@ -624,6 +701,8 @@ func (pw *PersistenceWorker) GetStats() map[string]interface{} {
 		"execute_proposer":            pw.executeProposer.Load(),
 		"execute_non_proposer":        pw.executeNonProposer.Load(),
 		"execute_dropped_non_owner":   pw.executeDroppedNonOwnerTotal.Load(),
+		"total_budget_exhausted":      pw.totalBudgetExhausted.Load(),
+		"attempt_timeout_capped":      pw.attemptTimeoutCapped.Load(),
 		"writer_policy_proposer_only": writerProposerOnly,
 		"writer_policy_is_configured": writerPolicyConfigured,
 	}
@@ -645,6 +724,33 @@ func (pw *PersistenceWorker) GetExecutionStats() (uint64, uint64, uint64) {
 		return 0, 0, 0
 	}
 	return pw.executeProposer.Load(), pw.executeNonProposer.Load(), pw.executeDroppedNonOwnerTotal.Load()
+}
+
+func (pw *PersistenceWorker) GetBudgetStats() (uint64, uint64) {
+	if pw == nil {
+		return 0, 0
+	}
+	return pw.totalBudgetExhausted.Load(), pw.attemptTimeoutCapped.Load()
+}
+
+func (pw *PersistenceWorker) GetQueueStats() (int, int) {
+	if pw == nil {
+		return 0, 0
+	}
+	return len(pw.queue), cap(pw.queue)
+}
+
+func (pw *PersistenceWorker) GetTimingStats() PersistenceWorkerTimingStats {
+	if pw == nil {
+		return PersistenceWorkerTimingStats{}
+	}
+	return PersistenceWorkerTimingStats{
+		OnPersistedDelaySumMs:  pw.onPersistedDelaySumMs.Load(),
+		OnPersistedDelayCount:  pw.onPersistedDelayCount.Load(),
+		MetadataUpdateSumMs:    pw.metadataUpdateSumMs.Load(),
+		MetadataUpdateCount:    pw.metadataUpdateCount.Load(),
+		MetadataUpdateFailures: pw.metadataUpdateFailures.Load(),
+	}
 }
 
 func (pw *PersistenceWorker) shouldExecuteTask(task *PersistenceTask) (bool, string, string) {

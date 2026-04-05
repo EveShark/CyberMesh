@@ -27,6 +27,7 @@ from ..feedback.tracker import AnomalyLifecycleTracker
 from .policy_emitter import PolicyContext, build_policy_candidate
 from .policy_aggregation import PolicyAggregationManager
 from .fast_mitigation import decide_fast_mitigation
+from .app_events_policy_pack import AppEventsPolicyPack, AppEventsPolicyDecision
 from .publisher import MessagePublisher
 from ..utils.errors import StorageError, ValidationError
 from ..utils.metrics import get_metrics_collector
@@ -152,6 +153,11 @@ class SentinelKafkaAdapter:
         self._policy_aggregator = policy_aggregator
         if self._policy_aggregator is None and self._policy_cfg is not None:
             self._policy_aggregator = PolicyAggregationManager(self._policy_cfg)
+        self._app_events_pack = AppEventsPolicyPack.from_env()
+        self._app_events_policy_bypass_clean_enabled = _env_bool(
+            "APP_EVENTS_POLICY_BYPASS_CLEAN_ENABLED",
+            False,
+        )
         self._service_metrics = get_metrics_collector()
         self._validator_ip_map = dict(getattr(settings, "sentinel_validator_ip_map", {}) or {})
 
@@ -175,6 +181,11 @@ class SentinelKafkaAdapter:
             "policy_skipped_threshold": 0,
             "policy_enqueued": 0,
             "policy_queue_overflow_sync": 0,
+            "app_events_detected": 0,
+            "app_events_promoted": 0,
+            "app_events_suppressed": 0,
+            "app_events_no_match": 0,
+            "clean_bypassed_for_app_events": 0,
             "commit_batches": 0,
             "commit_errors": 0,
         }
@@ -197,6 +208,17 @@ class SentinelKafkaAdapter:
     def _metrics_snapshot(self) -> Dict[str, int]:
         with self._metrics_lock:
             return dict(self._metrics)
+
+    def get_metrics(self) -> Dict[str, Any]:
+        return {
+            "enabled": self._cfg.enabled,
+            "mode": self._cfg.mode,
+            "topic": self._cfg.input_topic,
+            "policy_enabled": self._cfg.policy_enabled,
+            "app_events_policy_pack_enabled": self._app_events_pack.enabled,
+            "app_events_policy_bypass_clean_enabled": self._app_events_policy_bypass_clean_enabled,
+            "metrics": self._metrics_snapshot(),
+        }
 
     def start(self) -> None:
         if not self._cfg.enabled or self._running:
@@ -397,8 +419,35 @@ class SentinelKafkaAdapter:
 
             threat_level = self._normalize_threat_level_value(analysis.get("threat_level"))
             if threat_level in ("clean", "unknown", ""):
-                handle_status = "skipped"
-                self._metric_inc("skipped_clean")
+                bypassed = False
+                if (
+                    self._cfg.policy_enabled
+                    and self._app_events_pack.enabled
+                    and self._app_events_policy_bypass_clean_enabled
+                ):
+                    bypassed = self._maybe_publish_policy(
+                        event_id=event_id,
+                        anomaly_id=self._deterministic_uuid4_from_seed(event_id),
+                        anomaly_type=self._map_anomaly_type(analysis, envelope=envelope),
+                        severity=self._map_severity(analysis),
+                        confidence=self._safe_float(analysis.get("confidence"), default=0.5),
+                        envelope=envelope,
+                        ai_consume_ts_ms=ai_consume_ts_ms,
+                    )
+                if bypassed:
+                    handle_status = "app_events_bypass"
+                    self._metric_inc("clean_bypassed_for_app_events")
+                    try:
+                        self._service_metrics.record_service_operation(
+                            "sentinel_handle_clean_bypassed_for_app_events",
+                            0.0,
+                            status="ok",
+                        )
+                    except Exception:
+                        self._logger.debug("Failed to record app-events clean bypass metric", exc_info=True)
+                else:
+                    handle_status = "skipped"
+                    self._metric_inc("skipped_clean")
                 return
 
             anomaly_type = self._map_anomaly_type(analysis, envelope=envelope)
@@ -632,20 +681,19 @@ class SentinelKafkaAdapter:
         confidence: float,
         envelope: Dict[str, Any],
         ai_consume_ts_ms: int,
-    ) -> None:
+    ) -> bool:
         if not self._cfg.policy_enabled or self._cfg.mode != "prod":
-            return
+            return False
 
         payload = envelope.get("payload") if isinstance(envelope, dict) else {}
         analysis = payload.get("analysis") if isinstance(payload, dict) else {}
         findings = analysis.get("findings") if isinstance(analysis, dict) else []
         if not isinstance(findings, list):
             findings = []
-
-        network_context = self._extract_network_context(payload, findings)
         labels = envelope.get("labels") if isinstance(envelope, dict) else None
         if not isinstance(labels, dict):
             labels = {}
+        network_context = self._extract_network_context(payload, findings, labels=labels)
         label_source_event_id = labels.get("source_event_id") or labels.get("trace_id") or ""
         if label_source_event_id and not network_context.get("source_event_id"):
             network_context["source_event_id"] = label_source_event_id
@@ -701,6 +749,57 @@ class SentinelKafkaAdapter:
             network_context=network_context,
             metadata=metadata,
         )
+        app_events_decision = self._evaluate_app_events_policy_pack(
+            context=context,
+            envelope=envelope,
+            labels=labels,
+            metadata=metadata,
+        )
+        app_events_applies = app_events_decision.applies
+        if app_events_decision.applies:
+            metadata["app_events"] = {
+                "signal": app_events_decision.signal,
+                "count_in_window": app_events_decision.count_in_window,
+                "threshold": app_events_decision.threshold,
+                "entity_key": app_events_decision.entity_key,
+                "recommended_action": app_events_decision.recommended_action,
+                "critical": app_events_decision.is_critical,
+            }
+            metadata["control_action_recommendation"] = app_events_decision.recommended_action
+            if app_events_decision.should_suppress:
+                self._metric_inc("policy_skipped")
+                self._metric_inc("app_events_suppressed")
+                self._logger.info(
+                    "Sentinel policy suppressed by app-events cooldown",
+                    extra={
+                        "event_id": event_id,
+                        "anomaly_id": anomaly_id,
+                        "signal": app_events_decision.signal,
+                        "reason": app_events_decision.suppress_reason or "app_events_cooldown",
+                        "entity_key": app_events_decision.entity_key,
+                    },
+                )
+                return app_events_applies
+            severity = app_events_decision.effective_severity
+            confidence = app_events_decision.effective_confidence
+            context = PolicyContext(
+                anomaly_id=anomaly_id,
+                anomaly_type=anomaly_type,
+                severity=severity,
+                confidence=confidence,
+                network_context=network_context,
+                metadata=metadata,
+            )
+            self._metric_inc("app_events_promoted")
+            try:
+                self._service_metrics.record_service_operation(
+                    f"app_events_policy_pack_{app_events_decision.signal}",
+                    0.0,
+                    status="ok",
+                )
+            except Exception:
+                self._logger.debug("Failed to record app-events policy metric", exc_info=True)
+
         decision = build_policy_candidate(context, self._policy_cfg)
 
         if decision.candidate is None:
@@ -723,9 +822,12 @@ class SentinelKafkaAdapter:
                     "min_confidence": decision.effective_confidence_threshold,
                 },
             )
-            return
+            return app_events_applies
 
         candidate = decision.candidate
+        # Preserve adapter-side metadata enrichments that are not owned by
+        # policy_emitter's canonical metadata builder.
+        self._merge_runtime_policy_metadata(candidate_payload=candidate.payload, metadata=metadata)
         aggregation_metadata = None
         aggregation = None
         if self._policy_aggregator is not None:
@@ -742,7 +844,7 @@ class SentinelKafkaAdapter:
                         "policy_id": candidate.policy_id,
                     },
                 )
-                return
+                return app_events_applies
             if aggregation.policy_id and aggregation.policy_id != candidate.policy_id:
                 aggregation_metadata = {
                     "mode": aggregation.mode,
@@ -759,8 +861,9 @@ class SentinelKafkaAdapter:
                 )
                 if decision.candidate is None:
                     self._metric_inc("policy_skipped")
-                    return
+                    return app_events_applies
                 candidate = decision.candidate
+                self._merge_runtime_policy_metadata(candidate_payload=candidate.payload, metadata=metadata)
             elif aggregation.mode != "publish_new":
                 aggregation_metadata = {
                     "mode": aggregation.mode,
@@ -835,12 +938,13 @@ class SentinelKafkaAdapter:
             try:
                 self._policy_publish_queue.put_nowait(task)
                 self._metric_inc("policy_enqueued")
-                return
+                return app_events_applies
             except queue.Full:
                 # Preserve correctness over throughput: fallback to synchronous publish.
                 self._metric_inc("policy_queue_overflow_sync")
 
         self._publish_policy_task(task)
+        return app_events_applies
 
     def _publish_policy_task(self, task: Dict[str, Any]) -> None:
         publish_start = time.monotonic()
@@ -915,6 +1019,60 @@ class SentinelKafkaAdapter:
         except Exception:
             self._logger.debug("Failed to record sentinel policy publish metric", exc_info=True)
 
+    def _evaluate_app_events_policy_pack(
+        self,
+        *,
+        context: PolicyContext,
+        envelope: Dict[str, Any],
+        labels: Dict[str, Any],
+        metadata: Dict[str, Any],
+    ) -> AppEventsPolicyDecision:
+        if not self._app_events_pack.enabled:
+            self._metric_inc("app_events_no_match")
+            return AppEventsPolicyDecision(
+                matched=False,
+                signal="",
+                threshold=0,
+                count_in_window=0,
+                effective_severity=context.severity,
+                effective_confidence=context.confidence,
+                recommended_action="",
+                should_suppress=False,
+                suppress_reason="disabled",
+                entity_key="",
+                is_critical=False,
+            )
+
+        decision = self._app_events_pack.evaluate(
+            labels=labels if isinstance(labels, dict) else {},
+            metadata=metadata if isinstance(metadata, dict) else {},
+            network_context=context.network_context if isinstance(context.network_context, dict) else {},
+            anomaly_type=context.anomaly_type,
+            severity=context.severity,
+            confidence=context.confidence,
+        )
+        if decision.applies:
+            self._metric_inc("app_events_detected")
+        else:
+            self._metric_inc("app_events_no_match")
+        return decision
+
+    @staticmethod
+    def _merge_runtime_policy_metadata(*, candidate_payload: Dict[str, Any], metadata: Dict[str, Any]) -> None:
+        if not isinstance(candidate_payload, dict) or not isinstance(metadata, dict):
+            return
+        payload_metadata = candidate_payload.get("metadata")
+        if not isinstance(payload_metadata, dict):
+            payload_metadata = {}
+            candidate_payload["metadata"] = payload_metadata
+        if "app_events" in metadata:
+            app_events = metadata.get("app_events")
+            if isinstance(app_events, dict):
+                payload_metadata["app_events"] = dict(app_events)
+        recommendation = metadata.get("control_action_recommendation")
+        if isinstance(recommendation, str) and recommendation.strip():
+            payload_metadata["control_action_recommendation"] = recommendation.strip()
+
     @staticmethod
     def _map_severity(analysis: Dict[str, Any]) -> int:
         score = SentinelKafkaAdapter._safe_float(analysis.get("final_score"), default=0.5)
@@ -940,7 +1098,12 @@ class SentinelKafkaAdapter:
         return source[:256]
 
     @staticmethod
-    def _extract_network_context(payload: Any, findings: list[Dict[str, Any]]) -> Dict[str, Any]:
+    def _extract_network_context(
+        payload: Any,
+        findings: list[Dict[str, Any]],
+        *,
+        labels: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         network_context: Dict[str, Any] = {}
         input_part = payload.get("input") if isinstance(payload, dict) else {}
         if isinstance(input_part, dict):
@@ -964,6 +1127,20 @@ class SentinelKafkaAdapter:
                 value = input_part.get(key)
                 if isinstance(value, str) and value:
                     network_context[key] = value
+        if isinstance(labels, dict):
+            for key in ("src_ip", "source_ip", "dst_ip", "destination_ip"):
+                value = labels.get(key)
+                if isinstance(value, str) and value.strip():
+                    network_context.setdefault(key, value.strip())
+            for key in ("src_port", "dst_port", "proto"):
+                value = labels.get(key)
+                if value in (None, ""):
+                    continue
+                try:
+                    parsed = int(str(value).strip())
+                except (TypeError, ValueError):
+                    continue
+                network_context.setdefault(key, parsed)
 
         for finding in findings:
             if not isinstance(finding, dict):

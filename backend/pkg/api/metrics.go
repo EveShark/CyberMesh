@@ -337,6 +337,34 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 				for signal, count := range snap.PersistDiagnosticSignalTotals {
 					fmt.Fprintf(w, "cockroach_persist_diagnostic_signal_total{signal=\"%s\"} %d\n", signal, count)
 				}
+				lifecycleAuditDeferred := snap.PersistDiagnosticSignalTotals["lifecycle_audit_deferred"]
+				fmt.Fprintf(w, "# HELP control_policy_lifecycle_audit_deferred_total Total lifecycle audit writes deferred to protect durable commit budget.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_lifecycle_audit_deferred_total counter\n")
+				fmt.Fprintf(w, "control_policy_lifecycle_audit_deferred_total %d\n", lifecycleAuditDeferred)
+				fmt.Fprintf(w, "# HELP control_policy_outbox_refresh_rewrite_total Total semantic-refresh rewrite branch outcomes by reason.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_outbox_refresh_rewrite_total counter\n")
+				reasons := []string{
+					"skipped_nonmutable_status",
+					"skipped_same_hash",
+					"no_rows",
+					"applied",
+				}
+				for _, reason := range reasons {
+					key := "outbox_semantic_refresh_" + reason
+					if reason == "skipped_nonmutable_status" {
+						key = "outbox_semantic_refresh_skipped_nonmutable_status"
+					}
+					if reason == "skipped_same_hash" {
+						key = "outbox_semantic_refresh_skipped_same_hash"
+					}
+					if reason == "no_rows" {
+						key = "outbox_semantic_refresh_no_rows"
+					}
+					if reason == "applied" {
+						key = "outbox_semantic_refresh_applied"
+					}
+					fmt.Fprintf(w, "control_policy_outbox_refresh_rewrite_total{reason=\"%s\"} %d\n", reason, snap.PersistDiagnosticSignalTotals[key])
+				}
 			}
 			if len(snap.PersistIntegrityKindTotals) > 0 {
 				fmt.Fprintf(w, "# HELP cockroach_integrity_failure_total Deterministic integrity failure signals by kind observed in persistence verification.\n")
@@ -413,6 +441,15 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 				fmt.Fprintf(w, "cockroach_tx_verify_mode{mode=\"in_tx\"} 0\n")
 				fmt.Fprintf(w, "cockroach_tx_verify_mode{mode=\"out_of_tx\"} 1\n")
 			}
+			fmt.Fprintf(w, "# HELP cockroach_persist_tx_isolation Persistence transaction isolation level (serializable=1/read_committed=1).\n")
+			fmt.Fprintf(w, "# TYPE cockroach_persist_tx_isolation gauge\n")
+			if snap.PersistTxIsolation == "read_committed" {
+				fmt.Fprintf(w, "cockroach_persist_tx_isolation{level=\"serializable\"} 0\n")
+				fmt.Fprintf(w, "cockroach_persist_tx_isolation{level=\"read_committed\"} 1\n")
+			} else {
+				fmt.Fprintf(w, "cockroach_persist_tx_isolation{level=\"serializable\"} 1\n")
+				fmt.Fprintf(w, "cockroach_persist_tx_isolation{level=\"read_committed\"} 0\n")
+			}
 			fmt.Fprintf(w, "# HELP cockroach_tx_batch_canary_enabled Whether transaction upsert canary fallback is enabled (1/0).\n")
 			fmt.Fprintf(w, "# TYPE cockroach_tx_batch_canary_enabled gauge\n")
 			if snap.BatchCanaryEnabled {
@@ -484,6 +521,18 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 			fmt.Fprintf(w, "# HELP cockroach_outbox_batch_adaptive_scale_down_total Outbox batch adaptive scale-down operations.\n")
 			fmt.Fprintf(w, "# TYPE cockroach_outbox_batch_adaptive_scale_down_total counter\n")
 			fmt.Fprintf(w, "cockroach_outbox_batch_adaptive_scale_down_total %d\n", snap.OutboxBatchAdaptiveScaleDownTotal)
+			fmt.Fprintf(w, "# HELP cockroach_outbox_insert_retries_total Retryable outbox insert attempts observed.\n")
+			fmt.Fprintf(w, "# TYPE cockroach_outbox_insert_retries_total counter\n")
+			fmt.Fprintf(w, "cockroach_outbox_insert_retries_total %d\n", snap.OutboxInsertRetriesTotal)
+			fmt.Fprintf(w, "# HELP cockroach_outbox_insert_retry_serialization_total Outbox insert retries classified as SQLSTATE 40001.\n")
+			fmt.Fprintf(w, "# TYPE cockroach_outbox_insert_retry_serialization_total counter\n")
+			fmt.Fprintf(w, "cockroach_outbox_insert_retry_serialization_total %d\n", snap.OutboxInsertRetrySerialization)
+			fmt.Fprintf(w, "# HELP cockroach_outbox_returning_rows_total Total outbox rows returned by INSERT .. RETURNING.\n")
+			fmt.Fprintf(w, "# TYPE cockroach_outbox_returning_rows_total counter\n")
+			fmt.Fprintf(w, "cockroach_outbox_returning_rows_total %d\n", snap.OutboxReturningRowsTotal)
+			fmt.Fprintf(w, "# HELP cockroach_outbox_returning_estimated_bytes_total Estimated bytes returned by outbox INSERT .. RETURNING.\n")
+			fmt.Fprintf(w, "# TYPE cockroach_outbox_returning_estimated_bytes_total counter\n")
+			fmt.Fprintf(w, "cockroach_outbox_returning_estimated_bytes_total %d\n", snap.OutboxReturningEstimatedBytes)
 			fmt.Fprintf(w, "# HELP cockroach_tx_payload_mode Payload persistence mode for transactions (full=1, minimal=0).\n")
 			fmt.Fprintf(w, "# TYPE cockroach_tx_payload_mode gauge\n")
 			if snap.TxStoreFullPayload {
@@ -609,9 +658,18 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 			fmt.Fprintf(w, "# HELP control_persist_backfill_pending Current number of pending backfill entries.\n")
 			fmt.Fprintf(w, "# TYPE control_persist_backfill_pending gauge\n")
 			fmt.Fprintf(w, "control_persist_backfill_pending %d\n", commitStats.BackfillPending)
+			fmt.Fprintf(w, "# HELP control_persist_backfill_oldest_pending_age_ms Oldest pending backfill entry age in milliseconds.\n")
+			fmt.Fprintf(w, "# TYPE control_persist_backfill_oldest_pending_age_ms gauge\n")
+			fmt.Fprintf(w, "control_persist_backfill_oldest_pending_age_ms %d\n", commitStats.BackfillOldestPendingAgeMs)
+			fmt.Fprintf(w, "# HELP control_persist_pending_age_ms Oldest pending backfill entry age in milliseconds.\n")
+			fmt.Fprintf(w, "# TYPE control_persist_pending_age_ms gauge\n")
+			fmt.Fprintf(w, "control_persist_pending_age_ms %d\n", commitStats.BackfillOldestPendingAgeMs)
 			fmt.Fprintf(w, "# HELP control_persist_backfill_dropped_total Total pending backfill entries dropped due to cap/eviction.\n")
 			fmt.Fprintf(w, "# TYPE control_persist_backfill_dropped_total counter\n")
 			fmt.Fprintf(w, "control_persist_backfill_dropped_total %d\n", commitStats.BackfillDropped)
+			fmt.Fprintf(w, "# HELP control_persist_backfill_non_retryable_quarantined_total Total non-retryable backfill entries quarantined after repeated failures.\n")
+			fmt.Fprintf(w, "# TYPE control_persist_backfill_non_retryable_quarantined_total counter\n")
+			fmt.Fprintf(w, "control_persist_backfill_non_retryable_quarantined_total %d\n", commitStats.BackfillNonRetryQuarantined)
 			fmt.Fprintf(w, "# HELP control_tx_replay_rejected_total Total transactions rejected by replay filter.\n")
 			fmt.Fprintf(w, "# TYPE control_tx_replay_rejected_total counter\n")
 			fmt.Fprintf(w, "control_tx_replay_rejected_total{stage=\"admit\"} %d\n", commitStats.ReplayRejectedAdmit)
@@ -634,6 +692,56 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 			fmt.Fprintf(w, "# HELP control_persist_enqueue_errors_total Total persistence enqueue errors.\n")
 			fmt.Fprintf(w, "# TYPE control_persist_enqueue_errors_total counter\n")
 			fmt.Fprintf(w, "control_persist_enqueue_errors_total %d\n", commitStats.PersistEnqueueErrors)
+			fmt.Fprintf(w, "# HELP control_persist_enqueue_timeouts_total Total persistence enqueue timeout errors.\n")
+			fmt.Fprintf(w, "# TYPE control_persist_enqueue_timeouts_total counter\n")
+			fmt.Fprintf(w, "control_persist_enqueue_timeouts_total %d\n", commitStats.PersistEnqueueTimeouts)
+			fmt.Fprintf(w, "# HELP control_persist_enqueue_timeout_total Total persistence enqueue timeout errors partitioned by source.\n")
+			fmt.Fprintf(w, "# TYPE control_persist_enqueue_timeout_total counter\n")
+			fmt.Fprintf(w, "control_persist_enqueue_timeout_total{source=\"commit\"} %d\n", commitStats.PersistEnqueueTimeoutsCommit)
+			fmt.Fprintf(w, "control_persist_enqueue_timeout_total{source=\"backfill\"} %d\n", commitStats.PersistEnqueueTimeoutsBackfill)
+			fmt.Fprintf(w, "# HELP control_persist_enqueue_wait_ms_sum Sum of persistence enqueue wait time in milliseconds by source.\n")
+			fmt.Fprintf(w, "# TYPE control_persist_enqueue_wait_ms_sum counter\n")
+			fmt.Fprintf(w, "control_persist_enqueue_wait_ms_sum{source=\"commit\"} %d\n", commitStats.PersistEnqueueWaitCommitSumMs)
+			fmt.Fprintf(w, "control_persist_enqueue_wait_ms_sum{source=\"backfill\"} %d\n", commitStats.PersistEnqueueWaitBackfillSumMs)
+			fmt.Fprintf(w, "# HELP control_persist_enqueue_wait_ms_count Count of persistence enqueue attempts by source.\n")
+			fmt.Fprintf(w, "# TYPE control_persist_enqueue_wait_ms_count counter\n")
+			fmt.Fprintf(w, "control_persist_enqueue_wait_ms_count{source=\"commit\"} %d\n", commitStats.PersistEnqueueWaitCommitCount)
+			fmt.Fprintf(w, "control_persist_enqueue_wait_ms_count{source=\"backfill\"} %d\n", commitStats.PersistEnqueueWaitBackfillCount)
+			fmt.Fprintf(w, "# HELP control_persist_direct_fallback_total Total commit-path direct persistence fallback attempts by result.\n")
+			fmt.Fprintf(w, "# TYPE control_persist_direct_fallback_total counter\n")
+			fmt.Fprintf(w, "control_persist_direct_fallback_total{result=\"attempt\"} %d\n", commitStats.PersistDirectFallbackAttempts)
+			fmt.Fprintf(w, "control_persist_direct_fallback_total{result=\"success\"} %d\n", commitStats.PersistDirectFallbackSuccess)
+			fmt.Fprintf(w, "control_persist_direct_fallback_total{result=\"failure\"} %d\n", commitStats.PersistDirectFallbackFailures)
+			fmt.Fprintf(w, "control_persist_direct_fallback_total{result=\"throttled\"} %d\n", commitStats.PersistDirectFallbackThrottled)
+			fmt.Fprintf(w, "control_persist_direct_fallback_total{result=\"skipped_pressure\"} %d\n", commitStats.PersistDirectFallbackSkippedPressure)
+			fmt.Fprintf(w, "control_persist_direct_fallback_total{result=\"skipped_distress\"} %d\n", commitStats.PersistDirectFallbackSkippedDistress)
+			fmt.Fprintf(w, "# HELP control_persist_direct_fallback_in_flight Current number of direct fallback persist operations running.\n")
+			fmt.Fprintf(w, "# TYPE control_persist_direct_fallback_in_flight gauge\n")
+			fmt.Fprintf(w, "control_persist_direct_fallback_in_flight %d\n", commitStats.PersistDirectFallbackInFlight)
+			fmt.Fprintf(w, "# HELP control_persist_writer_takeover_activations_total Total non-proposer takeover activations in proposer_primary mode.\n")
+			fmt.Fprintf(w, "# TYPE control_persist_writer_takeover_activations_total counter\n")
+			fmt.Fprintf(w, "control_persist_writer_takeover_activations_total %d\n", commitStats.PersistWriterTakeoverActivations)
+			fmt.Fprintf(w, "# HELP control_persist_total_budget_exhausted_total Total persistence tasks stopped by total wall-clock budget cap.\n")
+			fmt.Fprintf(w, "# TYPE control_persist_total_budget_exhausted_total counter\n")
+			fmt.Fprintf(w, "control_persist_total_budget_exhausted_total %d\n", commitStats.PersistTotalBudgetExhausted)
+			fmt.Fprintf(w, "# HELP control_persist_attempt_timeout_capped_total Total attempt timeouts capped by remaining total budget.\n")
+			fmt.Fprintf(w, "# TYPE control_persist_attempt_timeout_capped_total counter\n")
+			fmt.Fprintf(w, "control_persist_attempt_timeout_capped_total %d\n", commitStats.PersistAttemptTimeoutCapped)
+			fmt.Fprintf(w, "# HELP control_persist_onpersisted_delay_ms_sum Sum of delay from PersistBlock success to onPersisted callback in milliseconds.\n")
+			fmt.Fprintf(w, "# TYPE control_persist_onpersisted_delay_ms_sum counter\n")
+			fmt.Fprintf(w, "control_persist_onpersisted_delay_ms_sum %d\n", commitStats.PersistOnPersistedDelaySumMs)
+			fmt.Fprintf(w, "# HELP control_persist_onpersisted_delay_ms_count Count of PersistBlock success events observed for onPersisted delay.\n")
+			fmt.Fprintf(w, "# TYPE control_persist_onpersisted_delay_ms_count counter\n")
+			fmt.Fprintf(w, "control_persist_onpersisted_delay_ms_count %d\n", commitStats.PersistOnPersistedDelayCount)
+			fmt.Fprintf(w, "# HELP control_persist_metadata_update_ms_sum Sum of SaveCommittedBlock metadata update duration in milliseconds.\n")
+			fmt.Fprintf(w, "# TYPE control_persist_metadata_update_ms_sum counter\n")
+			fmt.Fprintf(w, "control_persist_metadata_update_ms_sum %d\n", commitStats.PersistMetadataUpdateSumMs)
+			fmt.Fprintf(w, "# HELP control_persist_metadata_update_ms_count Count of SaveCommittedBlock metadata update attempts.\n")
+			fmt.Fprintf(w, "# TYPE control_persist_metadata_update_ms_count counter\n")
+			fmt.Fprintf(w, "control_persist_metadata_update_ms_count %d\n", commitStats.PersistMetadataUpdateCount)
+			fmt.Fprintf(w, "# HELP control_persist_metadata_update_failures_total Total SaveCommittedBlock metadata update failures.\n")
+			fmt.Fprintf(w, "# TYPE control_persist_metadata_update_failures_total counter\n")
+			fmt.Fprintf(w, "control_persist_metadata_update_failures_total %d\n", commitStats.PersistMetadataUpdateFailures)
 			fmt.Fprintf(w, "# HELP control_persist_execute_total Total persistence execution attempts by role and decision.\n")
 			fmt.Fprintf(w, "# TYPE control_persist_execute_total counter\n")
 			fmt.Fprintf(w, "control_persist_execute_total{role=\"proposer\",decision=\"allowed\"} %d\n", commitStats.PersistExecuteProposer)
@@ -701,6 +809,9 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 			fmt.Fprintf(w, "# HELP control_policy_causal_skew_corrections_total Total causal latency corrections due to clock skew.\n")
 			fmt.Fprintf(w, "# TYPE control_policy_causal_skew_corrections_total counter\n")
 			fmt.Fprintf(w, "control_policy_causal_skew_corrections_total %d\n", causal.SkewCorrectionsTotal)
+			fmt.Fprintf(w, "# HELP control_policy_ack_correlation_command_total Total ACK correlations matched via policy_id+command_id.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_ack_correlation_command_total counter\n")
+			fmt.Fprintf(w, "control_policy_ack_correlation_command_total %d\n", causal.CorrelationCommand)
 			fmt.Fprintf(w, "# HELP control_policy_ack_correlation_exact_total Total ACK correlations matched via policy_id+rule_hash+trace_id.\n")
 			fmt.Fprintf(w, "# TYPE control_policy_ack_correlation_exact_total counter\n")
 			fmt.Fprintf(w, "control_policy_ack_correlation_exact_total %d\n", causal.CorrelationExact)
@@ -716,6 +827,14 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 			fmt.Fprintf(w, "# HELP control_policy_ack_correlation_errors_total Total ACK correlation query errors.\n")
 			fmt.Fprintf(w, "# TYPE control_policy_ack_correlation_errors_total counter\n")
 			fmt.Fprintf(w, "control_policy_ack_correlation_errors_total %d\n", causal.CorrelationErrors)
+			if causal.CorrelationLatencyCount > 0 {
+				fmt.Fprintf(w, "# HELP control_policy_ack_correlation_latency_seconds Histogram of ACK outbox-correlation query/update latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_ack_correlation_latency_seconds histogram\n")
+				writePrometheusHistogram(w, "control_policy_ack_correlation_latency_seconds", causal.CorrelationLatencyBuckets, causal.CorrelationLatencyCount, causal.CorrelationLatencySumMs)
+				fmt.Fprintf(w, "# HELP control_policy_ack_correlation_latency_p95_seconds 95th percentile ACK correlation latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_ack_correlation_latency_p95_seconds gauge\n")
+				fmt.Fprintf(w, "control_policy_ack_correlation_latency_p95_seconds %.6f\n", causal.CorrelationLatencyP95Ms/1000.0)
+			}
 			fmt.Fprintf(w, "# HELP control_policy_ack_ai_event_unit_corrections_total Total AI-event timestamp unit corrections during ACK causal computation.\n")
 			fmt.Fprintf(w, "# TYPE control_policy_ack_ai_event_unit_corrections_total counter\n")
 			fmt.Fprintf(w, "control_policy_ack_ai_event_unit_corrections_total %d\n", causal.AIEventUnitCorrections)
@@ -769,6 +888,15 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 				fmt.Fprintf(w, "control_policy_causal_applied_to_acked_latency_p95_seconds %.6f\n", causal.AppliedToAckP95Ms/1000.0)
 			}
 		}
+		if pub, ok := s.outboxStats.GetPolicyPublisherStats(); ok {
+			if len(pub.DedupeSuppressedByReason) > 0 {
+				fmt.Fprintf(w, "# HELP control_policy_publish_dedupe_suppressed_total Total policy publish events suppressed by dedupe window, grouped by reason.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_publish_dedupe_suppressed_total counter\n")
+				for reason, count := range pub.DedupeSuppressedByReason {
+					fmt.Fprintf(w, "control_policy_publish_dedupe_suppressed_total{reason=\"%s\"} %d\n", sanitizeLabelValue(reason), count)
+				}
+			}
+		}
 
 		if outbox, ok := s.outboxStats.GetPolicyOutboxDispatcherStats(); ok {
 			fmt.Fprintf(w, "# HELP control_policy_outbox_dispatcher_lease_acquire_attempts_total Total lease acquire attempts by dispatcher.\n")
@@ -796,6 +924,15 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 			fmt.Fprintf(w, "# HELP control_policy_outbox_wake_signals_total Total coalesced JIT wake signals delivered to dispatcher.\n")
 			fmt.Fprintf(w, "# TYPE control_policy_outbox_wake_signals_total counter\n")
 			fmt.Fprintf(w, "control_policy_outbox_wake_signals_total %d\n", outbox.WakeSignalsTotal)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_wake_signals_dropped_total Total dispatcher wake signals dropped due to full wake queue.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_wake_signals_dropped_total counter\n")
+			fmt.Fprintf(w, "control_policy_outbox_wake_signals_dropped_total %d\n", outbox.WakeSignalsDroppedTotal)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_wake_queue_depth Current dispatcher wake queue depth.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_wake_queue_depth gauge\n")
+			fmt.Fprintf(w, "control_policy_outbox_wake_queue_depth %d\n", outbox.WakeQueueDepth)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_wake_queue_depth_avg Average dispatcher wake queue depth sampled during Notify calls.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_wake_queue_depth_avg gauge\n")
+			fmt.Fprintf(w, "control_policy_outbox_wake_queue_depth_avg %.6f\n", outbox.WakeQueueDepthAvg)
 			fmt.Fprintf(w, "# HELP control_policy_outbox_rows_claimed_total Total rows claimed by dispatcher.\n")
 			fmt.Fprintf(w, "# TYPE control_policy_outbox_rows_claimed_total counter\n")
 			fmt.Fprintf(w, "control_policy_outbox_rows_claimed_total %d\n", outbox.RowsClaimedTotal)
@@ -826,6 +963,18 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 			fmt.Fprintf(w, "# HELP control_policy_outbox_fenced_update_failures_total Total fenced/no-op state transitions.\n")
 			fmt.Fprintf(w, "# TYPE control_policy_outbox_fenced_update_failures_total counter\n")
 			fmt.Fprintf(w, "control_policy_outbox_fenced_update_failures_total %d\n", outbox.FencedUpdateFailures)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_claim_timeouts_total Total outbox claim phase timeouts.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_claim_timeouts_total counter\n")
+			fmt.Fprintf(w, "control_policy_outbox_claim_timeouts_total %d\n", outbox.ClaimTimeouts)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_claim_budget_exhausted_total Total outbox claim phase budget-exhausted outcomes.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_claim_budget_exhausted_total counter\n")
+			fmt.Fprintf(w, "control_policy_outbox_claim_budget_exhausted_total %d\n", outbox.ClaimBudgetExhausted)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_reclaim_timeouts_total Total outbox reclaim phase timeouts.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_reclaim_timeouts_total counter\n")
+			fmt.Fprintf(w, "control_policy_outbox_reclaim_timeouts_total %d\n", outbox.ReclaimTimeouts)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_mark_timeouts_total Total outbox mark phase timeouts.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_mark_timeouts_total counter\n")
+			fmt.Fprintf(w, "control_policy_outbox_mark_timeouts_total %d\n", outbox.MarkTimeouts)
 			fmt.Fprintf(w, "# HELP control_policy_outbox_throttled_logs_total Total outbox logs suppressed by throttle.\n")
 			fmt.Fprintf(w, "# TYPE control_policy_outbox_throttled_logs_total counter\n")
 			fmt.Fprintf(w, "control_policy_outbox_throttled_logs_total %d\n", outbox.ThrottledLogsTotal)
@@ -903,6 +1052,13 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 					fmt.Fprintf(w, "control_policy_outbox_publish_partition_total{topic=\"%s\",partition=\"%s\",result=\"%s\"} %d\n", topic, partition, result, count)
 				}
 			}
+			if len(outbox.TimeoutCauseTotals) > 0 {
+				fmt.Fprintf(w, "# HELP control_policy_outbox_timeout_cause_total Policy outbox timeout and pressure outcomes by cause.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_outbox_timeout_cause_total counter\n")
+				for cause, count := range outbox.TimeoutCauseTotals {
+					fmt.Fprintf(w, "control_policy_outbox_timeout_cause_total{cause=\"%s\"} %d\n", sanitizeLabelValue(cause), count)
+				}
+			}
 			if outbox.PublishLatencyCount > 0 {
 				fmt.Fprintf(w, "# HELP control_policy_outbox_publish_latency_seconds Histogram of durable outbox publish latency in seconds.\n")
 				fmt.Fprintf(w, "# TYPE control_policy_outbox_publish_latency_seconds histogram\n")
@@ -926,6 +1082,14 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 				fmt.Fprintf(w, "# HELP control_policy_outbox_created_to_claimed_latency_p95_seconds 95th percentile outbox row created-to-claimed latency in seconds.\n")
 				fmt.Fprintf(w, "# TYPE control_policy_outbox_created_to_claimed_latency_p95_seconds gauge\n")
 				fmt.Fprintf(w, "control_policy_outbox_created_to_claimed_latency_p95_seconds %.6f\n", outbox.OutboxCreatedToClaimedP95Ms/1000.0)
+			}
+			if outbox.WakeToClaimCount > 0 {
+				fmt.Fprintf(w, "# HELP control_policy_outbox_wake_to_claim_latency_seconds Histogram of dispatcher wake-to-first-claim latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_outbox_wake_to_claim_latency_seconds histogram\n")
+				writePrometheusHistogram(w, "control_policy_outbox_wake_to_claim_latency_seconds", outbox.WakeToClaimBuckets, outbox.WakeToClaimCount, outbox.WakeToClaimSumMs)
+				fmt.Fprintf(w, "# HELP control_policy_outbox_wake_to_claim_latency_p95_seconds 95th percentile dispatcher wake-to-first-claim latency in seconds.\n")
+				fmt.Fprintf(w, "# TYPE control_policy_outbox_wake_to_claim_latency_p95_seconds gauge\n")
+				fmt.Fprintf(w, "control_policy_outbox_wake_to_claim_latency_p95_seconds %.6f\n", outbox.WakeToClaimP95Ms/1000.0)
 			}
 			if outbox.MarkLatencyCount > 0 {
 				fmt.Fprintf(w, "# HELP control_policy_outbox_mark_latency_seconds Histogram of outbox state-mark latency in seconds.\n")
@@ -994,6 +1158,9 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 			fmt.Fprintf(w, "# HELP control_policy_outbox_terminal_rows Number of outbox rows currently in terminal_failed status.\n")
 			fmt.Fprintf(w, "# TYPE control_policy_outbox_terminal_rows gauge\n")
 			fmt.Fprintf(w, "control_policy_outbox_terminal_rows %d\n", backlog.TerminalRows)
+			fmt.Fprintf(w, "# HELP control_policy_outbox_backlog_cache_age_seconds Age of cached outbox backlog summary counters in seconds.\n")
+			fmt.Fprintf(w, "# TYPE control_policy_outbox_backlog_cache_age_seconds gauge\n")
+			fmt.Fprintf(w, "control_policy_outbox_backlog_cache_age_seconds %.3f\n", float64(backlog.BacklogCacheAgeMs)/1000.0)
 			committed := float64(backlog.TotalRows)
 			publishedOrAcked := float64(backlog.PublishedRows + backlog.AckedRows)
 			ackRatio := 1.0

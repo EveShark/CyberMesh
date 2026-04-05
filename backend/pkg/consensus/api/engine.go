@@ -482,13 +482,13 @@ func (e *ConsensusEngine) initializeComponents() error {
 
 	// 6. Initialize pacemaker
 	pacemakerConfig := &leader.PacemakerConfig{
-		BaseTimeout:           e.configMgr.GetDuration("CONSENSUS_BASE_TIMEOUT", 10*time.Second), // Increased from 2s for container startup variance
+		BaseTimeout:           e.configMgr.GetDuration("CONSENSUS_BASE_TIMEOUT", 5*time.Second),
 		MaxTimeout:            e.configMgr.GetDuration("CONSENSUS_MAX_TIMEOUT", 60*time.Second),
-		MinTimeout:            e.configMgr.GetDuration("CONSENSUS_MIN_TIMEOUT", 5*time.Second), // Increased from 1s
-		TimeoutIncreaseFactor: e.configMgr.GetFloat64("CONSENSUS_TIMEOUT_INCREASE_FACTOR", 1.5),
-		TimeoutDecreaseDelta:  e.configMgr.GetDuration("CONSENSUS_TIMEOUT_DECREASE_DELTA", 200*time.Millisecond),
+		MinTimeout:            e.configMgr.GetDuration("CONSENSUS_MIN_TIMEOUT", 2*time.Second),
+		TimeoutIncreaseFactor: e.configMgr.GetFloat64("CONSENSUS_TIMEOUT_INCREASE_FACTOR", 1.7),
+		TimeoutDecreaseDelta:  e.configMgr.GetDuration("CONSENSUS_TIMEOUT_DECREASE_DELTA", 100*time.Millisecond),
 		JitterPercent:         e.configMgr.GetFloat64("CONSENSUS_JITTER_PERCENT", 0.1),
-		ViewChangeTimeout:     e.configMgr.GetDuration("CONSENSUS_VIEWCHANGE_TIMEOUT", 30*time.Second),
+		ViewChangeTimeout:     e.configMgr.GetDuration("CONSENSUS_VIEWCHANGE_TIMEOUT", 60*time.Second),
 		EnableAIMD:            e.configMgr.GetBool("CONSENSUS_ENABLE_AIMD", true),
 		RequireQuorum:         e.configMgr.GetBool("CONSENSUS_REQUIRE_QUORUM", true),
 	}

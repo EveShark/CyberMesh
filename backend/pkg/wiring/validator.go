@@ -35,8 +35,24 @@ func (s *Service) validateBlock(b api.Block) error {
 			}
 			return errAlreadyCommittedBlock
 		}
-		return fmt.Errorf("invalid block height: got %d, expected %d",
-			b.GetHeight(), expectedHeight)
+		// Commit callbacks can be delivered out of order/duplicated during view churn.
+		// Once local state has advanced, stale callbacks must not fail the commit path.
+		if b.GetHeight() == lastCommittedHeight {
+			if s.log != nil {
+				s.log.Warn("stale conflicting commit callback ignored",
+					utils.ZapUint64("height", b.GetHeight()),
+					utils.ZapString("incoming_hash", fmt.Sprintf("%x", blockHash[:8])),
+					utils.ZapString("last_committed_hash", fmt.Sprintf("%x", lastCommittedHash[:8])))
+			}
+		} else {
+			if s.log != nil {
+				s.log.Info("stale commit callback ignored",
+					utils.ZapUint64("incoming_height", b.GetHeight()),
+					utils.ZapUint64("expected_height", expectedHeight),
+					utils.ZapUint64("last_committed_height", lastCommittedHeight))
+			}
+		}
+		return errAlreadyCommittedBlock
 	}
 
 	if b.GetHeight() > expectedHeight {

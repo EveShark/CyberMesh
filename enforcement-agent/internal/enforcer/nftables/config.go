@@ -6,6 +6,7 @@ import "go.uber.org/zap"
 type Config struct {
 	Binary             string
 	DryRun             bool
+	BatchAtomic        bool
 	Logger             *zap.Logger
 	NamespaceSetPrefix string
 	NodeSetPrefix      string

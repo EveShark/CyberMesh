@@ -48,6 +48,10 @@ func (b *Builder) BuildWithExclusions(height uint64, parent types.BlockHash, pro
 	count, _, oldest := b.mp.StatsDetailed()
 	maxCount := b.cfg.MaxTxsPerBlock
 	maxBytes := b.cfg.MaxBlockBytes
+	if maxBytes > 0 && b.cfg.ProposalSizeReserveBytes > 0 && b.cfg.ProposalSizeReserveBytes < maxBytes {
+		maxBytes -= b.cfg.ProposalSizeReserveBytes
+	}
+	policyFloor := b.cfg.PolicyPriorityMinTxs
 
 	backpressureThreshold := int(float64(b.cfg.MempoolCapacity) * b.cfg.BackpressureThreshold)
 
@@ -58,31 +62,71 @@ func (b *Builder) BuildWithExclusions(height uint64, parent types.BlockHash, pro
 	if oldest > 0 && now.Unix()-oldest > b.cfg.LatencyThresholdSeconds {
 		maxCount = min(count, b.cfg.MaxTxsLatency)
 	}
+	if policyFloor < 0 {
+		policyFloor = 0
+	}
+	if maxCount > 0 && policyFloor > maxCount {
+		policyFloor = maxCount
+	}
 
 	// Fetch with unlimited count, then apply exclusion and per-block cap locally.
 	// This avoids starvation when top-ranked txs are temporarily excluded.
 	candidates := b.mp.Select(0, maxBytes)
 	txs := make([]state.Transaction, 0, len(candidates))
+	selected := make(map[[32]byte]struct{}, len(candidates))
 	currentBytes := 0
-	for _, tx := range candidates {
+
+	appendTx := func(tx state.Transaction) bool {
 		if tx == nil {
-			continue
+			return false
 		}
 		env := tx.Envelope()
 		if env == nil {
-			continue
+			return false
+		}
+		if _, exists := selected[env.ContentHash]; exists {
+			return false
 		}
 		if len(exclusions) > 0 {
 			if _, blocked := exclusions[env.ContentHash]; blocked {
-				continue
+				return false
 			}
 		}
 		size := len(tx.Payload())
 		if maxBytes > 0 && currentBytes+size > maxBytes {
-			continue
+			return false
+		}
+		if maxCount > 0 && len(txs) >= maxCount {
+			return false
 		}
 		txs = append(txs, tx)
+		selected[env.ContentHash] = struct{}{}
 		currentBytes += size
+		return true
+	}
+
+	if policyFloor > 0 {
+		pickedPolicies := 0
+		for _, tx := range candidates {
+			if tx == nil || tx.Type() != state.TxPolicy {
+				continue
+			}
+			if appendTx(tx) {
+				pickedPolicies++
+				if pickedPolicies >= policyFloor {
+					break
+				}
+			}
+		}
+	}
+
+	for _, tx := range candidates {
+		if !appendTx(tx) {
+			if maxCount > 0 && len(txs) >= maxCount {
+				break
+			}
+			continue
+		}
 		if maxCount > 0 && len(txs) >= maxCount {
 			break
 		}

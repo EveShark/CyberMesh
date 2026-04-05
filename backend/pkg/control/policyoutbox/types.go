@@ -34,38 +34,43 @@ type Row struct {
 
 // Config controls the dispatcher loop and retry behavior.
 type Config struct {
-	Enabled             bool
-	LeaseKey            string
-	PolicyTopic         string
-	ScopeRoutingEnabled bool
-	DispatchOwnerCount  int
-	DispatchOwnerIndex  int
-	DispatchSafeMode    *atomic.Bool
-	RefreshSafeMode     func(context.Context) (bool, error)
-	ClusterShardingMode string
-	ClusterShardBuckets int
-	DispatchShardCount  int
-	DispatchShardCompat bool
-	MaxLeaseShards      int
-	LeaseTTL            time.Duration
-	LeaseAcquireTimeout time.Duration
-	ClaimTimeout        time.Duration
-	ReclaimAfter        time.Duration
-	PollInterval        time.Duration
-	DrainMaxDuration    time.Duration
-	BatchSize           int
-	BatchSizeMin        int
-	BatchSizeMax        int
-	AdaptiveBatch       bool
-	MaxInFlight         int
-	MarkWorkers         int
-	InternalQueue       int
-	DrainMaxBatches     int
-	MaxRetries          int
-	RetryInitialBack    time.Duration
-	RetryMaxBack        time.Duration
-	RetryJitterRatio    float64
-	LogThrottle         time.Duration
+	Enabled               bool
+	LeaseKey              string
+	PolicyTopic           string
+	ScopeRoutingEnabled   bool
+	DispatchOwnerCount    int
+	DispatchOwnerIndex    int
+	DispatchSafeMode      *atomic.Bool
+	RefreshSafeMode       func(context.Context) (bool, error)
+	ClusterShardingMode   string
+	ClusterShardBuckets   int
+	DispatchShardCount    int
+	DispatchShardCompat   bool
+	MaxLeaseShards        int
+	LeaseTTL              time.Duration
+	LeaseAcquireTimeout   time.Duration
+	ClaimTimeout          time.Duration
+	ReclaimAfter          time.Duration
+	PollInterval          time.Duration
+	PollIntervalHot       time.Duration
+	PollIntervalHotWindow time.Duration
+	DrainMaxDuration      time.Duration
+	WakeDrainMaxDuration  time.Duration
+	WakeDrainMaxTicks     int
+	WakeChannelSize       int
+	BatchSize             int
+	BatchSizeMin          int
+	BatchSizeMax          int
+	AdaptiveBatch         bool
+	MaxInFlight           int
+	MarkWorkers           int
+	InternalQueue         int
+	DrainMaxBatches       int
+	MaxRetries            int
+	RetryInitialBack      time.Duration
+	RetryMaxBack          time.Duration
+	RetryJitterRatio      float64
+	LogThrottle           time.Duration
 }
 
 // BacklogStats summarizes queue depth and age for publish-eligible rows.
@@ -78,6 +83,7 @@ type BacklogStats struct {
 	AckedRows        int64
 	TerminalRows     int64
 	OldestPendingAge int64
+	BacklogCacheAgeMs int64
 }
 
 // DispatcherStats captures runtime behavior of the outbox dispatcher.
@@ -90,6 +96,10 @@ type DispatcherStats struct {
 	LastLeaseEpoch                int64
 	TicksTotal                    uint64
 	WakeSignalsTotal              uint64
+	WakeSignalsDroppedTotal       uint64
+	WakeQueueDepth                int
+	WakeQueueDepthSamples         uint64
+	WakeQueueDepthAvg             float64
 	RowsClaimedTotal              uint64
 	CurrentBatchSize              int
 	BatchScaleUpTotal             uint64
@@ -110,6 +120,8 @@ type DispatcherStats struct {
 	ClaimLatencySumMs             float64
 	ClaimLatencyP95Ms             float64
 	ClaimTimeouts                 uint64
+	ClaimBudgetExhausted          uint64
+	ReclaimTimeouts               uint64
 	LeaseAcquireLatencyBuckets    []utils.HistogramBucket
 	LeaseAcquireLatencyCount      uint64
 	LeaseAcquireLatencySumMs      float64
@@ -139,6 +151,10 @@ type DispatcherStats struct {
 	OutboxCreatedToClaimedCount   uint64
 	OutboxCreatedToClaimedSumMs   float64
 	OutboxCreatedToClaimedP95Ms   float64
+	WakeToClaimBuckets            []utils.HistogramBucket
+	WakeToClaimCount              uint64
+	WakeToClaimSumMs              float64
+	WakeToClaimP95Ms              float64
 	SkewCorrectionsTotal          uint64
 	AIEventUnitCorrections        uint64
 	AIEventInvalidTotal           uint64

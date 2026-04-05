@@ -13,6 +13,7 @@ import (
 
 	pb "backend/proto"
 	"github.com/CyberMesh/enforcement-agent/internal/metrics"
+	"github.com/CyberMesh/enforcement-agent/internal/observability"
 	"github.com/CyberMesh/enforcement-agent/internal/policy"
 )
 
@@ -25,8 +26,15 @@ type syncProducer interface {
 type Result string
 
 const (
-	ResultApplied Result = "applied"
-	ResultFailed  Result = "failed"
+	ResultAccepted       Result = "accepted"
+	ResultApplied        Result = "applied"
+	ResultNoop           Result = "noop"
+	ResultRejected       Result = "rejected"
+	ResultTimeout        Result = "timeout"
+	ResultRetryExhausted Result = "retry_exhausted"
+	// ResultFailed is kept for backward-compatible call paths and
+	// should be normalized before publish.
+	ResultFailed Result = "failed"
 )
 
 // Payload contains data for ACK publication.
@@ -173,6 +181,7 @@ func (p *KafkaPublisher) Publish(ctx context.Context, payload Payload) error {
 				}
 			}
 		}
+		kmsg.Headers = observability.InjectContextToSaramaHeaders(ctx, kmsg.Headers)
 		_, _, err = p.producer.SendMessage(kmsg)
 		if err == nil {
 			if p.metrics != nil {

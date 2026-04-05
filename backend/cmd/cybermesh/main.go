@@ -31,6 +31,7 @@ import (
 	ctypes "backend/pkg/consensus/types"
 	"backend/pkg/ingest/kafka"
 	"backend/pkg/mempool"
+	"backend/pkg/observability"
 	"backend/pkg/p2p"
 	"backend/pkg/state"
 	"backend/pkg/storage/cockroach"
@@ -256,6 +257,20 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	otelShutdown, otelErr := observability.InitFromEnv(ctx, "cybermesh-backend")
+	if otelErr != nil {
+		logger.Warn("OpenTelemetry tracing disabled due to init error", utils.ZapError(otelErr))
+	} else {
+		defer func() {
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer shutdownCancel()
+			if err := otelShutdown(shutdownCtx); err != nil {
+				logger.Warn("OpenTelemetry shutdown failed", utils.ZapError(err))
+			}
+		}()
+		logger.Info("OpenTelemetry tracing initialized")
+	}
+
 	cryptoSvc, err := buildCryptoService(cfgMgr, logger)
 	if err != nil {
 		log.Fatalf("crypto service init failed: %v", err)
@@ -331,15 +346,17 @@ func main() {
 	}
 
 	blockCfg := block.Config{
-		MaxTxsPerBlock:          cfgMgr.GetInt("BLOCK_MAX_TXS", 500),
-		MaxBlockBytes:           cfgMgr.GetInt("BLOCK_MAX_BYTES", 4*1024*1024),
-		MinMempoolTxs:           cfgMgr.GetInt("BLOCK_MIN_MEMPOOL_TXS", 1),
-		BuildInterval:           cfgMgr.GetDuration("BLOCK_BUILD_INTERVAL", 500*time.Millisecond),
-		MempoolCapacity:         cfgMgr.GetInt("MEMPOOL_MAX_TXS", 2000),
-		BackpressureThreshold:   cfgMgr.GetFloat64("MEMPOOL_BACKPRESSURE_THRESHOLD", 0.8),
-		LatencyThresholdSeconds: int64(cfgMgr.GetInt("MEMPOOL_LATENCY_THRESHOLD_SECONDS", 60)),
-		MaxTxsBackpressure:      cfgMgr.GetInt("BLOCK_MAX_TXS_BACKPRESSURE", 200),
-		MaxTxsLatency:           cfgMgr.GetInt("BLOCK_MAX_TXS_LATENCY", 300),
+		MaxTxsPerBlock:           cfgMgr.GetInt("BLOCK_MAX_TXS", 200),
+		MaxBlockBytes:            cfgMgr.GetInt("BLOCK_MAX_BYTES", 4*1024*1024),
+		ProposalSizeReserveBytes: cfgMgr.GetInt("BLOCK_PROPOSAL_SIZE_RESERVE_BYTES", 256*1024),
+		MinMempoolTxs:            cfgMgr.GetInt("BLOCK_MIN_MEMPOOL_TXS", 1),
+		BuildInterval:            cfgMgr.GetDuration("BLOCK_BUILD_INTERVAL", 500*time.Millisecond),
+		PolicyPriorityMinTxs:     cfgMgr.GetInt("BLOCK_POLICY_PRIORITY_MIN_TXS", 0),
+		MempoolCapacity:          cfgMgr.GetInt("MEMPOOL_MAX_TXS", 2000),
+		BackpressureThreshold:    cfgMgr.GetFloat64("MEMPOOL_BACKPRESSURE_THRESHOLD", 0.8),
+		LatencyThresholdSeconds:  int64(cfgMgr.GetInt("MEMPOOL_LATENCY_THRESHOLD_SECONDS", 60)),
+		MaxTxsBackpressure:       cfgMgr.GetInt("BLOCK_MAX_TXS_BACKPRESSURE", 320),
+		MaxTxsLatency:            cfgMgr.GetInt("BLOCK_MAX_TXS_LATENCY", 400),
 	}
 	builder := block.NewBuilder(blockCfg, mp, store, logger)
 
@@ -1086,11 +1103,12 @@ func buildWiringConfig(
 		wiringCfg.KafkaProducerCfg = kafka.ProducerConfig{
 			Brokers: wiringCfg.KafkaConsumerCfg.Brokers,
 			Topics: kafka.ProducerTopics{
-				Commits:    getTopicConfig(cfgMgr, logger, "CONTROL_COMMITS_TOPIC", "TOPIC_CONTROL_COMMITS", "control.commits.v1"),
-				Reputation: getTopicConfig(cfgMgr, logger, "CONTROL_REPUTATION_TOPIC", "TOPIC_CONTROL_REPUTATION", ""),
-				Policy:     getTopicConfig(cfgMgr, logger, "CONTROL_POLICY_TOPIC", "TOPIC_CONTROL_POLICY", ""),
-				Evidence:   getTopicConfig(cfgMgr, logger, "CONTROL_EVIDENCE_TOPIC", "TOPIC_CONTROL_EVIDENCE", ""),
-				PolicyDLQ:  cfgMgr.GetString("CONTROL_POLICY_DLQ_TOPIC", ""),
+				Commits:       getTopicConfig(cfgMgr, logger, "CONTROL_COMMITS_TOPIC", "TOPIC_CONTROL_COMMITS", "control.commits.v1"),
+				Reputation:    getTopicConfig(cfgMgr, logger, "CONTROL_REPUTATION_TOPIC", "TOPIC_CONTROL_REPUTATION", ""),
+				Policy:        getTopicConfig(cfgMgr, logger, "CONTROL_POLICY_TOPIC", "TOPIC_CONTROL_POLICY", ""),
+				PolicyCommand: getTopicConfig(cfgMgr, logger, "CONTROL_ENFORCEMENT_COMMAND_TOPIC", "TOPIC_CONTROL_ENFORCEMENT_COMMAND", ""),
+				Evidence:      getTopicConfig(cfgMgr, logger, "CONTROL_EVIDENCE_TOPIC", "TOPIC_CONTROL_EVIDENCE", ""),
+				PolicyDLQ:     cfgMgr.GetString("CONTROL_POLICY_DLQ_TOPIC", ""),
 			},
 		}
 	}
@@ -1110,8 +1128,13 @@ func buildWiringConfig(
 		}
 
 		adapterCfg := &cockroach.AdapterConfig{
-			DB:     conn,
-			Logger: logger,
+			DB:                               conn,
+			Logger:                           logger,
+			PersistTxIsolation:               cfgMgr.GetString("DB_PERSIST_TX_ISOLATION", "serializable"),
+			AllowReadCommittedIsolation:      cfgMgr.GetBool("DB_PERSIST_TX_ISOLATION_ALLOW_READ_COMMITTED", false),
+			PolicyStateRefreshAsyncEnabled:   cfgMgr.GetBool("DB_POLICY_STATE_REFRESH_ASYNC_ENABLED", true),
+			PolicyStateRefreshAsyncTimeout:   cfgMgr.GetDuration("DB_POLICY_STATE_REFRESH_ASYNC_TIMEOUT", 1500*time.Millisecond),
+			PolicyStateRefreshAsyncMaxPolicy: cfgMgr.GetInt("DB_POLICY_STATE_REFRESH_ASYNC_MAX_POLICY", 16),
 			Performance: cockroach.AdapterPerformanceConfig{
 				TxBatchEnabled:         cfgMgr.GetBool("DB_TX_UPSERT_BATCH_ENABLED", true),
 				TxBatchEnabledSet:      true,
@@ -1156,12 +1179,13 @@ func buildWiringConfig(
 		wiringCfg.EnablePersistence = true
 		wiringCfg.DBAdapter = dbAdapter
 		wiringCfg.PersistenceWorker = wiring.PersistenceWorkerConfig{
-			QueueSize:       cfgMgr.GetInt("PERSIST_QUEUE_SIZE", 1024),
+			QueueSize:       cfgMgr.GetInt("PERSIST_QUEUE_SIZE", 2048),
 			RetryMax:        cfgMgr.GetInt("PERSIST_RETRY_MAX", 3),
 			RetryBackoffMS:  cfgMgr.GetInt("PERSIST_RETRY_BACKOFF_MS", 100),
 			MaxBackoffMS:    cfgMgr.GetInt("PERSIST_MAX_BACKOFF_MS", 5000),
 			AttemptTimeout:  cfgMgr.GetDuration("PERSIST_ATTEMPT_TIMEOUT", 25*time.Second),
-			WorkerCount:     cfgMgr.GetInt("PERSIST_WORKERS", 1),
+			TotalBudget:     cfgMgr.GetDuration("PERSIST_TOTAL_BUDGET", 75*time.Second),
+			WorkerCount:     cfgMgr.GetInt("PERSIST_WORKERS", 5),
 			ShutdownTimeout: cfgMgr.GetDuration("PERSIST_SHUTDOWN_TIMEOUT", 30*time.Second),
 		}
 

@@ -1230,6 +1230,11 @@ class ServiceManager:
         if self.circuit_breaker:
             cb_state = self.circuit_breaker.state
             status["circuit_breaker"] = cb_state.value if hasattr(cb_state, "value") else str(cb_state)
+        if self.sentinel_adapter is not None:
+            try:
+                status["sentinel_adapter"] = self.sentinel_adapter.get_metrics()
+            except Exception:
+                status["sentinel_adapter"] = {"available": False, "reason": "metrics_unavailable"}
         return status
     
     def _initialize_ml_pipeline(self, settings: Settings) -> None:

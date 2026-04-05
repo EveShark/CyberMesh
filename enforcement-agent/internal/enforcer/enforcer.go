@@ -7,6 +7,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/CyberMesh/enforcement-agent/internal/enforcer/app"
 	"github.com/CyberMesh/enforcement-agent/internal/enforcer/cilium"
 	"github.com/CyberMesh/enforcement-agent/internal/enforcer/gateway"
 	"github.com/CyberMesh/enforcement-agent/internal/enforcer/iptables"
@@ -43,6 +44,7 @@ type Options struct {
 	IPTables   iptables.Config
 	NFTables   nftables.Config
 	Kubernetes kubernetes.Config
+	App        app.Config
 }
 
 // Factory constructs the selected backend based on name.
@@ -68,6 +70,8 @@ func Factory(opts Options) (Enforcer, error) {
 		opts.Kubernetes.DryRun = opts.DryRun
 		opts.Kubernetes.Logger = opts.Logger
 		return kubernetes.New(opts.Kubernetes)
+	case "app":
+		return app.New(opts.App, opts.Logger)
 	case "noop":
 		return newNoopEnforcer("noop", opts.DryRun), nil
 	default:

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"backend/pkg/control/lifecycleaudit"
@@ -15,12 +17,17 @@ import (
 )
 
 const (
-	maxClaimAttempts             = 8
+	maxClaimAttemptsHard         = 3
+	minClaimAttemptBudget        = 50 * time.Millisecond
+	reclaimPhaseMinBudget        = 400 * time.Millisecond
+	compatPhaseMaxBudget         = 300 * time.Millisecond
 	markPublishedRecoveryBudget  = 30 * time.Second
 	markPublishedRecoveryPerTry  = 10 * time.Second
 	maxMarkPublishedRecoverTries = 6
 	maxLegacyDispatchShardLabel  = 999
 )
+
+var errClaimBudgetExhausted = errors.New("policy outbox: claim budget exhausted")
 
 type Store struct {
 	db                *sql.DB
@@ -30,13 +37,28 @@ type Store struct {
 	hasSourceColumns  bool
 	hasSentinelColumn bool
 	hasDispatchShard  bool
+	reclaimTimeouts   uint64
+	backlogSummaryMu  sync.Mutex
+	backlogSummaryAt  time.Time
+	backlogSummaryTTL time.Duration
+	backlogSummary    BacklogStats
 }
 
 func NewStore(db *sql.DB) (*Store, error) {
 	if db == nil {
 		return nil, fmt.Errorf("policy outbox: db required")
 	}
-	return &Store{db: db}, nil
+	return &Store{
+		db:                db,
+		backlogSummaryTTL: 30 * time.Second,
+	}, nil
+}
+
+func (s *Store) ReclaimTimeoutsTotal() uint64 {
+	if s == nil {
+		return 0
+	}
+	return atomic.LoadUint64(&s.reclaimTimeouts)
 }
 
 // EnsureSchema verifies required outbox tables/columns exist before runtime.
@@ -228,6 +250,34 @@ func (s *Store) TryAcquireLease(ctx context.Context, leaseKey, holderID string, 
 	return holder == holderID, epoch, nil
 }
 
+// ReleaseLease relinquishes a held lease early so another dispatcher holder can take over.
+// This is best-effort and guarded by holder/epoch ownership checks.
+func (s *Store) ReleaseLease(ctx context.Context, leaseKey, holderID string, epoch int64) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("policy outbox: store not initialized")
+	}
+	leaseKey = strings.TrimSpace(leaseKey)
+	holderID = strings.TrimSpace(holderID)
+	if leaseKey == "" || holderID == "" {
+		return fmt.Errorf("policy outbox: lease key and holder required")
+	}
+	if epoch <= 0 {
+		return fmt.Errorf("policy outbox: lease epoch required")
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE control_dispatcher_leases
+		SET lease_until = now() - INTERVAL '1s',
+		    updated_at = now()
+		WHERE lease_key = $1
+		  AND holder_id = $2
+		  AND epoch = $3
+	`, leaseKey, holderID, epoch)
+	if err != nil {
+		return fmt.Errorf("policy outbox: release lease: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) ClaimPending(ctx context.Context, holderID string, epoch int64, limit int, reclaimAfter time.Duration, leaseKey string, dispatchShard string, dispatchShardCount int, shardCompat bool) ([]Row, error) {
 	if s == nil || s.db == nil {
 		return nil, fmt.Errorf("policy outbox: store not initialized")
@@ -382,36 +432,103 @@ func (s *Store) ClaimPending(ctx context.Context, holderID string, epoch int64, 
 		pendingCompatQuery += returningClause
 		reclaimCompatQuery += returningClause
 	}
-	var claimRowsWithTimeout func(parent context.Context, query string, args []any, timeout time.Duration) ([]Row, error)
-	claimRowsWithTimeout = func(parent context.Context, query string, args []any, timeout time.Duration) ([]Row, error) {
+	totalBudget := remainingContextBudget(ctx)
+	pendingBudget := time.Duration(0)
+	compatBudget := time.Duration(0)
+	reclaimBudget := time.Duration(0)
+	if totalBudget > 0 {
+		reclaimBudget = minDuration(reclaimPhaseMinBudget, totalBudget/3)
+		if reclaimBudget < minClaimAttemptBudget {
+			reclaimBudget = minDuration(minClaimAttemptBudget, totalBudget)
+		}
+		pendingBudget = totalBudget - reclaimBudget
+		if pendingBudget < minClaimAttemptBudget {
+			pendingBudget = minClaimAttemptBudget
+		}
+		if shardCompat {
+			compatBudget = minDuration(compatPhaseMaxBudget, pendingBudget/3)
+			if compatBudget < minClaimAttemptBudget {
+				compatBudget = minClaimAttemptBudget
+			}
+			if compatBudget > pendingBudget {
+				compatBudget = pendingBudget
+			}
+			pendingBudget -= compatBudget
+		}
+	}
+
+	var claimRowsWithTimeout func(parent context.Context, query string, args []any, timeout time.Duration, detached bool) ([]Row, error)
+	claimRowsWithTimeout = func(parent context.Context, query string, args []any, timeout time.Duration, detached bool) ([]Row, error) {
 		attemptCtx := parent
 		cancel := func() {}
 		if timeout > 0 {
-			attemptCtx, cancel = context.WithTimeout(parent, timeout)
+			root := parent
+			if detached {
+				// Only detach when the parent cannot provide the phase budget.
+				// This preserves service-bound cancellation when enough budget exists.
+				if deadline, ok := parent.Deadline(); !ok || time.Until(deadline) < timeout {
+					// Detach per-phase claim budget from near-exhausted caller deadlines
+					// while retaining context values for tracing/audit.
+					// We still honor explicit parent cancellation (checked below).
+					root = context.WithoutCancel(parent)
+				}
+			}
+			attemptCtx, cancel = context.WithTimeout(root, timeout)
 		}
 		defer cancel()
 
 		var lastErr error
-		for attempt := 1; attempt <= maxClaimAttempts; attempt++ {
+		maxAttempts := claimMaxAttemptsForTimeout(timeout)
+		for attempt := 1; attempt <= maxAttempts; attempt++ {
+			if detached && parent != nil && errors.Is(parent.Err(), context.Canceled) {
+				return nil, fmt.Errorf("policy outbox: claim pending: %w", context.Canceled)
+			}
+			if isBudgetNearlyExhausted(attemptCtx, minClaimAttemptBudget) {
+				budgetErr := errors.Join(errClaimBudgetExhausted, context.DeadlineExceeded, lastErr)
+				return nil, fmt.Errorf("policy outbox: claim pending: %w", budgetErr)
+			}
 			out, err := s.claimPendingOnce(attemptCtx, query, args...)
 			if err == nil {
 				return out, nil
 			}
 			lastErr = err
-			if !isRetryableClaimErr(err) || attempt == maxClaimAttempts {
+			// Under cloud Cockroach pressure, connect/dial timeouts are not
+			// likely to recover within this claim phase budget. Fail fast so the
+			// dispatcher can cooldown the shard and avoid retry-amplifying DB load.
+			if isClaimConnectErr(err) {
+				break
+			}
+			if !isRetryableClaimErr(err) || attempt == maxAttempts {
 				break
 			}
 			backoff := time.Duration(attempt*25) * time.Millisecond
+			if remaining := remainingContextBudget(attemptCtx); remaining > 0 {
+				capBackoff := remaining / 2
+				if capBackoff < 5*time.Millisecond {
+					capBackoff = 5 * time.Millisecond
+				}
+				if backoff > capBackoff {
+					backoff = capBackoff
+				}
+			}
+			timer := time.NewTimer(backoff)
 			select {
 			case <-attemptCtx.Done():
+				timer.Stop()
 				return nil, fmt.Errorf("policy outbox: claim pending: %w", attemptCtx.Err())
-			case <-time.After(backoff):
+			case <-timer.C:
+			}
+			if detached && parent != nil && errors.Is(parent.Err(), context.Canceled) {
+				return nil, fmt.Errorf("policy outbox: claim pending: %w", context.Canceled)
 			}
 		}
 		return nil, lastErr
 	}
 	claimRows := func(query string, args []any) ([]Row, error) {
-		return claimRowsWithTimeout(ctx, query, args, 0)
+		return claimRowsWithTimeout(ctx, query, args, pendingBudget, false)
+	}
+	claimCompatRows := func(query string, args []any) ([]Row, error) {
+		return claimRowsWithTimeout(ctx, query, args, compatBudget, false)
 	}
 
 	setClaimLimit := func(args []any, n int) []any {
@@ -428,7 +545,7 @@ func (s *Store) ClaimPending(ctx context.Context, holderID string, epoch int64, 
 		return freshRows, nil
 	}
 	if shardCompat {
-		compatFreshRows, compatErr := claimRows(pendingCompatQuery, setClaimLimit(pendingCompatArgs, limit))
+		compatFreshRows, compatErr := claimCompatRows(pendingCompatQuery, setClaimLimit(pendingCompatArgs, limit))
 		if compatErr != nil {
 			return nil, compatErr
 		}
@@ -436,7 +553,7 @@ func (s *Store) ClaimPending(ctx context.Context, holderID string, epoch int64, 
 			return compatFreshRows, nil
 		}
 		if pendingNullCompatQuery != "" {
-			compatFreshRows, compatErr = claimRows(pendingNullCompatQuery, setClaimLimit(pendingCompatArgs, limit))
+			compatFreshRows, compatErr = claimCompatRows(pendingNullCompatQuery, setClaimLimit(pendingCompatArgs, limit))
 			if compatErr != nil {
 				return nil, compatErr
 			}
@@ -446,32 +563,35 @@ func (s *Store) ClaimPending(ctx context.Context, holderID string, epoch int64, 
 		}
 	}
 
-	reclaimRows, reclaimErr := claimRowsWithTimeout(ctx, reclaimQuery, setClaimLimit(reclaimArgs, limit), 0)
+	reclaimRows, reclaimErr := claimRowsWithTimeout(ctx, reclaimQuery, setClaimLimit(reclaimArgs, limit), reclaimBudget, true)
 	if reclaimErr != nil && !isClaimTimeoutErr(reclaimErr) {
 		return nil, reclaimErr
 	}
 	if reclaimErr != nil {
+		atomic.AddUint64(&s.reclaimTimeouts, 1)
 		reclaimRows = nil
 	}
 	if len(reclaimRows) > 0 || !shardCompat {
 		return reclaimRows, nil
 	}
 
-	compatReclaimRows, compatReclaimErr := claimRowsWithTimeout(ctx, reclaimCompatQuery, setClaimLimit(reclaimCompatArgs, limit), 0)
+	compatReclaimRows, compatReclaimErr := claimRowsWithTimeout(ctx, reclaimCompatQuery, setClaimLimit(reclaimCompatArgs, limit), reclaimBudget, true)
 	if compatReclaimErr != nil && !isClaimTimeoutErr(compatReclaimErr) {
 		return nil, compatReclaimErr
 	}
 	if compatReclaimErr != nil {
+		atomic.AddUint64(&s.reclaimTimeouts, 1)
 		compatReclaimRows = nil
 	}
 	if len(compatReclaimRows) > 0 || reclaimNullCompatQuery == "" {
 		return compatReclaimRows, nil
 	}
-	compatReclaimRows, compatReclaimErr = claimRowsWithTimeout(ctx, reclaimNullCompatQuery, setClaimLimit(reclaimCompatArgs, limit), 0)
+	compatReclaimRows, compatReclaimErr = claimRowsWithTimeout(ctx, reclaimNullCompatQuery, setClaimLimit(reclaimCompatArgs, limit), reclaimBudget, true)
 	if compatReclaimErr != nil && !isClaimTimeoutErr(compatReclaimErr) {
 		return nil, compatReclaimErr
 	}
 	if compatReclaimErr != nil {
+		atomic.AddUint64(&s.reclaimTimeouts, 1)
 		return nil, nil
 	}
 	return compatReclaimRows, nil
@@ -602,6 +722,48 @@ func compatibleDispatchShardMatches(label string, bucket int, shardCount int) bo
 	}
 }
 
+func remainingContextBudget(ctx context.Context) time.Duration {
+	if ctx == nil {
+		return 0
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return 0
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return 0
+	}
+	return remaining
+}
+
+func claimMaxAttemptsForTimeout(timeout time.Duration) int {
+	switch {
+	case timeout <= 0:
+		return maxClaimAttemptsHard
+	case timeout <= 400*time.Millisecond:
+		return 1
+	case timeout <= 2500*time.Millisecond:
+		return 2
+	default:
+		return maxClaimAttemptsHard
+	}
+}
+
+func isBudgetNearlyExhausted(ctx context.Context, minBudget time.Duration) bool {
+	if ctx == nil {
+		return false
+	}
+	if err := ctx.Err(); err != nil {
+		return true
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return false
+	}
+	return time.Until(deadline) < minBudget
+}
+
 func isRetryableClaimErr(err error) bool {
 	if err == nil {
 		return false
@@ -633,6 +795,19 @@ func isClaimTimeoutErr(err error) bool {
 		strings.Contains(msg, "timeout")
 }
 
+func isClaimConnectErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "failed to connect") ||
+		strings.Contains(msg, "dial error") ||
+		strings.Contains(msg, "dial tcp") ||
+		strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "no route to host")
+}
+
 func (s *Store) MarkPublished(ctx context.Context, id, holderID string, epoch int64, leaseKey string, topic string, partition int32, offset int64) error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("policy outbox: store not initialized")
@@ -656,7 +831,17 @@ func (s *Store) MarkPublished(ctx context.Context, id, holderID string, epoch in
 			if attemptBudget <= 0 {
 				break
 			}
-			recoveryCtx, cancel := context.WithTimeout(context.Background(), attemptBudget)
+			recoveryRoot := ctx
+			if recoveryRoot == nil {
+				recoveryRoot = context.TODO()
+			}
+			// Detach only when the caller cannot satisfy the attempt budget.
+			if deadline, ok := recoveryRoot.Deadline(); !ok || time.Until(deadline) < attemptBudget {
+				// Preserve context values while detaching from near-exhausted deadlines;
+				// explicit cancellation still honored via shouldAbortMarkPublishedRecovery.
+				recoveryRoot = context.WithoutCancel(recoveryRoot)
+			}
+			recoveryCtx, cancel := context.WithTimeout(recoveryRoot, attemptBudget)
 			res, err = s.markPublishedOnce(recoveryCtx, id, holderID, epoch, topic, partition, offset)
 			cancel()
 			if err == nil || !isRetryableMarkPublishedErr(err) {
@@ -672,7 +857,15 @@ func (s *Store) MarkPublished(ctx context.Context, id, holderID string, epoch in
 		}
 	}
 	if err != nil && shouldRecoverMarkPublished(err, ctx) {
-		finalizeCtx, cancel := context.WithTimeout(context.Background(), minDuration(markPublishedRecoveryPerTry, markPublishedRecoveryBudget))
+		finalizeRoot := ctx
+		if finalizeRoot == nil {
+			finalizeRoot = context.TODO()
+		}
+		finalizeBudget := minDuration(markPublishedRecoveryPerTry, markPublishedRecoveryBudget)
+		if deadline, ok := finalizeRoot.Deadline(); !ok || time.Until(deadline) < finalizeBudget {
+			finalizeRoot = context.WithoutCancel(finalizeRoot)
+		}
+		finalizeCtx, cancel := context.WithTimeout(finalizeRoot, finalizeBudget)
 		res, err = s.markPublishedFinalizeOnce(finalizeCtx, id, holderID, epoch, leaseKey, topic, partition, offset)
 		cancel()
 	}
@@ -966,10 +1159,6 @@ func (s *Store) BacklogStats(ctx context.Context) (BacklogStats, error) {
 			COALESCE(SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END), 0) AS pending_count,
 			COALESCE(SUM(CASE WHEN status='retry' THEN 1 ELSE 0 END), 0) AS retry_count,
 			COALESCE(SUM(CASE WHEN status='publishing' THEN 1 ELSE 0 END), 0) AS publishing_count,
-			COUNT(*) AS total_rows,
-			COALESCE(SUM(CASE WHEN status='published' THEN 1 ELSE 0 END), 0) AS published_rows,
-			COALESCE(SUM(CASE WHEN status='acked' THEN 1 ELSE 0 END), 0) AS acked_rows,
-			COALESCE(SUM(CASE WHEN status='terminal_failed' THEN 1 ELSE 0 END), 0) AS terminal_rows,
 			COALESCE(
 				MAX(
 					CASE
@@ -984,19 +1173,64 @@ func (s *Store) BacklogStats(ctx context.Context) (BacklogStats, error) {
 				), 0
 			) AS oldest_pending_age_ms
 		FROM control_policy_outbox
+		WHERE status IN ('pending', 'retry', 'publishing')
 	`).Scan(
 		&stats.Pending,
 		&stats.Retry,
 		&stats.Publishing,
-		&stats.TotalRows,
-		&stats.PublishedRows,
-		&stats.AckedRows,
-		&stats.TerminalRows,
 		&stats.OldestPendingAge,
 	)
 	if err != nil {
 		return BacklogStats{}, fmt.Errorf("policy outbox: backlog stats: %w", err)
 	}
+	summary, err := s.backlogSummaryStats(ctx)
+	if err != nil {
+		return BacklogStats{}, err
+	}
+	stats.PublishedRows = summary.PublishedRows
+	stats.AckedRows = summary.AckedRows
+	stats.TerminalRows = summary.TerminalRows
+	stats.BacklogCacheAgeMs = summary.BacklogCacheAgeMs
+	stats.TotalRows = stats.Pending + stats.Retry + stats.Publishing + stats.PublishedRows + stats.AckedRows + stats.TerminalRows
 
 	return stats, nil
+}
+
+func (s *Store) backlogSummaryStats(ctx context.Context) (BacklogStats, error) {
+	now := time.Now()
+	s.backlogSummaryMu.Lock()
+	if s.backlogSummaryTTL > 0 && now.Before(s.backlogSummaryAt.Add(s.backlogSummaryTTL)) {
+		snapshot := s.backlogSummary
+		if !s.backlogSummaryAt.IsZero() {
+			snapshot.BacklogCacheAgeMs = now.Sub(s.backlogSummaryAt).Milliseconds()
+		}
+		s.backlogSummaryMu.Unlock()
+		return snapshot, nil
+	}
+	s.backlogSummaryMu.Unlock()
+
+	var summary BacklogStats
+	err := s.db.QueryRowContext(ctx, `
+		SELECT
+			COALESCE(SUM(CASE WHEN status='published' THEN 1 ELSE 0 END), 0) AS published_rows,
+			COALESCE(SUM(CASE WHEN status='acked' THEN 1 ELSE 0 END), 0) AS acked_rows,
+			COALESCE(SUM(CASE WHEN status='terminal_failed' THEN 1 ELSE 0 END), 0) AS terminal_rows
+		FROM control_policy_outbox
+		WHERE status IN ('published', 'acked', 'terminal_failed')
+	`).Scan(
+		&summary.PublishedRows,
+		&summary.AckedRows,
+		&summary.TerminalRows,
+	)
+	if err != nil {
+		return BacklogStats{}, fmt.Errorf("policy outbox: backlog summary stats: %w", err)
+	}
+
+	s.backlogSummaryMu.Lock()
+	s.backlogSummary = summary
+	s.backlogSummaryAt = time.Now()
+	snapshot := s.backlogSummary
+	snapshot.BacklogCacheAgeMs = 0
+	s.backlogSummaryMu.Unlock()
+	return snapshot, nil
 }

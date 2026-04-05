@@ -39,10 +39,16 @@ var (
 	ErrInvalidData         = errors.New("storage: invalid data format")
 )
 
+func runPolicyStateRefreshMany(ctx context.Context, db *sql.DB, policyIDs []string) error {
+	return policystate.RefreshMany(ctx, db, db, policyIDs)
+}
+
+var refreshPolicyStateMany = runPolicyStateRefreshMany
+
 // Adapter defines the interface for CockroachDB persistence operations
 type Adapter interface {
 	// PersistBlock atomically persists a block, its transactions, and state snapshot
-	// Uses SERIALIZABLE transaction for linearizability
+	// Uses configured transaction isolation (default SERIALIZABLE)
 	// Idempotent: re-persisting same block succeeds if data matches
 	PersistBlock(ctx context.Context, blk *block.AppBlock, receipts []state.Receipt, stateRoot [32]byte) error
 
@@ -132,6 +138,16 @@ type adapter struct {
 	db                  *sql.DB
 	logger              *utils.Logger
 	auditLogger         *utils.AuditLogger
+	txIsolation         sql.IsolationLevel
+	txIsolationLabel    string
+	outboxNotifyMu      sync.RWMutex
+	outboxDurableNotify func(context.Context, uint64, int)
+	policyRefreshSem    chan struct{}
+	policyRefreshAsync  bool
+	policyRefreshMaxIDs int
+	policyRefreshTTL    time.Duration
+	policyRefreshFailureStreak atomic.Uint32
+	policyRefreshCooldownUntil atomic.Int64
 	metrics             *dbMetrics
 	anomalyStoreEnabled bool
 	txMismatchSeenMu    sync.Mutex
@@ -262,12 +278,21 @@ const (
 	outboxUpsertBatchSize  = 64
 	anomalyUpsertBatchSize = 64
 	maxUpsertBatchSize     = 1024
+	// Cockroach automatic retry buffering is limited; keep outbox RETURNING payload
+	// comfortably below that threshold with a conservative estimate.
+	outboxReturningSafetyBudgetBytes = 12 * 1024
+	// INSERT .. RETURNING currently returns id::STRING and tx_index.
+	outboxReturningEstimatedRowBytes = 96
 	// Keep a small commit reserve so optional anomaly writes do not consume the
 	// remaining transaction deadline and fail-close durable policy persistence.
 	anomalyPersistCommitReserve = 1500 * time.Millisecond
 	// Keep a commit reserve for optional lifecycle audit journal writes so
 	// best-effort audit work cannot consume the remaining durable commit budget.
 	lifecycleAuditCommitReserve = 1200 * time.Millisecond
+	// Async policy-state refresh should back off quickly after repeated DB timeouts
+	// so it does not amplify pressure on the hot persist/outbox path.
+	policyRefreshFailureStreakForCooldown = 1
+	policyRefreshFailureCooldown          = 5 * time.Second
 )
 
 // AdapterPerformanceConfig controls persistence hot-path batching and guardrails.
@@ -336,10 +361,27 @@ type adapterPerformanceConfig struct {
 
 // AdapterConfig holds configuration for the adapter
 type AdapterConfig struct {
-	DB          *sql.DB
-	Logger      *utils.Logger
-	AuditLogger *utils.AuditLogger
-	Performance AdapterPerformanceConfig
+	DB                               *sql.DB
+	Logger                           *utils.Logger
+	AuditLogger                      *utils.AuditLogger
+	PersistTxIsolation               string
+	AllowReadCommittedIsolation      bool
+	Performance                      AdapterPerformanceConfig
+	PolicyStateRefreshAsyncEnabled   bool
+	PolicyStateRefreshAsyncTimeout   time.Duration
+	PolicyStateRefreshAsyncMaxPolicy int
+}
+
+// SetOutboxDurableNotifier registers a best-effort callback fired immediately
+// after a block transaction commits durably and outbox rows are known durable.
+// It can be used to trigger low-latency dispatcher wake-ups.
+func (a *adapter) SetOutboxDurableNotifier(fn func(context.Context, uint64, int)) {
+	if a == nil {
+		return
+	}
+	a.outboxNotifyMu.Lock()
+	a.outboxDurableNotify = fn
+	a.outboxNotifyMu.Unlock()
 }
 
 // NewAdapter creates a new CockroachDB adapter
@@ -348,15 +390,37 @@ func NewAdapter(ctx context.Context, cfg *AdapterConfig) (Adapter, error) {
 		return nil, errors.New("storage: adapter config with DB is required")
 	}
 
+	policyRefreshEnabled := true
+	if !cfg.PolicyStateRefreshAsyncEnabled && (cfg.PolicyStateRefreshAsyncTimeout > 0 || cfg.PolicyStateRefreshAsyncMaxPolicy > 0) {
+		policyRefreshEnabled = false
+	} else if cfg.PolicyStateRefreshAsyncEnabled {
+		policyRefreshEnabled = true
+	}
+	policyRefreshTimeout := cfg.PolicyStateRefreshAsyncTimeout
+	if policyRefreshTimeout <= 0 {
+		policyRefreshTimeout = 5 * time.Second
+	}
+	policyRefreshMaxIDs := cfg.PolicyStateRefreshAsyncMaxPolicy
+	if policyRefreshMaxIDs <= 0 {
+		policyRefreshMaxIDs = 32
+	}
+	txIsolation, txIsolationLabel, txIsolationValid := parsePersistTxIsolation(cfg.PersistTxIsolation, cfg.AllowReadCommittedIsolation)
+
 	a := &adapter{
-		db:                cfg.DB,
-		logger:            cfg.Logger,
-		auditLogger:       cfg.AuditLogger,
-		metrics:           newDBMetrics(),
-		perf:              sanitizePerformanceConfig(cfg.Performance),
-		txMismatchSeen:    make(map[[32]byte]time.Time),
-		txMismatchSeenTTL: 6 * time.Hour,
-		txMismatchSeenMax: 100000,
+		db:                  cfg.DB,
+		logger:              cfg.Logger,
+		auditLogger:         cfg.AuditLogger,
+		txIsolation:         txIsolation,
+		txIsolationLabel:    txIsolationLabel,
+		policyRefreshSem:    make(chan struct{}, 1),
+		policyRefreshAsync:  policyRefreshEnabled,
+		policyRefreshMaxIDs: policyRefreshMaxIDs,
+		policyRefreshTTL:    policyRefreshTimeout,
+		metrics:             newDBMetrics(),
+		perf:                sanitizePerformanceConfig(cfg.Performance),
+		txMismatchSeen:      make(map[[32]byte]time.Time),
+		txMismatchSeenTTL:   6 * time.Hour,
+		txMismatchSeenMax:   100000,
 	}
 	a.txBatchCanary = newBatchCanaryState(a.perf.canaryWindowSize)
 	a.outboxBatchCanary = newBatchCanaryState(a.perf.canaryWindowSize)
@@ -371,6 +435,13 @@ func NewAdapter(ctx context.Context, cfg *AdapterConfig) (Adapter, error) {
 
 	if a.logger != nil {
 		a.logger.InfoContext(ctx, "CockroachDB adapter initialized")
+		a.logger.InfoContext(ctx, "persistence transaction isolation configured",
+			utils.ZapString("requested", strings.TrimSpace(cfg.PersistTxIsolation)),
+			utils.ZapString("effective", a.txIsolationLabel))
+		if !txIsolationValid && strings.TrimSpace(cfg.PersistTxIsolation) != "" {
+			a.logger.WarnContext(ctx, "unsupported or disallowed DB_PERSIST_TX_ISOLATION value; falling back to serializable",
+				utils.ZapString("value", cfg.PersistTxIsolation))
+		}
 		if !a.perf.txStoreFullPayload {
 			a.logger.WarnContext(ctx, "transaction payload persistence is in minimal mode; full tx JSON is not stored in transactions.payload")
 		}
@@ -380,6 +451,33 @@ func NewAdapter(ctx context.Context, cfg *AdapterConfig) (Adapter, error) {
 	}
 
 	return a, nil
+}
+
+func parsePersistTxIsolation(raw string, allowReadCommitted bool) (sql.IsolationLevel, string, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "serializable":
+		return sql.LevelSerializable, "serializable", true
+	case "read_committed", "read-committed", "read committed":
+		if !allowReadCommitted {
+			return sql.LevelSerializable, "serializable", false
+		}
+		return sql.LevelReadCommitted, "read_committed", true
+	default:
+		return sql.LevelSerializable, "serializable", false
+	}
+}
+
+func (a *adapter) persistTxIsolationLevel() sql.IsolationLevel {
+	if a != nil && a.txIsolation != 0 {
+		return a.txIsolation
+	}
+	return sql.LevelSerializable
+}
+
+func (a *adapter) persistTxOptions() *sql.TxOptions {
+	return &sql.TxOptions{
+		Isolation: a.persistTxIsolationLevel(),
+	}
 }
 
 func (a *adapter) detectTableExists(ctx context.Context, tableName string) bool {
@@ -840,7 +938,7 @@ func (a *adapter) prepareStatements(ctx context.Context) error {
 		SELECT vote_hash, view_number, height, voter_id, block_hash, vote_cbor
 		FROM consensus_votes
 		WHERE height >= $1
-		ORDER BY height ASC
+		ORDER BY height ASC, vote_hash ASC
 		LIMIT $2
 	`)
 	if err != nil {
@@ -1080,11 +1178,9 @@ func (a *adapter) PersistBlock(ctx context.Context, blk *block.AppBlock, receipt
 }
 
 func (a *adapter) persistBlockOnce(ctx context.Context, blk *block.AppBlock, receipts []state.Receipt, stateRoot [32]byte, _ time.Time, txBodyStart *time.Time) error {
-	// Start SERIALIZABLE transaction for linearizability
+	// Start configured isolation (defaults to SERIALIZABLE for strict linearizability).
 	beginStart := time.Now()
-	tx, err := a.db.BeginTx(ctx, &sql.TxOptions{
-		Isolation: sql.LevelSerializable,
-	})
+	tx, err := a.db.BeginTx(ctx, a.persistTxOptions())
 	beginWait := time.Since(beginStart)
 	if a.metrics != nil {
 		a.metrics.observePersistStage("tx_begin_wait", beginWait)
@@ -1189,6 +1285,7 @@ func (a *adapter) persistBlockOnce(ctx context.Context, blk *block.AppBlock, rec
 	}
 	a.logPolicyStageMarkers(policyMarkers, blk.GetHeight(), "t_db_tx_commit_done", time.Now().UnixMilli(), persistAttempt)
 	a.logPolicyStageMarkers(policyMarkers, blk.GetHeight(), "t_outbox_row_durable", time.Now().UnixMilli(), persistAttempt)
+	a.notifyOutboxDurableCommitted(ctx, blk.GetHeight(), len(policyMarkers))
 	a.refreshPolicyStateAsync(policyIDs, blk.GetHeight(), persistAttempt)
 
 	// Success audit
@@ -1209,6 +1306,27 @@ func (a *adapter) persistBlockOnce(ctx context.Context, blk *block.AppBlock, rec
 	}
 
 	return nil
+}
+
+func (a *adapter) notifyOutboxDurableCommitted(ctx context.Context, height uint64, policyRows int) {
+	if a == nil || policyRows <= 0 {
+		return
+	}
+	a.outboxNotifyMu.RLock()
+	fn := a.outboxDurableNotify
+	a.outboxNotifyMu.RUnlock()
+	if fn == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil && a.logger != nil {
+			a.logger.ErrorContext(ctx, "outbox durable notifier panic",
+				utils.ZapAny("panic", r),
+				utils.ZapUint64("height", height),
+				utils.ZapInt("policy_rows", policyRows))
+		}
+	}()
+	fn(ctx, height, policyRows)
 }
 
 func retryBackoff(attempt int, base, max time.Duration) time.Duration {
@@ -1536,7 +1654,7 @@ func (a *adapter) outboxInsertTemplate(rows int) string {
 	}
 	q.WriteString(`
 			ON CONFLICT DO NOTHING
-			RETURNING id::STRING, block_height, tx_index
+			RETURNING id::STRING, tx_index
 	`)
 	sql := q.String()
 	a.sqlTpl.outboxInsert.Store(rows, sql)
@@ -2647,25 +2765,9 @@ func (a *adapter) upsertTransactions(ctx context.Context, tx *sql.Tx, blk *block
 	if len(policyRows) > 0 {
 		outboxStart := time.Now()
 		if outboxBatchEnabled {
-			if err := a.upsertPolicyOutboxBatch(ctx, tx, policyRows, outboxChunkSize, persistAttempt); err != nil {
+			if err := a.upsertPolicyOutboxWithAdaptiveFallback(ctx, tx, policyRows, outboxChunkSize, persistAttempt, blk.GetHeight()); err != nil {
 				outboxErr = err
-				if IsRetryable(err) {
-					if a.logger != nil {
-						a.logger.WarnContext(ctx, "outbox batch upsert failed with retryable error; falling back to single-row upsert",
-							utils.ZapUint64("height", blk.GetHeight()),
-							utils.ZapInt("policy_rows", len(policyRows)),
-							utils.ZapError(err))
-					}
-					outboxErr = nil
-					for _, row := range policyRows {
-						if singleErr := a.upsertPolicyOutbox(ctx, tx, row.blockHeight, row.blockTS, row.txTS, row.txIndex, row.payload, persistAttempt); singleErr != nil {
-							outboxErr = singleErr
-							return fmt.Errorf("upsert policy outbox: %w", singleErr)
-						}
-					}
-				} else {
-					return fmt.Errorf("upsert policy outbox: %w", err)
-				}
+				return fmt.Errorf("upsert policy outbox: %w", err)
 			}
 		} else {
 			for _, row := range policyRows {
@@ -2707,6 +2809,58 @@ func (a *adapter) upsertTransactions(ctx context.Context, tx *sql.Tx, blk *block
 		}
 		if err := a.upsertAnomalies(ctx, tx, anomalyRows); err != nil {
 			return fmt.Errorf("upsert anomalies: %w", err)
+		}
+	}
+	return nil
+}
+
+func (a *adapter) upsertPolicyOutboxWithAdaptiveFallback(ctx context.Context, tx *sql.Tx, rows []policyOutboxInput, initialChunkSize int, persistAttempt int, height uint64) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	chunkSize := initialChunkSize
+	if chunkSize < 1 {
+		chunkSize = outboxUpsertBatchSize
+	}
+	if chunkSize > maxUpsertBatchSize {
+		chunkSize = maxUpsertBatchSize
+	}
+	const minAdaptiveChunk = 8
+	for {
+		err := a.upsertPolicyOutboxBatch(ctx, tx, rows, chunkSize, persistAttempt)
+		if err == nil {
+			return nil
+		}
+		if !IsRetryable(err) {
+			return err
+		}
+		if chunkSize <= minAdaptiveChunk {
+			if a.logger != nil {
+				a.logger.WarnContext(ctx, "outbox batch upsert retryable failure at minimum adaptive chunk; falling back to single-row upsert",
+					utils.ZapUint64("height", height),
+					utils.ZapInt("policy_rows", len(rows)),
+					utils.ZapInt("chunk_size", chunkSize),
+					utils.ZapError(err))
+			}
+			break
+		}
+		nextChunk := chunkSize / 2
+		if nextChunk < minAdaptiveChunk {
+			nextChunk = minAdaptiveChunk
+		}
+		if a.logger != nil {
+			a.logger.WarnContext(ctx, "outbox batch upsert retryable failure; reducing chunk size",
+				utils.ZapUint64("height", height),
+				utils.ZapInt("policy_rows", len(rows)),
+				utils.ZapInt("from_chunk", chunkSize),
+				utils.ZapInt("to_chunk", nextChunk),
+				utils.ZapError(err))
+		}
+		chunkSize = nextChunk
+	}
+	for _, row := range rows {
+		if err := a.upsertPolicyOutbox(ctx, tx, row.blockHeight, row.blockTS, row.txTS, row.txIndex, row.payload, persistAttempt); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -3743,6 +3897,9 @@ func (a *adapter) upsertPolicyOutbox(ctx context.Context, tx *sql.Tx, blockHeigh
 	if createdOutboxID != "" {
 		a.logPolicyStage(policyID, traceID, "t_outbox_row_created", time.Now().UnixMilli(), blockHeight, txIndex, persistAttempt)
 		if shouldSkipLifecycleAuditForDeadline(ctx, 1) {
+			if a.metrics != nil {
+				a.metrics.observePersistDiagnosticSignal("lifecycle_audit_deferred")
+			}
 			if a.logger != nil {
 				deadline, _ := ctx.Deadline()
 				a.logger.WarnContext(ctx, "skipping lifecycle audit for created outbox row to preserve durable commit budget",
@@ -3857,7 +4014,25 @@ func (a *adapter) upsertPolicyOutboxBatch(ctx context.Context, tx *sql.Tx, rows 
 	if chunkSize > maxUpsertBatchSize {
 		chunkSize = maxUpsertBatchSize
 	}
+	if safeChunk := outboxReturningSafeChunkLimit(); chunkSize > safeChunk {
+		if a.metrics != nil {
+			a.metrics.observePersistDiagnosticSignal("outbox_returning_guardrail_applied")
+		}
+		if a.logger != nil {
+			a.logger.InfoContext(ctx, "outbox returning guardrail reduced chunk size",
+				utils.ZapInt("from_chunk", chunkSize),
+				utils.ZapInt("to_chunk", safeChunk),
+				utils.ZapInt("persist_attempt", persistAttempt))
+		}
+		chunkSize = safeChunk
+	}
 	rows = coalescePolicyOutboxInputs(rows)
+	baseHeight := rows[0].blockHeight
+	for _, row := range rows[1:] {
+		if row.blockHeight != baseHeight {
+			return fmt.Errorf("%w: mixed block heights in outbox batch (%d,%d)", ErrInvalidData, baseHeight, row.blockHeight)
+		}
+	}
 	prepared := make([]outboxPrepared, 0, len(rows))
 	for _, row := range rows {
 		if len(row.payload) == 0 {
@@ -3943,7 +4118,27 @@ func (a *adapter) upsertPolicyOutboxBatch(ctx context.Context, tx *sql.Tx, rows 
 			continue
 		}
 
-		inserted := make(map[outboxKey]string, len(filteredChunk))
+		insertedByTxIndex := make(map[int]string, len(filteredChunk))
+		insertedRowsCount := 0
+		returningBytesEstimate := 0
+		logRetryableOutboxInsert := func(err error) {
+			if err == nil || !IsRetryable(err) {
+				return
+			}
+			state := extractSQLState(err)
+			if a.metrics != nil {
+				a.metrics.observeOutboxInsertRetry(state)
+			}
+			if a.logger != nil {
+				a.logger.WarnContext(ctx, "outbox batch insert retryable failure",
+					utils.ZapError(err),
+					utils.ZapString("sqlstate", state),
+					utils.ZapInt("chunk_size", len(filteredChunk)),
+					utils.ZapInt("returned_rows", insertedRowsCount),
+					utils.ZapInt("returning_estimated_bytes", returningBytesEstimate),
+					utils.ZapInt("persist_attempt", persistAttempt))
+			}
+		}
 		insertCtx, insertCancel := context.WithTimeout(ctx, a.outboxUpsertBudget(ctx, len(filteredChunk)))
 		rowsInserted, err := tx.QueryContext(insertCtx, a.outboxInsertTemplate(len(filteredChunk)), args...)
 		if err != nil {
@@ -3951,32 +4146,41 @@ func (a *adapter) upsertPolicyOutboxBatch(ctx context.Context, tx *sql.Tx, rows 
 			if a.metrics != nil && isTimeoutOrCanceledError(err) {
 				a.metrics.observePersistDiagnosticSignal("outbox_upsert_timeout")
 			}
+			logRetryableOutboxInsert(err)
 			return err
 		}
 		for rowsInserted.Next() {
 			var outboxID string
-			var h uint64
 			var i int
-			if scanErr := rowsInserted.Scan(&outboxID, &h, &i); scanErr != nil {
+			if scanErr := rowsInserted.Scan(&outboxID, &i); scanErr != nil {
 				rowsInserted.Close()
 				return fmt.Errorf("scan inserted outbox rows: %w", scanErr)
 			}
-			inserted[outboxKey{blockHeight: h, txIndex: i}] = outboxID
+			insertedByTxIndex[i] = outboxID
+			insertedRowsCount++
+			returningBytesEstimate += estimateOutboxReturningRowBytes(outboxID)
 		}
 		if err := rowsInserted.Err(); err != nil {
 			rowsInserted.Close()
 			insertCancel()
-			return fmt.Errorf("read inserted outbox rows: %w", err)
+			readErr := fmt.Errorf("read inserted outbox rows: %w", err)
+			logRetryableOutboxInsert(readErr)
+			return readErr
 		}
 		rowsInserted.Close()
 		insertCancel()
+		if a.metrics != nil {
+			a.metrics.observeOutboxReturning(insertedRowsCount, returningBytesEstimate)
+			if returningBytesEstimate >= outboxReturningSafetyBudgetBytes {
+				a.metrics.observePersistDiagnosticSignal("outbox_returning_near_safety_budget")
+			}
+		}
 
 		conflicts := make([]outboxPrepared, 0, len(filteredChunk))
 		lifecycleEvents := make([]lifecycleaudit.OutboxEvent, 0, len(filteredChunk))
 		nowMs := time.Now().UnixMilli()
 		for _, row := range filteredChunk {
-			key := outboxKey{blockHeight: row.blockHeight, txIndex: row.txIndex}
-			if outboxID, ok := inserted[key]; ok {
+			if outboxID, ok := insertedByTxIndex[row.txIndex]; ok {
 				a.logPolicyStage(row.policyID, row.traceID, "t_outbox_row_created", nowMs, row.blockHeight, row.txIndex, persistAttempt)
 				lifecycleEvents = append(lifecycleEvents, lifecycleaudit.OutboxEvent{
 					ActionType:  lifecycleaudit.ActionPolicyCreated,
@@ -3994,6 +4198,9 @@ func (a *adapter) upsertPolicyOutboxBatch(ctx context.Context, tx *sql.Tx, rows 
 		}
 		if len(lifecycleEvents) > 0 {
 			if shouldSkipLifecycleAuditForDeadline(ctx, len(lifecycleEvents)) {
+				if a.metrics != nil {
+					a.metrics.observePersistDiagnosticSignal("lifecycle_audit_deferred")
+				}
 				if a.logger != nil {
 					deadline, _ := ctx.Deadline()
 					a.logger.WarnContext(ctx, "skipping lifecycle audit for created outbox batch to preserve durable commit budget",
@@ -4128,6 +4335,29 @@ func (a *adapter) upsertPolicyOutboxBatch(ctx context.Context, tx *sql.Tx, rows 
 	return nil
 }
 
+func outboxReturningSafeChunkLimit() int {
+	limit := outboxReturningSafetyBudgetBytes / outboxReturningEstimatedRowBytes
+	if limit < 1 {
+		return 1
+	}
+	if limit > maxUpsertBatchSize {
+		return maxUpsertBatchSize
+	}
+	return limit
+}
+
+func estimateOutboxReturningRowBytes(outboxID string) int {
+	// RETURNING payload fields:
+	// - id::STRING (UUID text; typically 36 chars)
+	// - tx_index (INT)
+	// Include protocol/value overhead with a conservative floor.
+	bytes := len(strings.TrimSpace(outboxID)) + 24
+	if bytes < 64 {
+		bytes = 64
+	}
+	return bytes
+}
+
 func (a *adapter) lookupActivePolicyOutboxSemanticKeys(ctx context.Context, tx *sql.Tx, keys []string) (map[string]struct{}, error) {
 	rows, err := a.lookupActivePolicyOutboxSemanticRows(ctx, tx, keys)
 	if err != nil {
@@ -4217,9 +4447,15 @@ func (a *adapter) refreshActivePolicyOutboxRow(ctx context.Context, tx *sql.Tx, 
 		return false, nil
 	}
 	if bytes.Equal(existing.RuleHash, incoming.ruleHash[:]) {
+		if a.metrics != nil {
+			a.metrics.observePersistDiagnosticSignal("outbox_semantic_refresh_skipped_same_hash")
+		}
 		return false, nil
 	}
-	if existing.Status == "publishing" {
+	if existing.Status == "publishing" || existing.Status == "published" || existing.Status == "acked" {
+		if a.metrics != nil {
+			a.metrics.observePersistDiagnosticSignal("outbox_semantic_refresh_skipped_nonmutable_status")
+		}
 		return false, nil
 	}
 	res, err := tx.ExecContext(ctx, `
@@ -4251,7 +4487,7 @@ func (a *adapter) refreshActivePolicyOutboxRow(ctx context.Context, tx *sql.Tx, 
 		    acked_at = NULL,
 		    updated_at = NOW()
 		WHERE semantic_key = $12
-		  AND status IN ('pending', 'retry', 'published')
+		  AND status IN ('pending', 'retry')
 	`, incoming.policyID, incoming.ruleHash[:], incoming.payload, incoming.requestID, incoming.commandID, incoming.workflowID, incoming.traceID, incoming.aiEventTsMs, incoming.sourceEventID, incoming.sourceEventTsMs, incoming.sentinelEventID, incoming.semanticKey)
 	if err != nil {
 		return false, fmt.Errorf("refresh active semantic outbox row: %w", err)
@@ -4261,7 +4497,13 @@ func (a *adapter) refreshActivePolicyOutboxRow(ctx context.Context, tx *sql.Tx, 
 		return false, fmt.Errorf("refresh active semantic outbox row rows affected: %w", rowsErr)
 	}
 	if rows == 0 {
+		if a.metrics != nil {
+			a.metrics.observePersistDiagnosticSignal("outbox_semantic_refresh_no_rows")
+		}
 		return false, nil
+	}
+	if a.metrics != nil {
+		a.metrics.observePersistDiagnosticSignal("outbox_semantic_refresh_applied")
 	}
 	a.logPolicyStage(incoming.policyID, incoming.traceID, "t_outbox_row_refreshed", time.Now().UnixMilli(), incoming.blockHeight, incoming.txIndex, persistAttempt)
 	return true, nil
@@ -4287,20 +4529,92 @@ func collectPolicyIDsFromMarkers(markers []policyStageMarker) []string {
 	return out
 }
 
+func dedupePolicyIDList(policyIDs []string) []string {
+	if len(policyIDs) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(policyIDs))
+	seen := make(map[string]struct{}, len(policyIDs))
+	for _, raw := range policyIDs {
+		id := strings.TrimSpace(raw)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
 func (a *adapter) refreshPolicyStateAsync(policyIDs []string, blockHeight uint64, persistAttempt int) {
 	if a == nil || a.db == nil || len(policyIDs) == 0 {
 		return
 	}
-	ids := append([]string(nil), policyIDs...)
+	if !a.policyRefreshAsync {
+		return
+	}
+	if untilNs := a.policyRefreshCooldownUntil.Load(); untilNs > 0 && time.Now().UnixNano() < untilNs {
+		if a.metrics != nil {
+			a.metrics.observePersistDiagnosticSignal("policy_state_refresh_async_skipped_cooldown")
+		}
+		return
+	}
+	sem := a.policyRefreshSem
+	if sem == nil {
+		sem = make(chan struct{}, 1)
+		a.policyRefreshSem = sem
+	}
+	select {
+	case sem <- struct{}{}:
+	default:
+		if a.metrics != nil {
+			a.metrics.observePersistDiagnosticSignal("policy_state_refresh_async_skipped_busy")
+		}
+		if a.logger != nil {
+			a.logger.Warn("policy state async refresh skipped",
+				utils.ZapUint64("height", blockHeight),
+				utils.ZapInt("policy_count", len(policyIDs)),
+				utils.ZapInt("persist_attempt", persistAttempt))
+		}
+		return
+	}
+	ids := dedupePolicyIDList(policyIDs)
+	if len(ids) == 0 {
+		<-sem
+		return
+	}
+	if a.policyRefreshMaxIDs > 0 && len(ids) > a.policyRefreshMaxIDs {
+		ids = ids[:a.policyRefreshMaxIDs]
+	}
 	go func() {
+		defer func() { <-sem }()
 		start := time.Now()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		timeout := a.policyRefreshTTL
+		if timeout <= 0 {
+			timeout = 5 * time.Second
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
-		err := policystate.RefreshMany(ctx, a.db, a.db, ids)
+		err := refreshPolicyStateMany(ctx, a.db, ids)
 		if a.metrics != nil {
 			a.metrics.observePersistStage("policy_state_refresh_async", time.Since(start))
 			if err != nil {
 				a.metrics.observePersistFailureClass("policy_state_refresh_async", err)
+			}
+		}
+		if err == nil {
+			a.policyRefreshFailureStreak.Store(0)
+			a.policyRefreshCooldownUntil.Store(0)
+		} else if isTimeoutOrCanceledError(err) {
+			streak := a.policyRefreshFailureStreak.Add(1)
+			if streak >= policyRefreshFailureStreakForCooldown {
+				a.policyRefreshCooldownUntil.Store(time.Now().Add(policyRefreshFailureCooldown).UnixNano())
+				if a.metrics != nil {
+					a.metrics.observePersistDiagnosticSignal("policy_state_refresh_async_cooldown_opened")
+				}
 			}
 		}
 		if err != nil && a.logger != nil {
@@ -4803,6 +5117,7 @@ func (a *adapter) Metrics() MetricsSnapshot {
 	snap.BatchCanaryEnabled = a.perf.canaryAutoFallback
 	snap.TxVerifyUseTx = a.perf.txVerifyUseTx
 	snap.TxVerifyChunkSize = a.perf.txVerifyChunkSize
+	snap.PersistTxIsolation = a.txIsolationLabel
 	if a.txBatchCanary != nil {
 		snap.BatchFallbackUntilUnixMs = a.txBatchCanary.fallbackUntilUnixMilli()
 		snap.BatchFallbackActivations = a.txBatchCanary.activationCount()
@@ -4904,6 +5219,11 @@ type MetricsSnapshot struct {
 	TxBatchAdaptiveScaleDownTotal     uint64
 	OutboxBatchAdaptiveScaleUpTotal   uint64
 	OutboxBatchAdaptiveScaleDownTotal uint64
+	OutboxReturningRowsTotal          uint64
+	OutboxReturningEstimatedBytes     uint64
+	OutboxInsertRetriesTotal          uint64
+	OutboxInsertRetrySerialization    uint64
+	PersistTxIsolation                string
 	TxStoreFullPayload                bool
 	BatchCanaryEnabled                bool
 	TxVerifyUseTx                     bool
@@ -4941,6 +5261,10 @@ type dbMetrics struct {
 	outboxBatchModes            sync.Map
 	txBatchCanaryBadReasons     sync.Map
 	outboxBatchCanaryBadReasons sync.Map
+	outboxReturningRowsTotal    atomic.Uint64
+	outboxReturningBytesTotal   atomic.Uint64
+	outboxInsertRetriesTotal    atomic.Uint64
+	outboxInsertRetry40001Total atomic.Uint64
 }
 
 func newDBMetrics() *dbMetrics {
@@ -5118,6 +5442,28 @@ func (m *dbMetrics) observeOutboxBatchCanaryBad(reason string) {
 	incrementLabel(&m.outboxBatchCanaryBadReasons, reason)
 }
 
+func (m *dbMetrics) observeOutboxReturning(rows, estimatedBytes int) {
+	if m == nil {
+		return
+	}
+	if rows > 0 {
+		m.outboxReturningRowsTotal.Add(uint64(rows))
+	}
+	if estimatedBytes > 0 {
+		m.outboxReturningBytesTotal.Add(uint64(estimatedBytes))
+	}
+}
+
+func (m *dbMetrics) observeOutboxInsertRetry(sqlstate string) {
+	if m == nil {
+		return
+	}
+	m.outboxInsertRetriesTotal.Add(1)
+	if sqlstate == "40001" {
+		m.outboxInsertRetry40001Total.Add(1)
+	}
+}
+
 func (m *dbMetrics) snapshot() MetricsSnapshot {
 	if m == nil {
 		return MetricsSnapshot{}
@@ -5125,38 +5471,42 @@ func (m *dbMetrics) snapshot() MetricsSnapshot {
 	queryBuckets, qCount, qSum := m.queryLatency.Snapshot()
 	txnBuckets, tCount, tSum := m.txnLatency.Snapshot()
 	snapshot := MetricsSnapshot{
-		QueryBuckets:                  queryBuckets,
-		QueryCount:                    qCount,
-		QuerySumMs:                    qSum,
-		QueryP95Ms:                    m.queryLatency.Quantile(0.95),
-		TxnBuckets:                    txnBuckets,
-		TxnCount:                      tCount,
-		TxnSumMs:                      tSum,
-		TxnP95Ms:                      m.txnLatency.Quantile(0.95),
-		SlowQueryCount:                m.slowQueryCount.Load(),
-		SlowTransactionCount:          m.slowTxnCount.Load(),
-		SlowQueries:                   make(map[string]uint64),
-		SlowTransactions:              make(map[string]uint64),
-		PersistStageBuckets:           make(map[string][]utils.HistogramBucket),
-		PersistStageCount:             make(map[string]uint64),
-		PersistStageSumMs:             make(map[string]float64),
-		PersistStageP95Ms:             make(map[string]float64),
-		PersistFailureClassTotals:     make(map[string]uint64),
-		PersistIntegrityKindTotals:    make(map[string]uint64),
-		PersistContentionSignalTotals: make(map[string]uint64),
-		PersistDiagnosticSignalTotals: make(map[string]uint64),
-		TxUpsertBlocks:                m.txUpsertBlocks.Load(),
-		TxUpsertRows:                  m.txUpsertRows.Load(),
-		TxUpsertConflicts:             m.txUpsertConflicts.Load(),
-		TxUpsertPayloadBytes:          m.txUpsertPayloadBytes.Load(),
-		TxLocationMismatchTotal:       m.txLocationMismatchTotal.Load(),
-		TxLocationMismatchBySource:    make(map[string]uint64),
-		TxLocationMismatchByKind:      make(map[string]uint64),
-		TxLocationMismatchByLabel:     make(map[TxLocationMismatchLabel]uint64),
-		TxBatchModeTotals:             make(map[string]uint64),
-		OutboxBatchModeTotals:         make(map[string]uint64),
-		TxBatchCanaryBadByReason:      make(map[string]uint64),
-		OutboxBatchCanaryBadByReason:  make(map[string]uint64),
+		QueryBuckets:                   queryBuckets,
+		QueryCount:                     qCount,
+		QuerySumMs:                     qSum,
+		QueryP95Ms:                     m.queryLatency.Quantile(0.95),
+		TxnBuckets:                     txnBuckets,
+		TxnCount:                       tCount,
+		TxnSumMs:                       tSum,
+		TxnP95Ms:                       m.txnLatency.Quantile(0.95),
+		SlowQueryCount:                 m.slowQueryCount.Load(),
+		SlowTransactionCount:           m.slowTxnCount.Load(),
+		SlowQueries:                    make(map[string]uint64),
+		SlowTransactions:               make(map[string]uint64),
+		PersistStageBuckets:            make(map[string][]utils.HistogramBucket),
+		PersistStageCount:              make(map[string]uint64),
+		PersistStageSumMs:              make(map[string]float64),
+		PersistStageP95Ms:              make(map[string]float64),
+		PersistFailureClassTotals:      make(map[string]uint64),
+		PersistIntegrityKindTotals:     make(map[string]uint64),
+		PersistContentionSignalTotals:  make(map[string]uint64),
+		PersistDiagnosticSignalTotals:  make(map[string]uint64),
+		TxUpsertBlocks:                 m.txUpsertBlocks.Load(),
+		TxUpsertRows:                   m.txUpsertRows.Load(),
+		TxUpsertConflicts:              m.txUpsertConflicts.Load(),
+		TxUpsertPayloadBytes:           m.txUpsertPayloadBytes.Load(),
+		TxLocationMismatchTotal:        m.txLocationMismatchTotal.Load(),
+		TxLocationMismatchBySource:     make(map[string]uint64),
+		TxLocationMismatchByKind:       make(map[string]uint64),
+		TxLocationMismatchByLabel:      make(map[TxLocationMismatchLabel]uint64),
+		TxBatchModeTotals:              make(map[string]uint64),
+		OutboxBatchModeTotals:          make(map[string]uint64),
+		TxBatchCanaryBadByReason:       make(map[string]uint64),
+		OutboxBatchCanaryBadByReason:   make(map[string]uint64),
+		OutboxReturningRowsTotal:       m.outboxReturningRowsTotal.Load(),
+		OutboxReturningEstimatedBytes:  m.outboxReturningBytesTotal.Load(),
+		OutboxInsertRetriesTotal:       m.outboxInsertRetriesTotal.Load(),
+		OutboxInsertRetrySerialization: m.outboxInsertRetry40001Total.Load(),
 	}
 	if snapshot.TxUpsertRows > 0 {
 		snapshot.TxUpsertConflictRatio = float64(snapshot.TxUpsertConflicts) / float64(snapshot.TxUpsertRows)

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"backend/pkg/control/policytrace"
+	"backend/pkg/observability"
 	"backend/pkg/utils"
 	pb "backend/proto"
 	"github.com/IBM/sarama"
@@ -72,6 +73,7 @@ type ConsumerStats struct {
 
 type CausalStats struct {
 	SkewCorrectionsTotal       uint64
+	CorrelationCommand         uint64
 	CorrelationExact           uint64
 	CorrelationFallbackHash    uint64
 	CorrelationFallbackTrace   uint64
@@ -101,6 +103,10 @@ type CausalStats struct {
 	AppliedToAckCount          uint64
 	AppliedToAckSumMs          float64
 	AppliedToAckP95Ms          float64
+	CorrelationLatencyBuckets  []utils.HistogramBucket
+	CorrelationLatencyCount    uint64
+	CorrelationLatencySumMs    float64
+	CorrelationLatencyP95Ms    float64
 }
 
 type Options struct {
@@ -249,7 +255,8 @@ func (h *handler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.Co
 			if item.msg == nil {
 				continue
 			}
-			err := h.c.process(ctx, item.msg)
+			msgCtx := observability.ExtractContextFromSaramaHeaders(ctx, item.msg.Headers)
+			err := h.c.process(msgCtx, item.msg)
 			if err == nil {
 				sess.MarkMessage(item.msg, "")
 				continue
@@ -366,13 +373,16 @@ func (c *Consumer) process(ctx context.Context, msg *sarama.ConsumerMessage) err
 		return fmt.Errorf("%w: invalid producer_id size", errPermanent)
 	}
 
-	res := strings.ToLower(strings.TrimSpace(ack.Result))
-	if res != "applied" && res != "failed" {
+	res, cls, ok := normalizeAckOutcome(strings.TrimSpace(ack.Result), strings.TrimSpace(ack.ErrorCode), strings.TrimSpace(ack.Reason))
+	if !ok {
 		c.rejectedTotal.Add(1)
 		c.sendDLQ(ctx, msg, "invalid_result", fmt.Errorf("result=%q", ack.Result))
 		return fmt.Errorf("%w: invalid result", errPermanent)
 	}
 	ack.Result = res
+	if strings.TrimSpace(ack.ErrorCode) == "" {
+		ack.ErrorCode = cls
+	}
 	if strings.TrimSpace(ack.AckEventId) == "" {
 		ack.AckEventId = fallbackAckEventID(msg)
 	}
@@ -460,6 +470,50 @@ func (c *Consumer) process(ctx context.Context, msg *sarama.ConsumerMessage) err
 	return fmt.Errorf("policy ack store retries exhausted")
 }
 
+func normalizeAckOutcome(resultRaw, errorCodeRaw, reasonRaw string) (string, string, bool) {
+	result := strings.ToLower(strings.TrimSpace(resultRaw))
+	errorCode := strings.ToLower(strings.TrimSpace(errorCodeRaw))
+	reason := strings.ToLower(strings.TrimSpace(reasonRaw))
+
+	timeoutLike := strings.Contains(errorCode, "timeout") || strings.Contains(errorCode, "deadline")
+	if !timeoutLike {
+		timeoutLike = strings.Contains(reason, "timeout") || strings.Contains(reason, "deadline")
+	}
+	retryExhaustedLike := strings.Contains(errorCode, "retry_exhausted") || strings.Contains(errorCode, "retries_exhausted")
+	if !retryExhaustedLike {
+		retryExhaustedLike = strings.Contains(reason, "retry_exhausted") || strings.Contains(reason, "retries_exhausted")
+	}
+	noopLike := strings.Contains(errorCode, "noop") || strings.Contains(reason, "noop") || strings.Contains(errorCode, "duplicate")
+
+	switch result {
+	case "accepted":
+		return "accepted", "accepted", true
+	case "applied":
+		if noopLike {
+			return "noop", "noop", true
+		}
+		return "applied", "applied", true
+	case "failed":
+		if timeoutLike {
+			return "timeout", "timeout", true
+		}
+		if retryExhaustedLike {
+			return "retry_exhausted", "retry_exhausted", true
+		}
+		return "rejected", "rejected", true
+	case "noop":
+		return "noop", "noop", true
+	case "rejected":
+		return "rejected", "rejected", true
+	case "timeout":
+		return "timeout", "timeout", true
+	case "retry_exhausted":
+		return "retry_exhausted", "retry_exhausted", true
+	default:
+		return "", "", false
+	}
+}
+
 func fallbackAckEventID(msg *sarama.ConsumerMessage) string {
 	if msg == nil {
 		return uuid.NewSHA1(legacyAckEventNamespace, []byte("ack:nil")).String()
@@ -523,6 +577,7 @@ func (c *Consumer) sendDLQ(ctx context.Context, msg *sarama.ConsumerMessage, rea
 		Value:   sarama.ByteEncoder(msg.Value),
 		Headers: headers,
 	}
+	dlqMsg.Headers = observability.InjectContextToSaramaHeaders(ctx, dlqMsg.Headers)
 	if _, _, perr := c.dlqProducer.SendMessage(dlqMsg); perr != nil {
 		c.dlqPublishFailures.Add(1)
 		if c.log != nil && c.shouldLog(&c.lastDLQErrLogNs) {
@@ -587,6 +642,7 @@ func (c *Consumer) CausalStats() CausalStats {
 	s := c.store.Stats()
 	return CausalStats{
 		SkewCorrectionsTotal:       s.SkewCorrectionsTotal,
+		CorrelationCommand:         s.CorrelationCommand,
 		CorrelationExact:           s.CorrelationExact,
 		CorrelationFallbackHash:    s.CorrelationFallbackHash,
 		CorrelationFallbackTrace:   s.CorrelationFallbackTrace,
@@ -616,5 +672,9 @@ func (c *Consumer) CausalStats() CausalStats {
 		AppliedToAckCount:          s.AppliedToAckCount,
 		AppliedToAckSumMs:          s.AppliedToAckSumMs,
 		AppliedToAckP95Ms:          s.AppliedToAckP95Ms,
+		CorrelationLatencyBuckets:  s.CorrelationLatencyBuckets,
+		CorrelationLatencyCount:    s.CorrelationLatencyCount,
+		CorrelationLatencySumMs:    s.CorrelationLatencySumMs,
+		CorrelationLatencyP95Ms:    s.CorrelationLatencyP95Ms,
 	}
 }

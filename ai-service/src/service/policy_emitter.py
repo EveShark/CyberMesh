@@ -92,7 +92,6 @@ def build_policy_candidate(
     policy_id = policy_id_override or generate_uuid7()
 
     target_scope = config.scope
-    direction = config.direction
     enforcement_action = "drop"
 
     tenant = (
@@ -108,6 +107,19 @@ def build_policy_candidate(
     if not tenant:
         return PolicyDecision(candidate=None, reason="missing_tenant")
 
+    namespace = (
+        context.metadata.get("namespace")
+        or context.metadata.get("kubernetes_namespace")
+        or os.getenv("POLICY_PUBLISHING_NAMESPACE")
+        or os.getenv("POLICY_GATEWAY_NAMESPACE")
+    )
+    direction, direction_source = _resolve_target_direction(
+        context=context,
+        config=config,
+        namespace=namespace,
+        enforcement_action=enforcement_action,
+    )
+
     target: Dict[str, Any] = {
         "ips": [target_ip],
         "cidrs": [],
@@ -120,12 +132,6 @@ def build_policy_candidate(
         "selectors": {},
     }
 
-    namespace = (
-        context.metadata.get("namespace")
-        or context.metadata.get("kubernetes_namespace")
-        or os.getenv("POLICY_PUBLISHING_NAMESPACE")
-        or os.getenv("POLICY_GATEWAY_NAMESPACE")
-    )
     if namespace:
         # Keep both keys for backward compatibility while backend gateway profile
         # standardizes on target.selectors.namespace.
@@ -228,6 +234,7 @@ def build_policy_candidate(
             "source_type": context.metadata.get("source_type") or context.network_context.get("source_type"),
             "sensor_id": context.metadata.get("sensor_id") or context.network_context.get("sensor_id"),
             "validator_id": context.metadata.get("validator_id") or context.network_context.get("validator_id"),
+            "direction_source": direction_source,
             "source_service": "ai-service",
             "trace_version": 1,
         },
@@ -246,6 +253,7 @@ def build_policy_candidate(
             "source_type": context.metadata.get("source_type") or context.network_context.get("source_type"),
             "sensor_id": context.metadata.get("sensor_id") or context.network_context.get("sensor_id"),
             "validator_id": context.metadata.get("validator_id") or context.network_context.get("validator_id"),
+            "direction_source": direction_source,
             "source": "ai-service",
             "version": 1,
             "stages": trace_stages,
@@ -276,6 +284,41 @@ def _select_target_ip(network_context: Dict[str, Any]) -> Optional[str]:
         if value and isinstance(value, str) and value.lower() not in {"unknown", "null", "none"}:
             return value
     return None
+
+
+def _resolve_target_direction(
+    *,
+    context: PolicyContext,
+    config: PolicyPublishingConfig,
+    namespace: Optional[str],
+    enforcement_action: str,
+) -> tuple[str, str]:
+    metadata_direction = str(context.metadata.get("direction") or "").strip().lower()
+    if metadata_direction in {"ingress", "egress"}:
+        return metadata_direction, "metadata"
+
+    network_direction = str(context.network_context.get("direction") or "").strip().lower()
+    if network_direction in {"ingress", "egress"}:
+        return network_direction, "network_context"
+
+    gateway_ns = str(os.getenv("POLICY_GATEWAY_NAMESPACE") or "").strip().lower()
+    namespace_norm = str(namespace or "").strip().lower()
+    action_norm = str(enforcement_action or "").strip().lower()
+    if (
+        action_norm in {"drop", "reject", "rate_limit"}
+        and gateway_ns
+        and namespace_norm == gateway_ns
+    ):
+        return "egress", "gateway_namespace_guardrail"
+
+    anomaly_type = str(context.anomaly_type or "").strip().lower()
+    if any(token in anomaly_type for token in ("exfil", "egress", "data_loss")):
+        return "egress", "anomaly_type_hint"
+
+    configured = str(config.direction or "").strip().lower()
+    if configured in {"ingress", "egress"}:
+        return configured, "config"
+    return "ingress", "default"
 
 
 def _derive_scope_identifier(target: Dict[str, Any], tenant: str) -> str:

@@ -15,6 +15,10 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+const (
+	legacyPolicyDomain = "control.policy.v2"
+)
+
 // Event wraps a protobuf PolicyUpdateEvent plus computed spec.
 type Event struct {
 	Proto *pb.PolicyUpdateEvent
@@ -91,8 +95,14 @@ func LoadTrustedKeys(dir string) (*TrustedKeys, error) {
 	return store, nil
 }
 
-// VerifyAndParse validates signature and rule payload.
+// VerifyAndParse validates signature and rule payload with legacy policy domain defaults.
 func (t *TrustedKeys) VerifyAndParse(evt *pb.PolicyUpdateEvent) (Event, error) {
+	return t.VerifyAndParseWithDomain(evt, legacyPolicyDomain)
+}
+
+// VerifyAndParseWithDomain validates signature and rule payload with an explicit domain.
+// It falls back to the legacy domain for rollout compatibility.
+func (t *TrustedKeys) VerifyAndParseWithDomain(evt *pb.PolicyUpdateEvent, domain string) (Event, error) {
 	if t == nil {
 		return Event{}, errors.New("policy: trusted store nil")
 	}
@@ -127,14 +137,23 @@ func (t *TrustedKeys) VerifyAndParse(evt *pb.PolicyUpdateEvent) (Event, error) {
 		ProducerId:       evt.ProducerId,
 	}
 
-	// Domain separation identical to backend producer (control.policy.v2).
+	if domain == "" {
+		domain = legacyPolicyDomain
+	}
+
 	bytes, err := proto.Marshal(&signed)
 	if err != nil {
 		return Event{}, fmt.Errorf("policy: marshal sign payload: %w", err)
 	}
-	message := append([]byte("control.policy.v2"), bytes...)
-	if !ed25519.Verify(pub, message, evt.Signature) {
-		return Event{}, errors.New("policy: signature verification failed")
+	verifyWithDomain := func(d string) bool {
+		message := append([]byte(d), bytes...)
+		return ed25519.Verify(pub, message, evt.Signature)
+	}
+	if !verifyWithDomain(domain) {
+		// Backward-compatible fallback during topic/domain transition.
+		if domain != legacyPolicyDomain && !verifyWithDomain(legacyPolicyDomain) {
+			return Event{}, errors.New("policy: signature verification failed")
+		}
 	}
 
 	if len(evt.RuleHash) != 32 {

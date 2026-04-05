@@ -12,6 +12,7 @@ import (
 	ctypes "backend/pkg/consensus/types"
 	"backend/pkg/mempool"
 	"backend/pkg/state"
+	"backend/pkg/storage/cockroach"
 	"backend/pkg/utils"
 )
 
@@ -197,13 +198,21 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 					utils.ZapError(err),
 					utils.ZapUint64("height", ab.GetHeight()))
 				if !errors.Is(err, errPersistEnqueueNonProposer) {
-					s.rememberPendingPersistence(task)
+					reason := pendingReasonCommitEnqueueError
+					if isEnqueueTimeoutErr(err) {
+						reason = pendingReasonCommitEnqueueTimeout
+					}
+					// Commit-path enqueue failures should attempt bounded direct persistence
+					// before entering slower backfill recovery.
+					if ok, pendingReason := s.tryDirectPersistFallback(ctx, task, reason); !ok {
+						s.rememberPendingPersistence(task, pendingReason)
+					}
 				}
 			} else if logCommitInfo {
 				s.log.InfoContext(ctx, "persistence task enqueued successfully")
 			}
 		} else {
-			s.rememberPendingPersistence(task)
+			s.rememberPendingPersistence(task, pendingReasonNonProposer)
 		}
 
 	} else {
@@ -237,11 +246,223 @@ func (s *Service) enqueuePersistenceTask(ctx context.Context, task *PersistenceT
 		}
 		return errPersistEnqueueNonProposer
 	}
-	if err := s.persistWorker.Enqueue(ctx, task); err != nil {
+	enqueueCtx := ctx
+	cancel := func() {}
+	if source == "commit" {
+		// Commit-path persistence enqueue is durability-critical and should not
+		// inherit a near-expired consensus callback context. Use a bounded,
+		// detached enqueue timeout to avoid falling into slow backfill recovery.
+		timeout := s.persistEnqueueTimeout
+		if timeout <= 0 {
+			timeout = 2 * time.Second
+		}
+		baseCtx := s.persistBaseContext()
+		enqueueCtx, cancel = context.WithTimeout(baseCtx, timeout)
+	}
+	defer cancel()
+	started := time.Now()
+	if err := s.persistWorker.Enqueue(enqueueCtx, task); err != nil {
+		waitMs := uint64(time.Since(started) / time.Millisecond)
+		s.recordPersistEnqueueWait(source, waitMs)
 		atomic.AddUint64(&s.persistEnqueueErrors, 1)
+		if source == "commit" && isEnqueueTimeoutErr(err) {
+			atomic.AddUint64(&s.persistEnqueueTimeouts, 1)
+			atomic.AddUint64(&s.persistEnqueueTimeoutsCommit, 1)
+			s.noteCommitEnqueueResult(true)
+		}
+		if source == "commit" && !isEnqueueTimeoutErr(err) {
+			// Keep distress gate tied to consecutive timeout pressure only.
+			s.noteCommitEnqueueResult(false)
+		}
+		if source == "backfill" && isEnqueueTimeoutErr(err) {
+			atomic.AddUint64(&s.persistEnqueueTimeouts, 1)
+			atomic.AddUint64(&s.persistEnqueueTimeoutsBackfill, 1)
+		}
 		return err
 	}
+	waitMs := uint64(time.Since(started) / time.Millisecond)
+	s.recordPersistEnqueueWait(source, waitMs)
+	if source == "commit" {
+		s.noteCommitEnqueueResult(false)
+	}
 	return nil
+}
+
+func isEnqueueTimeoutErr(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded)
+}
+
+func (s *Service) tryDirectPersistFallback(ctx context.Context, task *PersistenceTask, reason pendingPersistenceReason) (bool, pendingPersistenceReason) {
+	if s == nil || task == nil || task.Block == nil || s.persistWorker == nil || !s.persistDirectFallbackEnabled {
+		return false, reason
+	}
+	if blocked, pendingReason := s.shouldSkipDirectFallback(reason); blocked {
+		return false, pendingReason
+	}
+	adapter := s.persistWorker.GetAdapter()
+	if adapter == nil {
+		return false, reason
+	}
+	if !s.acquireDirectFallbackSlot() {
+		atomic.AddUint64(&s.persistDirectFallbackThrottled, 1)
+		return false, pendingReasonDirectFallbackThrottled
+	}
+	atomic.AddUint64(&s.persistDirectFallbackAttempts, 1)
+	go func(task *PersistenceTask, reason pendingPersistenceReason) {
+		defer s.releaseDirectFallbackSlot()
+		atomic.AddInt64(&s.persistDirectFallbackInFlight, 1)
+		defer atomic.AddInt64(&s.persistDirectFallbackInFlight, -1)
+		timeout := s.persistDirectFallbackTimeout
+		if timeout <= 0 {
+			timeout = 5 * time.Second
+		}
+		baseCtx := s.persistBaseContext()
+		fallbackCtx, cancel := context.WithTimeout(baseCtx, timeout)
+		defer cancel()
+		if err := adapter.PersistBlock(fallbackCtx, task.Block, task.Receipts, task.StateRoot); err != nil {
+			atomic.AddUint64(&s.persistDirectFallbackFailures, 1)
+			retryable := cockroach.IsRetryable(err)
+			pendingReason := pendingReasonDirectFallbackNonRetry
+			if retryable {
+				pendingReason = pendingReasonDirectFallbackFailed
+			}
+			// Fail closed for durability: always retain a recovery handoff.
+			// Non-retryable failures are tagged separately for observability and triage.
+			s.rememberPendingPersistence(task, pendingReason)
+			if s.log != nil {
+				s.log.WarnContext(ctx, "direct persistence fallback failed",
+					utils.ZapUint64("height", task.Block.GetHeight()),
+					utils.ZapString("reason", string(reason)),
+					utils.ZapBool("retryable", retryable),
+					utils.ZapBool("pending_enqueued", true),
+					utils.ZapString("pending_reason", string(pendingReason)),
+					utils.ZapError(err))
+			}
+			return
+		}
+		atomic.AddUint64(&s.persistDirectFallbackSuccess, 1)
+		s.persistWorker.handlePersistSuccess(baseCtx, task, 1)
+		if s.log != nil {
+			s.log.InfoContext(ctx, "direct persistence fallback succeeded",
+				utils.ZapUint64("height", task.Block.GetHeight()),
+				utils.ZapString("reason", string(reason)))
+		}
+	}(task, reason)
+	return true, ""
+}
+
+func (s *Service) shouldSkipDirectFallback(reason pendingPersistenceReason) (bool, pendingPersistenceReason) {
+	if s == nil || s.persistWorker == nil || !s.persistDirectFallbackDisableOnQueuePressure {
+		// keep evaluating distress gate below when pressure gate is disabled
+	}
+	// Distress guard applies only to enqueue-timeout storms.
+	if reason != pendingReasonCommitEnqueueTimeout {
+		return false, ""
+	}
+	if s.isDirectFallbackInDistressCooldown() {
+		atomic.AddUint64(&s.persistDirectFallbackSkippedDistress, 1)
+		return true, pendingReasonDirectFallbackDistress
+	}
+	if s == nil || s.persistWorker == nil || !s.persistDirectFallbackDisableOnQueuePressure {
+		return false, ""
+	}
+	queueSize, queueCap := s.persistWorker.GetQueueStats()
+	if queueCap <= 0 {
+		return false, ""
+	}
+	thresholdPct := s.persistDirectFallbackQueuePressurePct
+	if thresholdPct <= 0 {
+		thresholdPct = 85
+	}
+	queuePct := (queueSize * 100) / queueCap
+	if queuePct < thresholdPct {
+		return false, ""
+	}
+	atomic.AddUint64(&s.persistDirectFallbackSkippedPressure, 1)
+	if s.log != nil {
+		s.log.Warn("skipping direct persistence fallback due to queue pressure",
+			utils.ZapInt("queue_size", queueSize),
+			utils.ZapInt("queue_cap", queueCap),
+			utils.ZapInt("queue_pressure_pct", queuePct),
+			utils.ZapInt("pressure_threshold_pct", thresholdPct))
+	}
+	return true, pendingReasonDirectFallbackPressure
+}
+
+func (s *Service) noteCommitEnqueueResult(timeout bool) {
+	if s == nil {
+		return
+	}
+	if !timeout {
+		atomic.StoreUint64(&s.persistCommitEnqueueTimeoutStreak, 0)
+		return
+	}
+	streak := atomic.AddUint64(&s.persistCommitEnqueueTimeoutStreak, 1)
+	if s.persistDirectFallbackDistressThreshold <= 0 || int(streak) < s.persistDirectFallbackDistressThreshold {
+		return
+	}
+	cooldown := s.persistDirectFallbackDistressCooldown
+	if cooldown <= 0 {
+		cooldown = 5 * time.Second
+	}
+	atomic.StoreInt64(&s.persistDirectFallbackDistressUntilNs, time.Now().Add(cooldown).UnixNano())
+}
+
+func (s *Service) isDirectFallbackInDistressCooldown() bool {
+	if s == nil {
+		return false
+	}
+	untilNs := atomic.LoadInt64(&s.persistDirectFallbackDistressUntilNs)
+	if untilNs <= 0 {
+		return false
+	}
+	return time.Now().UnixNano() < untilNs
+}
+
+func (s *Service) recordPersistEnqueueWait(source string, waitMs uint64) {
+	if s == nil {
+		return
+	}
+	switch source {
+	case "commit":
+		atomic.AddUint64(&s.persistEnqueueWaitCommitSumMs, waitMs)
+		atomic.AddUint64(&s.persistEnqueueWaitCommitCount, 1)
+	case "backfill":
+		atomic.AddUint64(&s.persistEnqueueWaitBackfillSumMs, waitMs)
+		atomic.AddUint64(&s.persistEnqueueWaitBackfillCount, 1)
+	}
+}
+
+func (s *Service) acquireDirectFallbackSlot() bool {
+	if s == nil {
+		return false
+	}
+	if s.persistFallbackSlots == nil {
+		return true
+	}
+	select {
+	case s.persistFallbackSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Service) persistBaseContext() context.Context {
+	if s == nil || s.persistDetachedCtx == nil {
+		return context.Background()
+	}
+	return s.persistDetachedCtx
+}
+
+func (s *Service) releaseDirectFallbackSlot() {
+	if s == nil || s.persistFallbackSlots == nil {
+		return
+	}
+	select {
+	case <-s.persistFallbackSlots:
+	default:
+	}
 }
 
 func (s *Service) recordPersistEnqueueAttempt(source string, proposer bool) {
@@ -304,9 +525,12 @@ func (s *Service) shouldPersistOnCommit(ab *block.AppBlock) bool {
 		}
 	}
 	if s.audit != nil {
-		mode := "all"
-		if s.persistCommitProposerOnly {
-			mode = "proposer"
+		mode := s.persistWriterMode
+		if mode == "" {
+			mode = "all"
+			if s.persistCommitProposerOnly {
+				mode = "proposer"
+			}
 		}
 		_ = s.audit.Info("persist_writer_decision", map[string]interface{}{
 			"height":       ab.GetHeight(),
@@ -364,6 +588,141 @@ func decidePersistFromCommit(proposerOnly bool, localNodeID ctypes.ValidatorID, 
 	}
 }
 
+func (s *Service) decidePersistWithTakeover(ab *block.AppBlock, localNodeID ctypes.ValidatorID) persistWriterDecision {
+	if s == nil || ab == nil {
+		return persistWriterDecision{allowed: false, role: "unknown", reason: "invalid_task"}
+	}
+	base := decidePersistFromCommit(true, localNodeID, ab.Proposer())
+	if base.allowed {
+		base.reason = "owner_proposer_primary"
+		return base
+	}
+	if base.reason == "missing_proposer_id" {
+		return base
+	}
+	if s.persistWorker == nil {
+		return persistWriterDecision{
+			allowed:  false,
+			role:     "non_proposer",
+			reason:   "worker_unavailable",
+			local:    localNodeID,
+			proposer: ab.Proposer(),
+		}
+	}
+	adapter := s.persistWorker.GetAdapter()
+	if adapter == nil {
+		return persistWriterDecision{
+			allowed:  false,
+			role:     "non_proposer",
+			reason:   "adapter_unavailable",
+			local:    localNodeID,
+			proposer: ab.Proposer(),
+		}
+	}
+	committed := uint64(0)
+	s.mu.Lock()
+	committed = s.lastCommittedHeight
+	s.mu.Unlock()
+
+	latestDurable, err := s.getTakeoverLatestDurable(adapter)
+	if err != nil {
+		return persistWriterDecision{
+			allowed:  false,
+			role:     "non_proposer",
+			reason:   "takeover_probe_failed",
+			local:    localNodeID,
+			proposer: ab.Proposer(),
+		}
+	}
+	lag := uint64(0)
+	if committed > latestDurable {
+		lag = committed - latestDurable
+	}
+	if lag < s.persistTakeoverLagThreshold {
+		return persistWriterDecision{
+			allowed:  false,
+			role:     "non_proposer",
+			reason:   "takeover_lag_below_threshold",
+			local:    localNodeID,
+			proposer: ab.Proposer(),
+		}
+	}
+	if s.persistTakeoverDelay > 0 {
+		now := time.Now()
+		firstSeen := s.takeoverFirstSeen(ab.GetHeight(), now)
+		if now.Sub(firstSeen) < s.persistTakeoverDelay {
+			return persistWriterDecision{
+				allowed:  false,
+				role:     "non_proposer",
+				reason:   "takeover_delay_guard",
+				local:    localNodeID,
+				proposer: ab.Proposer(),
+			}
+		}
+	}
+	atomic.AddUint64(&s.persistWriterTakeoverActivations, 1)
+	return persistWriterDecision{
+		allowed:  true,
+		role:     "non_proposer",
+		reason:   "takeover_allowed",
+		local:    localNodeID,
+		proposer: ab.Proposer(),
+	}
+}
+
+func (s *Service) getTakeoverLatestDurable(adapter interface {
+	GetLatestHeight(ctx context.Context) (uint64, error)
+}) (uint64, error) {
+	if s == nil || adapter == nil {
+		return 0, fmt.Errorf("takeover durable probe unavailable")
+	}
+	now := time.Now()
+	s.persistTakeoverMu.Lock()
+	cached := s.persistTakeoverCached
+	minInterval := s.persistTakeoverProbeMinInterval
+	s.persistTakeoverMu.Unlock()
+	if cached.set && minInterval > 0 && now.Sub(cached.at) <= minInterval {
+		return cached.latest, nil
+	}
+	probeCtx, cancel := context.WithTimeout(s.persistBaseContext(), s.persistTakeoverProbeTimeout)
+	latest, err := adapter.GetLatestHeight(probeCtx)
+	cancel()
+	if err != nil {
+		return 0, err
+	}
+	s.persistTakeoverMu.Lock()
+	s.persistTakeoverCached.latest = latest
+	s.persistTakeoverCached.at = now
+	s.persistTakeoverCached.set = true
+	s.persistTakeoverMu.Unlock()
+	return latest, nil
+}
+
+func (s *Service) takeoverFirstSeen(height uint64, now time.Time) time.Time {
+	if s == nil {
+		return now
+	}
+	s.persistTakeoverMu.Lock()
+	defer s.persistTakeoverMu.Unlock()
+	if first, ok := s.persistTakeoverSeen[height]; ok {
+		return first
+	}
+	s.persistTakeoverSeen[height] = now
+	// Keep map bounded while preserving recent takeover windows.
+	if len(s.persistTakeoverSeen) > 4096 {
+		cutoff := uint64(0)
+		if height > 2048 {
+			cutoff = height - 2048
+		}
+		for h := range s.persistTakeoverSeen {
+			if h < cutoff {
+				delete(s.persistTakeoverSeen, h)
+			}
+		}
+	}
+	return now
+}
+
 func (s *Service) persistWriterDecisionForBlock(ab *block.AppBlock) persistWriterDecision {
 	if ab == nil {
 		return persistWriterDecision{allowed: false, role: "unknown", reason: "nil_block"}
@@ -373,7 +732,14 @@ func (s *Service) persistWriterDecisionForBlock(ab *block.AppBlock) persistWrite
 	}
 	if s.persistStatusFn != nil {
 		if nodeID, ok := s.persistStatusFn(); ok {
-			return decidePersistFromCommit(s.persistCommitProposerOnly, nodeID, ab.Proposer())
+			switch s.persistWriterMode {
+			case "all":
+				return decidePersistFromCommit(false, nodeID, ab.Proposer())
+			case "proposer_primary":
+				return s.decidePersistWithTakeover(ab, nodeID)
+			default:
+				return decidePersistFromCommit(true, nodeID, ab.Proposer())
+			}
 		}
 		return persistWriterDecision{allowed: false, role: "unknown", reason: "engine_unavailable", proposer: ab.Proposer()}
 	}
@@ -381,7 +747,14 @@ func (s *Service) persistWriterDecisionForBlock(ab *block.AppBlock) persistWrite
 		return persistWriterDecision{allowed: false, role: "unknown", reason: "engine_unavailable", proposer: ab.Proposer()}
 	}
 	status := s.eng.GetStatus()
-	return decidePersistFromCommit(s.persistCommitProposerOnly, status.NodeID, ab.Proposer())
+	switch s.persistWriterMode {
+	case "all":
+		return decidePersistFromCommit(false, status.NodeID, ab.Proposer())
+	case "proposer_primary":
+		return s.decidePersistWithTakeover(ab, status.NodeID)
+	default:
+		return decidePersistFromCommit(true, status.NodeID, ab.Proposer())
+	}
 }
 
 func (s *Service) persistCommittedMetadataOnly(ctx context.Context, ab *block.AppBlock, qc ctypes.QC) error {

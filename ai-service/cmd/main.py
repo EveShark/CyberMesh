@@ -38,6 +38,7 @@ from src.__version__ import VERSION, SERVICE_NAME
 from src.config.loader import load_settings
 from src.config.settings import Settings
 from src.logging import configure_logging, get_logger
+from src.observability import init_tracing_from_env, shutdown_tracing
 from src.service import ServiceManager
 from src.utils.errors import ConfigError, ServiceError
 
@@ -263,6 +264,7 @@ def main():
     
     # Health server (initialized later)
     health_server = None
+    tracing_enabled = False
     
     # Parse arguments
     args = parse_args()
@@ -274,6 +276,12 @@ def main():
         log_file=args.log_file
     )
     logger = get_logger("main")
+    try:
+        tracing_enabled = init_tracing_from_env(default_service_name="cybermesh-ai-service")
+        if tracing_enabled:
+            logger.info("OpenTelemetry tracing initialized")
+    except Exception as trace_err:
+        logger.warning(f"OpenTelemetry tracing disabled due to init error: {trace_err}")
     
     # PID file path (now in cmd/, so go up one level to ai-service root)
     pid_file = Path(__file__).parent.parent / "data" / "service.pid"
@@ -364,6 +372,11 @@ def main():
                 pass  # Already logged
         
         remove_pid_file(pid_file)
+        if tracing_enabled:
+            try:
+                shutdown_tracing()
+            except Exception:
+                pass
         logger.info("Service stopped")
 
 

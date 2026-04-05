@@ -25,6 +25,7 @@ from ..contracts import (
 from ..contracts.policy_ack import PolicyAckContractError
 from ..utils.errors import ContractError, KafkaError, ValidationError, StorageError, TimestampSkewError
 from ..utils.metrics import get_metrics_collector
+from ..observability import extract_context_from_headers, start_span
 import hashlib
 import json
 from ..config.settings import Settings, FeedbackConfig
@@ -247,7 +248,7 @@ class AIConsumer:
                 # Process message
                 self._messages_received += 1
                 self._last_message_ts = time.time()
-                self._process_message(msg.topic(), msg.value())
+                self._process_message(msg.topic(), msg.value(), msg.headers())
                 
                 # Manual commit if auto-commit disabled
                 if not self._auto_commit_enabled:
@@ -265,43 +266,54 @@ class AIConsumer:
                     self.logger.error(f"Consumer loop error: {e}", exc_info=True)
                 time.sleep(1)
     
-    def _process_message(self, topic: str, data: bytes):
+    def _process_message(self, topic: str, data: bytes, headers=None):
         """Process single message with signature verification"""
+        parent_ctx = extract_context_from_headers(headers)
         try:
+            with start_span(
+                "ai.kafka.consume.process",
+                tracer_name="ai-service/kafka-consumer",
+                context=parent_ctx,
+                attributes={
+                    "messaging.system": "kafka",
+                    "messaging.destination": topic,
+                    "messaging.operation": "consume",
+                },
+            ):
             # Parse and verify message based on topic
-            if topic == self.config.kafka_topics.control_commits:
-                # CommitEvent auto-verifies signature in __init__ (no param needed)
-                msg = CommitEvent.from_bytes(data)
-                handler = self.handlers.get("commit")
-                    
-            elif topic == self.config.kafka_topics.control_reputation:
-                msg = ReputationEvent.from_bytes(data, verify_signature=True)
-                handler = self.handlers.get("reputation")
-                    
-            elif topic == self.config.kafka_topics.control_policy:
-                # PolicyUpdateEvent auto-verifies signature in __init__ (no param needed)
-                msg = PolicyUpdateEvent.from_bytes(data)
-                handler = self.handlers.get("policy_update")
+                if topic == self.config.kafka_topics.control_commits:
+                    # CommitEvent auto-verifies signature in __init__ (no param needed)
+                    msg = CommitEvent.from_bytes(data)
+                    handler = self.handlers.get("commit")
+                        
+                elif topic == self.config.kafka_topics.control_reputation:
+                    msg = ReputationEvent.from_bytes(data, verify_signature=True)
+                    handler = self.handlers.get("reputation")
+                        
+                elif topic == self.config.kafka_topics.control_policy:
+                    # PolicyUpdateEvent auto-verifies signature in __init__ (no param needed)
+                    msg = PolicyUpdateEvent.from_bytes(data)
+                    handler = self.handlers.get("policy_update")
 
-            elif topic == self.config.kafka_topics.control_policy_ack:
-                msg = PolicyAckEvent.from_bytes(data)
-                handler = self.handlers.get("policy_ack")
-                    
-            elif topic == self.config.kafka_topics.control_evidence:
-                msg = EvidenceRequestEvent.from_bytes(data, verify_signature=True)
-                handler = self.handlers.get("evidence_request")
-            else:
-                raise ContractError(f"Unknown topic: {topic}")
-            
-            # Execute handler if registered
-            if handler:
-                handler(msg)
-            else:
-                if self.logger:
-                    self.logger.warning(f"No handler registered for topic: {topic}")
-            
-            self._messages_processed += 1
-            self._messages_by_topic[topic] = self._messages_by_topic.get(topic, 0) + 1
+                elif topic == self.config.kafka_topics.control_policy_ack:
+                    msg = PolicyAckEvent.from_bytes(data)
+                    handler = self.handlers.get("policy_ack")
+                        
+                elif topic == self.config.kafka_topics.control_evidence:
+                    msg = EvidenceRequestEvent.from_bytes(data, verify_signature=True)
+                    handler = self.handlers.get("evidence_request")
+                else:
+                    raise ContractError(f"Unknown topic: {topic}")
+                
+                # Execute handler if registered
+                if handler:
+                    handler(msg)
+                else:
+                    if self.logger:
+                        self.logger.warning(f"No handler registered for topic: {topic}")
+                
+                self._messages_processed += 1
+                self._messages_by_topic[topic] = self._messages_by_topic.get(topic, 0) + 1
             
         except ContractError as e:
             # Identify timestamp skew via structured error type in the cause chain

@@ -47,6 +47,8 @@ type policyPublisher struct {
 	dlqEnabled          bool
 	guardrailMu         sync.Mutex
 	guardrailHits       map[string]uint64
+	dedupeMu            sync.Mutex
+	dedupeSuppressed    map[string]uint64
 	publishMu           sync.Mutex
 	publishedAt         map[string]time.Time
 	dedupeWindow        time.Duration
@@ -58,9 +60,22 @@ type policyPublisher struct {
 	trace               *policytrace.Collector
 	dlqSuccesses        atomic.Uint64
 	dlqFailures         atomic.Uint64
+	commandStrict       bool
 }
 
 const minIPv6Prefix = 64
+
+var supportedPolicyActions = map[string]struct{}{
+	"drop":            {},
+	"reject":          {},
+	"remove":          {},
+	"force_reauth":    {},
+	"disable_export":  {},
+	"freeze_user":     {},
+	"freeze_tenant":   {},
+	"throttle_action": {},
+	"rate_limit":      {},
+}
 
 type policyDLQRecord struct {
 	Timestamp      time.Time `json:"timestamp"`
@@ -105,6 +120,7 @@ func newPolicyPublisher(producer *kafka.Producer, cfgMgr *utils.ConfigManager, t
 		maxCacheSize = 10000
 	}
 	scopeRouting := cfgMgr.GetBool("CONTROL_POLICY_SCOPE_ROUTING_ENABLED", false)
+	commandStrict := cfgMgr.GetBool("CONTROL_POLICY_ENFORCEMENT_CONTRACT_STRICT", false)
 	rawClusterShardingMode := strings.TrimSpace(cfgMgr.GetString("CONTROL_POLICY_CLUSTER_SHARDING_MODE", policyoutbox.ClusterShardingOff))
 	normalizedRouting, unknownMode := policyoutbox.NormalizeRoutingOptions(policyoutbox.RoutingOptions{
 		ClusterShardingMode: rawClusterShardingMode,
@@ -150,6 +166,7 @@ func newPolicyPublisher(producer *kafka.Producer, cfgMgr *utils.ConfigManager, t
 		dlqTopic:            dlqTopic,
 		dlqEnabled:          dlqEnabled,
 		guardrailHits:       make(map[string]uint64),
+		dedupeSuppressed:    make(map[string]uint64),
 		publishedAt:         make(map[string]time.Time),
 		dedupeWindow:        dedupeWindow,
 		maxCacheSize:        maxCacheSize,
@@ -158,6 +175,7 @@ func newPolicyPublisher(producer *kafka.Producer, cfgMgr *utils.ConfigManager, t
 		clusterShardBuckets: clusterShardBuckets,
 		clusterShardLanes:   clusterShardLanes,
 		trace:               trace,
+		commandStrict:       commandStrict,
 	}
 
 	// Optional: when set, any policy payload that targets this namespace is treated as a
@@ -168,6 +186,10 @@ func newPolicyPublisher(producer *kafka.Producer, cfgMgr *utils.ConfigManager, t
 
 	if !enabled && logger != nil {
 		logger.Info("Policy publishing disabled via POLICY_ENFORCEMENT_ENABLED=false")
+	}
+	if logger != nil {
+		logger.Info("Policy command contract mode configured",
+			utils.ZapBool("strict", commandStrict))
 	}
 
 	return pp, nil
@@ -203,6 +225,7 @@ func (p *policyPublisher) Publish(ctx context.Context, height uint64, ts int64, 
 		if key := buildPolicyDedupKey(raw); key != "" {
 			dedupeToken = key
 			if _, exists := seen[key]; exists {
+				p.recordDedupeSuppressed("same_batch")
 				if p.logger != nil {
 					p.logger.DebugContext(ctx, "Duplicate policy payload skipped",
 						utils.ZapString("dedup_key", key))
@@ -221,6 +244,7 @@ func (p *policyPublisher) Publish(ctx context.Context, height uint64, ts int64, 
 			dedupeToken = policyID
 		}
 		if p.alreadyPublishedRecently(dedupeToken, blockTime) {
+			p.recordDedupeSuppressed("within_window")
 			if p.logger != nil {
 				p.logger.InfoContext(ctx, "Skipping duplicate policy publish within dedupe window",
 					utils.ZapString("policy_id", policyID),
@@ -358,8 +382,11 @@ func buildPolicyDedupKey(raw []byte) string {
 	if err := json.Unmarshal(raw, &params); err != nil {
 		return ""
 	}
+	identity := extractPolicyDedupIdentity(raw)
 
 	builder := strings.Builder{}
+	builder.WriteString(strings.TrimSpace(params.PolicyID))
+	builder.WriteString("|")
 	builder.WriteString(strings.ToLower(strings.TrimSpace(params.RuleType)))
 	builder.WriteString("|")
 	builder.WriteString(strings.ToLower(strings.TrimSpace(params.ControlAction)))
@@ -405,8 +432,73 @@ func buildPolicyDedupKey(raw []byte) string {
 			builder.Write(selBytes)
 		}
 	}
+	builder.WriteString("|")
+	builder.WriteString(identity.CommandID)
+	builder.WriteString("|")
+	builder.WriteString(identity.RequestID)
+	builder.WriteString("|")
+	builder.WriteString(identity.WorkflowID)
+	builder.WriteString("|")
+	builder.WriteString(identity.IdempotencyKey)
+	builder.WriteString("|")
+	builder.WriteString(identity.TraceID)
 
 	return builder.String()
+}
+
+type policyDedupIdentity struct {
+	CommandID      string
+	RequestID      string
+	WorkflowID     string
+	IdempotencyKey string
+	TraceID        string
+}
+
+func extractPolicyDedupIdentity(raw []byte) policyDedupIdentity {
+	var root map[string]interface{}
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return policyDedupIdentity{}
+	}
+	getNested := func(parent map[string]interface{}, key string) string {
+		if parent == nil {
+			return ""
+		}
+		value, ok := parent[key]
+		if !ok {
+			return ""
+		}
+		s, ok := value.(string)
+		if !ok {
+			return ""
+		}
+		return strings.TrimSpace(s)
+	}
+	getMap := func(key string) map[string]interface{} {
+		if root == nil {
+			return nil
+		}
+		child, _ := root[key].(map[string]interface{})
+		return child
+	}
+	metadata := getMap("metadata")
+	trace := getMap("trace")
+	params := getMap("params")
+	return policyDedupIdentity{
+		CommandID:      firstNonEmpty(getNested(root, "command_id"), getNested(metadata, "command_id"), getNested(params, "command_id")),
+		RequestID:      firstNonEmpty(getNested(root, "request_id"), getNested(metadata, "request_id"), getNested(params, "request_id")),
+		WorkflowID:     firstNonEmpty(getNested(root, "workflow_id"), getNested(metadata, "workflow_id"), getNested(params, "workflow_id")),
+		IdempotencyKey: firstNonEmpty(getNested(root, "idempotency_key"), getNested(metadata, "idempotency_key"), getNested(params, "idempotency_key")),
+		TraceID:        firstNonEmpty(getNested(root, "trace_id"), getNested(trace, "trace_id"), getNested(trace, "id"), getNested(metadata, "trace_id"), getNested(params, "trace_id")),
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func (p *policyPublisher) prepareEvent(height uint64, blockTime time.Time, raw []byte) (*pb.PolicyUpdateEvent, string, string, error) {
@@ -446,7 +538,7 @@ func (p *policyPublisher) prepareEvent(height uint64, blockTime time.Time, raw [
 		return nil, policyID, "action_missing", nil
 	}
 	normalizedAction := strings.ToLower(action)
-	if normalizedAction != "drop" && normalizedAction != "reject" && normalizedAction != "remove" {
+	if _, ok := supportedPolicyActions[normalizedAction]; !ok {
 		return nil, policyID, "action_invalid", fmt.Errorf("action: %s", payload.Action)
 	}
 	action = normalizedAction
@@ -471,13 +563,25 @@ func (p *policyPublisher) prepareEvent(height uint64, blockTime time.Time, raw [
 		}
 	}
 
+	contract, cErr := buildCommandContract(raw, payload, policyID, controlAction, action, ruleType, blockTime)
+	if cErr != nil {
+		return nil, policyID, "enforcement_contract_build_failed", cErr
+	}
+	if vErr := validateCommandContract(contract, commandContractOptions{Strict: p.commandStrict}); vErr != nil {
+		return nil, policyID, "enforcement_contract_invalid", vErr
+	}
+	normalizedRaw, nErr := enrichPolicyPayloadWithContract(raw, contract)
+	if nErr != nil {
+		return nil, policyID, "enforcement_contract_enrich_failed", nErr
+	}
+
 	if action == "remove" {
-		hash := sha256.Sum256(raw)
+		hash := sha256.Sum256(normalizedRaw)
 		evt := &pb.PolicyUpdateEvent{
 			PolicyId:         policyID,
 			Action:           controlAction,
 			RuleType:         ruleType,
-			RuleData:         raw,
+			RuleData:         normalizedRaw,
 			RuleHash:         hash[:],
 			RequiresAck:      payload.Guardrails.RequiresAck,
 			RollbackPolicyId: rollbackPolicyID,
@@ -505,13 +609,17 @@ func (p *policyPublisher) prepareEvent(height uint64, blockTime time.Time, raw [
 		}
 	}
 
+	if requiresDirectionalTarget(action) && direction == "" {
+		return nil, policyID, "direction_required_for_action", fmt.Errorf("action: %s", action)
+	}
+
 	// Gateway enforcement profile: if this payload targets the configured gateway namespace,
-	// enforce egress-only semantics and keep scope namespaced for safety.
+	// enforce egress-only semantics for directional network actions and keep scope namespaced for safety.
 	if p.gatewayNS != "" {
 		if ns, ok := payload.Target.Selectors["namespace"]; ok {
 			nsStr, ok := ns.(string)
 			if ok && strings.ToLower(strings.TrimSpace(nsStr)) == p.gatewayNS {
-				if direction != "egress" {
+				if requiresDirectionalTarget(action) && direction != "egress" {
 					return nil, policyID, "gateway_policy_direction_invalid", fmt.Errorf("direction: %s", payload.Target.Direction)
 				}
 				if scope != "" && scope != "namespace" && scope != "tenant" && scope != "region" {
@@ -602,13 +710,13 @@ func (p *policyPublisher) prepareEvent(height uint64, blockTime time.Time, raw [
 	}
 	expirationHeight := int64(height) + int64(blocksToExpire)
 
-	hash := sha256.Sum256(raw)
+	hash := sha256.Sum256(normalizedRaw)
 
 	evt := &pb.PolicyUpdateEvent{
 		PolicyId: policyID,
 		Action:   controlAction,
 		RuleType: ruleType,
-		RuleData: raw,
+		RuleData: normalizedRaw,
 		RuleHash: hash[:],
 		// RequiresAck is an execution/telemetry concern (did an agent apply it),
 		// not the same thing as manual-approval staging.
@@ -620,6 +728,113 @@ func (p *policyPublisher) prepareEvent(height uint64, blockTime time.Time, raw [
 	}
 
 	return evt, policyID, "", nil
+}
+
+func requiresDirectionalTarget(action string) bool {
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case "drop", "reject":
+		return true
+	default:
+		return false
+	}
+}
+
+func enrichPolicyPayloadWithContract(raw []byte, contract commandContract) ([]byte, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("empty payload")
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return nil, fmt.Errorf("decode payload: %w", err)
+	}
+
+	metadata := ensureNestedMap(root, "metadata")
+	trace := ensureNestedMap(root, "trace")
+	params := ensureNestedMap(root, "params")
+
+	setString(root, "policy_id", contract.PolicyID)
+	setString(root, "command_id", contract.CommandID)
+	setString(root, "request_id", contract.RequestID)
+	setString(root, "trace_id", contract.TraceID)
+	setString(root, "workflow_id", contract.WorkflowID)
+	setString(root, "idempotency_key", contract.IdempotencyKey)
+	setString(root, "action", contract.ActionType)
+	setString(root, "control_action", contract.ControlAction)
+	setString(root, "rule_type", contract.RuleType)
+	setString(root, "scope_identifier", contract.ScopeID)
+	setString(root, "tenant", contract.Tenant)
+	setString(root, "region", contract.Region)
+	setString(root, "command_schema_version", contract.SchemaVersion)
+	setInt(root, "issued_at_ms", contract.IssuedAtMs)
+	setInt(root, "ttl_seconds", contract.TTLSeconds)
+
+	setString(metadata, "policy_id", contract.PolicyID)
+	setString(metadata, "command_id", contract.CommandID)
+	setString(metadata, "request_id", contract.RequestID)
+	setString(metadata, "trace_id", contract.TraceID)
+	setString(metadata, "workflow_id", contract.WorkflowID)
+	setString(metadata, "idempotency_key", contract.IdempotencyKey)
+	setString(metadata, "scope_identifier", contract.ScopeID)
+	setString(metadata, "tenant", contract.Tenant)
+	setString(metadata, "region", contract.Region)
+	setString(metadata, "command_schema_version", contract.SchemaVersion)
+	setInt(metadata, "issued_at_ms", contract.IssuedAtMs)
+	setInt(metadata, "ttl_seconds", contract.TTLSeconds)
+
+	setString(trace, "id", contract.TraceID)
+	setString(trace, "trace_id", contract.TraceID)
+	setString(trace, "policy_id", contract.PolicyID)
+	setString(trace, "command_id", contract.CommandID)
+	setString(trace, "request_id", contract.RequestID)
+	setString(trace, "workflow_id", contract.WorkflowID)
+	setString(trace, "scope_identifier", contract.ScopeID)
+	setString(trace, "tenant", contract.Tenant)
+	setString(trace, "region", contract.Region)
+	setInt(trace, "issued_at_ms", contract.IssuedAtMs)
+
+	setString(params, "policy_id", contract.PolicyID)
+	setString(params, "command_id", contract.CommandID)
+	setString(params, "request_id", contract.RequestID)
+	setString(params, "trace_id", contract.TraceID)
+	setString(params, "workflow_id", contract.WorkflowID)
+
+	normalized, err := json.Marshal(root)
+	if err != nil {
+		return nil, fmt.Errorf("encode payload: %w", err)
+	}
+	return normalized, nil
+}
+
+func ensureNestedMap(root map[string]interface{}, key string) map[string]interface{} {
+	if root == nil || strings.TrimSpace(key) == "" {
+		return map[string]interface{}{}
+	}
+	if existing, ok := root[key].(map[string]interface{}); ok && existing != nil {
+		return existing
+	}
+	created := map[string]interface{}{}
+	root[key] = created
+	return created
+}
+
+func setString(target map[string]interface{}, key, value string) {
+	if target == nil || strings.TrimSpace(key) == "" {
+		return
+	}
+	if strings.TrimSpace(value) == "" {
+		return
+	}
+	target[key] = strings.TrimSpace(value)
+}
+
+func setInt(target map[string]interface{}, key string, value int64) {
+	if target == nil || strings.TrimSpace(key) == "" {
+		return
+	}
+	if value <= 0 {
+		return
+	}
+	target[key] = value
 }
 
 func (p *policyPublisher) guardrailReject(ctx context.Context, policyID string, height uint64, reason string, err error, payload []byte) {
@@ -679,6 +894,41 @@ func (p *policyPublisher) recordGuardrail(reason string) {
 	p.guardrailMu.Lock()
 	p.guardrailHits[reason]++
 	p.guardrailMu.Unlock()
+}
+
+func (p *policyPublisher) recordDedupeSuppressed(reason string) {
+	if p == nil {
+		return
+	}
+	reason = strings.TrimSpace(strings.ToLower(reason))
+	if reason == "" {
+		reason = "unknown"
+	}
+	p.dedupeMu.Lock()
+	if p.dedupeSuppressed == nil {
+		p.dedupeSuppressed = make(map[string]uint64)
+	}
+	p.dedupeSuppressed[reason]++
+	p.dedupeMu.Unlock()
+}
+
+type policyPublisherStats struct {
+	DedupeSuppressedByReason map[string]uint64
+}
+
+func (p *policyPublisher) statsSnapshot() policyPublisherStats {
+	if p == nil {
+		return policyPublisherStats{}
+	}
+	out := policyPublisherStats{
+		DedupeSuppressedByReason: make(map[string]uint64),
+	}
+	p.dedupeMu.Lock()
+	for reason, count := range p.dedupeSuppressed {
+		out.DedupeSuppressedByReason[reason] = count
+	}
+	p.dedupeMu.Unlock()
+	return out
 }
 
 func (p *policyPublisher) emitDLQ(ctx context.Context, policyID, reason string, height uint64, guardrailErr error, payload []byte) {
@@ -761,10 +1011,19 @@ type policyParams struct {
 	PolicyID         string           `json:"policy_id"`
 	RollbackPolicyID string           `json:"rollback_policy_id"`
 	ControlAction    string           `json:"control_action"`
+	Tenant           string           `json:"tenant"`
+	Region           string           `json:"region"`
 	RuleType         string           `json:"rule_type"`
 	Action           string           `json:"action"`
 	Target           policyTarget     `json:"target"`
 	Guardrails       policyGuardrails `json:"guardrails"`
+}
+
+func (p policyParams) getTTLSeconds() int {
+	if p.Guardrails.TTLSeconds == nil {
+		return 0
+	}
+	return *p.Guardrails.TTLSeconds
 }
 
 type policyTarget struct {

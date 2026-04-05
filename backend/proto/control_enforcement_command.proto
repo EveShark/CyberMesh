@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package cybermesh.control.v1;
+
+option go_package = "backend/proto;pb";
+
+// EnforcementCommandEvent defines the normalized command contract emitted by
+// backend policy dispatch for enforcement execution and ACK correlation.
+message EnforcementCommandEvent {
+  // Contract/versioning
+  string schema_version = 1; // enforcement.command.v1
+
+  // Core lineage/correlation identifiers
+  string command_id = 2;
+  string request_id = 3;
+  string trace_id = 4;
+  string workflow_id = 5;
+  string policy_id = 6;
+
+  // Command semantics
+  string action_type = 7; // drop | reject | remove | force_reauth | disable_export | freeze_user | freeze_tenant | throttle_action
+  string control_action = 8; // add | remove | approve | reject
+  string rule_type = 9;
+  bytes rule_hash = 10;
+  string idempotency_key = 11;
+
+  // Scope/target context
+  string tenant = 12;
+  string region = 13;
+  string scope_identifier = 14;
+
+  // Timing
+  int64 issued_at_ms = 15;
+  int64 ttl_seconds = 16;
+
+  // Cryptographic envelope
+  bytes producer_id = 17;
+  bytes signature = 18;
+  bytes pubkey = 19;
+  string alg = 20; // Ed25519
+}

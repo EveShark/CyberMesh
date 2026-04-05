@@ -20,6 +20,7 @@ from ..utils.errors import KafkaError
 from ..utils.circuit_breaker import CircuitBreaker
 from ..utils.backoff import ExponentialBackoff
 from ..utils.metrics import get_metrics_collector
+from ..observability import inject_context_headers, start_span
 from ..config.settings import Settings
 
 
@@ -200,16 +201,27 @@ class AIProducer:
             attempt_start = time.monotonic()
             try:
                 def _send():
+                    otel_headers = inject_context_headers()
                     self.producer.produce(
                         topic,
                         value=data,
                         key=key,
+                        headers=otel_headers,
                         callback=self._delivery_callback
                     )
                     self.producer.poll(0)
                     self._maybe_flush(force=force_flush)
 
-                self.circuit_breaker.call(_send)
+                with start_span(
+                    "ai.kafka.produce",
+                    tracer_name="ai-service/kafka-producer",
+                    attributes={
+                        "messaging.system": "kafka",
+                        "messaging.destination": topic,
+                        "messaging.operation": "publish",
+                    },
+                ):
+                    self.circuit_breaker.call(_send)
 
                 with self._lock:
                     if self._delivery_errors:

@@ -15,11 +15,42 @@ type pendingPersistenceEntry struct {
 	// This retains AppBlock references until processed/pruned; cap the map size.
 	task   *PersistenceTask
 	seenAt time.Time
+	// firstFailAt marks the first time this height entered pending backfill.
+	// For enqueue-timeout reasons we allow a single fast-lane probe before
+	// falling back to the normal stale window.
+	firstFailAt       time.Time
+	reason            pendingPersistenceReason
+	fastLaneProbeUsed bool
+	nonRetryAttempts  uint32
+	nextEligibleAt    time.Time
 }
 
-func (s *Service) rememberPendingPersistence(task *PersistenceTask) {
+type pendingPersistenceReason string
+
+const (
+	pendingReasonUnknown                 pendingPersistenceReason = "unknown"
+	pendingReasonNonProposer             pendingPersistenceReason = "non_proposer"
+	pendingReasonCommitEnqueueError      pendingPersistenceReason = "commit_enqueue_error"
+	pendingReasonCommitEnqueueTimeout    pendingPersistenceReason = "commit_enqueue_timeout"
+	pendingReasonDirectFallbackFailed    pendingPersistenceReason = "direct_fallback_failed"
+	pendingReasonDirectFallbackNonRetry  pendingPersistenceReason = "direct_fallback_non_retryable_failed"
+	pendingReasonDirectFallbackThrottled pendingPersistenceReason = "direct_fallback_throttled"
+	pendingReasonDirectFallbackPressure  pendingPersistenceReason = "direct_fallback_pressure"
+	pendingReasonDirectFallbackDistress  pendingPersistenceReason = "direct_fallback_distress"
+)
+
+const (
+	nonRetryBackfillMaxAttempts = 3
+	nonRetryBackfillBaseDelay   = 30 * time.Second
+	nonRetryBackfillMaxDelay    = 10 * time.Minute
+)
+
+func (s *Service) rememberPendingPersistence(task *PersistenceTask, reason pendingPersistenceReason) {
 	if s == nil || task == nil || task.Block == nil || !s.persistCommitProposerOnly || !s.persistBackfillEnabled {
 		return
+	}
+	if reason == "" {
+		reason = pendingReasonUnknown
 	}
 	h := task.Block.GetHeight()
 	s.persistBackfillMu.Lock()
@@ -48,8 +79,30 @@ func (s *Service) rememberPendingPersistence(task *PersistenceTask) {
 			}
 		}
 	}
+	now := time.Now()
+	if existing, exists := s.persistBackfillPending[h]; exists {
+		existing.task = task
+		if reason != "" && existing.reason != reason {
+			existing.reason = reason
+			if reason == pendingReasonDirectFallbackNonRetry {
+				existing.nonRetryAttempts = 0
+				existing.nextEligibleAt = time.Time{}
+			}
+		}
+		s.persistBackfillPending[h] = existing
+		s.persistBackfillMu.Unlock()
+		return
+	}
 	if _, exists := s.persistBackfillPending[h]; !exists {
-		s.persistBackfillPending[h] = pendingPersistenceEntry{task: task, seenAt: time.Now()}
+		s.persistBackfillPending[h] = pendingPersistenceEntry{
+			task:              task,
+			seenAt:            now,
+			firstFailAt:       now,
+			reason:            reason,
+			fastLaneProbeUsed: false,
+			nonRetryAttempts:  0,
+			nextEligibleAt:    time.Time{},
+		}
 	}
 	s.persistBackfillMu.Unlock()
 }
@@ -149,10 +202,14 @@ func (s *Service) tryPersistenceBackfill(ctx context.Context) bool {
 				s.deletePersistBackfill(height)
 				continue
 			}
+			if entry.reason == pendingReasonDirectFallbackNonRetry {
+				s.recordNonRetryBackfillFailure(height)
+			}
 			if s.log != nil {
 				s.log.Warn("persistence backfill enqueue failed",
 					utils.ZapError(err),
-					utils.ZapUint64("height", height))
+					utils.ZapUint64("height", height),
+					utils.ZapString("reason", string(entry.reason)))
 			}
 			continue
 		}
@@ -162,13 +219,15 @@ func (s *Service) tryPersistenceBackfill(ctx context.Context) bool {
 			s.log.Info("persistence backfill enqueued",
 				utils.ZapUint64("height", height),
 				utils.ZapUint64("latest_durable_height", latest),
-				utils.ZapUint64("latest_committed_height", committed))
+				utils.ZapUint64("latest_committed_height", committed),
+				utils.ZapString("reason", string(entry.reason)))
 		}
 		if s.audit != nil {
 			_ = s.audit.Warn("persistence_backfill_enqueued", map[string]interface{}{
 				"height":                height,
 				"latest_durable_height": latest,
 				"latest_committed":      committed,
+				"reason":                string(entry.reason),
 			})
 		}
 	}
@@ -188,8 +247,13 @@ func (s *Service) collectPersistBackfillCandidates(latest uint64, committed uint
 		if h > committed {
 			continue
 		}
-		if now.Sub(entry.seenAt) < s.persistBackfillStaleAfter {
+		ready, consumedFastLane := s.shouldBackfillNow(entry, now)
+		if !ready {
 			continue
+		}
+		if consumedFastLane {
+			entry.fastLaneProbeUsed = true
+			s.persistBackfillPending[h] = entry
 		}
 		heights = append(heights, h)
 	}
@@ -199,6 +263,31 @@ func (s *Service) collectPersistBackfillCandidates(latest uint64, committed uint
 		heights = heights[:s.persistBackfillMaxPerCycle]
 	}
 	return heights
+}
+
+func (s *Service) shouldBackfillNow(entry pendingPersistenceEntry, now time.Time) (bool, bool) {
+	if s == nil {
+		return false, false
+	}
+	if entry.seenAt.IsZero() {
+		return true, false
+	}
+	if entry.firstFailAt.IsZero() {
+		entry.firstFailAt = entry.seenAt
+	}
+	if entry.reason == pendingReasonDirectFallbackNonRetry {
+		if !entry.nextEligibleAt.IsZero() && now.Before(entry.nextEligibleAt) {
+			return false, false
+		}
+	}
+	if s.persistBackfillFastLaneEnabled &&
+		entry.reason == pendingReasonCommitEnqueueTimeout &&
+		!entry.fastLaneProbeUsed {
+		if now.Sub(entry.firstFailAt) >= s.persistBackfillFastLaneMaxAge {
+			return true, true
+		}
+	}
+	return now.Sub(entry.seenAt) >= s.persistBackfillStaleAfter, false
 }
 
 func (s *Service) dropPersistBackfillUpTo(height uint64) {
@@ -222,4 +311,65 @@ func (s *Service) deletePersistBackfill(height uint64) {
 	s.persistBackfillMu.Lock()
 	delete(s.persistBackfillPending, height)
 	s.persistBackfillMu.Unlock()
+}
+
+func (s *Service) recordNonRetryBackfillFailure(height uint64) {
+	if s == nil {
+		return
+	}
+	attempt := uint32(0)
+	nextEligible := time.Time{}
+	quarantined := false
+	s.persistBackfillMu.Lock()
+	entry, ok := s.persistBackfillPending[height]
+	if !ok {
+		s.persistBackfillMu.Unlock()
+		return
+	}
+	entry.nonRetryAttempts++
+	attempt = entry.nonRetryAttempts
+	if entry.nonRetryAttempts > nonRetryBackfillMaxAttempts {
+		delete(s.persistBackfillPending, height)
+		quarantined = true
+		atomic.AddUint64(&s.persistBackfillDropped, 1)
+	} else {
+		backoff := nextNonRetryBackoff(entry.nonRetryAttempts)
+		entry.nextEligibleAt = time.Now().Add(backoff)
+		nextEligible = entry.nextEligibleAt
+		s.persistBackfillPending[height] = entry
+	}
+	s.persistBackfillMu.Unlock()
+
+	if quarantined {
+		atomic.AddUint64(&s.persistBackfillNonRetryQuarantined, 1)
+		if s.log != nil {
+			s.log.Error("persistence backfill quarantined non-retryable entry after repeated failures",
+				utils.ZapUint64("height", height),
+				utils.ZapUint64("attempts", uint64(attempt)))
+		}
+		if s.audit != nil {
+			_ = s.audit.Error("persistence_backfill_non_retryable_quarantined", map[string]interface{}{
+				"height":   height,
+				"attempts": attempt,
+			})
+		}
+		return
+	}
+	if s.log != nil {
+		s.log.Warn("persistence backfill scheduling cooldown for non-retryable entry",
+			utils.ZapUint64("height", height),
+			utils.ZapUint64("attempt", uint64(attempt)),
+			utils.ZapTime("next_eligible_at", nextEligible))
+	}
+}
+
+func nextNonRetryBackoff(attempt uint32) time.Duration {
+	if attempt == 0 {
+		return nonRetryBackfillBaseDelay
+	}
+	backoff := nonRetryBackfillBaseDelay * time.Duration(1<<uint(attempt-1))
+	if backoff > nonRetryBackfillMaxDelay {
+		backoff = nonRetryBackfillMaxDelay
+	}
+	return backoff
 }

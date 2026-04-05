@@ -3,6 +3,7 @@ package kafka
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"math"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"backend/pkg/observability"
 	"backend/pkg/utils"
 	pb "backend/proto"
 	"google.golang.org/protobuf/proto"
@@ -55,8 +57,11 @@ type ProducerTopics struct {
 	Commits    string // control.commits.v1
 	Reputation string // control.reputation.v1 (future)
 	Policy     string // control.policy.v2
-	Evidence   string // control.evidence.v1 (future)
-	PolicyDLQ  string // control.policy.dlq.v1 (optional)
+	// PolicyCommand is the dedicated enforcement command topic.
+	// When set, policy events are published here instead of Policy.
+	PolicyCommand string // control.enforcement_command.v1
+	Evidence      string // control.evidence.v1 (future)
+	PolicyDLQ     string // control.policy.dlq.v1 (optional)
 }
 
 // ProducerConfig holds configuration for creating a producer
@@ -73,13 +78,13 @@ func NewProducer(ctx context.Context, cfg ProducerConfig, saramaCfg *sarama.Conf
 	if len(cfg.Brokers) == 0 {
 		return nil, fmt.Errorf("kafka producer: no brokers configured")
 	}
-	if cfg.Topics.Commits == "" && cfg.Topics.Policy == "" {
-		return nil, fmt.Errorf("kafka producer: commits or policy topic required")
+	if cfg.Topics.Commits == "" && cfg.Topics.Policy == "" && cfg.Topics.PolicyCommand == "" {
+		return nil, fmt.Errorf("kafka producer: commits or policy/command topic required")
 	}
 	if cfg.Topics.Commits != "" && cfg.Signer == nil {
 		return nil, fmt.Errorf("kafka producer: commit signer not configured")
 	}
-	if cfg.Topics.Policy != "" && cfg.PolicySigner == nil {
+	if (cfg.Topics.Policy != "" || cfg.Topics.PolicyCommand != "") && cfg.PolicySigner == nil {
 		if cfg.Topics.Commits == "" {
 			return nil, fmt.Errorf("kafka producer: policy signer not configured")
 		}
@@ -123,10 +128,11 @@ func NewProducer(ctx context.Context, cfg ProducerConfig, saramaCfg *sarama.Conf
 
 	if audit != nil {
 		_ = audit.Info("kafka_producer_created", map[string]interface{}{
-			"brokers":          fmt.Sprintf("%d configured", len(cfg.Brokers)),
-			"commits_topic":    cfg.Topics.Commits,
-			"policy_topic":     cfg.Topics.Policy,
-			"policy_dlq_topic": cfg.Topics.PolicyDLQ,
+			"brokers":              fmt.Sprintf("%d configured", len(cfg.Brokers)),
+			"commits_topic":        cfg.Topics.Commits,
+			"policy_topic":         cfg.Topics.Policy,
+			"policy_command_topic": cfg.Topics.PolicyCommand,
+			"policy_dlq_topic":     cfg.Topics.PolicyDLQ,
 		})
 	}
 
@@ -135,6 +141,7 @@ func NewProducer(ctx context.Context, cfg ProducerConfig, saramaCfg *sarama.Conf
 			utils.ZapInt("brokers", len(cfg.Brokers)),
 			utils.ZapString("commits_topic", cfg.Topics.Commits),
 			utils.ZapString("policy_topic", cfg.Topics.Policy),
+			utils.ZapString("policy_command_topic", cfg.Topics.PolicyCommand),
 			utils.ZapString("policy_dlq_topic", cfg.Topics.PolicyDLQ))
 	}
 
@@ -229,6 +236,7 @@ func (p *Producer) PublishCommit(ctx context.Context, height uint64, hash [32]by
 			{Key: []byte("type"), Value: []byte("commit")},
 		},
 	}
+	kafkaMsg.Headers = observability.InjectContextToSaramaHeaders(ctx, kafkaMsg.Headers)
 
 	// Send message (blocking with idempotent producer)
 	start := time.Now()
@@ -311,8 +319,12 @@ func (p *Producer) publishPolicyWithKey(ctx context.Context, evt *pb.PolicyUpdat
 	}
 	p.mu.RUnlock()
 
-	if p.topics.Policy == "" {
-		return 0, 0, fmt.Errorf("kafka producer: policy topic not configured")
+	policyTopic := strings.TrimSpace(p.topics.PolicyCommand)
+	if policyTopic == "" {
+		policyTopic = strings.TrimSpace(p.topics.Policy)
+	}
+	if policyTopic == "" {
+		return 0, 0, fmt.Errorf("kafka producer: policy/command topic not configured")
 	}
 	if p.policySigner == nil {
 		return 0, 0, fmt.Errorf("kafka producer: policy signer unavailable")
@@ -347,7 +359,7 @@ func (p *Producer) publishPolicyWithKey(ctx context.Context, evt *pb.PolicyUpdat
 	}
 
 	kafkaMsg := &sarama.ProducerMessage{
-		Topic: p.topics.Policy,
+		Topic: policyTopic,
 		Key:   key,
 		Value: sarama.ByteEncoder(msg),
 		Headers: []sarama.RecordHeader{
@@ -355,6 +367,19 @@ func (p *Producer) publishPolicyWithKey(ctx context.Context, evt *pb.PolicyUpdat
 			{Key: []byte("type"), Value: []byte("policy")},
 			{Key: []byte("policy_id"), Value: []byte(evt.GetPolicyId())},
 		},
+	}
+	kafkaMsg.Headers = observability.InjectContextToSaramaHeaders(ctx, kafkaMsg.Headers)
+	if strings.TrimSpace(p.topics.PolicyCommand) != "" {
+		kafkaMsg.Headers = append(kafkaMsg.Headers, sarama.RecordHeader{
+			Key:   []byte("message_kind"),
+			Value: []byte("enforcement_command"),
+		})
+	}
+	for k, v := range extractPolicyCommandHeaders(evt.GetRuleData()) {
+		if strings.TrimSpace(k) == "" || strings.TrimSpace(v) == "" {
+			continue
+		}
+		kafkaMsg.Headers = append(kafkaMsg.Headers, sarama.RecordHeader{Key: []byte(k), Value: []byte(v)})
 	}
 	if routingKey != "" {
 		routingScopeKind := deriveRoutingScopeKind(routingKey)
@@ -420,6 +445,81 @@ func (p *Producer) publishPolicyWithKey(ctx context.Context, evt *pb.PolicyUpdat
 	return partition, offset, nil
 }
 
+func extractPolicyCommandHeaders(raw []byte) map[string]string {
+	headers := map[string]string{}
+	if len(raw) == 0 {
+		return headers
+	}
+	var obj map[string]interface{}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return headers
+	}
+
+	put := func(hk, key string) {
+		if headers[hk] != "" {
+			return
+		}
+		if v := extractPolicyString(obj, key); v != "" {
+			headers[hk] = v
+		}
+	}
+
+	put("command_id", "command_id")
+	put("request_id", "request_id")
+	put("trace_id", "trace_id")
+	put("workflow_id", "workflow_id")
+	put("scope_identifier", "scope_identifier")
+	put("tenant", "tenant")
+	put("region", "region")
+	put("action_type", "action")
+	put("control_action", "control_action")
+	put("rule_type", "rule_type")
+	if pid := extractPolicyString(obj, "policy_id"); pid != "" {
+		headers["policy_id"] = pid
+	}
+	if traceID := headers["trace_id"]; traceID == "" {
+		if v := extractPolicyTraceID(obj); v != "" {
+			headers["trace_id"] = v
+		}
+	}
+	if commandID := headers["command_id"]; commandID != "" && headers["policy_id"] != "" && headers["action_type"] != "" {
+		headers["idempotency_key"] = headers["policy_id"] + "|" + headers["command_id"] + "|" + headers["action_type"]
+	}
+	return headers
+}
+
+func extractPolicyString(obj map[string]interface{}, key string) string {
+	if obj == nil {
+		return ""
+	}
+	if v, ok := obj[key].(string); ok && strings.TrimSpace(v) != "" {
+		return strings.TrimSpace(v)
+	}
+	if meta, ok := obj["metadata"].(map[string]interface{}); ok {
+		if v, ok := meta[key].(string); ok && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	if trace, ok := obj["trace"].(map[string]interface{}); ok {
+		if v, ok := trace[key].(string); ok && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+func extractPolicyTraceID(obj map[string]interface{}) string {
+	if traceID := extractPolicyString(obj, "trace_id"); traceID != "" {
+		return traceID
+	}
+	if trace, ok := obj["trace"].(map[string]interface{}); ok {
+		if v, ok := trace["id"].(string); ok && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
 // PublishDLQ publishes a raw payload to the configured topic (used for guardrail rejects).
 func (p *Producer) PublishDLQ(ctx context.Context, topic string, key sarama.Encoder, payload []byte, headers []sarama.RecordHeader) (int32, int64, error) {
 	if topic == "" {
@@ -439,6 +539,7 @@ func (p *Producer) PublishDLQ(ctx context.Context, topic string, key sarama.Enco
 		Value:   sarama.ByteEncoder(payload),
 		Headers: headers,
 	}
+	msg.Headers = observability.InjectContextToSaramaHeaders(ctx, msg.Headers)
 
 	if msg.Key == nil {
 		msg.Key = sarama.StringEncoder(fmt.Sprintf("dlq-%d", time.Now().UnixNano()))

@@ -12,53 +12,82 @@ import (
 
 // Recorder exposes Prometheus metrics for the agent.
 type Recorder struct {
-	ingested            prometheus.Counter
-	validated           prometheus.Counter
-	rejected            prometheus.Counter
-	applied             prometheus.Counter
-	removed             prometheus.Counter
-	applyDuration       *prometheus.HistogramVec
-	reconciled          prometheus.Counter
-	reconcileErrs       prometheus.Counter
-	reconcileDur        *prometheus.HistogramVec
-	guardrail           *prometheus.CounterVec
-	fastPathEligibility *prometheus.CounterVec
-	backendApplied      *prometheus.CounterVec
-	activeGauge         prometheus.Gauge
-	killSwitch          prometheus.Gauge
-	backoffGauge        *prometheus.GaugeVec
-	ledgerDrift         *prometheus.CounterVec
-	kafkaLag            *prometheus.GaugeVec
-	kafkaConsumed       *prometheus.CounterVec
-	kafkaErrors         *prometheus.CounterVec
-	kafkaPartitions     *prometheus.GaugeVec
-	kafkaPartitionEvent *prometheus.CounterVec
-	kafkaQueueSaturated prometheus.Counter
-	kafkaDispatchWait   prometheus.Histogram
-	publishToConsume    prometheus.Histogram
-	consumeToApply      *prometheus.HistogramVec
-	consumeToDone       *prometheus.HistogramVec
-	applyPersist        *prometheus.HistogramVec
-	applyToAckEnqueue   *prometheus.HistogramVec
-	offsetMark          prometheus.Histogram
-	duplicatesByScope   *prometheus.CounterVec
-	ackPublish          *prometheus.CounterVec
-	ackRetry            prometheus.Counter
-	ackQueueDepth       prometheus.Gauge
-	ackLatency          prometheus.Histogram
-	ackQueueFailures    prometheus.Counter
-	ackQueueBlocked     prometheus.Counter
-	ackBatchSize        prometheus.Histogram
-	ackBatchFlush       *prometheus.CounterVec
-	gatewayTranslation  *prometheus.CounterVec
-	gatewayApplyTotal   *prometheus.CounterVec
-	gatewayApplyDur     *prometheus.HistogramVec
-	gatewayGuardrail    *prometheus.CounterVec
-	gatewayReplay       *prometheus.CounterVec
-	gatewayTenantReject prometheus.Counter
-	gatewayActiveRules  prometheus.Gauge
-	gatewayAckPublish   *prometheus.CounterVec
-	backend             string
+	ingested                     prometheus.Counter
+	validated                    prometheus.Counter
+	rejected                     prometheus.Counter
+	applied                      prometheus.Counter
+	removed                      prometheus.Counter
+	applyDuration                *prometheus.HistogramVec
+	reconciled                   prometheus.Counter
+	reconcileErrs                prometheus.Counter
+	reconcileDur                 *prometheus.HistogramVec
+	guardrail                    *prometheus.CounterVec
+	fastPathEligibility          *prometheus.CounterVec
+	backendApplied               *prometheus.CounterVec
+	activeGauge                  prometheus.Gauge
+	killSwitch                   prometheus.Gauge
+	backoffGauge                 *prometheus.GaugeVec
+	ledgerDrift                  *prometheus.CounterVec
+	kafkaLag                     *prometheus.GaugeVec
+	kafkaConsumed                *prometheus.CounterVec
+	consumeTotal                 *prometheus.CounterVec
+	kafkaErrors                  *prometheus.CounterVec
+	kafkaPartitions              *prometheus.GaugeVec
+	kafkaPartitionEvent          *prometheus.CounterVec
+	kafkaRebalance               *prometheus.CounterVec
+	rebalanceTotal               prometheus.Counter
+	kafkaQueueSaturated          prometheus.Counter
+	queueSaturatedTotal          prometheus.Counter
+	kafkaDispatchWait            prometheus.Histogram
+	dispatchWaitMs               prometheus.Histogram
+	kafkaDispatchBudgetExhausted prometheus.Counter
+	kafkaStripeStall             *prometheus.CounterVec
+	kafkaStripeDistressOpen      *prometheus.CounterVec
+	stripeDistressOpenTotal      *prometheus.CounterVec
+	kafkaStripeDistressActive    *prometheus.GaugeVec
+	stripeDistressActive         *prometheus.GaugeVec
+	kafkaStripeInflight          *prometheus.GaugeVec
+	kafkaStripeOldest            *prometheus.GaugeVec
+	publishToConsume             prometheus.Histogram
+	consumeToApply               *prometheus.HistogramVec
+	consumeToDone                *prometheus.HistogramVec
+	applyPersist                 *prometheus.HistogramVec
+	applyToAckEnqueue            *prometheus.HistogramVec
+	applyRetry                   *prometheus.CounterVec
+	retryTotal                   *prometheus.CounterVec
+	timeoutTotal                 prometheus.Counter
+	applyTerminal                *prometheus.CounterVec
+	applyRetryExhausted          prometheus.Counter
+	applyTimeoutBudgetExceeded   prometheus.Counter
+	applyTimeoutBreakerOpen      prometheus.Counter
+	applyTimeoutBreakerSkip      prometheus.Counter
+	commandRejectPublish         *prometheus.CounterVec
+	rejectPublishFail            prometheus.Counter
+	policyShedding               *prometheus.CounterVec
+	lifecycleCompaction          *prometheus.CounterVec
+	kafkaAdmissionPause          prometheus.Counter
+	laneQueueDepth               *prometheus.GaugeVec
+	laneDispatchWait             *prometheus.HistogramVec
+	laneStarvation               *prometheus.CounterVec
+	offsetMark                   prometheus.Histogram
+	duplicatesByScope            *prometheus.CounterVec
+	ackPublish                   *prometheus.CounterVec
+	ackRetry                     prometheus.Counter
+	ackQueueDepth                prometheus.Gauge
+	ackLatency                   prometheus.Histogram
+	ackQueueFailures             prometheus.Counter
+	ackQueueBlocked              prometheus.Counter
+	ackBatchSize                 prometheus.Histogram
+	ackBatchFlush                *prometheus.CounterVec
+	gatewayTranslation           *prometheus.CounterVec
+	gatewayApplyTotal            *prometheus.CounterVec
+	gatewayApplyDur              *prometheus.HistogramVec
+	gatewayGuardrail             *prometheus.CounterVec
+	gatewayReplay                *prometheus.CounterVec
+	gatewayTenantReject          prometheus.Counter
+	gatewayActiveRules           prometheus.Gauge
+	gatewayAckPublish            *prometheus.CounterVec
+	backend                      string
 }
 
 // NewRecorder registers metrics with provided registry.
@@ -138,6 +167,10 @@ func NewRecorder(reg prometheus.Registerer) *Recorder {
 			Name: "policy_consumer_messages_total",
 			Help: "Kafka policy messages consumed grouped by partition and handler result",
 		}, []string{"partition", "result"}),
+		consumeTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "consume_total",
+			Help: "Parity alias: total consumed messages grouped by result",
+		}, []string{"result"}),
 		kafkaErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "policy_consumer_errors_total",
 			Help: "Kafka consumer errors grouped by reason",
@@ -150,15 +183,64 @@ func NewRecorder(reg prometheus.Registerer) *Recorder {
 			Name: "policy_consumer_partition_events_total",
 			Help: "Kafka partition assignment lifecycle events grouped by partition and event",
 		}, []string{"partition", "event"}),
+		kafkaRebalance: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "policy_consumer_partition_rebalance_events_total",
+			Help: "Kafka consumer partition assignment/revocation events grouped by event",
+		}, []string{"event"}),
+		rebalanceTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "rebalance_total",
+			Help: "Parity alias: total partition assignment/revocation events",
+		}),
 		kafkaQueueSaturated: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "policy_consumer_queue_saturated_total",
 			Help: "Number of times consumer worker queues were saturated and dispatch had to wait",
+		}),
+		queueSaturatedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "queue_saturated_total",
+			Help: "Parity alias: total queue saturation events",
 		}),
 		kafkaDispatchWait: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "policy_consumer_dispatch_wait_seconds",
 			Help:    "Latency waiting to dispatch a consumed message to a worker",
 			Buckets: prometheus.DefBuckets,
 		}),
+		dispatchWaitMs: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "dispatch_wait_ms",
+			Help:    "Parity alias: dispatch wait latency in milliseconds",
+			Buckets: []float64{1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000},
+		}),
+		kafkaDispatchBudgetExhausted: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "policy_consumer_dispatch_budget_exhausted_total",
+			Help: "Number of times dispatch max-wait budget was exhausted while queue remained saturated",
+		}),
+		kafkaStripeStall: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "policy_consumer_stripe_stall_total",
+			Help: "Number of stall detections where a stripe in-flight message exceeded stall threshold",
+		}, []string{"stripe"}),
+		kafkaStripeDistressOpen: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "policy_consumer_stripe_distress_open_total",
+			Help: "Number of times a stripe entered distress due to sustained saturation",
+		}, []string{"stripe"}),
+		stripeDistressOpenTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "stripe_distress_open_total",
+			Help: "Parity alias: stripe distress openings grouped by stripe",
+		}, []string{"stripe"}),
+		kafkaStripeDistressActive: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "policy_consumer_stripe_distress_active",
+			Help: "Whether a stripe is currently in distress state (1 active, 0 inactive)",
+		}, []string{"stripe"}),
+		stripeDistressActive: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "stripe_distress_active",
+			Help: "Parity alias: stripe distress state grouped by stripe (1 active, 0 inactive)",
+		}, []string{"stripe"}),
+		kafkaStripeInflight: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "policy_consumer_stripe_inflight",
+			Help: "Current in-flight message count per stripe (0/1 for striped worker model)",
+		}, []string{"stripe"}),
+		kafkaStripeOldest: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "policy_consumer_stripe_oldest_inflight_seconds",
+			Help: "Age in seconds of the oldest in-flight message per stripe",
+		}, []string{"stripe"}),
 		publishToConsume: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "policy_publish_to_consume_seconds",
 			Help:    "Latency from Kafka publish timestamp to enforcement consume time",
@@ -184,6 +266,71 @@ func NewRecorder(reg prometheus.Registerer) *Recorder {
 			Help:    "Latency from policy apply completion to ACK enqueue result",
 			Buckets: prometheus.DefBuckets,
 		}, []string{"result"}),
+		applyRetry: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "policy_apply_retry_total",
+			Help: "Apply retry attempts grouped by reason class",
+		}, []string{"reason"}),
+		retryTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "retry_total",
+			Help: "Parity alias: total retries grouped by reason",
+		}, []string{"reason"}),
+		timeoutTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "timeout_total",
+			Help: "Parity alias: total timeout events observed",
+		}),
+		applyTerminal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "policy_apply_terminal_failure_total",
+			Help: "Terminal apply failures grouped by reason",
+		}, []string{"reason"}),
+		applyRetryExhausted: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "policy_apply_retry_exhausted_total",
+			Help: "Total number of apply operations that exhausted retries",
+		}),
+		applyTimeoutBudgetExceeded: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "policy_apply_timeout_budget_exceeded_total",
+			Help: "Total number of apply attempts that exceeded per-attempt timeout budget",
+		}),
+		applyTimeoutBreakerOpen: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "policy_apply_timeout_breaker_open_total",
+			Help: "Total number of times apply timeout breaker opened",
+		}),
+		applyTimeoutBreakerSkip: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "policy_apply_timeout_breaker_skip_total",
+			Help: "Total number of apply attempts skipped due to open timeout breaker",
+		}),
+		commandRejectPublish: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "policy_command_reject_publish_total",
+			Help: "Command reject artifact publish outcomes grouped by result",
+		}, []string{"result"}),
+		rejectPublishFail: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "policy_reject_publish_fail_total",
+			Help: "Total number of terminal paths where reject artifact publish failed",
+		}),
+		policyShedding: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "policy_shedding_total",
+			Help: "Alert-level counter for policy shedding paths grouped by reason",
+		}, []string{"reason"}),
+		lifecycleCompaction: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "policy_lifecycle_compaction_total",
+			Help: "Lifecycle compaction outcomes grouped by result",
+		}, []string{"result"}),
+		kafkaAdmissionPause: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "policy_consumer_admission_pause_total",
+			Help: "Number of admission-shaping pauses applied in consumer read path",
+		}),
+		laneQueueDepth: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "lane_queue_depth",
+			Help: "Current queued requests waiting for execution slots by lane",
+		}, []string{"lane"}),
+		laneDispatchWait: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "lane_dispatch_wait_ms",
+			Help:    "Time spent waiting for lane execution slot in milliseconds",
+			Buckets: []float64{1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000},
+		}, []string{"lane"}),
+		laneStarvation: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "lane_starvation_total",
+			Help: "Number of lane wait events that exceeded starvation threshold",
+		}, []string{"lane"}),
 		offsetMark: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "policy_offset_mark_seconds",
 			Help:    "Latency to mark a consumed Kafka message for offset commit",
@@ -281,16 +428,45 @@ func NewRecorder(reg prometheus.Registerer) *Recorder {
 		r.ledgerDrift,
 		r.kafkaLag,
 		r.kafkaConsumed,
+		r.consumeTotal,
 		r.kafkaErrors,
 		r.kafkaPartitions,
 		r.kafkaPartitionEvent,
+		r.kafkaRebalance,
+		r.rebalanceTotal,
 		r.kafkaQueueSaturated,
+		r.queueSaturatedTotal,
 		r.kafkaDispatchWait,
+		r.dispatchWaitMs,
+		r.kafkaDispatchBudgetExhausted,
+		r.kafkaStripeStall,
+		r.kafkaStripeDistressOpen,
+		r.stripeDistressOpenTotal,
+		r.kafkaStripeDistressActive,
+		r.stripeDistressActive,
+		r.kafkaStripeInflight,
+		r.kafkaStripeOldest,
 		r.publishToConsume,
 		r.consumeToApply,
 		r.consumeToDone,
 		r.applyPersist,
 		r.applyToAckEnqueue,
+		r.applyRetry,
+		r.retryTotal,
+		r.timeoutTotal,
+		r.applyTerminal,
+		r.applyRetryExhausted,
+		r.applyTimeoutBudgetExceeded,
+		r.applyTimeoutBreakerOpen,
+		r.applyTimeoutBreakerSkip,
+		r.commandRejectPublish,
+		r.rejectPublishFail,
+		r.policyShedding,
+		r.lifecycleCompaction,
+		r.kafkaAdmissionPause,
+		r.laneQueueDepth,
+		r.laneDispatchWait,
+		r.laneStarvation,
 		r.offsetMark,
 		r.duplicatesByScope,
 		r.ackPublish,
@@ -435,6 +611,9 @@ func (r *Recorder) ObserveKafkaConsumed(partition int32, result string) {
 		result = "unknown"
 	}
 	r.kafkaConsumed.WithLabelValues(fmt.Sprintf("%d", partition), result).Inc()
+	if r.consumeTotal != nil {
+		r.consumeTotal.WithLabelValues(result).Inc()
+	}
 }
 
 // ObserveKafkaError increments consumer error counters.
@@ -459,6 +638,12 @@ func (r *Recorder) ObservePartitionAssigned(partition int32) {
 	if r.kafkaPartitionEvent != nil {
 		r.kafkaPartitionEvent.WithLabelValues(label, "assigned").Inc()
 	}
+	if r.kafkaRebalance != nil {
+		r.kafkaRebalance.WithLabelValues("assigned").Inc()
+	}
+	if r.rebalanceTotal != nil {
+		r.rebalanceTotal.Inc()
+	}
 }
 
 // ObservePartitionRevoked marks a Kafka partition as no longer owned by this process.
@@ -473,6 +658,12 @@ func (r *Recorder) ObservePartitionRevoked(partition int32) {
 	if r.kafkaPartitionEvent != nil {
 		r.kafkaPartitionEvent.WithLabelValues(label, "revoked").Inc()
 	}
+	if r.kafkaRebalance != nil {
+		r.kafkaRebalance.WithLabelValues("revoked").Inc()
+	}
+	if r.rebalanceTotal != nil {
+		r.rebalanceTotal.Inc()
+	}
 }
 
 // ObserveKafkaQueueSaturated increments consumer dispatch saturation counter.
@@ -481,6 +672,9 @@ func (r *Recorder) ObserveKafkaQueueSaturated() {
 		return
 	}
 	r.kafkaQueueSaturated.Inc()
+	if r.queueSaturatedTotal != nil {
+		r.queueSaturatedTotal.Inc()
+	}
 }
 
 // ObserveKafkaDispatchWait records dispatch wait latency before worker enqueue.
@@ -489,6 +683,113 @@ func (r *Recorder) ObserveKafkaDispatchWait(d time.Duration) {
 		return
 	}
 	r.kafkaDispatchWait.Observe(d.Seconds())
+	if r.dispatchWaitMs != nil {
+		r.dispatchWaitMs.Observe(float64(d) / float64(time.Millisecond))
+	}
+}
+
+// ObserveKafkaDispatchBudgetExhausted increments dispatch budget exhaustion counter.
+func (r *Recorder) ObserveKafkaDispatchBudgetExhausted() {
+	if r == nil || r.kafkaDispatchBudgetExhausted == nil {
+		return
+	}
+	r.kafkaDispatchBudgetExhausted.Inc()
+}
+
+// ObserveKafkaAdmissionPause increments admission shaping pause counter.
+func (r *Recorder) ObserveKafkaAdmissionPause() {
+	if r == nil || r.kafkaAdmissionPause == nil {
+		return
+	}
+	r.kafkaAdmissionPause.Inc()
+}
+
+// SetLaneQueueDepth sets queued depth for execution lane.
+func (r *Recorder) SetLaneQueueDepth(lane string, depth int64) {
+	if r == nil || r.laneQueueDepth == nil {
+		return
+	}
+	if lane == "" {
+		lane = "unknown"
+	}
+	if depth < 0 {
+		depth = 0
+	}
+	r.laneQueueDepth.WithLabelValues(lane).Set(float64(depth))
+}
+
+// ObserveLaneDispatchWait records lane slot wait duration in milliseconds.
+func (r *Recorder) ObserveLaneDispatchWait(lane string, d time.Duration) {
+	if r == nil || r.laneDispatchWait == nil || d < 0 {
+		return
+	}
+	if lane == "" {
+		lane = "unknown"
+	}
+	r.laneDispatchWait.WithLabelValues(lane).Observe(float64(d) / float64(time.Millisecond))
+}
+
+// ObserveLaneStarvation increments starvation counter for lane.
+func (r *Recorder) ObserveLaneStarvation(lane string) {
+	if r == nil || r.laneStarvation == nil {
+		return
+	}
+	if lane == "" {
+		lane = "unknown"
+	}
+	r.laneStarvation.WithLabelValues(lane).Inc()
+}
+
+// ObserveKafkaStripeStall increments stripe stall detection counter.
+func (r *Recorder) ObserveKafkaStripeStall(stripe int) {
+	if r == nil || r.kafkaStripeStall == nil {
+		return
+	}
+	r.kafkaStripeStall.WithLabelValues(fmt.Sprintf("%d", stripe)).Inc()
+}
+
+// ObserveKafkaStripeDistressOpen increments distress-open counter for a stripe.
+func (r *Recorder) ObserveKafkaStripeDistressOpen(stripe int) {
+	if r == nil || r.kafkaStripeDistressOpen == nil {
+		return
+	}
+	label := fmt.Sprintf("%d", stripe)
+	r.kafkaStripeDistressOpen.WithLabelValues(label).Inc()
+	if r.stripeDistressOpenTotal != nil {
+		r.stripeDistressOpenTotal.WithLabelValues(label).Inc()
+	}
+}
+
+// SetKafkaStripeDistressActive sets distress-active state for a stripe.
+func (r *Recorder) SetKafkaStripeDistressActive(stripe int, active bool) {
+	if r == nil || r.kafkaStripeDistressActive == nil {
+		return
+	}
+	label := fmt.Sprintf("%d", stripe)
+	v := 0.0
+	if active {
+		v = 1
+	}
+	r.kafkaStripeDistressActive.WithLabelValues(label).Set(v)
+	if r.stripeDistressActive != nil {
+		r.stripeDistressActive.WithLabelValues(label).Set(v)
+	}
+}
+
+// ObserveKafkaStripeInflight sets per-stripe in-flight gauge.
+func (r *Recorder) ObserveKafkaStripeInflight(stripe int, inflight int) {
+	if r == nil || r.kafkaStripeInflight == nil {
+		return
+	}
+	r.kafkaStripeInflight.WithLabelValues(fmt.Sprintf("%d", stripe)).Set(float64(inflight))
+}
+
+// ObserveKafkaStripeOldestInflight sets per-stripe oldest in-flight age gauge.
+func (r *Recorder) ObserveKafkaStripeOldestInflight(stripe int, age time.Duration) {
+	if r == nil || r.kafkaStripeOldest == nil || age < 0 {
+		return
+	}
+	r.kafkaStripeOldest.WithLabelValues(fmt.Sprintf("%d", stripe)).Set(age.Seconds())
 }
 
 // ObservePublishToConsume records Kafka publish-to-consume latency.
@@ -541,6 +842,115 @@ func (r *Recorder) ObserveApplyToAckEnqueue(result string, d time.Duration) {
 		result = "unknown"
 	}
 	r.applyToAckEnqueue.WithLabelValues(result).Observe(d.Seconds())
+}
+
+// ObserveApplyRetry increments apply retry counter grouped by reason.
+func (r *Recorder) ObserveApplyRetry(reason string) {
+	if r == nil || r.applyRetry == nil {
+		return
+	}
+	if reason == "" {
+		reason = "unknown"
+	}
+	r.applyRetry.WithLabelValues(reason).Inc()
+	if r.retryTotal != nil {
+		r.retryTotal.WithLabelValues(reason).Inc()
+	}
+	if reason == "timeout" && r.timeoutTotal != nil {
+		r.timeoutTotal.Inc()
+	}
+}
+
+// ObserveApplyTerminalFailure increments terminal apply failure counter.
+func (r *Recorder) ObserveApplyTerminalFailure(reason string) {
+	if r == nil || r.applyTerminal == nil {
+		return
+	}
+	if reason == "" {
+		reason = "unknown"
+	}
+	r.applyTerminal.WithLabelValues(reason).Inc()
+}
+
+// ObserveApplyRetryExhausted increments retry exhausted counter.
+func (r *Recorder) ObserveApplyRetryExhausted() {
+	if r == nil || r.applyRetryExhausted == nil {
+		return
+	}
+	r.applyRetryExhausted.Inc()
+}
+
+// ObserveApplyTimeoutBudgetExceeded increments timeout budget exceeded counter.
+func (r *Recorder) ObserveApplyTimeoutBudgetExceeded() {
+	if r == nil || r.applyTimeoutBudgetExceeded == nil {
+		return
+	}
+	r.applyTimeoutBudgetExceeded.Inc()
+}
+
+// ObserveApplyTimeoutBreakerOpen increments breaker-open counter.
+func (r *Recorder) ObserveApplyTimeoutBreakerOpen() {
+	if r == nil || r.applyTimeoutBreakerOpen == nil {
+		return
+	}
+	r.applyTimeoutBreakerOpen.Inc()
+}
+
+// ObserveApplyTimeoutBreakerSkip increments breaker-skip counter.
+func (r *Recorder) ObserveApplyTimeoutBreakerSkip() {
+	if r == nil || r.applyTimeoutBreakerSkip == nil {
+		return
+	}
+	r.applyTimeoutBreakerSkip.Inc()
+}
+
+// ObserveCommandRejectPublish records command reject artifact publish result.
+func (r *Recorder) ObserveCommandRejectPublish(result string) {
+	if r == nil || r.commandRejectPublish == nil {
+		return
+	}
+	if result == "" {
+		result = "unknown"
+	}
+	r.commandRejectPublish.WithLabelValues(result).Inc()
+}
+
+// ObserveRejectPublishFail increments reject publish failure counter.
+func (r *Recorder) ObserveRejectPublishFail() {
+	if r == nil || r.rejectPublishFail == nil {
+		return
+	}
+	r.rejectPublishFail.Inc()
+}
+
+// ObservePolicyShedding increments alert-level shedding counter.
+func (r *Recorder) ObservePolicyShedding(reason string) {
+	if r == nil || r.policyShedding == nil {
+		return
+	}
+	if reason == "" {
+		reason = "unknown"
+	}
+	r.policyShedding.WithLabelValues(reason).Inc()
+}
+
+// ObserveLifecycleCompaction increments lifecycle compaction counters.
+func (r *Recorder) ObserveLifecycleCompaction(result string) {
+	if r == nil || r.lifecycleCompaction == nil {
+		return
+	}
+	if result == "" {
+		result = "unknown"
+	}
+	r.lifecycleCompaction.WithLabelValues(result).Inc()
+}
+
+// ObserveTimeout increments timeout parity counter.
+func (r *Recorder) ObserveTimeout() {
+	if r == nil || r.timeoutTotal == nil {
+		return
+	}
+	r.timeoutTotal.Inc()
 }
 
 // ObserveOffsetMark records latency to mark a consumed message for commit.
@@ -729,8 +1139,38 @@ func (r *Recorder) KafkaPartitionGauge() *prometheus.GaugeVec { return r.kafkaPa
 // KafkaPartitionEventCounter exposes partition lifecycle counters (used in tests).
 func (r *Recorder) KafkaPartitionEventCounter() *prometheus.CounterVec { return r.kafkaPartitionEvent }
 
+// KafkaRebalanceCounter exposes low-cardinality rebalance counters for tests/alerts.
+func (r *Recorder) KafkaRebalanceCounter() *prometheus.CounterVec { return r.kafkaRebalance }
+
 // KafkaQueueSaturatedCounter exposes queue saturation counter for tests.
 func (r *Recorder) KafkaQueueSaturatedCounter() prometheus.Counter { return r.kafkaQueueSaturated }
+
+// KafkaAdmissionPauseCounter exposes admission pause counter for tests.
+func (r *Recorder) KafkaAdmissionPauseCounter() prometheus.Counter { return r.kafkaAdmissionPause }
+
+// KafkaDispatchBudgetExhaustedCounter exposes dispatch budget exhaustion counter for tests.
+func (r *Recorder) KafkaDispatchBudgetExhaustedCounter() prometheus.Counter {
+	return r.kafkaDispatchBudgetExhausted
+}
+
+// KafkaStripeStallCounter exposes stripe stall counter for tests.
+func (r *Recorder) KafkaStripeStallCounter() *prometheus.CounterVec { return r.kafkaStripeStall }
+
+// KafkaStripeDistressOpenCounter exposes distress-open counters for tests.
+func (r *Recorder) KafkaStripeDistressOpenCounter() *prometheus.CounterVec {
+	return r.kafkaStripeDistressOpen
+}
+
+// KafkaStripeDistressActiveGauge exposes distress-active gauges for tests.
+func (r *Recorder) KafkaStripeDistressActiveGauge() *prometheus.GaugeVec {
+	return r.kafkaStripeDistressActive
+}
+
+// KafkaStripeInflightGauge exposes per-stripe inflight gauges for tests.
+func (r *Recorder) KafkaStripeInflightGauge() *prometheus.GaugeVec { return r.kafkaStripeInflight }
+
+// KafkaStripeOldestInflightGauge exposes per-stripe oldest-inflight gauges for tests.
+func (r *Recorder) KafkaStripeOldestInflightGauge() *prometheus.GaugeVec { return r.kafkaStripeOldest }
 
 // AppliedCounter exposes the total applied counter (used in tests).
 func (r *Recorder) AppliedCounter() prometheus.Counter { return r.applied }

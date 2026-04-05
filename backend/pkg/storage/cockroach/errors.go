@@ -2,6 +2,7 @@ package cockroach
 
 import (
 	"context"
+	"database/sql/driver"
 	"errors"
 	"net"
 	"strings"
@@ -57,6 +58,9 @@ func IsRetryable(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
+	if errors.Is(err, driver.ErrBadConn) {
+		return true
+	}
 
 	var netErr net.Error
 	if errors.As(err, &netErr) {
@@ -72,7 +76,9 @@ func IsRetryable(err error) bool {
 	if strings.Contains(msg, "sqlstate 40001") ||
 		strings.Contains(msg, "restart transaction") ||
 		strings.Contains(msg, "retry_serializable") ||
-		strings.Contains(msg, "transactionretrywithprotorefresherror") {
+		strings.Contains(msg, "transactionretrywithprotorefresherror") ||
+		strings.Contains(msg, "driver: bad connection") ||
+		strings.Contains(msg, "bad connection") {
 		return true
 	}
 

@@ -37,12 +37,13 @@ const (
 type ConnectionConfig struct {
 	// Connection
 	DSN         string        // PostgreSQL connection string (REQUIRED, SENSITIVE)
-	ConnTimeout time.Duration // Connection timeout (default: 5s)
+	ConnTimeout time.Duration // Connection timeout (default: 8s)
 	TLSEnabled  bool          // TLS enabled (REQUIRED in prod/staging)
 
 	// Pool configuration
-	MaxOpenConns int           // Maximum open connections (default: 50)
-	MaxIdleConns int           // Maximum idle connections (default: 10)
+	MaxOpenConns int           // Maximum open connections (default: 100)
+	MaxIdleConns int           // Maximum idle connections (default: 40)
+	MaxIdleTime  time.Duration // Maximum idle connection time (default: 5m)
 	MaxLifetime  time.Duration // Maximum connection lifetime (default: 30m)
 
 	// Environment
@@ -155,14 +156,15 @@ func loadConfigFromManager(cfg *ConnectionConfig) error {
 	}
 
 	// Load connection timeout
-	cfg.ConnTimeout = cm.GetDuration("DB_CONN_TIMEOUT", 5*time.Second)
+	cfg.ConnTimeout = cm.GetDuration("DB_CONN_TIMEOUT", 8*time.Second)
 
 	// Load TLS setting (must be true in prod/staging)
 	cfg.TLSEnabled = cm.GetBool("DB_TLS", true)
 
 	// Load pool configuration
-	cfg.MaxOpenConns = cm.GetInt("DB_MAX_OPEN", 50)
-	cfg.MaxIdleConns = cm.GetInt("DB_MAX_IDLE", 10)
+	cfg.MaxOpenConns = cm.GetInt("DB_MAX_OPEN", 100)
+	cfg.MaxIdleConns = cm.GetInt("DB_MAX_IDLE", 40)
+	cfg.MaxIdleTime = cm.GetDuration("DB_MAX_IDLE_TIME", 5*time.Minute)
 	cfg.MaxLifetime = cm.GetDuration("DB_MAX_LIFETIME", 30*time.Minute)
 
 	// Load environment
@@ -175,16 +177,22 @@ func loadConfigFromManager(cfg *ConnectionConfig) error {
 // applyDefaults applies default values to configuration
 func applyDefaults(cfg *ConnectionConfig) {
 	if cfg.ConnTimeout == 0 {
-		cfg.ConnTimeout = 5 * time.Second
+		cfg.ConnTimeout = 8 * time.Second
 	}
 	if cfg.MaxOpenConns == 0 {
-		cfg.MaxOpenConns = 50
+		cfg.MaxOpenConns = 100
 	}
 	if cfg.MaxIdleConns == 0 {
-		cfg.MaxIdleConns = 10
+		cfg.MaxIdleConns = 40
+	}
+	if cfg.MaxIdleConns > cfg.MaxOpenConns {
+		cfg.MaxIdleConns = cfg.MaxOpenConns
 	}
 	if cfg.MaxLifetime == 0 {
 		cfg.MaxLifetime = 30 * time.Minute
+	}
+	if cfg.MaxIdleTime == 0 {
+		cfg.MaxIdleTime = 5 * time.Minute
 	}
 	if cfg.Environment == "" {
 		cfg.Environment = EnvProduction
@@ -212,6 +220,9 @@ func validateConfig(cfg *ConnectionConfig) error {
 	}
 	if cfg.MaxLifetime < 0 {
 		return fmt.Errorf("%w: max_lifetime must be non-negative", ErrConnectionPoolInvalid)
+	}
+	if cfg.MaxIdleTime < 0 {
+		return fmt.Errorf("%w: max_idle_time must be non-negative", ErrConnectionPoolInvalid)
 	}
 	if cfg.ConnTimeout < time.Second || cfg.ConnTimeout > time.Minute {
 		return fmt.Errorf("%w: conn_timeout must be between 1s and 1m", ErrConnectionPoolInvalid)
@@ -271,8 +282,8 @@ func configurePool(db *sql.DB, cfg *ConnectionConfig) {
 	db.SetMaxIdleConns(cfg.MaxIdleConns)
 	db.SetConnMaxLifetime(cfg.MaxLifetime)
 
-	// Set max idle time to prevent stale connections
-	db.SetConnMaxIdleTime(5 * time.Minute)
+	// Set max idle time to prevent stale cloud connections.
+	db.SetConnMaxIdleTime(cfg.MaxIdleTime)
 }
 
 // verifyConnection verifies the database connection is healthy

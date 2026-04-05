@@ -1213,6 +1213,16 @@ func materializeControlTrace(outbox []controlOutboxRow, acks []policyAckRow, run
 			sentinelEventID = primaryOutbox.SentinelEventID.String
 		}
 	}
+	if normalized, _, valid := utils.NormalizeTimestampMs(sourceEventTsMs, utils.TimestampNormalizeTraceCompatible); valid {
+		sourceEventTsMs = normalized
+	} else {
+		sourceEventTsMs = 0
+	}
+	if normalized, _, valid := utils.NormalizeTimestampMs(aiEventTsMs, utils.TimestampNormalizeTraceCompatible); valid {
+		aiEventTsMs = normalized
+	} else {
+		aiEventTsMs = 0
+	}
 	if sentinelEventID == "" {
 		if ackSentinel := firstNonEmptyAckField(acks, func(row policyAckRow) sql.NullString { return row.SentinelEventID }, traceID); ackSentinel != "" {
 			sentinelEventID = ackSentinel
@@ -1290,8 +1300,8 @@ func materializeControlTrace(outbox []controlOutboxRow, acks []policyAckRow, run
 	policyAckMs := materializedAckTs(primaryAck)
 	latencies := make([]materializedTraceLatencyDTO, 0, 12)
 	appendLatency := func(name string, start, end int64) {
-		if start > 0 && end > 0 && end >= start {
-			latencies = append(latencies, materializedTraceLatencyDTO{Name: name, DurationMs: end - start})
+		if duration, ok, _ := utils.DurationMillis(start, end); ok {
+			latencies = append(latencies, materializedTraceLatencyDTO{Name: name, DurationMs: duration})
 		}
 	}
 	appendLatency("source_to_ai_decision", sourceEventTsMs, aiEventTsMs)
@@ -1585,51 +1595,11 @@ func parseMaterializedUpstreamStages(outbox *controlOutboxRow) map[string]int64 
 		"t_ai_sentinel_consume",
 		"t_ai_decision_done",
 	} {
-		if ts := materializedStageTimestamp(rawStages[name]); ts > 0 {
+		if ts, _, valid := utils.NormalizeTimestampMsAny(rawStages[name], utils.TimestampNormalizeTraceCompatible); valid && ts > 0 {
 			stages[name] = ts
 		}
 	}
 	return stages
-}
-
-func materializedStageTimestamp(v interface{}) int64 {
-	toMs := func(raw int64) int64 {
-		switch {
-		// already small relative ms (legacy/local traces)
-		case raw > 0 && raw < 946684800:
-			return raw
-		// seconds
-		case raw >= 946684800 && raw <= 4102444800:
-			return raw * 1000
-		// milliseconds
-		case raw >= 946684800000 && raw <= 4102444800000:
-			return raw
-		// microseconds
-		case raw >= 946684800000000 && raw <= 4102444800000000:
-			return raw / 1000
-		// nanoseconds
-		case raw >= 946684800000000000 && raw <= 4102444800000000000:
-			return raw / 1_000_000
-		default:
-			return 0
-		}
-	}
-
-	switch n := v.(type) {
-	case int64:
-		return toMs(n)
-	case float64:
-		return toMs(int64(n))
-	case json.Number:
-		if parsed, err := n.Int64(); err == nil {
-			return toMs(parsed)
-		}
-	case string:
-		if parsed, err := strconv.ParseInt(strings.TrimSpace(n), 10, 64); err == nil {
-			return toMs(parsed)
-		}
-	}
-	return 0
 }
 
 func stageTimestamp(stages []materializedTraceStageDTO, stage string) int64 {
@@ -1835,6 +1805,10 @@ func sanitizeDispatcherStats(stats policyoutbox.DispatcherStats) policyoutbox.Di
 	stats.OutboxCreatedToClaimedBuckets = sanitizeHistogramBuckets(stats.OutboxCreatedToClaimedBuckets)
 	stats.OutboxCreatedToClaimedSumMs = sanitizeFloat(stats.OutboxCreatedToClaimedSumMs)
 	stats.OutboxCreatedToClaimedP95Ms = sanitizeFloat(stats.OutboxCreatedToClaimedP95Ms)
+	stats.WakeQueueDepthAvg = sanitizeFloat(stats.WakeQueueDepthAvg)
+	stats.WakeToClaimBuckets = sanitizeHistogramBuckets(stats.WakeToClaimBuckets)
+	stats.WakeToClaimSumMs = sanitizeFloat(stats.WakeToClaimSumMs)
+	stats.WakeToClaimP95Ms = sanitizeFloat(stats.WakeToClaimP95Ms)
 	return stats
 }
 

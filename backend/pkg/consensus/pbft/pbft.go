@@ -49,11 +49,16 @@ type HotStuff struct {
 	votesSent     map[uint64]types.BlockHash // Tracks block hash we voted for in each view (safety)
 
 	// Proposal tracking
-	pendingVotes map[types.BlockHash]map[types.ValidatorID]*messages.Vote // blockHash -> votes
+	pendingVotes map[pendingVoteKey]map[types.ValidatorID]*messages.Vote // (view, blockHash) -> votes
 
 	mu        sync.RWMutex
 	stopCh    chan struct{}
 	callbacks types.ConsensusCallbacks
+}
+
+type pendingVoteKey struct {
+	view      uint64
+	blockHash types.BlockHash
 }
 
 // HotStuffConfig contains consensus parameters
@@ -114,7 +119,7 @@ func NewHotStuff(
 		audit:        audit,
 		logger:       logger,
 		votesSent:    make(map[uint64]types.BlockHash),
-		pendingVotes: make(map[types.BlockHash]map[types.ValidatorID]*messages.Vote),
+		pendingVotes: make(map[pendingVoteKey]map[types.ValidatorID]*messages.Vote),
 		stopCh:       make(chan struct{}),
 		callbacks:    callbacks,
 	}
@@ -447,15 +452,27 @@ func (hs *HotStuff) onVoteInternal(ctx context.Context, vote *messages.Vote) (ty
 	}
 	hs.logger.InfoContext(ctx, "OnVote: vote stored")
 
-	// Add to pending votes
-	if hs.pendingVotes[vote.BlockHash] == nil {
-		hs.pendingVotes[vote.BlockHash] = make(map[types.ValidatorID]*messages.Vote)
+	// Add to pending votes bucket keyed by (view, block hash) to avoid cross-view mixing.
+	key := pendingVoteKey{view: vote.View, blockHash: vote.BlockHash}
+	if hs.pendingVotes[key] == nil {
+		hs.pendingVotes[key] = make(map[types.ValidatorID]*messages.Vote)
 	}
-	hs.pendingVotes[vote.BlockHash][types.ValidatorID(vote.VoterID)] = vote
+	// Defensive invariant: reject mixed height/round in the same QC bucket.
+	for _, existing := range hs.pendingVotes[key] {
+		if existing == nil {
+			continue
+		}
+		if existing.Height != vote.Height || existing.Round != vote.Round {
+			return nil, fmt.Errorf("invalid vote bucket invariant: mixed height/round for view %d block %x (existing h=%d r=%d, incoming h=%d r=%d)",
+				vote.View, vote.BlockHash[:8], existing.Height, existing.Round, vote.Height, vote.Round)
+		}
+		break
+	}
+	hs.pendingVotes[key][types.ValidatorID(vote.VoterID)] = vote
 	hs.emitPolicyStageForStoredProposal(vote.BlockHash, "t_vote_aggregated", time.Now().UnixMilli())
 
 	// DEBUG: Log quorum check with detailed progress
-	voteCount := len(hs.pendingVotes[vote.BlockHash])
+	voteCount := len(hs.pendingVotes[key])
 	validatorCount := hs.validatorSet.GetValidatorCount()
 	quorumThreshold := hs.quorum.GetQuorumThreshold()
 	remaining := quorumThreshold - voteCount
@@ -472,7 +489,7 @@ func (hs *HotStuff) onVoteInternal(ctx context.Context, vote *messages.Vote) (ty
 	)
 
 	// Check if we have quorum
-	if hs.quorum.HasQuorum(hs.pendingVotes[vote.BlockHash]) {
+	if hs.quorum.HasQuorum(hs.pendingVotes[key]) {
 		hs.logger.InfoContext(ctx, "QUORUM REACHED - forming QC",
 			"block_hash", fmt.Sprintf("%x", vote.BlockHash[:8]),
 			"view", vote.View,
@@ -558,7 +575,11 @@ func (hs *HotStuff) createEquivocationEvidence(ctx context.Context, vote1, vote2
 
 // formQC aggregates votes into a Quorum Certificate. Caller must hold hs.mu.
 func (hs *HotStuff) formQC(ctx context.Context, blockHash [32]byte, view uint64) (types.QC, error) {
-	votes := hs.pendingVotes[blockHash]
+	key := pendingVoteKey{view: view, blockHash: blockHash}
+	votes := hs.pendingVotes[key]
+	if len(votes) == 0 {
+		return nil, fmt.Errorf("cannot form qc: no pending votes for view %d block %x", view, blockHash[:8])
+	}
 
 	hs.logger.InfoContext(ctx, "forming QC",
 		"view", view,
@@ -566,17 +587,33 @@ func (hs *HotStuff) formQC(ctx context.Context, blockHash [32]byte, view uint64)
 		"vote_count", len(votes),
 	)
 
-	// Aggregate signatures
+	// Aggregate signatures and enforce strict per-QC vote invariants.
+	firstVoter := getFirstVoter(votes)
+	firstVote := votes[firstVoter]
+	if firstVote == nil {
+		delete(hs.pendingVotes, key)
+		return nil, fmt.Errorf("cannot form qc: first vote is nil for view %d block %x", view, blockHash[:8])
+	}
 	signatures := make([]types.Signature, 0, len(votes))
 	for _, vote := range votes {
+		if vote == nil {
+			delete(hs.pendingVotes, key)
+			return nil, fmt.Errorf("cannot form qc: nil vote encountered for view %d block %x", view, blockHash[:8])
+		}
+		if vote.View != firstVote.View || vote.Height != firstVote.Height || vote.Round != firstVote.Round || vote.BlockHash != firstVote.BlockHash {
+			delete(hs.pendingVotes, key)
+			return nil, fmt.Errorf("cannot form qc: mixed vote set detected (expected v=%d h=%d r=%d hash=%x, got v=%d h=%d r=%d hash=%x)",
+				firstVote.View, firstVote.Height, firstVote.Round, firstVote.BlockHash[:8],
+				vote.View, vote.Height, vote.Round, vote.BlockHash[:8])
+		}
 		signatures = append(signatures, vote.Signature)
 	}
 
 	// Create QC
 	qc := &QuorumCertificate{
-		View:         view,
-		Height:       votes[getFirstVoter(votes)].Height,
-		Round:        votes[getFirstVoter(votes)].Round,
+		View:         firstVote.View,
+		Height:       firstVote.Height,
+		Round:        firstVote.Round,
 		BlockHash:    blockHash,
 		Signatures:   signatures,
 		Timestamp:    time.Now(),
@@ -625,7 +662,7 @@ func (hs *HotStuff) formQC(ctx context.Context, blockHash [32]byte, view uint64)
 	}
 
 	// Cleanup pending votes
-	delete(hs.pendingVotes, blockHash)
+	delete(hs.pendingVotes, key)
 
 	return qc, nil
 }
@@ -1027,9 +1064,27 @@ func (hs *HotStuff) sanitizeJustifyQC(ctx context.Context, qc types.QC) (types.Q
 
 	rebuilt, err := hs.rebuildQCFromVotes(ctx, qc)
 	if err != nil {
+		if fallback := hs.bestValidatedFallbackQC(ctx, qc); fallback != nil {
+			hs.logger.WarnContext(ctx, "using fallback justify qc after repair failure",
+				"failed_qc_view", qc.GetView(),
+				"failed_qc_height", qc.GetHeight(),
+				"fallback_view", fallback.GetView(),
+				"fallback_height", fallback.GetHeight(),
+				"error", err)
+			return fallback, nil
+		}
 		return nil, fmt.Errorf("rebuild qc from votes: %w", err)
 	}
 	if err := hs.validator.ValidateQC(ctx, rebuilt); err != nil {
+		if fallback := hs.bestValidatedFallbackQC(ctx, qc); fallback != nil {
+			hs.logger.WarnContext(ctx, "using fallback justify qc after rebuilt qc validation failure",
+				"failed_qc_view", qc.GetView(),
+				"failed_qc_height", qc.GetHeight(),
+				"fallback_view", fallback.GetView(),
+				"fallback_height", fallback.GetHeight(),
+				"error", err)
+			return fallback, nil
+		}
 		return nil, fmt.Errorf("rebuilt qc still invalid: %w", err)
 	}
 
@@ -1049,6 +1104,43 @@ func (hs *HotStuff) sanitizeJustifyQC(ctx context.Context, qc types.QC) (types.Q
 		}(),
 		"signature_count", len(rebuilt.GetSignatures()))
 	return rebuilt, nil
+}
+
+func (hs *HotStuff) bestValidatedFallbackQC(ctx context.Context, exclude types.QC) types.QC {
+	if hs == nil || hs.validator == nil {
+		return nil
+	}
+
+	hs.mu.RLock()
+	locked := hs.lockedQC
+	prepare := hs.prepareQC
+	hs.mu.RUnlock()
+
+	candidates := []types.QC{locked, prepare}
+	if hs.storage != nil {
+		candidates = append(candidates, hs.storage.GetLastCommittedQC())
+	}
+
+	var best types.QC
+	for _, candidate := range candidates {
+		if candidate == nil {
+			continue
+		}
+		if exclude != nil && candidate.GetView() == exclude.GetView() &&
+			candidate.GetHeight() == exclude.GetHeight() &&
+			candidate.GetBlockHash() == exclude.GetBlockHash() {
+			continue
+		}
+		if err := hs.validator.ValidateQC(ctx, candidate); err != nil {
+			continue
+		}
+		if best == nil ||
+			candidate.GetHeight() > best.GetHeight() ||
+			(candidate.GetHeight() == best.GetHeight() && candidate.GetView() > best.GetView()) {
+			best = candidate
+		}
+	}
+	return best
 }
 
 func (hs *HotStuff) rebuildQCFromVotes(ctx context.Context, qc types.QC) (types.QC, error) {
@@ -1082,8 +1174,8 @@ func (hs *HotStuff) rebuildQCFromVotes(ctx context.Context, qc types.QC) (types.
 		}
 	}
 	if !hs.quorum.HasQuorum(votesByValidator) {
-		return nil, fmt.Errorf("have %d valid matching votes after discarding %d invalid votes, quorum requires %d",
-			len(votesByValidator), discardedVotes, hs.quorum.GetQuorumThreshold())
+		return nil, fmt.Errorf("have %d valid matching votes after discarding %d invalid votes, quorum requires %d (reasons=%v samples=%v)",
+			len(votesByValidator), discardedVotes, hs.quorum.GetQuorumThreshold(), discardedByReason, discardedSamples)
 	}
 	if discardedVotes > 0 {
 		hs.logger.WarnContext(ctx, "discarded invalid persisted votes during qc repair",
@@ -1145,9 +1237,6 @@ func (hs *HotStuff) verifyPersistedVoteForQCRepair(ctx context.Context, vote *me
 	}
 	if !hs.validatorSet.IsValidator(vote.VoterID) {
 		return fmt.Errorf("voter %x is not in validator set", vote.VoterID[:8])
-	}
-	if !hs.validatorSet.IsActiveInView(vote.VoterID, vote.View) {
-		return fmt.Errorf("voter %x is not active in view %d", vote.VoterID[:8], vote.View)
 	}
 	publicKey, err := hs.crypto.GetPublicKey(vote.VoterID)
 	if err != nil {
@@ -1229,8 +1318,8 @@ func (hs *HotStuff) cleanupOldData(currentHeight uint64) {
 	// Cleanup votes older than replay window
 	if currentHeight > 100 {
 		_ = currentHeight - 100 // cutoffHeight for potential future use
-		for blockHash := range hs.pendingVotes {
-			delete(hs.pendingVotes, blockHash)
+		for key := range hs.pendingVotes {
+			delete(hs.pendingVotes, key)
 		}
 		// Storage will handle its own cleanup
 	}

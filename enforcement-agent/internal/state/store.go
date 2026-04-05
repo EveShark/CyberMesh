@@ -64,6 +64,7 @@ type Store struct {
 	persistMinGap    time.Duration
 	lastPersistAt    time.Time
 	dirty            bool
+	stateVersion     uint64
 	lastApplied      map[string]time.Time
 	scopeWatermarks  map[string]time.Time
 }
@@ -686,6 +687,7 @@ func (s *Store) markDirtyAndMaybePersistLocked(now time.Time) error {
 	if s.persistPath == "" {
 		return nil
 	}
+	s.stateVersion++
 	s.dirty = true
 	// Latency-first path: when a persist gap is configured, writes are coalesced
 	// and persisted by the background flush loop instead of inline on the
@@ -701,11 +703,7 @@ func (s *Store) persistNowLocked(now time.Time) error {
 		return nil
 	}
 
-	unlock, err := s.acquireLock()
-	if err != nil {
-		return err
-	}
-	defer unlock()
+	persistVersion := s.stateVersion
 
 	records := make([]Record, 0, len(s.records))
 	for _, rec := range s.records {
@@ -738,6 +736,17 @@ func (s *Store) persistNowLocked(now time.Time) error {
 		ScopeWatermarks:  scopeWatermarksCopy,
 		CreatedAt:        time.Now().UTC(),
 	}
+
+	// Release the hot-path mutex before expensive checksum/marshal/fsync work.
+	s.mu.Unlock()
+	defer s.mu.Lock()
+
+	unlock, err := s.acquireLock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	if s.checksumEnabled {
 		checksum, err := computeChecksum(snap)
 		if err != nil {
@@ -759,7 +768,9 @@ func (s *Store) persistNowLocked(now time.Time) error {
 	if err := os.Rename(tmp, s.persistPath); err != nil {
 		return fmt.Errorf("state store: rename snapshot: %w", err)
 	}
-	s.dirty = false
+	if s.stateVersion == persistVersion {
+		s.dirty = false
+	}
 	s.lastPersistAt = now
 	return nil
 }

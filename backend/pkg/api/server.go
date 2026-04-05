@@ -35,6 +35,7 @@ type PolicyOutboxStatsProvider interface {
 	GetCommitPathStats() (CommitPathStats, bool)
 	GetPolicyAckConsumerStats() (PolicyAckConsumerStats, bool)
 	GetPolicyAckCausalStats() (PolicyAckCausalStats, bool)
+	GetPolicyPublisherStats() (PolicyPublisherStats, bool)
 	NotifyPolicyOutboxDispatcher()
 }
 
@@ -43,55 +44,79 @@ type PolicyRuntimeTraceProvider interface {
 }
 
 type CommitPathStats struct {
-	LogSampleEvery                    uint64
-	LogsSuppressed                    uint64
-	BackfillPending                   uint64
-	BackfillDropped                   uint64
-	ReplayRejectedAdmit               uint64
-	ReplayRejectedBuild               uint64
-	ReplayFilterSize                  uint64
-	ReplayFilterEvictions             uint64
-	PersistEnqueueCommitProposer      uint64
-	PersistEnqueueCommitNonProposer   uint64
-	PersistEnqueueBackfillProposer    uint64
-	PersistEnqueueBackfillNonProposer uint64
-	PersistEnqueueDroppedNonProposer  uint64
-	PersistEnqueueErrors              uint64
-	PersistExecuteProposer            uint64
-	PersistExecuteNonProposer         uint64
-	PersistExecuteDroppedNonOwner     uint64
-	ApplyBlockRuns                    uint64
-	ApplyBlockEventTxs                uint64
-	ApplyBlockEvidenceTxs             uint64
-	ApplyBlockPolicyTxs               uint64
-	ApplyBlockTotalBuckets            []utils.HistogramBucket
-	ApplyBlockTotalCount              uint64
-	ApplyBlockTotalSumMs              float64
-	ApplyBlockTotalP95Ms              float64
-	ApplyBlockValidateBuckets         []utils.HistogramBucket
-	ApplyBlockValidateCount           uint64
-	ApplyBlockValidateSumMs           float64
-	ApplyBlockValidateP95Ms           float64
-	ApplyBlockNonceCheckBuckets       []utils.HistogramBucket
-	ApplyBlockNonceCheckCount         uint64
-	ApplyBlockNonceCheckSumMs         float64
-	ApplyBlockNonceCheckP95Ms         float64
-	ApplyBlockReducerEventBuckets     []utils.HistogramBucket
-	ApplyBlockReducerEventCount       uint64
-	ApplyBlockReducerEventSumMs       float64
-	ApplyBlockReducerEventP95Ms       float64
-	ApplyBlockReducerEvidenceBuckets  []utils.HistogramBucket
-	ApplyBlockReducerEvidenceCount    uint64
-	ApplyBlockReducerEvidenceSumMs    float64
-	ApplyBlockReducerEvidenceP95Ms    float64
-	ApplyBlockReducerPolicyBuckets    []utils.HistogramBucket
-	ApplyBlockReducerPolicyCount      uint64
-	ApplyBlockReducerPolicySumMs      float64
-	ApplyBlockReducerPolicyP95Ms      float64
-	ApplyBlockCommitStateBuckets      []utils.HistogramBucket
-	ApplyBlockCommitStateCount        uint64
-	ApplyBlockCommitStateSumMs        float64
-	ApplyBlockCommitStateP95Ms        float64
+	LogSampleEvery                       uint64
+	LogsSuppressed                       uint64
+	BackfillPending                      uint64
+	BackfillDropped                      uint64
+	ReplayRejectedAdmit                  uint64
+	ReplayRejectedBuild                  uint64
+	ReplayFilterSize                     uint64
+	ReplayFilterEvictions                uint64
+	PersistEnqueueCommitProposer         uint64
+	PersistEnqueueCommitNonProposer      uint64
+	PersistEnqueueBackfillProposer       uint64
+	PersistEnqueueBackfillNonProposer    uint64
+	PersistEnqueueDroppedNonProposer     uint64
+	PersistEnqueueErrors                 uint64
+	PersistEnqueueTimeouts               uint64
+	PersistEnqueueTimeoutsCommit         uint64
+	PersistEnqueueTimeoutsBackfill       uint64
+	PersistEnqueueWaitCommitSumMs        uint64
+	PersistEnqueueWaitCommitCount        uint64
+	PersistEnqueueWaitBackfillSumMs      uint64
+	PersistEnqueueWaitBackfillCount      uint64
+	PersistDirectFallbackAttempts        uint64
+	PersistDirectFallbackSuccess         uint64
+	PersistDirectFallbackFailures        uint64
+	PersistDirectFallbackThrottled       uint64
+	PersistDirectFallbackSkippedPressure uint64
+	PersistDirectFallbackSkippedDistress uint64
+	PersistDirectFallbackInFlight        uint64
+	PersistWriterTakeoverActivations     uint64
+	BackfillOldestPendingAgeMs           uint64
+	BackfillNonRetryQuarantined          uint64
+	PersistTotalBudgetExhausted          uint64
+	PersistAttemptTimeoutCapped          uint64
+	PersistOnPersistedDelaySumMs         uint64
+	PersistOnPersistedDelayCount         uint64
+	PersistMetadataUpdateSumMs           uint64
+	PersistMetadataUpdateCount           uint64
+	PersistMetadataUpdateFailures        uint64
+	PersistExecuteProposer               uint64
+	PersistExecuteNonProposer            uint64
+	PersistExecuteDroppedNonOwner        uint64
+	ApplyBlockRuns                       uint64
+	ApplyBlockEventTxs                   uint64
+	ApplyBlockEvidenceTxs                uint64
+	ApplyBlockPolicyTxs                  uint64
+	ApplyBlockTotalBuckets               []utils.HistogramBucket
+	ApplyBlockTotalCount                 uint64
+	ApplyBlockTotalSumMs                 float64
+	ApplyBlockTotalP95Ms                 float64
+	ApplyBlockValidateBuckets            []utils.HistogramBucket
+	ApplyBlockValidateCount              uint64
+	ApplyBlockValidateSumMs              float64
+	ApplyBlockValidateP95Ms              float64
+	ApplyBlockNonceCheckBuckets          []utils.HistogramBucket
+	ApplyBlockNonceCheckCount            uint64
+	ApplyBlockNonceCheckSumMs            float64
+	ApplyBlockNonceCheckP95Ms            float64
+	ApplyBlockReducerEventBuckets        []utils.HistogramBucket
+	ApplyBlockReducerEventCount          uint64
+	ApplyBlockReducerEventSumMs          float64
+	ApplyBlockReducerEventP95Ms          float64
+	ApplyBlockReducerEvidenceBuckets     []utils.HistogramBucket
+	ApplyBlockReducerEvidenceCount       uint64
+	ApplyBlockReducerEvidenceSumMs       float64
+	ApplyBlockReducerEvidenceP95Ms       float64
+	ApplyBlockReducerPolicyBuckets       []utils.HistogramBucket
+	ApplyBlockReducerPolicyCount         uint64
+	ApplyBlockReducerPolicySumMs         float64
+	ApplyBlockReducerPolicyP95Ms         float64
+	ApplyBlockCommitStateBuckets         []utils.HistogramBucket
+	ApplyBlockCommitStateCount           uint64
+	ApplyBlockCommitStateSumMs           float64
+	ApplyBlockCommitStateP95Ms           float64
 }
 
 type PolicyAckConsumerStats struct {
@@ -112,6 +137,7 @@ type PolicyAckConsumerStats struct {
 
 type PolicyAckCausalStats struct {
 	SkewCorrectionsTotal       uint64
+	CorrelationCommand         uint64
 	CorrelationExact           uint64
 	CorrelationFallbackHash    uint64
 	CorrelationFallbackTrace   uint64
@@ -141,6 +167,14 @@ type PolicyAckCausalStats struct {
 	AppliedToAckCount          uint64
 	AppliedToAckSumMs          float64
 	AppliedToAckP95Ms          float64
+	CorrelationLatencyBuckets  []utils.HistogramBucket
+	CorrelationLatencyCount    uint64
+	CorrelationLatencySumMs    float64
+	CorrelationLatencyP95Ms    float64
+}
+
+type PolicyPublisherStats struct {
+	DedupeSuppressedByReason map[string]uint64
 }
 
 // Server provides read-only API access to backend state

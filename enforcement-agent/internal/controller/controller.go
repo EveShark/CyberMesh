@@ -7,51 +7,90 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
+	"net"
 	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/IBM/sarama"
 	"go.uber.org/zap"
 
 	"github.com/CyberMesh/enforcement-agent/internal/ack"
+	"github.com/CyberMesh/enforcement-agent/internal/consumercontract"
 	"github.com/CyberMesh/enforcement-agent/internal/control"
 	"github.com/CyberMesh/enforcement-agent/internal/enforcer"
 	"github.com/CyberMesh/enforcement-agent/internal/metrics"
+	"github.com/CyberMesh/enforcement-agent/internal/observability"
 	"github.com/CyberMesh/enforcement-agent/internal/policy"
 	"github.com/CyberMesh/enforcement-agent/internal/ratelimit"
 	"github.com/CyberMesh/enforcement-agent/internal/state"
 
 	pb "backend/proto"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/protobuf/proto"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
 // Controller bridges Kafka messages to enforcement backend.
 type Controller struct {
-	trust             *policy.TrustedKeys
-	store             *state.Store
-	enforcer          enforcer.Enforcer
-	metrics           *metrics.Recorder
-	logger            *zap.Logger
-	rate              ratelimit.Coordinator
-	killSwitch        *control.KillSwitch
-	seenHashes        sync.Map // policyID -> string(hash)
-	pending           map[string]policy.Event
-	pendingMu         sync.Mutex
-	fastPath          FastPathConfig
-	acks              ack.Publisher
-	ackEnqueueTimeout time.Duration
-	instanceID        string
-	replay            replayConfig
-	replaySeen        map[string]time.Time
-	replayMu          sync.Mutex
-	scopeLocks        sync.Map // scope key -> *sync.Mutex
-	decisionMu        sync.RWMutex
-	decisions         []DecisionRecord
-	decMax            int
+	trust                         *policy.TrustedKeys
+	store                         *state.Store
+	enforcer                      enforcer.Enforcer
+	metrics                       *metrics.Recorder
+	logger                        *zap.Logger
+	rate                          ratelimit.Coordinator
+	killSwitch                    *control.KillSwitch
+	seenHashes                    sync.Map // policyID -> string(hash)
+	pending                       map[string]policy.Event
+	pendingMu                     sync.Mutex
+	fastPath                      FastPathConfig
+	acks                          ack.Publisher
+	ackEnqueueTimeout             time.Duration
+	applyTimeout                  time.Duration
+	applyTotalBudget              time.Duration
+	applyRetryMax                 int
+	applyRetryBackoff             time.Duration
+	applyRetryBase                time.Duration
+	applyRetryMaxCap              time.Duration
+	applyRetryJitter              float64
+	applyTimeoutBreakerThreshold  int
+	applyTimeoutBreakerCooldown   time.Duration
+	applyTimeoutStreak            int64
+	applyTimeoutBreakerUntilNs    int64
+	enableExpiredShed             bool
+	rngMu                         sync.Mutex
+	rng                           *rand.Rand
+	instanceID                    string
+	replay                        replayConfig
+	replaySeen                    map[string]time.Time
+	replayMu                      sync.Mutex
+	scopeLocks                    sync.Map // scope key -> *sync.Mutex
+	decisionMu                    sync.RWMutex
+	decisions                     []DecisionRecord
+	decMax                        int
+	commandRejects                CommandRejectSink
+	commandTopic                  string
+	lifecycleCompactor            *lifecycleCompactor
+	criticalSlots                 chan struct{}
+	maintenanceSlots              chan struct{}
+	criticalQueueDepth            int64
+	maintQueueDepth               int64
+	laneStarveAfter               time.Duration
+	emitAcceptedAck               bool
+	criticalMode                  string
+	maintenanceMode               string
+	lifecyclePromotionGateEnabled bool
+	lifecyclePromotionMinWindow   time.Duration
+	startedAt                     time.Time
+	criticalGateWarned            uint32
+	maintenanceGateWarned         uint32
 }
 
 type DecisionRecord struct {
@@ -78,15 +117,37 @@ type FastPathConfig struct {
 }
 
 type Options struct {
-	FastPathEnabled       bool
-	FastPathMinConfidence float64
-	FastPathSignals       int64
-	AckPublisher          ack.Publisher
-	AckEnqueueTimeout     time.Duration
-	ControllerInstanceID  string
-	ReplayWindow          time.Duration
-	ReplayFutureSkew      time.Duration
-	ReplayCacheMaxEntries int
+	FastPathEnabled               bool
+	FastPathMinConfidence         float64
+	FastPathSignals               int64
+	AckPublisher                  ack.Publisher
+	AckEnqueueTimeout             time.Duration
+	ApplyTimeout                  time.Duration
+	ApplyTotalBudget              time.Duration
+	ApplyRetryMax                 int
+	ApplyRetryBackoff             time.Duration
+	ApplyRetryBaseBackoff         time.Duration
+	ApplyRetryMaxBackoff          time.Duration
+	ApplyRetryJitterRatio         float64
+	ApplyTimeoutBreakerThreshold  int
+	ApplyTimeoutBreakerCooldown   time.Duration
+	ExpiredShedding               bool
+	ControllerInstanceID          string
+	ReplayWindow                  time.Duration
+	ReplayFutureSkew              time.Duration
+	ReplayCacheMaxEntries         int
+	CommandRejectSink             CommandRejectSink
+	CommandTopic                  string
+	LifecycleCompactionEnabled    bool
+	LifecycleCompactionWindow     time.Duration
+	CriticalLaneMaxInFlight       int
+	MaintenanceLaneMaxInFlight    int
+	LaneStarvationThreshold       time.Duration
+	EmitAcceptedAck               bool
+	CriticalMode                  string
+	MaintenanceMode               string
+	LifecyclePromotionGateEnabled bool
+	LifecyclePromotionMinWindow   time.Duration
 }
 
 type replayConfig struct {
@@ -108,6 +169,7 @@ const (
 	stageEnforcementPersisted = "t_enforcement_persist_done"
 	stageAckPublishStart      = "t_ack_publish_start"
 	stageAckPublishDone       = "t_ack_publish_done"
+	reservationReleaseTimeout = 2 * time.Second
 )
 
 // New constructs a controller.
@@ -138,9 +200,20 @@ func New(trust *policy.TrustedKeys, store *state.Store, backend enforcer.Enforce
 			MinConfidence:   opts.FastPathMinConfidence,
 			SignalsRequired: opts.FastPathSignals,
 		},
-		acks:              opts.AckPublisher,
-		ackEnqueueTimeout: opts.AckEnqueueTimeout,
-		instanceID:        opts.ControllerInstanceID,
+		acks:                         opts.AckPublisher,
+		ackEnqueueTimeout:            opts.AckEnqueueTimeout,
+		applyTimeout:                 opts.ApplyTimeout,
+		applyTotalBudget:             opts.ApplyTotalBudget,
+		applyRetryMax:                opts.ApplyRetryMax,
+		applyRetryBackoff:            opts.ApplyRetryBackoff,
+		applyRetryBase:               opts.ApplyRetryBaseBackoff,
+		applyRetryMaxCap:             opts.ApplyRetryMaxBackoff,
+		applyRetryJitter:             opts.ApplyRetryJitterRatio,
+		applyTimeoutBreakerThreshold: opts.ApplyTimeoutBreakerThreshold,
+		applyTimeoutBreakerCooldown:  opts.ApplyTimeoutBreakerCooldown,
+		enableExpiredShed:            opts.ExpiredShedding,
+		rng:                          rand.New(rand.NewSource(time.Now().UnixNano())),
+		instanceID:                   opts.ControllerInstanceID,
 		replay: replayConfig{
 			window:         replayWindow,
 			futureSkew:     replayFutureSkew,
@@ -148,11 +221,82 @@ func New(trust *policy.TrustedKeys, store *state.Store, backend enforcer.Enforce
 			enabled:        replayWindow > 0,
 			requirePayload: true,
 		},
-		replaySeen: make(map[string]time.Time, replayMax),
-		decMax:     500,
+		replaySeen:                    make(map[string]time.Time, replayMax),
+		decMax:                        500,
+		commandRejects:                opts.CommandRejectSink,
+		commandTopic:                  strings.TrimSpace(opts.CommandTopic),
+		emitAcceptedAck:               opts.EmitAcceptedAck,
+		criticalMode:                  strings.ToLower(strings.TrimSpace(opts.CriticalMode)),
+		maintenanceMode:               strings.ToLower(strings.TrimSpace(opts.MaintenanceMode)),
+		lifecyclePromotionGateEnabled: opts.LifecyclePromotionGateEnabled,
+		lifecyclePromotionMinWindow:   opts.LifecyclePromotionMinWindow,
+		startedAt:                     time.Now().UTC(),
 	}
 	if c.ackEnqueueTimeout <= 0 {
 		c.ackEnqueueTimeout = 500 * time.Millisecond
+	}
+	if c.applyRetryMax < 0 {
+		c.applyRetryMax = 0
+	}
+	if c.applyRetryBackoff <= 0 {
+		c.applyRetryBackoff = 100 * time.Millisecond
+	}
+	if c.applyRetryBase <= 0 {
+		c.applyRetryBase = c.applyRetryBackoff
+	}
+	if c.applyRetryMaxCap <= 0 {
+		c.applyRetryMaxCap = time.Second
+	}
+	if c.applyRetryMaxCap < c.applyRetryBase {
+		c.applyRetryMaxCap = c.applyRetryBase
+	}
+	if c.applyRetryJitter < 0 {
+		c.applyRetryJitter = 0
+	}
+	if c.applyRetryJitter > 1 {
+		c.applyRetryJitter = 1
+	}
+	if c.applyTimeoutBreakerThreshold < 0 {
+		c.applyTimeoutBreakerThreshold = 0
+	}
+	if c.applyTimeoutBreakerCooldown < 0 {
+		c.applyTimeoutBreakerCooldown = 0
+	}
+	if c.applyTotalBudget < 0 {
+		c.applyTotalBudget = 0
+	}
+	if opts.LifecycleCompactionEnabled {
+		window := opts.LifecycleCompactionWindow
+		if window <= 0 {
+			window = 2 * time.Minute
+		}
+		c.lifecycleCompactor = newLifecycleCompactor(window)
+	}
+	criticalCap := opts.CriticalLaneMaxInFlight
+	if criticalCap <= 0 {
+		criticalCap = 32
+	}
+	maintCap := opts.MaintenanceLaneMaxInFlight
+	if maintCap <= 0 {
+		maintCap = 8
+	}
+	c.criticalSlots = make(chan struct{}, criticalCap)
+	c.maintenanceSlots = make(chan struct{}, maintCap)
+	if c.criticalMode == "" {
+		c.criticalMode = "enforce"
+	}
+	if c.criticalMode != "enforce" && c.criticalMode != "dry_run" {
+		c.criticalMode = "enforce"
+	}
+	if c.maintenanceMode == "" {
+		c.maintenanceMode = "enforce"
+	}
+	if c.maintenanceMode != "enforce" && c.maintenanceMode != "dry_run" {
+		c.maintenanceMode = "enforce"
+	}
+	c.laneStarveAfter = opts.LaneStarvationThreshold
+	if c.laneStarveAfter <= 0 {
+		c.laneStarveAfter = 2 * time.Second
 	}
 	c.loadPendingApprovals()
 	return c
@@ -189,6 +333,18 @@ func (c *Controller) loadPendingApprovals() {
 
 // HandleMessage satisfies kafka.MessageHandler.
 func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMessage) error {
+	ctx, span := observability.Tracer("enforcement-agent/controller").Start(
+		ctx,
+		"enforcement.handle_message",
+		trace.WithAttributes(
+			attribute.String("messaging.system", "kafka"),
+			attribute.String("messaging.destination", msg.Topic),
+			attribute.Int64("messaging.kafka.partition", int64(msg.Partition)),
+			attribute.Int64("messaging.kafka.offset", msg.Offset),
+		),
+	)
+	defer span.End()
+
 	consumeStart := time.Now()
 	c.metrics.ObserveIngest()
 	if c.logger != nil {
@@ -204,21 +360,28 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 
 	var event pb.PolicyUpdateEvent
 	if err := proto.Unmarshal(msg.Value, &event); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "unmarshal policy event")
 		c.metrics.ObserveRejected()
 		if c.logger != nil {
 			c.logger.Warn("failed to unmarshal policy", zap.Error(err), zap.Int("value_bytes", len(msg.Value)))
 		}
+		c.publishCommandReject(ctx, msg, err)
 		return nil
 	}
 
-	evt, err := c.trust.VerifyAndParse(&event)
+	evt, err := c.trust.VerifyAndParseWithDomain(&event, c.policyDomainForTopic(msg.Topic))
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "verify policy event")
 		c.metrics.ObserveRejected()
 		if c.logger != nil {
 			c.logger.Warn("policy verification failed", zap.String("policy_id", event.PolicyId), zap.Error(err))
 		}
+		c.publishCommandReject(ctx, msg, err)
 		return nil
 	}
+	span.SetAttributes(attribute.String("policy.id", evt.Spec.ID))
 	c.emitStageMarker(evt, stageEnforcementConsume, time.Now().UnixMilli())
 	if c.logger != nil {
 		c.logger.Debug(
@@ -251,6 +414,21 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 	replayNow := time.Now().UTC()
 	replayReason, replayKey, replayErr := c.checkReplay(evt, replayNow)
 	if replayErr != nil {
+		if replayReason == "replay_duplicate" {
+			appliedAt = time.Now().UTC()
+			if c.logger != nil {
+				c.logger.Debug("duplicate replay treated as idempotent noop",
+					zap.String("policy_id", evt.Spec.ID),
+					zap.Error(replayErr))
+			}
+			c.emitStageMarker(evt, stageEnforcementApplyDone, appliedAt.UnixMilli(), zap.String("result", "duplicate_noop"))
+			if c.metrics != nil {
+				c.metrics.ObserveConsumeToApply("duplicate", time.Since(consumeStart))
+				c.metrics.ObserveDuplicateScope(scopeKindLabel(evt.Spec))
+			}
+			c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultApplied, "duplicate_noop", "policy replay duplicate detected", appliedAt)
+			return nil
+		}
 		if c.metrics != nil {
 			c.metrics.ObserveGuardrailViolation(replayReason)
 			c.metrics.ObserveGatewayReplayReject(replayReason)
@@ -261,8 +439,49 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 				zap.String("reason", replayReason),
 				zap.Error(replayErr))
 		}
+		if replayReason == "replay_invalid_timestamp" || replayReason == "replay_future_timestamp" {
+			c.publishCommandReject(ctx, msg, replayErr)
+		}
 		c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultFailed, replayReason, replayErr.Error(), appliedAt)
 		return nil
+	}
+
+	if c.enableExpiredShed {
+		now := time.Now().UTC()
+		if expiryAt, expired, ok := policyExpiryDeadline(evt, now); ok && expired {
+			errorCode := "shed_expired_policy"
+			reason := fmt.Sprintf("policy expired before enforcement apply (expiry=%s now=%s)", expiryAt.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
+			if c.metrics != nil {
+				c.metrics.ObserveApplyTerminalFailure("expired_shed")
+				c.metrics.ObservePolicyShedding("expired")
+			}
+			if rejectErr := c.publishCommandReject(ctx, msg, errors.New(reason)); rejectErr != nil {
+				if c.metrics != nil {
+					c.metrics.ObserveRejectPublishFail()
+				}
+				errorCode = "shed_expired_policy_reject_publish_failed"
+				reason = reason + "; reject artifact publish failed: " + rejectErr.Error()
+			}
+			if c.logger != nil {
+				fields := []zap.Field{
+					zap.String("policy_id", strings.TrimSpace(evt.Spec.ID)),
+					zap.String("error_code", errorCode),
+					zap.String("reason", reason),
+					zap.Time("expiry_at", expiryAt),
+					zap.Time("now", now),
+				}
+				if msg != nil {
+					fields = append(fields,
+						zap.String("topic", msg.Topic),
+						zap.Int32("partition", msg.Partition),
+						zap.Int64("offset", msg.Offset),
+					)
+				}
+				c.logger.Warn("policy shed due to policy-expiry semantics", fields...)
+			}
+			c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultFailed, errorCode, reason, now)
+			return nil
+		}
 	}
 
 	if c.killSwitch != nil && c.killSwitch.Enabled() {
@@ -392,6 +611,31 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 	}
 
 	if isRemoveAction(evt) {
+		if c.shouldCompactEvent(evt, eventTS, hasEventTS, consumeStart, "critical") {
+			appliedAt = time.Now().UTC()
+			c.emitStageMarker(evt, stageEnforcementApplyDone, appliedAt.UnixMilli(), zap.String("result", "compacted_noop"))
+			advanceScopeWatermark()
+			c.commitDuplicateFingerprint(evt)
+			c.commitReplayKey(replayKey, time.Now().UTC())
+			c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultNoop, "lifecycle_compacted_superseded", "superseded lifecycle intent compacted", appliedAt)
+			if approvedFromPending {
+				c.clearPendingApproval(pendingKey)
+			}
+			return nil
+		}
+		if c.effectiveLaneMode(laneCritical) == "dry_run" {
+			now := time.Now().UTC()
+			c.emitStageMarker(evt, stageEnforcementApplyDone, now.UnixMilli(), zap.String("result", "critical_dry_run_noop"))
+			c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultNoop, "lifecycle_class_critical_dry_run", "critical lifecycle class in dry_run mode", now)
+			return nil
+		}
+		releaseLane, laneErr := c.enterLane(ctx, laneCritical)
+		if laneErr != nil {
+			c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultFailed, "critical_lane_wait_failed", laneErr.Error(), time.Now().UTC())
+			return laneErr
+		}
+		defer releaseLane()
+
 		removeReason := ""
 		if c.store != nil {
 			if existing, ok := c.store.Get(evt.Spec.ID); ok && existing.PendingConsensus {
@@ -414,6 +658,9 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 			c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultFailed, "remove_error", err.Error(), time.Now().UTC())
 			return fmt.Errorf("controller: remove policy %s: %w", evt.Spec.ID, err)
 		}
+		// Keep critical-lane occupancy focused on dataplane mutation only.
+		// ACK + state persistence happen after slot release.
+		releaseLane()
 		appliedAt = time.Now().UTC()
 		c.emitStageMarker(evt, stageEnforcementApplyDone, appliedAt.UnixMilli(), zap.String("result", "remove"))
 		if c.metrics != nil {
@@ -443,7 +690,7 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 	reservation, reason, err := c.checkGuardrails(ctx, evt.Spec)
 	if err != nil {
 		if reservation != nil {
-			_ = reservation.Release(ctx)
+			c.releaseReservation(reservation, evt.Spec.ID)
 		}
 		if c.metrics != nil {
 			c.metrics.ObserveGuardrailViolation(reason)
@@ -460,6 +707,24 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 		}
 		c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultFailed, errorCode, err.Error(), appliedAt)
 		return nil
+	}
+	reservationFinalized := false
+	finalizeReservation := func(commit bool) {
+		if reservation == nil || reservationFinalized {
+			return
+		}
+		if commit {
+			if err := reservation.Commit(ctx); err != nil && c.logger != nil {
+				c.logger.Warn("rate reservation commit failed", zap.String("policy_id", evt.Spec.ID), zap.Error(err))
+			}
+		} else {
+			c.releaseReservation(reservation, evt.Spec.ID)
+		}
+		reservationFinalized = true
+	}
+	defer finalizeReservation(false)
+	if c.emitAcceptedAck {
+		c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultAccepted, "accepted_pre_apply", "policy accepted after verification and guardrails", time.Now().UTC())
 	}
 
 	refreshReason := "applied_new"
@@ -486,6 +751,32 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 	}
 
 	if refreshOnly {
+		if c.shouldCompactEvent(evt, eventTS, hasEventTS, consumeStart, "maintenance") {
+			appliedAt = time.Now().UTC()
+			c.emitStageMarker(evt, stageEnforcementApplyDone, appliedAt.UnixMilli(), zap.String("result", "compacted_noop"))
+			advanceScopeWatermark()
+			c.commitDuplicateFingerprint(evt)
+			c.commitReplayKey(replayKey, time.Now().UTC())
+			c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultNoop, "lifecycle_compacted_superseded", "superseded lifecycle intent compacted", appliedAt)
+			if approvedFromPending {
+				c.clearPendingApproval(pendingKey)
+			}
+			return nil
+		}
+		if c.effectiveLaneMode(laneMaintenance) == "dry_run" {
+			now := time.Now().UTC()
+			c.emitStageMarker(evt, stageEnforcementApplyDone, now.UnixMilli(), zap.String("result", "maintenance_dry_run_noop"))
+			c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultNoop, "lifecycle_class_maintenance_dry_run", "maintenance lifecycle class in dry_run mode", now)
+			return nil
+		}
+
+		releaseLane, laneErr := c.enterLane(ctx, laneMaintenance)
+		if laneErr != nil {
+			c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultFailed, "maintenance_lane_wait_failed", laneErr.Error(), time.Now().UTC())
+			return laneErr
+		}
+		defer releaseLane()
+
 		appliedAt = time.Now().UTC()
 		c.emitStageMarker(evt, stageEnforcementApplyDone, appliedAt.UnixMilli(), zap.String("result", "refresh_only"))
 		persistStart := time.Now()
@@ -497,11 +788,7 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 			c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultFailed, "refresh_persist_error", err.Error(), appliedAt)
 			return fmt.Errorf("controller: refresh policy %s: %w", evt.Spec.ID, err)
 		}
-		if reservation != nil {
-			if err := reservation.Commit(ctx); err != nil && c.logger != nil {
-				c.logger.Warn("rate reservation commit failed", zap.String("policy_id", evt.Spec.ID), zap.Error(err))
-			}
-		}
+		finalizeReservation(true)
 		if c.metrics != nil {
 			c.metrics.ObserveApplyPersist("success", time.Since(persistStart))
 			c.metrics.ObserveConsumeToApply("success", time.Since(consumeStart))
@@ -529,6 +816,31 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 	}
 
 	start := time.Now()
+	if c.shouldCompactEvent(evt, eventTS, hasEventTS, consumeStart, "critical") {
+		appliedAt = time.Now().UTC()
+		c.emitStageMarker(evt, stageEnforcementApplyDone, appliedAt.UnixMilli(), zap.String("result", "compacted_noop"))
+		advanceScopeWatermark()
+		c.commitDuplicateFingerprint(evt)
+		c.commitReplayKey(replayKey, time.Now().UTC())
+		c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultNoop, "lifecycle_compacted_superseded", "superseded lifecycle intent compacted", appliedAt)
+		if approvedFromPending {
+			c.clearPendingApproval(pendingKey)
+		}
+		return nil
+	}
+	if c.effectiveLaneMode(laneCritical) == "dry_run" {
+		now := time.Now().UTC()
+		c.emitStageMarker(evt, stageEnforcementApplyDone, now.UnixMilli(), zap.String("result", "critical_dry_run_noop"))
+		c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultNoop, "lifecycle_class_critical_dry_run", "critical lifecycle class in dry_run mode", now)
+		return nil
+	}
+	releaseLane, laneErr := c.enterLane(ctx, laneCritical)
+	if laneErr != nil {
+		finalizeReservation(false)
+		c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultFailed, "critical_lane_wait_failed", laneErr.Error(), time.Now().UTC())
+		return laneErr
+	}
+	defer releaseLane()
 	if c.logger != nil {
 		c.logger.Debug(
 			"policy apply started",
@@ -538,17 +850,13 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 			zap.Bool("dry_run", evt.Spec.Guardrails.DryRun),
 		)
 	}
-	if err := c.enforcer.Apply(ctx, evt.Spec); err != nil {
-		if reservation != nil {
-			_ = reservation.Release(ctx)
-		}
-		c.metrics.ObserveApplyError(time.Since(start))
-		if c.metrics != nil {
-			c.metrics.ObserveConsumeToApply("error", time.Since(consumeStart))
-		}
-		c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultFailed, "apply_error", err.Error(), time.Now().UTC())
-		return fmt.Errorf("controller: apply policy %s: %w", evt.Spec.ID, err)
+	if err := c.applyWithTerminalHandling(ctx, msg, evt.Spec, consumeStart, requiresAck, fastPath, evt, "apply policy"); err != nil {
+		finalizeReservation(false)
+		return err
 	}
+	// Keep critical-lane occupancy focused on dataplane mutation only.
+	// ACK + state persistence happen after slot release.
+	releaseLane()
 	appliedAt = time.Now().UTC()
 	c.metrics.ObserveApplied(time.Since(start))
 	c.emitStageMarker(evt, stageEnforcementApplyDone, appliedAt.UnixMilli())
@@ -560,11 +868,7 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 	}
 	c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultApplied, "", refreshReason, appliedAt)
 
-	if reservation != nil {
-		if err := reservation.Commit(ctx); err != nil && c.logger != nil {
-			c.logger.Warn("rate reservation commit failed", zap.String("policy_id", evt.Spec.ID), zap.Error(err))
-		}
-	}
+	finalizeReservation(true)
 
 	persistStart := time.Now()
 	if err := c.store.Upsert(evt.Spec, time.Now().UTC()); err != nil {
@@ -607,6 +911,73 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 	}
 
 	return nil
+}
+
+// MessageLane classifies incoming command into critical vs maintenance lane.
+// Default is critical for fail-closed behavior.
+func (c *Controller) MessageLane(msg *sarama.ConsumerMessage) string {
+	if msg == nil || len(msg.Value) == 0 {
+		return "critical"
+	}
+	var evt pb.PolicyUpdateEvent
+	if err := proto.Unmarshal(msg.Value, &evt); err != nil {
+		return "critical"
+	}
+	action := strings.ToLower(strings.TrimSpace(evt.GetAction()))
+	switch action {
+	case "refresh", "renew", "ttl_refresh", "reconcile", "sync", "heartbeat":
+		return "maintenance"
+	case "remove", "reject", "rejected", "deny", "denied", "freeze", "drop", "quarantine", "block":
+		return "critical"
+	default:
+		return "critical"
+	}
+}
+
+func (c *Controller) publishCommandReject(ctx context.Context, msg *sarama.ConsumerMessage, reason error) error {
+	if c == nil || c.commandRejects == nil || msg == nil || reason == nil {
+		return nil
+	}
+	_ = ctx
+	// Best-effort reject artifact publication should not be canceled by the
+	// caller's consume-loop context. Use a short detached budget.
+	publishCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	if err := c.commandRejects.PublishReject(publishCtx, msg, reason); err != nil {
+		if c.metrics != nil {
+			c.metrics.ObserveCommandRejectPublish("error")
+		}
+		if c.logger != nil {
+			c.logger.Warn("command reject artifact publish failed", zap.Error(err))
+		}
+		return err
+	}
+	if c.metrics != nil {
+		c.metrics.ObserveCommandRejectPublish("success")
+	}
+	return nil
+}
+
+func (c *Controller) policyDomainForTopic(topic string) string {
+	t := strings.TrimSpace(topic)
+	if t == "" {
+		return "control.policy.v2"
+	}
+	if c != nil && strings.TrimSpace(c.commandTopic) != "" {
+		ct := strings.TrimSpace(c.commandTopic)
+		// Legacy fallback deployments may set commandTopic == control.policy.v2.
+		// In that compatibility mode, keep legacy signing domain semantics.
+		if ct == "control.policy.v2" {
+			return "control.policy.v2"
+		}
+		if t == ct {
+			return "control.enforcement_command.v1"
+		}
+	}
+	if t == "control.enforcement_command.v1" {
+		return "control.enforcement_command.v1"
+	}
+	return "control.policy.v2"
 }
 
 func sameEffectiveRule(a policy.PolicySpec, b policy.PolicySpec) bool {
@@ -792,6 +1163,9 @@ func (c *Controller) commitReplayKey(key string, now time.Time) {
 }
 
 func replayKey(evt policy.Event) string {
+	if cmdID := eventCommandID(evt); cmdID != "" {
+		return "cmd:" + cmdID
+	}
 	policyID := evt.Spec.ID
 	if evt.Proto != nil && strings.TrimSpace(evt.Proto.GetPolicyId()) != "" {
 		policyID = strings.TrimSpace(evt.Proto.GetPolicyId())
@@ -804,11 +1178,42 @@ func replayKey(evt policy.Event) string {
 	}, "|")
 }
 
+func eventCommandID(evt policy.Event) string {
+	if evt.Spec.Raw != nil {
+		if id := strings.TrimSpace(stringValue(evt.Spec.Raw["command_id"])); id != "" {
+			return id
+		}
+		if md, ok := evt.Spec.Raw["metadata"].(map[string]any); ok {
+			if id := strings.TrimSpace(stringValue(md["command_id"])); id != "" {
+				return id
+			}
+		}
+		if tr, ok := evt.Spec.Raw["trace"].(map[string]any); ok {
+			if id := strings.TrimSpace(stringValue(tr["command_id"])); id != "" {
+				return id
+			}
+		}
+	}
+	return ""
+}
+
 func policyEventTimestamp(evt policy.Event) (time.Time, bool) {
 	if evt.Proto == nil || evt.Proto.GetTimestamp() <= 0 {
 		return time.Time{}, false
 	}
 	return time.Unix(evt.Proto.GetTimestamp(), 0).UTC(), true
+}
+
+func policyExpiryDeadline(evt policy.Event, now time.Time) (time.Time, bool, bool) {
+	if evt.Spec.Guardrails.TTLSeconds <= 0 {
+		return time.Time{}, false, false
+	}
+	ts, ok := policyEventTimestamp(evt)
+	if !ok {
+		return time.Time{}, false, false
+	}
+	deadline := ts.Add(time.Duration(evt.Spec.Guardrails.TTLSeconds) * time.Second)
+	return deadline, now.After(deadline), true
 }
 
 func orderingKey(evt policy.Event) string {
@@ -865,7 +1270,7 @@ func (c *Controller) checkGuardrails(ctx context.Context, spec policy.PolicySpec
 	releaseAll := func() {
 		for _, r := range reservations {
 			if r != nil {
-				_ = r.Release(ctx)
+				c.releaseReservation(r, strings.TrimSpace(spec.ID))
 			}
 		}
 	}
@@ -1006,9 +1411,22 @@ func (c *Controller) checkGuardrails(ctx context.Context, spec policy.PolicySpec
 func (c *Controller) EvaluateGuardrails(ctx context.Context, spec policy.PolicySpec) (string, error) {
 	reservation, reason, err := c.checkGuardrails(ctx, spec)
 	if reservation != nil {
-		_ = reservation.Release(ctx)
+		c.releaseReservation(reservation, strings.TrimSpace(spec.ID))
 	}
 	return reason, err
+}
+
+func (c *Controller) releaseReservation(res ratelimit.Reservation, policyID string) {
+	if res == nil {
+		return
+	}
+	releaseCtx, cancel := context.WithTimeout(context.Background(), reservationReleaseTimeout)
+	defer cancel()
+	if err := res.Release(releaseCtx); err != nil && c.logger != nil {
+		c.logger.Warn("rate reservation release failed",
+			zap.String("policy_id", strings.TrimSpace(policyID)),
+			zap.Error(err))
+	}
 }
 
 func rateScope(spec policy.PolicySpec) string {
@@ -1228,13 +1646,8 @@ func (c *Controller) HandleFastEvent(ctx context.Context, evt policy.Event) erro
 	}
 
 	start := time.Now()
-	if err := c.enforcer.Apply(ctx, evt.Spec); err != nil {
-		if c.metrics != nil {
-			c.metrics.ObserveApplyError(time.Since(start))
-			c.metrics.ObserveConsumeToApply("error", time.Since(consumeStart))
-		}
-		c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultFailed, "apply_error", err.Error(), time.Now().UTC())
-		return fmt.Errorf("controller: apply fast mitigation %s: %w", evt.Spec.ID, err)
+	if err := c.applyWithTerminalHandling(ctx, nil, evt.Spec, consumeStart, requiresAck, fastPath, evt, "apply fast mitigation"); err != nil {
+		return err
 	}
 	appliedAt = time.Now().UTC()
 	if c.metrics != nil {
@@ -1335,6 +1748,7 @@ func (c *Controller) clearPendingApproval(key string) {
 }
 
 func (c *Controller) emitAck(ctx context.Context, evt policy.Event, requiresAck bool, fastPath FastPathEligibility, result ack.Result, errorCode, reason string, appliedAt time.Time) {
+	result = canonicalAckResult(result, errorCode, reason)
 	ackAttempted := requiresAck && c.acks != nil
 	ackStatus := "skipped"
 	ackEnqueueAt := time.Time{}
@@ -1425,6 +1839,486 @@ func (c *Controller) emitAck(ctx context.Context, evt policy.Event, requiresAck 
 	if c.logger != nil {
 		c.logger.Debug("ack publish succeeded", zap.String("policy_id", evt.Spec.ID), zap.String("result", string(result)))
 	}
+}
+
+func canonicalAckResult(result ack.Result, errorCode, reason string) ack.Result {
+	res := strings.ToLower(strings.TrimSpace(string(result)))
+	code := strings.ToLower(strings.TrimSpace(errorCode))
+	rsn := strings.ToLower(strings.TrimSpace(reason))
+
+	isTimeout := strings.Contains(code, "timeout") || strings.Contains(code, "deadline") ||
+		strings.Contains(rsn, "timeout") || strings.Contains(rsn, "deadline")
+	isRetryExhausted := strings.Contains(code, "retry_exhausted") || strings.Contains(code, "retries_exhausted") ||
+		strings.Contains(rsn, "retry_exhausted") || strings.Contains(rsn, "retries_exhausted")
+	isNoop := strings.Contains(code, "noop") || strings.Contains(code, "duplicate") || strings.Contains(rsn, "noop")
+
+	switch res {
+	case string(ack.ResultAccepted):
+		return ack.ResultAccepted
+	case string(ack.ResultApplied):
+		if isNoop {
+			return ack.ResultNoop
+		}
+		return ack.ResultApplied
+	case string(ack.ResultNoop):
+		return ack.ResultNoop
+	case string(ack.ResultRejected):
+		return ack.ResultRejected
+	case string(ack.ResultTimeout):
+		return ack.ResultTimeout
+	case string(ack.ResultRetryExhausted):
+		return ack.ResultRetryExhausted
+	case string(ack.ResultFailed):
+		if isTimeout {
+			return ack.ResultTimeout
+		}
+		if isRetryExhausted {
+			return ack.ResultRetryExhausted
+		}
+		return ack.ResultRejected
+	default:
+		if isTimeout {
+			return ack.ResultTimeout
+		}
+		if isRetryExhausted {
+			return ack.ResultRetryExhausted
+		}
+		if isNoop {
+			return ack.ResultNoop
+		}
+		if res == "" {
+			return ack.ResultRejected
+		}
+		return ack.Result(res)
+	}
+}
+
+func (c *Controller) applyWithTimeout(ctx context.Context, spec policy.PolicySpec) error {
+	applyCtx := ctx
+	cancel := func() {}
+	if c.applyTimeout > 0 {
+		applyCtx, cancel = context.WithTimeout(ctx, c.applyTimeout)
+	}
+	defer cancel()
+	start := time.Now()
+	err := c.enforcer.Apply(applyCtx, spec)
+	elapsed := time.Since(start)
+	if c.applyTimeout > 0 && err != nil {
+		if class, ok := applyErrorClass(err); ok && class == consumercontract.ErrorClassTimeout && elapsed >= c.applyTimeout {
+			if c.metrics != nil {
+				c.metrics.ObserveApplyTimeoutBudgetExceeded()
+			}
+			if c.logger != nil {
+				c.logger.Warn("apply attempt exceeded timeout budget",
+					zap.String("policy_id", strings.TrimSpace(spec.ID)),
+					zap.Duration("attempt_elapsed", elapsed),
+					zap.Duration("attempt_budget", c.applyTimeout),
+					zap.Error(err))
+			}
+		}
+	}
+	return err
+}
+
+func (c *Controller) applyWithRetries(ctx context.Context, spec policy.PolicySpec) (error, int, bool) {
+	retryCtx := ctx
+	cancelRetryCtx := func() {}
+	if c.applyTotalBudget > 0 {
+		// Do not inherit caller deadlines (e.g. consumer handler budget) so retry
+		// policy remains deterministic; still honor explicit cancellation.
+		retryCtx, cancelRetryCtx = context.WithTimeout(context.WithoutCancel(ctx), c.applyTotalBudget)
+	}
+	defer cancelRetryCtx()
+
+	maxAttempts := c.applyRetryMax + 1
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	backoff := c.applyRetryBase
+	if backoff <= 0 {
+		backoff = c.applyRetryBackoff
+	}
+	if backoff <= 0 {
+		backoff = 100 * time.Millisecond
+	}
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return ctx.Err(), attempt - 1, false
+		}
+		err := c.applyWithTimeout(retryCtx, spec)
+		if err == nil {
+			return nil, attempt, false
+		}
+		lastErr = err
+		class, ok := applyErrorClass(err)
+		retryable := ok && (class == consumercontract.ErrorClassTimeout || class == consumercontract.ErrorClassTransient)
+		if !retryable {
+			return lastErr, attempt, false
+		}
+		if attempt >= maxAttempts {
+			return lastErr, attempt, true
+		}
+		if c.metrics != nil {
+			c.metrics.ObserveApplyRetry(string(class))
+		}
+		wait := c.jitteredBackoff(backoff)
+		if !waitForBackoff(retryCtx, ctx, wait) {
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return ctx.Err(), attempt, false
+			}
+			if cerr := retryCtx.Err(); cerr != nil {
+				return cerr, attempt, false
+			}
+			return context.Canceled, attempt, false
+		}
+		if backoff < c.applyRetryMaxCap {
+			backoff *= 2
+			if backoff > c.applyRetryMaxCap {
+				backoff = c.applyRetryMaxCap
+			}
+		}
+	}
+	return lastErr, maxAttempts, true
+}
+
+func (c *Controller) jitteredBackoff(base time.Duration) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	wait := base
+	if c.applyRetryJitter > 0 && c.rng != nil {
+		span := float64(base) * c.applyRetryJitter
+		c.rngMu.Lock()
+		j := (c.rng.Float64()*2 - 1) * span
+		c.rngMu.Unlock()
+		wait = time.Duration(float64(base) + j)
+		if wait < 0 {
+			wait = 0
+		}
+	}
+	if c.applyRetryMaxCap > 0 && wait > c.applyRetryMaxCap {
+		wait = c.applyRetryMaxCap
+	}
+	return wait
+}
+
+func waitForBackoff(retryCtx context.Context, parentCtx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return true
+	}
+	deadline := time.Now().Add(d)
+	parentDone := parentCtx.Done()
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return true
+		}
+		timer := time.NewTimer(remaining)
+		select {
+		case <-retryCtx.Done():
+			timer.Stop()
+			return false
+		case <-parentDone:
+			timer.Stop()
+			// Honor explicit cancellation (shutdown/rebalance), but ignore parent
+			// deadlines so retry budget remains internally deterministic.
+			if errors.Is(parentCtx.Err(), context.Canceled) {
+				return false
+			}
+			// Parent deadline exceeded: stop listening to parent done channel for
+			// this backoff window to avoid hot-looping until retryCtx expires.
+			parentDone = nil
+		case <-timer.C:
+			return true
+		}
+	}
+}
+
+func (c *Controller) applyWithTerminalHandling(
+	ctx context.Context,
+	msg *sarama.ConsumerMessage,
+	spec policy.PolicySpec,
+	consumeStart time.Time,
+	requiresAck bool,
+	fastPath FastPathEligibility,
+	evt policy.Event,
+	op string,
+) error {
+	if c.isApplyTimeoutBreakerOpen(time.Now()) {
+		if c.metrics != nil {
+			c.metrics.ObserveApplyTimeoutBreakerSkip()
+		}
+		reason := "apply timeout breaker open; skipping apply attempt during cooldown"
+		if c.logger != nil {
+			c.logger.Warn("apply timeout breaker skipping apply",
+				zap.String("policy_id", strings.TrimSpace(spec.ID)),
+				zap.String("op", op))
+		}
+		c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultTimeout, "apply_timeout_breaker_open", reason, time.Now().UTC())
+		return fmt.Errorf("controller: %s %s: breaker open", op, spec.ID)
+	}
+
+	start := time.Now()
+	err, attempts, exhausted := c.applyWithRetries(ctx, spec)
+	if err == nil {
+		c.recordApplyTimeoutOutcome(false)
+		return nil
+	}
+	if c.metrics != nil {
+		c.metrics.ObserveApplyError(time.Since(start))
+		c.metrics.ObserveConsumeToApply("error", time.Since(consumeStart))
+	}
+	errorCode := applyErrorCode(err)
+	result := ack.ResultFailed
+	reason := err.Error()
+	class, classOK := applyErrorClass(err)
+	c.recordApplyTimeoutOutcome(classOK && class == consumercontract.ErrorClassTimeout)
+	classLabel := "unknown"
+	if classOK {
+		classLabel = string(class)
+		if class == consumercontract.ErrorClassTimeout && c.metrics != nil {
+			c.metrics.ObserveTimeout()
+		}
+	}
+	decision := terminalRejectPolicy(class, classOK, exhausted)
+	if exhausted {
+		result = ack.ResultRetryExhausted
+		errorCode = "apply_retry_exhausted"
+		reason = fmt.Sprintf("apply retries exhausted after %d attempts: %s", attempts, err.Error())
+		if c.metrics != nil {
+			c.metrics.ObserveApplyTerminalFailure(decision.metricReason)
+			c.metrics.ObserveApplyRetryExhausted()
+		}
+		if decision.publishReject {
+			if rejectErr := c.publishCommandReject(ctx, msg, err); rejectErr != nil {
+				if c.metrics != nil {
+					c.metrics.ObserveRejectPublishFail()
+				}
+				errorCode = "apply_retry_exhausted_reject_publish_failed"
+				reason = reason + "; reject artifact publish failed: " + rejectErr.Error()
+			}
+		}
+	} else {
+		if c.metrics != nil {
+			c.metrics.ObserveApplyTerminalFailure(decision.metricReason)
+		}
+		if decision.publishReject {
+			if rejectErr := c.publishCommandReject(ctx, msg, err); rejectErr != nil {
+				if c.metrics != nil {
+					c.metrics.ObserveRejectPublishFail()
+				}
+				if classOK && class == consumercontract.ErrorClassPermanent {
+					errorCode = "apply_error_reject_publish_failed"
+				} else {
+					errorCode = "apply_terminal_reject_publish_failed"
+				}
+				reason = reason + "; reject artifact publish failed: " + rejectErr.Error()
+			}
+		}
+	}
+	if c.logger != nil {
+		fields := []zap.Field{
+			zap.String("policy_id", strings.TrimSpace(spec.ID)),
+			zap.String("class", classLabel),
+			zap.Int("attempts", attempts),
+			zap.Bool("retry_exhausted", exhausted),
+			zap.String("error_code", errorCode),
+			zap.String("reason", reason),
+			zap.Bool("reject_artifact_enabled", decision.publishReject),
+			zap.String("reject_policy", decision.policy),
+			zap.Error(err),
+		}
+		if msg != nil {
+			fields = append(fields,
+				zap.String("topic", msg.Topic),
+				zap.Int32("partition", msg.Partition),
+				zap.Int64("offset", msg.Offset),
+			)
+		}
+		c.logger.Warn("policy apply terminal failure", fields...)
+	}
+	c.emitAck(ctx, evt, requiresAck, fastPath, result, errorCode, reason, time.Now().UTC())
+	return fmt.Errorf("controller: %s %s: %w", op, spec.ID, err)
+}
+
+func (c *Controller) isApplyTimeoutBreakerOpen(now time.Time) bool {
+	if c == nil || c.applyTimeoutBreakerCooldown <= 0 || c.applyTimeoutBreakerThreshold <= 0 {
+		return false
+	}
+	untilNs := atomic.LoadInt64(&c.applyTimeoutBreakerUntilNs)
+	if untilNs <= 0 {
+		return false
+	}
+	return now.UnixNano() < untilNs
+}
+
+func (c *Controller) recordApplyTimeoutOutcome(timeout bool) {
+	if c == nil {
+		return
+	}
+	if !timeout {
+		atomic.StoreInt64(&c.applyTimeoutStreak, 0)
+		return
+	}
+	if c.applyTimeoutBreakerCooldown <= 0 || c.applyTimeoutBreakerThreshold <= 0 {
+		return
+	}
+	streak := atomic.AddInt64(&c.applyTimeoutStreak, 1)
+	if int(streak) < c.applyTimeoutBreakerThreshold {
+		return
+	}
+	openUntil := time.Now().Add(c.applyTimeoutBreakerCooldown).UnixNano()
+	atomic.StoreInt64(&c.applyTimeoutBreakerUntilNs, openUntil)
+	atomic.StoreInt64(&c.applyTimeoutStreak, 0)
+	if c.metrics != nil {
+		c.metrics.ObserveApplyTimeoutBreakerOpen()
+	}
+	if c.logger != nil {
+		c.logger.Warn("apply timeout breaker opened",
+			zap.Int("threshold", c.applyTimeoutBreakerThreshold),
+			zap.Duration("cooldown", c.applyTimeoutBreakerCooldown))
+	}
+}
+
+type rejectPolicyDecision struct {
+	publishReject bool
+	metricReason  string
+	policy        string
+}
+
+// terminalRejectPolicy centralizes terminal-failure reject behavior:
+// - retry_exhausted: publish reject artifact (always).
+// - permanent: publish reject artifact (always).
+// - timeout/transient/canceled: no reject artifact, ACK + metric only.
+// - unknown classification: publish reject to fail closed.
+func terminalRejectPolicy(class consumercontract.ErrorClass, classOK bool, exhausted bool) rejectPolicyDecision {
+	if exhausted {
+		return rejectPolicyDecision{
+			publishReject: true,
+			metricReason:  "retry_exhausted",
+			policy:        "retry_exhausted_publish",
+		}
+	}
+	if !classOK {
+		return rejectPolicyDecision{
+			publishReject: true,
+			metricReason:  "unknown",
+			policy:        "unknown_fail_closed_publish",
+		}
+	}
+	switch class {
+	case consumercontract.ErrorClassPermanent:
+		return rejectPolicyDecision{
+			publishReject: true,
+			metricReason:  "permanent",
+			policy:        "permanent_publish",
+		}
+	case consumercontract.ErrorClassTimeout, consumercontract.ErrorClassTransient:
+		return rejectPolicyDecision{
+			publishReject: false,
+			metricReason:  "retry_skipped",
+			policy:        "retryable_no_reject",
+		}
+	case consumercontract.ErrorClassCanceled:
+		return rejectPolicyDecision{
+			publishReject: false,
+			metricReason:  "canceled",
+			policy:        "canceled_no_reject",
+		}
+	default:
+		return rejectPolicyDecision{
+			publishReject: true,
+			metricReason:  "unknown",
+			policy:        "default_fail_closed_publish",
+		}
+	}
+}
+
+func applyErrorCode(err error) string {
+	class, ok := applyErrorClass(err)
+	if !ok {
+		return "apply_error"
+	}
+	switch class {
+	case consumercontract.ErrorClassCanceled:
+		return "apply_canceled"
+	case consumercontract.ErrorClassTimeout:
+		return "apply_timeout"
+	default:
+		return "apply_error"
+	}
+}
+
+func applyErrorClass(err error) (consumercontract.ErrorClass, bool) {
+	if err == nil {
+		return "", false
+	}
+	if class, ok := consumercontract.ClassifyContextError(err); ok {
+		return class, true
+	}
+	if apierrors.IsTimeout(err) || apierrors.IsServerTimeout(err) {
+		return consumercontract.ErrorClassTimeout, true
+	}
+	if apierrors.IsTooManyRequests(err) || apierrors.IsServiceUnavailable(err) || apierrors.IsInternalError(err) {
+		return consumercontract.ErrorClassTransient, true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() {
+			return consumercontract.ErrorClassTimeout, true
+		}
+		return consumercontract.ErrorClassTransient, true
+	}
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	switch {
+	case strings.Contains(msg, "timeout"),
+		strings.Contains(msg, "i/o timeout"),
+		strings.Contains(msg, "deadline exceeded"),
+		strings.Contains(msg, "context deadline exceeded"):
+		return consumercontract.ErrorClassTimeout, true
+	case strings.Contains(msg, "connection reset"),
+		strings.Contains(msg, "connection refused"),
+		strings.Contains(msg, "broken pipe"),
+		strings.Contains(msg, "temporary"),
+		strings.Contains(msg, "try again"),
+		strings.Contains(msg, "econnreset"),
+		strings.Contains(msg, "econnrefused"),
+		strings.Contains(msg, "503"),
+		strings.Contains(msg, "429"):
+		return consumercontract.ErrorClassTransient, true
+	}
+	return consumercontract.ErrorClassPermanent, true
+}
+
+func (c *Controller) shouldCompactEvent(evt policy.Event, eventTS time.Time, hasEventTS bool, consumeStart time.Time, lane string) bool {
+	if c == nil || c.lifecycleCompactor == nil {
+		return false
+	}
+	eventStamp := time.Now().UTC()
+	if hasEventTS {
+		eventStamp = eventTS
+	}
+	decision := c.lifecycleCompactor.Observe(evt, eventStamp, time.Now().UTC())
+	if decision.Superseded {
+		if c.metrics != nil {
+			c.metrics.ObserveLifecycleCompaction("superseded")
+			c.metrics.ObserveConsumeToApply("duplicate", time.Since(consumeStart))
+		}
+		if c.logger != nil {
+			c.logger.Info("lifecycle intent compacted as superseded",
+				zap.String("policy_id", strings.TrimSpace(evt.Spec.ID)),
+				zap.String("lane", strings.TrimSpace(lane)),
+				zap.String("event_action", decision.Action),
+				zap.String("last_action", decision.LastAction),
+				zap.Time("last_seen_at", decision.LastSeen))
+		}
+		return true
+	}
+	if c.metrics != nil {
+		c.metrics.ObserveLifecycleCompaction("accepted")
+	}
+	return false
 }
 
 func (c *Controller) emitStageMarker(evt policy.Event, stage string, tMs int64, extras ...zap.Field) {

@@ -10,8 +10,10 @@ import (
 	"sync"
 	"time"
 
+	"backend/pkg/consumercontract"
 	"backend/pkg/control/policytrace"
 	"backend/pkg/mempool"
+	"backend/pkg/observability"
 	"backend/pkg/state"
 	"backend/pkg/utils"
 
@@ -380,11 +382,12 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 				h.consumer.observeIngestLatency(latency)
 			}
 
+			msgCtx := observability.ExtractContextFromSaramaHeaders(ctx, message.Headers)
 			backoff := h.consumer.retryBackoffBase
 			var attempts int
 			for attempts = 1; attempts <= h.consumer.retryMax; attempts++ {
 				startProcess := time.Now()
-				err := h.consumer.processMessage(ctx, session, message)
+				err := h.consumer.processMessage(msgCtx, session, message)
 				h.consumer.observeProcessLatency(time.Since(startProcess))
 
 				if err == nil {
@@ -441,6 +444,9 @@ func isPermanentErr(err error) bool {
 	if err == nil {
 		return false
 	}
+	if class, ok := classifyProcessError(err); ok {
+		return class == consumercontract.ErrorClassPermanent
+	}
 	// Transient mempool conditions
 	if errors.Is(err, mempool.ErrRateLimited) || errors.Is(err, mempool.ErrMempoolFull) {
 		return false
@@ -451,6 +457,22 @@ func isPermanentErr(err error) bool {
 	}
 	// Default to permanent to avoid infinite retries on unknown errors
 	return true
+}
+
+func classifyProcessError(err error) (consumercontract.ErrorClass, bool) {
+	if err == nil {
+		return "", false
+	}
+	if class, ok := consumercontract.ClassifyContextError(err); ok {
+		return class, true
+	}
+	if errors.Is(err, mempool.ErrRateLimited) || errors.Is(err, mempool.ErrMempoolFull) {
+		return consumercontract.ErrorClassTransient, true
+	}
+	if errors.Is(err, ErrReplayRejected) || errors.Is(err, mempool.ErrDuplicate) || errors.Is(err, mempool.ErrInvalidTx) {
+		return consumercontract.ErrorClassPermanent, true
+	}
+	return "", false
 }
 
 // processMessage handles a single Kafka message: decode → verify → mempool.Admit

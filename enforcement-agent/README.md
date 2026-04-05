@@ -190,6 +190,7 @@ Note: This README intentionally excludes `bin/` and `test/` (per project usage),
 Backend-specific:
 - `ENFORCER_IPTABLES_BIN` (default: `iptables`)
 - `ENFORCER_NFT_BIN` (default: `nft`)
+- `ENFORCER_NFT_BATCH_ATOMIC` (`true|false`, default: `true`)
 - `ENFORCER_KUBE_CONFIG`, `ENFORCER_KUBE_CONTEXT`, `ENFORCER_KUBE_NAMESPACE` (default: `default`)
 - `ENFORCER_KUBE_QPS` (default: `5.0`), `ENFORCER_KUBE_BURST` (default: `10`)
 - Cilium backend:
@@ -251,6 +252,17 @@ Signing:
 - `FAST_PATH_MIN_CONFIDENCE` (default: `0.9`)
 - `FAST_PATH_SIGNALS_REQUIRED` (default: `2`)
 
+### Lifecycle Controls
+
+- `ENFORCEMENT_LIFECYCLE_COMPACTION_ENABLED` (`true|false`, default: `true`)
+- `ENFORCEMENT_LIFECYCLE_COMPACTION_WINDOW` (default: `2m`)
+- `ENFORCEMENT_CRITICAL_MAX_IN_FLIGHT` (default: `32`)
+- `ENFORCEMENT_MAINTENANCE_MAX_IN_FLIGHT` (default: `8`)
+- `ENFORCEMENT_LANE_STARVATION_THRESHOLD` (default: `2s`)
+- `ENFORCEMENT_ACK_ACCEPTED_ENABLED` (`true|false`, default: `false`)
+- `LIFECYCLE_CLASS_CRITICAL_MODE` (`enforce|dry_run`, default: `enforce`)
+- `LIFECYCLE_CLASS_MAINTENANCE_MODE` (`enforce|dry_run`, default: `enforce`)
+
 ### Observability / Ops
 
 - `METRICS_ADDR` (default: `:9094`)
@@ -272,3 +284,4 @@ The agent exposes a small HTTP server on `METRICS_ADDR`:
 - `backend/proto` import: Go code imports protobuf types from the `backend` module (see `go.mod` line `replace backend => ../backend`). The `proto/` directory here contains schemas and generated code aligned to that `go_package`, but the build expects the sibling `../backend` module to be present.
 - Non-Linux builds: iptables/nftables are `//go:build linux` and have stub implementations for other platforms.
 - Selector-only policies: For iptables/nftables, policies that target selectors (e.g., namespace/node) require selector set prefixes (`ENFORCER_SELECTOR_NAMESPACE_PREFIX`, `ENFORCER_SELECTOR_NODE_PREFIX`) so the backend can map selectors into set names.
+- Timeout behavior is cooperative: `ENFORCEMENT_APPLY_TIMEOUT` and `ENFORCEMENT_HANDLER_TIMEOUT` cancel contexts, but they cannot forcibly terminate backend operations that ignore `ctx.Done()`. For non-cooperative calls, runtime can exceed timeout until the call returns.

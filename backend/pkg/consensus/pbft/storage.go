@@ -40,6 +40,12 @@ type Storage struct {
 
 	backgroundCtx context.Context
 
+	// Replay-window recovery telemetry (protected by mu).
+	replayWindowRejectCount          uint64
+	replayWindowRecoverSuccessCount  uint64
+	replayWindowRecoverFailureCount  uint64
+	lastReplayWindowRecoverAttemptAt time.Time
+
 	mu sync.RWMutex
 }
 
@@ -335,14 +341,16 @@ func (s *Storage) restoreQCs(ctx context.Context, minHeight uint64) error {
 
 func (s *Storage) restoreVotes(ctx context.Context, minHeight uint64) error {
 	const pageSize = 512
-	for offset := minHeight; ; offset += pageSize {
-		records, err := s.backend.ListVotes(ctx, offset, pageSize)
+	nextMinHeight := minHeight
+	for {
+		records, err := s.backend.ListVotes(ctx, nextMinHeight, pageSize)
 		if err != nil {
 			return fmt.Errorf("list votes: %w", err)
 		}
 		if len(records) == 0 {
 			break
 		}
+		maxHeightSeen := nextMinHeight
 		for _, rec := range records {
 			vote, err := s.decodeVote(rec.Data)
 			if err != nil {
@@ -350,7 +358,22 @@ func (s *Storage) restoreVotes(ctx context.Context, minHeight uint64) error {
 				continue
 			}
 			s.votes[rec.View] = append(s.votes[rec.View], vote)
+			if rec.Height > maxHeightSeen {
+				maxHeightSeen = rec.Height
+			}
 		}
+		// Advance by durable height cursor rather than page size to avoid skipping sparse heights.
+		// NOTE: With a min-height API we cannot paginate all rows at the exact same height beyond pageSize.
+		// Stabilize ordering and emit a warning when this edge case is likely.
+		if len(records) == pageSize && maxHeightSeen == nextMinHeight {
+			s.logger.WarnContext(ctx, "vote restore page saturated at single height; additional same-height votes may require larger page",
+				"height", nextMinHeight,
+				"page_size", pageSize)
+		}
+		if maxHeightSeen == ^uint64(0) {
+			break
+		}
+		nextMinHeight = maxHeightSeen + 1
 		if len(records) < pageSize {
 			break
 		}
@@ -416,8 +439,33 @@ func (s *Storage) StoreProposal(p *messages.Proposal) error {
 
 	// Check if within replay window
 	if !s.isWithinWindow(p.Height) {
-		return fmt.Errorf("proposal height %d outside replay window [%d, %d]",
-			p.Height, s.lastCommitted+1, s.lastCommitted+uint64(s.config.ReplayWindowSize))
+		s.replayWindowRejectCount++
+		windowSize := uint64(s.config.ReplayWindowSize)
+		if windowSize == 0 {
+			windowSize = 1
+		}
+		forceRecover := p.Height > s.lastCommitted+(windowSize*2)
+		recovered, recoverErr := s.tryReconcileReplayWindowLocked(p.Height, forceRecover)
+		if recoverErr != nil {
+			s.replayWindowRecoverFailureCount++
+			if s.logger != nil {
+				s.logger.WarnContext(s.backgroundCtx, "replay window reconcile failed",
+					"proposal_height", p.Height,
+					"last_committed", s.lastCommitted,
+					"force", forceRecover,
+					"error", recoverErr,
+				)
+			}
+		}
+		if recovered && s.isWithinWindow(p.Height) {
+			s.replayWindowRecoverSuccessCount++
+		} else if recovered {
+			s.replayWindowRecoverFailureCount++
+		}
+		if !s.isWithinWindow(p.Height) {
+			return fmt.Errorf("proposal height %d outside replay window [%d, %d]",
+				p.Height, s.lastCommitted+1, s.lastCommitted+uint64(s.config.ReplayWindowSize))
+		}
 	}
 
 	// Check capacity
@@ -447,6 +495,64 @@ func (s *Storage) StoreProposal(p *messages.Proposal) error {
 	}
 
 	return nil
+}
+
+func (s *Storage) tryReconcileReplayWindowLocked(proposalHeight uint64, force bool) (bool, error) {
+	if s.backend == nil {
+		return false, nil
+	}
+	tipBackend, ok := s.backend.(durableTipBackend)
+	if !ok {
+		return false, nil
+	}
+	now := time.Now()
+	// Guard repeated expensive backend lookups during hot reject loops.
+	if !force && !s.lastReplayWindowRecoverAttemptAt.IsZero() && now.Sub(s.lastReplayWindowRecoverAttemptAt) < 500*time.Millisecond {
+		return false, nil
+	}
+	s.lastReplayWindowRecoverAttemptAt = now
+
+	recoverCtx := s.backgroundCtx
+	if recoverCtx == nil {
+		recoverCtx = context.Background()
+	}
+	var cancel context.CancelFunc
+	timeout := 750 * time.Millisecond
+	if force {
+		timeout = 3 * time.Second
+	}
+	recoverCtx, cancel = context.WithTimeout(recoverCtx, timeout)
+	defer cancel()
+
+	durableHeight, err := tipBackend.GetLatestHeight(recoverCtx)
+	if err != nil {
+		return false, err
+	}
+	if durableHeight <= s.lastCommitted {
+		return false, nil
+	}
+	durableHash, found, hashErr := tipBackend.GetCommittedBlockHash(recoverCtx, durableHeight)
+	if hashErr != nil {
+		return false, hashErr
+	}
+	if !found || len(durableHash) != 32 {
+		return false, nil
+	}
+
+	prevCommitted := s.lastCommitted
+	s.lastCommitted = durableHeight
+	var bh BlockHash
+	copy(bh[:], durableHash)
+	s.committedBlocks[durableHeight] = bh
+
+	if s.logger != nil {
+		s.logger.WarnContext(s.backgroundCtx, "replay window reconciled from durable tip",
+			"proposal_height", proposalHeight,
+			"prev_last_committed", prevCommitted,
+			"new_last_committed", durableHeight,
+		)
+	}
+	return true, nil
 }
 
 // GetProposal retrieves a proposal by block hash
@@ -894,23 +1000,29 @@ func (s *Storage) GetStats() StorageStats {
 	}
 
 	return StorageStats{
-		ProposalCount:       len(s.proposals),
-		VoteCount:           totalVotes,
-		QCCount:             len(s.qcs),
-		EvidenceCount:       len(s.evidence),
-		CommittedBlockCount: len(s.committedBlocks),
-		LastCommittedHeight: s.lastCommitted,
-		ReplayWindowSize:    s.config.ReplayWindowSize,
+		ProposalCount:                   len(s.proposals),
+		VoteCount:                       totalVotes,
+		QCCount:                         len(s.qcs),
+		EvidenceCount:                   len(s.evidence),
+		CommittedBlockCount:             len(s.committedBlocks),
+		LastCommittedHeight:             s.lastCommitted,
+		ReplayWindowSize:                s.config.ReplayWindowSize,
+		ReplayWindowRejectCount:         s.replayWindowRejectCount,
+		ReplayWindowRecoverSuccessCount: s.replayWindowRecoverSuccessCount,
+		ReplayWindowRecoverFailureCount: s.replayWindowRecoverFailureCount,
 	}
 }
 
 // StorageStats contains storage statistics
 type StorageStats struct {
-	ProposalCount       int
-	VoteCount           int
-	QCCount             int
-	EvidenceCount       int
-	CommittedBlockCount int
-	LastCommittedHeight uint64
-	ReplayWindowSize    int
+	ProposalCount                   int
+	VoteCount                       int
+	QCCount                         int
+	EvidenceCount                   int
+	CommittedBlockCount             int
+	LastCommittedHeight             uint64
+	ReplayWindowSize                int
+	ReplayWindowRejectCount         uint64
+	ReplayWindowRecoverSuccessCount uint64
+	ReplayWindowRecoverFailureCount uint64
 }

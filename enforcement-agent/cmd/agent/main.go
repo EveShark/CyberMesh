@@ -31,6 +31,7 @@ import (
 	"github.com/CyberMesh/enforcement-agent/internal/control"
 	"github.com/CyberMesh/enforcement-agent/internal/controller"
 	"github.com/CyberMesh/enforcement-agent/internal/enforcer"
+	enforcerapp "github.com/CyberMesh/enforcement-agent/internal/enforcer/app"
 	"github.com/CyberMesh/enforcement-agent/internal/enforcer/cilium"
 	"github.com/CyberMesh/enforcement-agent/internal/enforcer/gateway"
 	"github.com/CyberMesh/enforcement-agent/internal/enforcer/iptables"
@@ -39,6 +40,7 @@ import (
 	"github.com/CyberMesh/enforcement-agent/internal/kafka"
 	"github.com/CyberMesh/enforcement-agent/internal/ledger"
 	"github.com/CyberMesh/enforcement-agent/internal/metrics"
+	"github.com/CyberMesh/enforcement-agent/internal/observability"
 	"github.com/CyberMesh/enforcement-agent/internal/policy"
 	"github.com/CyberMesh/enforcement-agent/internal/ratelimit"
 	"github.com/CyberMesh/enforcement-agent/internal/reconciler"
@@ -60,11 +62,67 @@ func main() {
 		panic(err)
 	}
 	defer logger.Sync() //nolint:errcheck
+
+	otelShutdown, otelErr := observability.InitFromEnv(ctx, "cybermesh-enforcement-agent")
+	if otelErr != nil {
+		logger.Warn("OpenTelemetry tracing disabled due to init error", zap.Error(otelErr))
+	} else {
+		defer func() {
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer shutdownCancel()
+			if err := otelShutdown(shutdownCtx); err != nil {
+				logger.Warn("OpenTelemetry shutdown failed", zap.Error(err))
+			}
+		}()
+		logger.Info("OpenTelemetry tracing initialized")
+	}
 	logger.Info("enforcement consumption mode configured",
 		zap.String("mode", cfg.Kafka.ConsumptionMode),
 		zap.String("group_id", cfg.Kafka.GroupID),
 		zap.String("node_name", cfg.NodeName),
 		zap.String("backend", cfg.EnforcementBackend))
+	logger.Info("enforcement effective resilience settings",
+		zap.Duration("apply_timeout", cfg.ApplyTimeout),
+		zap.Duration("apply_total_budget", cfg.ApplyTotalBudget),
+		zap.Int("apply_retry_max", cfg.ApplyRetryMax),
+		zap.Duration("apply_retry_backoff", cfg.ApplyRetryBackoff),
+		zap.Duration("apply_retry_base_backoff", cfg.ApplyRetryBaseBackoff),
+		zap.Duration("apply_retry_max_backoff", cfg.ApplyRetryMaxBackoff),
+		zap.Float64("apply_retry_jitter_ratio", cfg.ApplyRetryJitterRatio),
+		zap.Int("apply_timeout_breaker_threshold", cfg.ApplyTimeoutBreakerThreshold),
+		zap.Duration("apply_timeout_breaker_cooldown", cfg.ApplyTimeoutBreakerCooldown),
+		zap.Bool("expired_shedding_enabled", cfg.ExpiredSheddingEnabled),
+		zap.Int("handler_workers", cfg.Kafka.HandlerWorkers),
+		zap.Int("handler_queue", cfg.Kafka.HandlerQueue),
+		zap.Duration("stripe_stall_threshold", cfg.Kafka.StripeStallThreshold),
+		zap.Duration("admission_pause_on_saturation", cfg.Kafka.AdmissionPauseOnSaturation),
+		zap.Duration("dispatch_max_wait", cfg.Kafka.DispatchMaxWait),
+		zap.Duration("dispatch_pause", cfg.Kafka.DispatchPause),
+		zap.Duration("consumer_handler_timeout", cfg.Kafka.HandlerTimeout),
+		zap.Int("stripe_distress_threshold", cfg.Kafka.StripeDistressThreshold),
+		zap.Bool("lifecycle_compaction_enabled", cfg.LifecycleCompactionEnabled),
+		zap.Duration("lifecycle_compaction_window", cfg.LifecycleCompactionWindow),
+		zap.Int("critical_lane_max_in_flight", cfg.CriticalLaneMaxInFlight),
+		zap.Int("maintenance_lane_max_in_flight", cfg.MaintenanceLaneMaxInFlight),
+		zap.Duration("lane_starvation_threshold", cfg.LaneStarvationThreshold),
+		zap.Bool("ack_accepted_enabled", cfg.AckAcceptedEnabled),
+		zap.String("lifecycle_class_critical_mode", cfg.LifecycleCriticalMode),
+		zap.String("lifecycle_class_maintenance_mode", cfg.LifecycleMaintenanceMode),
+		zap.Bool("lifecycle_promotion_gate_enabled", cfg.LifecyclePromotionGateEnabled),
+		zap.Duration("lifecycle_promotion_min_window", cfg.LifecyclePromotionMinWindow),
+		zap.Bool("nft_batch_atomic", cfg.NFTBatchAtomic),
+	)
+	logger.Info("enforcement timeout contract",
+		zap.Bool("handler_timeout_cooperative_only", true),
+		zap.String("note", "timeouts rely on cooperative context cancellation; non-cooperative backend calls can overrun until they return"))
+	if cfg.ApplyTotalBudget > 0 {
+		recommendedMin := cfg.ApplyTotalBudget + 250*time.Millisecond
+		if cfg.Kafka.HandlerTimeout > 0 && cfg.Kafka.HandlerTimeout < recommendedMin {
+			logger.Warn("consumer handler timeout is below recommended minimum for retry budget",
+				zap.Duration("handler_timeout", cfg.Kafka.HandlerTimeout),
+				zap.Duration("recommended_min", recommendedMin))
+		}
+	}
 
 	trust, err := policy.LoadTrustedKeys(cfg.TrustedKeysDir)
 	if err != nil {
@@ -141,6 +199,7 @@ func main() {
 		},
 		NFTables: nftables.Config{
 			Binary:             cfg.NFTBinary,
+			BatchAtomic:        cfg.NFTBatchAtomic,
 			NamespaceSetPrefix: cfg.SelectorNamespacePrefix,
 			NodeSetPrefix:      cfg.SelectorNodePrefix,
 		},
@@ -150,6 +209,14 @@ func main() {
 			Namespace:      cfg.KubeNamespace,
 			QPS:            cfg.KubeQPS,
 			Burst:          cfg.KubeBurst,
+		},
+		App: enforcerapp.Config{
+			BaseURL:        cfg.App.BaseURL,
+			CommandPath:    cfg.App.CommandPath,
+			HealthPath:     cfg.App.HealthPath,
+			Timeout:        cfg.App.Timeout,
+			BearerToken:    cfg.App.BearerToken,
+			AllowedActions: append([]string(nil), cfg.App.AllowedActions...),
 		},
 	})
 	if err != nil {
@@ -186,16 +253,62 @@ func main() {
 		defer ackCloser()
 	}
 
+	var commandRejectSink controller.CommandRejectSink = noopCommandRejectSinkShim{}
+	commandRejectCfg, err := controller.BuildFastRejectSaramaConfig(
+		cfg.Kafka.ProtocolVersion,
+		cfg.Kafka.TLS,
+		cfg.Kafka.TLSCAPath,
+		cfg.Kafka.TLSCertPath,
+		cfg.Kafka.TLSKeyPath,
+		cfg.Kafka.SASLEnabled,
+		cfg.Kafka.SASLMechanism,
+		cfg.Kafka.SASLUsername,
+		cfg.Kafka.SASLPassword,
+	)
+	if err != nil {
+		logger.Warn("command reject sink disabled: failed to build producer config", zap.Error(err))
+	} else {
+		sink, sinkErr := controller.NewKafkaCommandRejectSink(commandRejectCfg, cfg.Kafka.Brokers, cfg.CommandRejectTopic, cfg.Kafka.GroupID, logger)
+		if sinkErr != nil {
+			logger.Warn("command reject sink disabled: failed to create sink", zap.Error(sinkErr))
+		} else {
+			commandRejectSink = sink
+			defer commandRejectSink.Close()
+		}
+	}
+
 	ctrl := controller.New(trust, store, backend, recorder, rateCoord, killSwitch, logger, controller.Options{
-		FastPathEnabled:       cfg.FastPathEnabled,
-		FastPathMinConfidence: cfg.FastPathMinConfidence,
-		FastPathSignals:       cfg.FastPathSignalsRequired,
-		AckPublisher:          ackPublisher,
-		AckEnqueueTimeout:     cfg.Ack.EnqueueTimeout,
-		ControllerInstanceID:  controllerInstanceID(cfg.Ack.ClientID),
-		ReplayWindow:          cfg.Security.ReplayWindow,
-		ReplayFutureSkew:      cfg.Security.ReplayFutureSkew,
-		ReplayCacheMaxEntries: cfg.Security.ReplayCacheMaxEntries,
+		FastPathEnabled:               cfg.FastPathEnabled,
+		FastPathMinConfidence:         cfg.FastPathMinConfidence,
+		FastPathSignals:               cfg.FastPathSignalsRequired,
+		AckPublisher:                  ackPublisher,
+		AckEnqueueTimeout:             cfg.Ack.EnqueueTimeout,
+		ApplyTimeout:                  cfg.ApplyTimeout,
+		ApplyTotalBudget:              cfg.ApplyTotalBudget,
+		ApplyRetryMax:                 cfg.ApplyRetryMax,
+		ApplyRetryBackoff:             cfg.ApplyRetryBackoff,
+		ApplyRetryBaseBackoff:         cfg.ApplyRetryBaseBackoff,
+		ApplyRetryMaxBackoff:          cfg.ApplyRetryMaxBackoff,
+		ApplyRetryJitterRatio:         cfg.ApplyRetryJitterRatio,
+		ApplyTimeoutBreakerThreshold:  cfg.ApplyTimeoutBreakerThreshold,
+		ApplyTimeoutBreakerCooldown:   cfg.ApplyTimeoutBreakerCooldown,
+		ExpiredShedding:               cfg.ExpiredSheddingEnabled,
+		ControllerInstanceID:          controllerInstanceID(cfg.Ack.ClientID),
+		ReplayWindow:                  cfg.Security.ReplayWindow,
+		ReplayFutureSkew:              cfg.Security.ReplayFutureSkew,
+		ReplayCacheMaxEntries:         cfg.Security.ReplayCacheMaxEntries,
+		CommandRejectSink:             commandRejectSink,
+		CommandTopic:                  cfg.Kafka.Topic,
+		LifecycleCompactionEnabled:    cfg.LifecycleCompactionEnabled,
+		LifecycleCompactionWindow:     cfg.LifecycleCompactionWindow,
+		CriticalLaneMaxInFlight:       cfg.CriticalLaneMaxInFlight,
+		MaintenanceLaneMaxInFlight:    cfg.MaintenanceLaneMaxInFlight,
+		LaneStarvationThreshold:       cfg.LaneStarvationThreshold,
+		EmitAcceptedAck:               cfg.AckAcceptedEnabled,
+		CriticalMode:                  cfg.LifecycleCriticalMode,
+		MaintenanceMode:               cfg.LifecycleMaintenanceMode,
+		LifecyclePromotionGateEnabled: cfg.LifecyclePromotionGateEnabled,
+		LifecyclePromotionMinWindow:   cfg.LifecyclePromotionMinWindow,
 	})
 
 	var ledgerProvider reconciler.LedgerProvider
@@ -204,22 +317,30 @@ func main() {
 	}
 
 	consumer, err := createKafkaConsumerWithRetry(ctx, logger, kafka.Config{
-		Brokers:         cfg.Kafka.Brokers,
-		GroupID:         cfg.Kafka.GroupID,
-		Topic:           cfg.Kafka.Topic,
-		HandlerWorkers:  cfg.Kafka.HandlerWorkers,
-		HandlerQueue:    cfg.Kafka.HandlerQueue,
-		ProtocolVersion: cfg.Kafka.ProtocolVersion,
-		TLS:             cfg.Kafka.TLS,
-		TLSCAPath:       cfg.Kafka.TLSCAPath,
-		TLSCertPath:     cfg.Kafka.TLSCertPath,
-		TLSKeyPath:      cfg.Kafka.TLSKeyPath,
-		SASLEnabled:     cfg.Kafka.SASLEnabled,
-		SASLMechanism:   cfg.Kafka.SASLMechanism,
-		SASLUsername:    cfg.Kafka.SASLUsername,
-		SASLPassword:    cfg.Kafka.SASLPassword,
-		Metrics:         recorder,
-		Logger:          logger,
+		Brokers:                 cfg.Kafka.Brokers,
+		GroupID:                 cfg.Kafka.GroupID,
+		Topic:                   cfg.Kafka.Topic,
+		HandlerWorkers:          cfg.Kafka.HandlerWorkers,
+		HandlerQueue:            cfg.Kafka.HandlerQueue,
+		StallThreshold:          cfg.Kafka.StripeStallThreshold,
+		AdmissionPause:          cfg.Kafka.AdmissionPauseOnSaturation,
+		DispatchMaxWait:         cfg.Kafka.DispatchMaxWait,
+		DispatchPause:           cfg.Kafka.DispatchPause,
+		HandlerTimeout:          cfg.Kafka.HandlerTimeout,
+		StripeDistressThreshold: cfg.Kafka.StripeDistressThreshold,
+		CriticalMaxInFlight:     cfg.CriticalLaneMaxInFlight,
+		MaintenanceMaxInFlight:  cfg.MaintenanceLaneMaxInFlight,
+		ProtocolVersion:         cfg.Kafka.ProtocolVersion,
+		TLS:                     cfg.Kafka.TLS,
+		TLSCAPath:               cfg.Kafka.TLSCAPath,
+		TLSCertPath:             cfg.Kafka.TLSCertPath,
+		TLSKeyPath:              cfg.Kafka.TLSKeyPath,
+		SASLEnabled:             cfg.Kafka.SASLEnabled,
+		SASLMechanism:           cfg.Kafka.SASLMechanism,
+		SASLUsername:            cfg.Kafka.SASLUsername,
+		SASLPassword:            cfg.Kafka.SASLPassword,
+		Metrics:                 recorder,
+		Logger:                  logger,
 	}, ctrl)
 	if err != nil {
 		logger.Fatal("failed to create kafka consumer after retries", zap.Error(err))
@@ -249,22 +370,28 @@ func main() {
 		}
 		defer fastRejectSink.Close()
 		fastConsumer, err = createKafkaConsumerWithRetry(ctx, logger, kafka.Config{
-			Brokers:         cfg.Kafka.Brokers,
-			GroupID:         cfg.FastMitigation.GroupID,
-			Topic:           cfg.FastMitigation.Topic,
-			HandlerWorkers:  cfg.Kafka.HandlerWorkers,
-			HandlerQueue:    cfg.Kafka.HandlerQueue,
-			ProtocolVersion: cfg.Kafka.ProtocolVersion,
-			TLS:             cfg.Kafka.TLS,
-			TLSCAPath:       cfg.Kafka.TLSCAPath,
-			TLSCertPath:     cfg.Kafka.TLSCertPath,
-			TLSKeyPath:      cfg.Kafka.TLSKeyPath,
-			SASLEnabled:     cfg.Kafka.SASLEnabled,
-			SASLMechanism:   cfg.Kafka.SASLMechanism,
-			SASLUsername:    cfg.Kafka.SASLUsername,
-			SASLPassword:    cfg.Kafka.SASLPassword,
-			Metrics:         recorder,
-			Logger:          logger,
+			Brokers:                 cfg.Kafka.Brokers,
+			GroupID:                 cfg.FastMitigation.GroupID,
+			Topic:                   cfg.FastMitigation.Topic,
+			HandlerWorkers:          cfg.Kafka.HandlerWorkers,
+			HandlerQueue:            cfg.Kafka.HandlerQueue,
+			StallThreshold:          cfg.Kafka.StripeStallThreshold,
+			AdmissionPause:          cfg.Kafka.AdmissionPauseOnSaturation,
+			DispatchMaxWait:         cfg.Kafka.DispatchMaxWait,
+			DispatchPause:           cfg.Kafka.DispatchPause,
+			HandlerTimeout:          cfg.Kafka.HandlerTimeout,
+			StripeDistressThreshold: cfg.Kafka.StripeDistressThreshold,
+			ProtocolVersion:         cfg.Kafka.ProtocolVersion,
+			TLS:                     cfg.Kafka.TLS,
+			TLSCAPath:               cfg.Kafka.TLSCAPath,
+			TLSCertPath:             cfg.Kafka.TLSCertPath,
+			TLSKeyPath:              cfg.Kafka.TLSKeyPath,
+			SASLEnabled:             cfg.Kafka.SASLEnabled,
+			SASLMechanism:           cfg.Kafka.SASLMechanism,
+			SASLUsername:            cfg.Kafka.SASLUsername,
+			SASLPassword:            cfg.Kafka.SASLPassword,
+			Metrics:                 recorder,
+			Logger:                  logger,
 		}, controller.NewFastHandler(fastTrust, ctrl, recorder, fastRejectSink, logger))
 		if err != nil {
 			logger.Fatal("failed to create fast mitigation consumer after retries", zap.Error(err))
@@ -335,6 +462,13 @@ func (noopFastRejectSinkShim) PublishReject(context.Context, *sarama.ConsumerMes
 	return nil
 }
 func (noopFastRejectSinkShim) Close() error { return nil }
+
+type noopCommandRejectSinkShim struct{}
+
+func (noopCommandRejectSinkShim) PublishReject(context.Context, *sarama.ConsumerMessage, error) error {
+	return nil
+}
+func (noopCommandRejectSinkShim) Close() error { return nil }
 
 func buildRateCoordinator(ctx context.Context, cfg config.Config, store *state.Store, logger *zap.Logger) (ratelimit.Coordinator, func()) {
 	backend := cfg.RateLimiter.Backend
