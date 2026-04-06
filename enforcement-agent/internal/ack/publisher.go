@@ -15,6 +15,9 @@ import (
 	"github.com/CyberMesh/enforcement-agent/internal/metrics"
 	"github.com/CyberMesh/enforcement-agent/internal/observability"
 	"github.com/CyberMesh/enforcement-agent/internal/policy"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type syncProducer interface {
@@ -124,6 +127,17 @@ func NewKafkaPublisher(opts Options) (*KafkaPublisher, error) {
 
 // Publish enqueues ACK payload.
 func (p *KafkaPublisher) Publish(ctx context.Context, payload Payload) error {
+	ctx, span := observability.Tracer("enforcement-agent/ack").Start(
+		ctx,
+		"enforcement.ack.publish",
+		trace.WithAttributes(
+			attribute.String("messaging.system", "kafka"),
+			attribute.String("messaging.destination", p.topic),
+			attribute.String("policy.id", payload.Event.Spec.ID),
+			attribute.String("ack.result", string(payload.Result)),
+		),
+	)
+	defer span.End()
 	var lastErr error
 	backoff := p.retryBackoff
 	ackEventID := newAckEventID()
@@ -159,6 +173,8 @@ func (p *KafkaPublisher) Publish(ctx context.Context, payload Payload) error {
 		}
 		msgBytes, err := proto.Marshal(ackEvent)
 		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "ack_marshal_failed")
 			p.logError("marshal ack payload", payload.Event.Spec.ID, err)
 			return fmt.Errorf("ack publish: marshal payload: %w", err)
 		}
@@ -171,6 +187,8 @@ func (p *KafkaPublisher) Publish(ctx context.Context, payload Payload) error {
 		if p.signer != nil {
 			out, serr := p.signer.Sign(ctx, payload, msgBytes)
 			if serr != nil {
+				span.RecordError(serr)
+				span.SetStatus(codes.Error, "ack_sign_failed")
 				p.logError("sign ack payload", payload.Event.Spec.ID, serr)
 				return fmt.Errorf("ack publish: sign payload: %w", serr)
 			}
@@ -184,6 +202,7 @@ func (p *KafkaPublisher) Publish(ctx context.Context, payload Payload) error {
 		kmsg.Headers = observability.InjectContextToSaramaHeaders(ctx, kmsg.Headers)
 		_, _, err = p.producer.SendMessage(kmsg)
 		if err == nil {
+			span.SetStatus(codes.Ok, "ack_publish_ok")
 			if p.metrics != nil {
 				p.metrics.ObserveAckPublish("success")
 			}
@@ -193,6 +212,7 @@ func (p *KafkaPublisher) Publish(ctx context.Context, payload Payload) error {
 			return nil
 		}
 		lastErr = err
+		span.RecordError(err, trace.WithAttributes(attribute.Int("retry.attempt", attempt+1)))
 		if p.metrics != nil {
 			p.metrics.ObserveAckRetry()
 		}
@@ -205,6 +225,7 @@ func (p *KafkaPublisher) Publish(ctx context.Context, payload Payload) error {
 		backoff *= 2
 	}
 	p.logError("publish ack", payload.Event.Spec.ID, lastErr)
+	span.SetStatus(codes.Error, "ack_publish_failed")
 	if p.metrics != nil {
 		p.metrics.ObserveAckPublish("failure")
 	}

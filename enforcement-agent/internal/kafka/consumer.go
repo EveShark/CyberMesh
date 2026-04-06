@@ -14,6 +14,9 @@ import (
 	"time"
 
 	"github.com/IBM/sarama"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
 	"github.com/CyberMesh/enforcement-agent/internal/metrics"
@@ -539,8 +542,24 @@ func (g *groupHandler) consumeClaimParallel(session sarama.ConsumerGroupSession,
 			task := consumerTask{msg: msgPending, start: time.Now(), lane: lane}
 			stripe := workerStripeForMessage(msgPending, workers)
 			dispatchStart := time.Now()
+			dispatchCtx := observability.ExtractContextFromSaramaHeaders(session.Context(), msgPending.Headers)
+			_, dispatchSpan := observability.Tracer("enforcement-agent/kafka-consumer").Start(
+				dispatchCtx,
+				"enforcement.kafka.dispatch",
+				trace.WithAttributes(
+					attribute.String("messaging.system", "kafka"),
+					attribute.String("messaging.destination", msgPending.Topic),
+					attribute.Int64("messaging.kafka.partition", int64(msgPending.Partition)),
+					attribute.Int64("messaging.kafka.offset", msgPending.Offset),
+					attribute.Int("dispatch.stripe", stripe),
+					attribute.String("dispatch.lane", lane),
+				),
+			)
 			select {
 			case workerQueues[stripe] <- task:
+				dispatchSpan.SetAttributes(attribute.Int64("dispatch.wait_ms", time.Since(dispatchStart).Milliseconds()))
+				dispatchSpan.SetStatus(codes.Ok, "queued")
+				dispatchSpan.End()
 				if g.metrics != nil {
 					g.metrics.ObserveKafkaDispatchWait(time.Since(dispatchStart))
 				}
@@ -559,6 +578,7 @@ func (g *groupHandler) consumeClaimParallel(session sarama.ConsumerGroupSession,
 				}
 				msgPending = nil
 			default:
+				dispatchSpan.SetAttributes(attribute.Bool("dispatch.queue_saturated", true))
 				if g.metrics != nil {
 					g.metrics.ObserveKafkaQueueSaturated()
 				}
@@ -595,16 +615,24 @@ func (g *groupHandler) consumeClaimParallel(session sarama.ConsumerGroupSession,
 				}
 				select {
 				case <-session.Context().Done():
+					dispatchSpan.SetStatus(codes.Error, "session_done")
+					dispatchSpan.End()
 					return nil
 				case <-stallTick(stallTicker):
+					dispatchSpan.SetStatus(codes.Error, "stall_tick")
+					dispatchSpan.End()
 					g.observeStripeStall(stripeStartedAtNs, stripeStallLatched)
 				case <-waitBudget:
+					dispatchSpan.SetStatus(codes.Error, "dispatch_budget_exhausted")
+					dispatchSpan.End()
 					if g.metrics != nil {
 						g.metrics.ObserveKafkaDispatchBudgetExhausted()
 					}
 					// Keep message pending and return to loop to apply pause/read shaping.
 					continue
 				case res := <-results:
+					dispatchSpan.SetStatus(codes.Error, "wait_for_slot")
+					dispatchSpan.End()
 					if res.msg == nil {
 						continue
 					}
@@ -617,6 +645,9 @@ func (g *groupHandler) consumeClaimParallel(session sarama.ConsumerGroupSession,
 					pending[res.msg.Offset] = res
 					drainMarkableResults(g, session, pending, &nextOffset, &nextOffsetSet)
 				case workerQueues[stripe] <- task:
+					dispatchSpan.SetAttributes(attribute.Int64("dispatch.wait_ms", time.Since(dispatchStart).Milliseconds()))
+					dispatchSpan.SetStatus(codes.Ok, "queued_after_wait")
+					dispatchSpan.End()
 					if g.metrics != nil {
 						g.metrics.ObserveKafkaDispatchWait(time.Since(dispatchStart))
 					}

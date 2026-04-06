@@ -938,12 +938,24 @@ func (c *Controller) publishCommandReject(ctx context.Context, msg *sarama.Consu
 	if c == nil || c.commandRejects == nil || msg == nil || reason == nil {
 		return nil
 	}
-	_ = ctx
+	ctx, span := observability.Tracer("enforcement-agent/controller").Start(
+		ctx,
+		"enforcement.command_reject.publish",
+		trace.WithAttributes(
+			attribute.String("messaging.system", "kafka"),
+			attribute.String("messaging.destination", msg.Topic),
+			attribute.Int64("messaging.kafka.partition", int64(msg.Partition)),
+			attribute.Int64("messaging.kafka.offset", msg.Offset),
+		),
+	)
+	defer span.End()
 	// Best-effort reject artifact publication should not be canceled by the
 	// caller's consume-loop context. Use a short detached budget.
 	publishCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
 	if err := c.commandRejects.PublishReject(publishCtx, msg, reason); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "command_reject_publish_failed")
 		if c.metrics != nil {
 			c.metrics.ObserveCommandRejectPublish("error")
 		}
@@ -955,6 +967,7 @@ func (c *Controller) publishCommandReject(ctx context.Context, msg *sarama.Consu
 	if c.metrics != nil {
 		c.metrics.ObserveCommandRejectPublish("success")
 	}
+	span.SetStatus(codes.Ok, "command_reject_publish_ok")
 	return nil
 }
 
@@ -1748,6 +1761,16 @@ func (c *Controller) clearPendingApproval(key string) {
 }
 
 func (c *Controller) emitAck(ctx context.Context, evt policy.Event, requiresAck bool, fastPath FastPathEligibility, result ack.Result, errorCode, reason string, appliedAt time.Time) {
+	ctx, span := observability.Tracer("enforcement-agent/controller").Start(
+		ctx,
+		"enforcement.ack.emit",
+		trace.WithAttributes(
+			attribute.String("policy.id", evt.Spec.ID),
+			attribute.String("ack.result", string(result)),
+			attribute.Bool("ack.required", requiresAck),
+		),
+	)
+	defer span.End()
 	result = canonicalAckResult(result, errorCode, reason)
 	ackAttempted := requiresAck && c.acks != nil
 	ackStatus := "skipped"
@@ -1780,6 +1803,7 @@ func (c *Controller) emitAck(ctx context.Context, evt policy.Event, requiresAck 
 		if c.metrics != nil && !appliedAt.IsZero() {
 			c.metrics.ObserveApplyToAckEnqueue("skipped", time.Since(appliedAt))
 		}
+		span.SetStatus(codes.Ok, "ack_skipped")
 		return
 	}
 	ackEnqueueAt = time.Now().UTC()
@@ -1814,6 +1838,8 @@ func (c *Controller) emitAck(ctx context.Context, evt policy.Event, requiresAck 
 	ackCtx, cancelAck := context.WithTimeout(context.Background(), c.ackEnqueueTimeout)
 	defer cancelAck()
 	if err := c.acks.Publish(ackCtx, payload); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "ack_enqueue_failed")
 		if c.metrics != nil && !appliedAt.IsZero() {
 			c.metrics.ObserveApplyToAckEnqueue("error", time.Since(appliedAt))
 		}
@@ -1836,6 +1862,7 @@ func (c *Controller) emitAck(ctx context.Context, evt policy.Event, requiresAck 
 	}
 	ackStatus = "enqueue_ok"
 	c.emitStageMarker(evt, stageAckPublishDone, ackJournaledAt.UnixMilli())
+	span.SetStatus(codes.Ok, "ack_enqueue_ok")
 	if c.logger != nil {
 		c.logger.Debug("ack publish succeeded", zap.String("policy_id", evt.Spec.ID), zap.String("result", string(result)))
 	}

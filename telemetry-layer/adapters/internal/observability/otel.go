@@ -19,11 +19,16 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+const envEnabled = "OTEL_ENABLED"
+
+// InitFromEnv initializes OpenTelemetry tracing from env vars.
+// It is fail-open by design: callers may log init error and continue.
 func InitFromEnv(ctx context.Context, serviceName string) (func(context.Context) error, error) {
-	enabled := strings.EqualFold(strings.TrimSpace(os.Getenv("OTEL_ENABLED")), "true")
+	enabled := strings.EqualFold(strings.TrimSpace(os.Getenv(envEnabled)), "true")
 	if !enabled {
 		return func(context.Context) error { return nil }, nil
 	}
+
 	endpoint := strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
 	if endpoint == "" {
 		return nil, fmt.Errorf("otel enabled but OTEL_EXPORTER_OTLP_ENDPOINT is empty")
@@ -35,19 +40,9 @@ func InitFromEnv(ctx context.Context, serviceName string) (func(context.Context)
 
 	sampleRatio := 0.1
 	if raw := strings.TrimSpace(os.Getenv("OTEL_TRACES_SAMPLER_ARG")); raw != "" {
-		if parsed, err := strconv.ParseFloat(raw, 64); err == nil && parsed >= 0 && parsed <= 1 {
+		if parsed, parseErr := strconv.ParseFloat(raw, 64); parseErr == nil && parsed >= 0 && parsed <= 1 {
 			sampleRatio = parsed
 		}
-	}
-	if protocol := strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_PROTOCOL")); protocol != "" &&
-		!strings.EqualFold(protocol, "http/protobuf") &&
-		!strings.EqualFold(protocol, "http") {
-		return nil, fmt.Errorf("unsupported OTEL_EXPORTER_OTLP_PROTOCOL %q (only http/protobuf is supported)", protocol)
-	}
-
-	effectiveServiceName := strings.TrimSpace(os.Getenv("OTEL_SERVICE_NAME"))
-	if effectiveServiceName == "" {
-		effectiveServiceName = serviceName
 	}
 
 	opts := []otlptracehttp.Option{
@@ -66,7 +61,7 @@ func InitFromEnv(ctx context.Context, serviceName string) (func(context.Context)
 	res, err := resource.New(ctx,
 		resource.WithFromEnv(),
 		resource.WithAttributes(
-			semconv.ServiceNameKey.String(effectiveServiceName),
+			semconv.ServiceNameKey.String(serviceName),
 			attribute.String("telemetry.sdk.language", "go"),
 		),
 	)

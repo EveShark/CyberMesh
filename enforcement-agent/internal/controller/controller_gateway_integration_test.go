@@ -282,8 +282,8 @@ func TestGatewayBackend_ControllerHandleMessage_DuplicateIsIdempotent(t *testing
 	if len(acks.payloads) != 2 {
 		t.Fatalf("expected 2 ack payloads, got %d", len(acks.payloads))
 	}
-	if acks.payloads[1].Result != ack.ResultApplied {
-		t.Fatalf("expected duplicate ack to be applied/noop, got %s", acks.payloads[1].Result)
+	if acks.payloads[1].Result != ack.ResultNoop {
+		t.Fatalf("expected duplicate ack to be noop, got %s", acks.payloads[1].Result)
 	}
 	if acks.payloads[1].ErrorCode != "duplicate_noop" {
 		t.Fatalf("expected duplicate_noop error code, got %s", acks.payloads[1].ErrorCode)
@@ -542,8 +542,8 @@ func TestGatewayBackend_ControllerHandleMessage_DoesNotPoisonReplayOnTransientAp
 	if delegate.applied != 1 {
 		t.Fatalf("expected first apply attempt count 1, got %d", delegate.applied)
 	}
-	if len(acks.payloads) != 1 || acks.payloads[0].ErrorCode != "apply_error" {
-		t.Fatalf("expected first ack apply_error, got %#v", acks.payloads)
+	if len(acks.payloads) != 1 || acks.payloads[0].ErrorCode != "apply_canceled" {
+		t.Fatalf("expected first ack apply_canceled, got %#v", acks.payloads)
 	}
 
 	// Same Kafka envelope redelivery should be re-attempted (not replay_duplicate).
@@ -561,6 +561,111 @@ func TestGatewayBackend_ControllerHandleMessage_DoesNotPoisonReplayOnTransientAp
 	}
 	if acks.payloads[1].ErrorCode == "replay_duplicate" {
 		t.Fatalf("unexpected replay_duplicate after transient apply failure")
+	}
+}
+
+func TestGatewayBackend_ControllerHandleMessage_ExactRedeliveryIsIdempotentNoop(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("gen key: %v", err)
+	}
+	trust := policy.NewTrustedKeys(pub)
+
+	tmp := t.TempDir()
+	store := state.NewStore(state.Options{PersistPath: filepath.Join(tmp, "state.db")})
+	if err := store.Load(); err != nil {
+		t.Fatalf("load store: %v", err)
+	}
+
+	reg := prometheus.NewRegistry()
+	rec := metrics.NewRecorder(reg)
+	rec.SetBackend("gateway")
+	coord, err := ratelimit.Factory("local", ratelimit.Options{Local: &ratelimit.LocalOptions{Counter: store}})
+	if err != nil {
+		t.Fatalf("ratelimit: %v", err)
+	}
+	kill := control.NewKillSwitch(false)
+	acks := &capturePublisher{}
+	delegate := &fakeGatewayDelegate{}
+	ge, err := gateway.New(gateway.Config{GatewayNamespace: "cybermesh-gateway", DryRun: true, Logger: zap.NewNop(), Delegate: delegate})
+	if err != nil {
+		t.Fatalf("gateway new: %v", err)
+	}
+
+	ctrl := New(trust, store, ge, rec, coord, kill, zap.NewNop(), Options{
+		AckPublisher:         acks,
+		ControllerInstanceID: "gw-agent-1",
+	})
+
+	rule := map[string]any{
+		"policy_id":   "99999999-9999-4999-8999-999999999999",
+		"rule_type":   "block",
+		"action":      "drop",
+		"command_id":  "cmd-redelivery-001",
+		"request_id":  "req-redelivery-001",
+		"workflow_id": "wf-redelivery-001",
+		"target": map[string]any{
+			"cidrs":     []any{"203.0.113.0/24"},
+			"direction": "egress",
+			"scope":     "namespace",
+			"selectors": map[string]any{"namespace": "cybermesh-gateway"},
+		},
+		"guardrails": map[string]any{
+			"ttl_seconds": 30,
+			"dry_run":     true,
+		},
+		"metadata": map[string]any{
+			"command_id":  "cmd-redelivery-001",
+			"request_id":  "req-redelivery-001",
+			"workflow_id": "wf-redelivery-001",
+		},
+		"trace": map[string]any{
+			"id":          "trace-redelivery-001",
+			"command_id":  "cmd-redelivery-001",
+			"request_id":  "req-redelivery-001",
+			"workflow_id": "wf-redelivery-001",
+		},
+	}
+	ruleBytes, err := json.Marshal(rule)
+	if err != nil {
+		t.Fatalf("marshal rule: %v", err)
+	}
+
+	evt := &pb.PolicyUpdateEvent{
+		PolicyId:         "99999999-9999-4999-8999-999999999999",
+		Action:           "add",
+		RuleType:         "block",
+		RuleData:         ruleBytes,
+		RequiresAck:      true,
+		Timestamp:        time.Now().Unix(),
+		EffectiveHeight:  1,
+		ExpirationHeight: 10,
+	}
+	signPolicyEvent(t, priv, pub, evt)
+	raw, err := proto.Marshal(evt)
+	if err != nil {
+		t.Fatalf("marshal evt: %v", err)
+	}
+	msg := &sarama.ConsumerMessage{Value: raw}
+
+	if err := ctrl.HandleMessage(context.Background(), msg); err != nil {
+		t.Fatalf("first handle: %v", err)
+	}
+	if err := ctrl.HandleMessage(context.Background(), msg); err != nil {
+		t.Fatalf("second handle: %v", err)
+	}
+
+	if delegate.applied != 1 {
+		t.Fatalf("expected one apply for exact redelivery, got %d", delegate.applied)
+	}
+	if len(acks.payloads) != 2 {
+		t.Fatalf("expected 2 ack payloads, got %d", len(acks.payloads))
+	}
+	if acks.payloads[1].Result != ack.ResultNoop {
+		t.Fatalf("expected replay duplicate noop as applied, got %s", acks.payloads[1].Result)
+	}
+	if acks.payloads[1].ErrorCode != "duplicate_noop" {
+		t.Fatalf("expected duplicate_noop on exact redelivery, got %s", acks.payloads[1].ErrorCode)
 	}
 }
 

@@ -436,7 +436,7 @@ func Load() (Config, error) {
 	cfg.App.BearerToken = strings.TrimSpace(os.Getenv("APP_ENFORCER_BEARER_TOKEN"))
 	cfg.App.AllowedActions = splitAndTrim(strings.TrimSpace(envWithDefault(
 		"APP_ENFORCER_ALLOWED_ACTIONS",
-		"drop,reject,remove,force_reauth,disable_export,freeze_user,freeze_tenant,throttle_action,rate_limit",
+		"drop,reject,remove,force_reauth,disable_export,freeze_user,freeze_tenant,throttle_action,disable_ai_api_for_scope,rate_limit",
 	)))
 
 	// Preserve legacy behavior when unset/invalid/non-positive: no controller-level apply timeout.
