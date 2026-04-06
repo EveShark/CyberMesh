@@ -31,6 +31,9 @@ def init_tracing_from_env(default_service_name: str = "cybermesh-ai-service") ->
     if not endpoint:
         return False
     endpoint = _normalize_http_trace_endpoint(endpoint)
+    protocol = os.getenv("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf").strip().lower()
+    if protocol not in {"http/protobuf", "http"}:
+        return False
 
     service_name = os.getenv("OTEL_SERVICE_NAME", default_service_name).strip() or default_service_name
     sample_ratio = os.getenv("OTEL_TRACES_SAMPLER_ARG", "0.1").strip()
@@ -43,7 +46,9 @@ def init_tracing_from_env(default_service_name: str = "cybermesh-ai-service") ->
     if ratio > 1:
         ratio = 1.0
 
-    resource = Resource.create({"service.name": service_name})
+    attrs: Dict[str, str] = {"service.name": service_name}
+    attrs.update(_parse_resource_attributes(os.getenv("OTEL_RESOURCE_ATTRIBUTES", "")))
+    resource = Resource.create(attrs)
     provider = TracerProvider(
         resource=resource,
         sampler=ParentBased(TraceIdRatioBased(ratio)),
@@ -63,6 +68,22 @@ def _normalize_http_trace_endpoint(endpoint: str) -> str:
     if parsed.path and parsed.path != "/":
         return endpoint.rstrip("/")
     return endpoint.rstrip("/") + "/v1/traces"
+
+
+def _parse_resource_attributes(raw: str) -> Dict[str, str]:
+    attrs: Dict[str, str] = {}
+    if not raw:
+        return attrs
+    for token in raw.split(","):
+        part = token.strip()
+        if not part or "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key and value:
+            attrs[key] = value
+    return attrs
 
 
 def shutdown_tracing() -> None:

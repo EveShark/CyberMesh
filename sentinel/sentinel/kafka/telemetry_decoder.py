@@ -13,8 +13,15 @@ from pathlib import Path
 from typing import Any, Dict
 
 from sentinel.agents.event_builder import build_flow_event, build_scan_findings_event
-from sentinel.contracts import CanonicalEvent
-from sentinel.contracts.schemas import ScanFindingV1, ScanFindingsV1
+from sentinel.contracts import CanonicalEvent, Modality
+from sentinel.contracts.schemas import (
+    ActionEventV1,
+    ExfilEventV1,
+    MCPRuntimeEventV1,
+    ResilienceEventV1,
+    ScanFindingV1,
+    ScanFindingsV1,
+)
 from sentinel.telemetry.adapters import normalize_flow_record
 from sentinel.utils.error_codes import (
     ERR_INVALID_FIELDS,
@@ -370,7 +377,131 @@ def _derive_sentinel_event_id(*, tenant_id: str, source: str, modality: str, sou
     return str(uuid.uuid5(_SENTINEL_EVENT_NAMESPACE, seed))
 
 
+def _parse_modality(value: Any) -> Modality | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    try:
+        return Modality(text)
+    except ValueError as exc:
+        raise ValueError(format_error(ERR_INVALID_SCHEMA, f"unsupported modality: {text}")) from exc
+
+
+def _modal_features_version(modality: Modality) -> str:
+    mapping = {
+        Modality.ACTION_EVENT: "ActionEventV1",
+        Modality.MCP_RUNTIME: "MCPRuntimeEventV1",
+        Modality.EXFIL_EVENT: "ExfilEventV1",
+        Modality.RESILIENCE_EVENT: "ResilienceEventV1",
+    }
+    return mapping.get(modality, "UnknownV1")
+
+
+def _build_modal_features(modality: Modality, payload: Dict[str, Any]) -> Dict[str, Any]:
+    features = payload.get("features")
+    if not isinstance(features, dict):
+        features = {}
+    merged = dict(features)
+
+    if modality == Modality.ACTION_EVENT:
+        merged.setdefault("event_name", _first_non_empty(payload.get("event_name"), payload.get("alert_type")))
+        if payload.get("event_category") and "event_category" not in merged:
+            category = payload.get("event_category")
+            merged["event_category"] = category if isinstance(category, list) else [str(category)]
+        if payload.get("request_id"):
+            merged.setdefault("session_id", str(payload.get("request_id")))
+        attrs = payload.get("attributes")
+        if isinstance(attrs, dict):
+            merged.setdefault("attributes", attrs)
+        return ActionEventV1.from_dict(merged).to_dict()
+
+    if modality == Modality.MCP_RUNTIME:
+        attrs = payload.get("attributes")
+        if isinstance(attrs, dict):
+            merged.setdefault("attributes", attrs)
+        if payload.get("request_id"):
+            merged.setdefault("request_id", str(payload.get("request_id")))
+        return MCPRuntimeEventV1.from_dict(merged).to_dict()
+
+    if modality == Modality.EXFIL_EVENT:
+        attrs = payload.get("attributes")
+        if isinstance(attrs, dict):
+            merged.setdefault("attributes", attrs)
+        return ExfilEventV1.from_dict(merged).to_dict()
+
+    if modality == Modality.RESILIENCE_EVENT:
+        attrs = payload.get("attributes")
+        if isinstance(attrs, dict):
+            merged.setdefault("attributes", attrs)
+        return ResilienceEventV1.from_dict(merged).to_dict()
+
+    raise ValueError(format_error(ERR_INVALID_SCHEMA, f"unsupported modality: {modality.value}"))
+
+
+def _to_modality_event(topic: str, payload: Dict[str, Any], raw_bytes: bytes) -> CanonicalEvent:
+    tenant_id = str(payload.get("tenant_id") or "").strip()
+    if not tenant_id:
+        raise ValueError(format_error(ERR_MISSING_TENANT, "missing tenant_id"))
+    source = f"kafka:{topic}"
+    source_event_id = _derive_legacy_source_event_id(topic, payload, raw_bytes)
+    modality = _parse_modality(payload.get("modality"))
+    if modality is None:
+        raise ValueError(format_error(ERR_INVALID_SCHEMA, "missing modality"))
+    if modality not in (
+        Modality.ACTION_EVENT,
+        Modality.MCP_RUNTIME,
+        Modality.EXFIL_EVENT,
+        Modality.RESILIENCE_EVENT,
+    ):
+        raise ValueError(format_error(ERR_INVALID_SCHEMA, f"unsupported modality: {modality.value}"))
+
+    event_id = _derive_sentinel_event_id(
+        tenant_id=tenant_id,
+        source=source,
+        modality=modality.value,
+        source_event_id=source_event_id,
+    )
+    event_ts = float(payload.get("ts") or time.time())
+    features = _build_modal_features(modality, payload)
+    labels = _ensure_trace_labels(
+        payload.get("labels") if isinstance(payload.get("labels"), dict) else {},
+        event_id=event_id,
+        timestamp_s=event_ts,
+        payload=payload,
+        source_event_id=source_event_id,
+    )
+    raw_context = {
+        "_source_topic": topic,
+        "_source_schema": payload.get("schema", ""),
+        "source_id": _first_non_empty(payload.get("source_id"), payload.get("sensor_id")),
+        "source_type": _coerce_source_type_label(payload.get("source_type")),
+        "event_name": _first_non_empty(payload.get("event_name")),
+        "event_category": _first_non_empty(payload.get("event_category")),
+    }
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict):
+        raw_context["metadata"] = metadata
+    attributes = payload.get("attributes")
+    if isinstance(attributes, dict):
+        raw_context["attributes"] = attributes
+
+    return CanonicalEvent(
+        id=event_id,
+        timestamp=event_ts,
+        source=source,
+        tenant_id=tenant_id,
+        modality=modality,
+        features_version=_modal_features_version(modality),
+        features=features,
+        raw_context=raw_context,
+        labels=labels,
+    )
+
+
 def _to_deepflow_event(topic: str, payload: Dict[str, Any], raw_bytes: bytes) -> CanonicalEvent:
+    if payload.get("modality"):
+        return _to_modality_event(topic, payload, raw_bytes)
+
     tenant_id = str(payload.get("tenant_id") or "").strip()
     if not tenant_id:
         raise ValueError(format_error(ERR_MISSING_TENANT, "missing tenant_id"))

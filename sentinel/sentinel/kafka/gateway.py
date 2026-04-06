@@ -14,6 +14,7 @@ from sentinel.agents import SentinelOrchestrator
 from sentinel.contracts import CanonicalEvent, Modality
 from sentinel.contracts.generated.sentinel_result_pb2 import SentinelFinding, SentinelResultEvent
 from sentinel.logging import get_logger
+from sentinel.observability import extract_context_from_headers, start_span
 from sentinel.utils.metrics import get_metrics_collector
 from sentinel.utils.error_codes import (
     ERR_INVALID_FIELDS,
@@ -39,6 +40,7 @@ class KafkaRecord(Protocol):
     topic: str
     value: bytes
     key: Optional[bytes]
+    headers: Optional[list[tuple[str, Any]]]
 
 
 class KafkaClient(Protocol):
@@ -95,6 +97,28 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _metric_modality_token(value: Any) -> str:
+    token = str(value or "").strip().lower()
+    token = token.replace("-", "_").replace(".", "_").replace(" ", "_")
+    if token in {
+        "network_flow",
+        "file",
+        "scan_findings",
+        "process_event",
+        "action_event",
+        "mcp_runtime",
+        "exfil_event",
+        "resilience_event",
+    }:
+        return token
+    return "unknown"
+
+
+def _record_modality_operation(stage: str, modality: Any, duration_seconds: float, status: str) -> None:
+    operation = f"{stage}_modality_{_metric_modality_token(modality)}"
+    _metrics.record_operation(operation, duration_seconds, status)
 
 
 def _stage_markers_enabled() -> bool:
@@ -159,12 +183,24 @@ def _normalized_trace_id(current: Any, *, source_event_id: str, event_id: str) -
 def _populate_operational_labels(event: CanonicalEvent, labels: Dict[str, str]) -> Dict[str, str]:
     out = dict(labels or {})
     raw_context = event.raw_context if isinstance(event.raw_context, dict) else {}
+    features = event.features if isinstance(event.features, dict) else {}
     for key in ("flow_id", "source_id", "source_type", "sensor_id"):
         value = ""
         if isinstance(event.labels, dict):
             value = str(event.labels.get(key) or "").strip()
         if not value:
             value = str(raw_context.get(key) or "").strip()
+        if value:
+            out.setdefault(key, value)
+    # Preserve network targeting hints for downstream policy materialization.
+    for key in ("src_ip", "dst_ip", "source_ip", "destination_ip", "src_port", "dst_port", "proto"):
+        value = ""
+        if isinstance(event.labels, dict):
+            value = str(event.labels.get(key) or "").strip()
+        if not value and key in raw_context:
+            value = str(raw_context.get(key) or "").strip()
+        if not value and key in features:
+            value = str(features.get(key) or "").strip()
         if value:
             out.setdefault(key, value)
     return out
@@ -327,85 +363,151 @@ class KafkaGatewayWorker:
         if len(self._pending_commits) >= self.config.producer_max_pending_commits:
             # Force a flush before consuming more to keep bounded memory and
             # preserve commit-after-produce ordering.
-            self._flush_pending_if_due(force=True)
+            if not self._flush_pending_if_due(force=True):
+                return False
 
         record = self.kafka.poll(self.config.poll_timeout_seconds)
         if record is None:
             return False
+        parent_ctx = extract_context_from_headers(getattr(record, "headers", None))
+        with start_span(
+            "sentinel.gateway.process_record",
+            tracer_name="sentinel/kafka-gateway",
+            context=parent_ctx,
+            attributes={
+                "messaging.system": "kafka",
+                "messaging.destination": str(getattr(record, "topic", "")),
+                "messaging.message_payload_size_bytes": len(getattr(record, "value", b"") or b""),
+            },
+        ) as span:
+            self.stats["received"] += 1
+            topic_schema = self.config.topic_schema_map.get(record.topic, "canonical_event")
+            if topic_schema == "canonical_event":
+                validate_start = time.perf_counter()
+                try:
+                    parsed = parse_gateway_message(record.value, self.config)
+                    event = parsed.event
+                    _metrics.record_operation("gateway_validate", time.perf_counter() - validate_start, "ok")
+                    _record_modality_operation(
+                        "gateway_validate",
+                        event.modality.value,
+                        time.perf_counter() - validate_start,
+                        "ok",
+                    )
+                    _set_event_stage_label(event, "t_sentinel_consume_ms", int(time.time() * 1000))
+                    _emit_stage_marker("t_sentinel_consume", event)
+                    if span is not None:
+                        span.set_attribute("event.id", event.id)
+                        span.set_attribute("event.tenant_id", event.tenant_id)
+                        span.set_attribute("event.modality", event.modality.value)
+                except Exception as exc:  # pylint: disable=broad-except
+                    _metrics.record_operation("gateway_validate", time.perf_counter() - validate_start, "error")
+                    _record_modality_operation("gateway_validate", "unknown", time.perf_counter() - validate_start, "error")
+                    self.stats["validation_errors"] += 1
+                    self._publish_dlq(record=record, error=str(exc), stage="validate")
+                    self._queue_commit(record)
+                    self._flush_pending_if_due(force=False)
+                    if span is not None:
+                        span.record_exception(exc)
+                    return True
+            else:
+                decode_start = time.perf_counter()
+                try:
+                    event = decode_telemetry_topic_message(record.topic, record.value, self.config)
+                    _metrics.record_operation("gateway_decode", time.perf_counter() - decode_start, "ok")
+                    _record_modality_operation(
+                        "gateway_decode",
+                        event.modality.value,
+                        time.perf_counter() - decode_start,
+                        "ok",
+                    )
+                    _set_event_stage_label(event, "t_sentinel_consume_ms", int(time.time() * 1000))
+                    _emit_stage_marker("t_sentinel_consume", event)
+                    if span is not None:
+                        span.set_attribute("event.id", event.id)
+                        span.set_attribute("event.tenant_id", event.tenant_id)
+                        span.set_attribute("event.modality", event.modality.value)
+                except Exception as exc:  # pylint: disable=broad-except
+                    _metrics.record_operation("gateway_decode", time.perf_counter() - decode_start, "error")
+                    _record_modality_operation("gateway_decode", "unknown", time.perf_counter() - decode_start, "error")
+                    self.stats["validation_errors"] += 1
+                    self._publish_dlq(record=record, error=str(exc), stage="decode")
+                    self._queue_commit(record)
+                    self._flush_pending_if_due(force=False)
+                    if span is not None:
+                        span.record_exception(exc)
+                    return True
 
-        self.stats["received"] += 1
-        topic_schema = self.config.topic_schema_map.get(record.topic, "canonical_event")
-        if topic_schema == "canonical_event":
-            validate_start = time.perf_counter()
+            analyze_start = time.perf_counter()
             try:
-                parsed = parse_gateway_message(record.value, self.config)
-                event = parsed.event
-                _metrics.record_operation("gateway_validate", time.perf_counter() - validate_start, "ok")
-                _set_event_stage_label(event, "t_sentinel_consume_ms", int(time.time() * 1000))
-                _emit_stage_marker("t_sentinel_consume", event)
+                result = self.orchestrator.analyze_event(event)
+                _metrics.record_operation("gateway_analyze", time.perf_counter() - analyze_start, "ok")
+                _record_modality_operation(
+                    "gateway_analyze",
+                    event.modality.value,
+                    time.perf_counter() - analyze_start,
+                    "ok",
+                )
+                _set_event_stage_label(event, "t_sentinel_analysis_done_ms", int(time.time() * 1000))
+                _emit_stage_marker("t_sentinel_analysis_done", event)
             except Exception as exc:  # pylint: disable=broad-except
-                _metrics.record_operation("gateway_validate", time.perf_counter() - validate_start, "error")
-                self.stats["validation_errors"] += 1
-                self._publish_dlq(record=record, error=str(exc), stage="validate")
+                _metrics.record_operation("gateway_analyze", time.perf_counter() - analyze_start, "error")
+                _record_modality_operation(
+                    "gateway_analyze",
+                    event.modality.value,
+                    time.perf_counter() - analyze_start,
+                    "error",
+                )
+                self.stats["analyze_errors"] += 1
+                self._publish_dlq(record=record, error=f"analysis failed: {exc}", stage="analyze")
                 self._queue_commit(record)
                 self._flush_pending_if_due(force=False)
+                if span is not None:
+                    span.record_exception(exc)
                 return True
-        else:
-            decode_start = time.perf_counter()
+
+            publish_start = time.perf_counter()
             try:
-                event = decode_telemetry_topic_message(record.topic, record.value, self.config)
-                _metrics.record_operation("gateway_decode", time.perf_counter() - decode_start, "ok")
-                _set_event_stage_label(event, "t_sentinel_consume_ms", int(time.time() * 1000))
-                _emit_stage_marker("t_sentinel_consume", event)
+                payload, schema_version = self._serialize_result(event, result)
+                self.kafka.produce(
+                    topic=self.config.output_topic,
+                    key=event.id.encode("utf-8"),
+                    value=payload,
+                    headers={
+                        "schema_version": schema_version,
+                        "tenant_id": event.tenant_id,
+                        "encoding": self.config.output_encoding,
+                    },
+                )
+                self.stats["published"] += 1
+                _metrics.record_operation("gateway_publish", time.perf_counter() - publish_start, "ok")
+                _record_modality_operation(
+                    "gateway_publish",
+                    event.modality.value,
+                    time.perf_counter() - publish_start,
+                    "ok",
+                )
+                _emit_stage_marker("t_sentinel_publish_ack", event)
             except Exception as exc:  # pylint: disable=broad-except
-                _metrics.record_operation("gateway_decode", time.perf_counter() - decode_start, "error")
-                self.stats["validation_errors"] += 1
-                self._publish_dlq(record=record, error=str(exc), stage="decode")
+                _metrics.record_operation("gateway_publish", time.perf_counter() - publish_start, "error")
+                _record_modality_operation(
+                    "gateway_publish",
+                    event.modality.value,
+                    time.perf_counter() - publish_start,
+                    "error",
+                )
+                self._publish_dlq(record=record, error=f"publish failed: {exc}", stage="publish")
                 self._queue_commit(record)
                 self._flush_pending_if_due(force=False)
+                if span is not None:
+                    span.record_exception(exc)
                 return True
 
-        analyze_start = time.perf_counter()
-        try:
-            result = self.orchestrator.analyze_event(event)
-            _metrics.record_operation("gateway_analyze", time.perf_counter() - analyze_start, "ok")
-            _set_event_stage_label(event, "t_sentinel_analysis_done_ms", int(time.time() * 1000))
-            _emit_stage_marker("t_sentinel_analysis_done", event)
-        except Exception as exc:  # pylint: disable=broad-except
-            _metrics.record_operation("gateway_analyze", time.perf_counter() - analyze_start, "error")
-            self.stats["analyze_errors"] += 1
-            self._publish_dlq(record=record, error=f"analysis failed: {exc}", stage="analyze")
             self._queue_commit(record)
-            self._flush_pending_if_due(force=False)
+            if not self._flush_pending_if_due(force=False):
+                return False
+            self.stats["processed"] += 1
             return True
-
-        publish_start = time.perf_counter()
-        try:
-            payload, schema_version = self._serialize_result(event, result)
-            self.kafka.produce(
-                topic=self.config.output_topic,
-                key=event.id.encode("utf-8"),
-                value=payload,
-                headers={
-                    "schema_version": schema_version,
-                    "tenant_id": event.tenant_id,
-                    "encoding": self.config.output_encoding,
-                },
-            )
-            self.stats["published"] += 1
-            _metrics.record_operation("gateway_publish", time.perf_counter() - publish_start, "ok")
-            _emit_stage_marker("t_sentinel_publish_ack", event)
-        except Exception as exc:  # pylint: disable=broad-except
-            _metrics.record_operation("gateway_publish", time.perf_counter() - publish_start, "error")
-            self._publish_dlq(record=record, error=f"publish failed: {exc}", stage="publish")
-            self._queue_commit(record)
-            self._flush_pending_if_due(force=False)
-            return True
-
-        self._queue_commit(record)
-        self._flush_pending_if_due(force=False)
-        self.stats["processed"] += 1
-        return True
 
     def close(self) -> None:
         try:
@@ -457,8 +559,9 @@ class KafkaGatewayWorker:
             self.stats["flush_errors"] += 1
             logger.error("kafka producer flush failed: %s", exc)
             self._apply_backpressure_pause()
-            # Fail fast: keep offsets uncommitted and let process restart.
-            raise RuntimeError("kafka producer flush failed") from exc
+            # Keep pending offsets uncommitted and retry flush on next loop.
+            # This preserves at-least-once semantics without crashing on transient broker pressure.
+            return False
         _metrics.record_operation("gateway_flush", time.perf_counter() - flush_start, "ok")
 
         self._last_flush_at = now

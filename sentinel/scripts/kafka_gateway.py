@@ -18,6 +18,7 @@ if str(BASE_DIR) not in sys.path:
 from sentinel.agents import SentinelOrchestrator
 from sentinel.kafka import ConfluentKafkaClient, KafkaGatewayWorker, load_kafka_worker_config
 from sentinel.logging import configure_logging
+from sentinel.observability import init_tracing_from_env, shutdown_tracing
 from sentinel.utils.metrics import start_metrics_server
 
 
@@ -44,6 +45,7 @@ def main() -> int:
         return 2
 
     metrics_server = start_metrics_server(os.getenv("SENTINEL_METRICS_ADDR", ":9202"))
+    tracing_enabled = init_tracing_from_env("cybermesh-sentinel-kafka-gateway")
 
     kafka_client = ConfluentKafkaClient(cfg)
     orchestrator = SentinelOrchestrator(
@@ -58,6 +60,8 @@ def main() -> int:
         stats = worker.run(max_messages=args.max_messages, stop_on_idle=args.stop_on_idle)
     finally:
         worker.close()
+        if tracing_enabled:
+            shutdown_tracing()
         if metrics_server is not None:
             metrics_server.shutdown()
             metrics_server.server_close()

@@ -7,6 +7,7 @@ import time
 from typing import Any, Dict, Optional
 
 from sentinel.logging import get_logger
+from sentinel.observability import inject_context_headers
 from sentinel.utils.metrics import get_metrics_collector
 
 from .config import KafkaWorkerConfig
@@ -22,6 +23,7 @@ class ConfluentRecord:
     topic: str
     value: bytes
     key: Optional[bytes] = None
+    headers: Optional[list[tuple[str, Any]]] = None
     _raw: Any = None
 
 
@@ -88,6 +90,7 @@ class ConfluentKafkaClient:
             topic=msg.topic(),
             value=msg.value() or b"",
             key=msg.key(),
+            headers=msg.headers() or [],
             _raw=msg,
         )
 
@@ -102,11 +105,12 @@ class ConfluentKafkaClient:
         last_error: Optional[Exception] = None
         for _ in range(self._queue_full_retries):
             try:
+                otel_headers = inject_context_headers(existing_headers=headers or {})
                 self._producer.produce(
                     topic=topic,
                     value=value,
                     key=key,
-                    headers=headers or {},
+                    headers=otel_headers,
                     on_delivery=self._delivery_callback,
                 )
                 self._producer.poll(0)
