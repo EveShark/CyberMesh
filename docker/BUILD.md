@@ -64,7 +64,43 @@ docker build -f docker/backend/Dockerfile \
 
 **Context:** Project root  
 **Dockerfile:** `docker/backend/Dockerfile`  
-**Copies:** `backend/bin/cybermesh` → `/app/cybermesh`
+**Builds in-container:** `backend/cmd/cybermesh` → `/app/cybermesh`
+
+### kubectl Plugin
+
+The `kubectl-cybermesh` plugin is a standalone CLI binary. It is **not** deployed as a pod, sidecar, or separate cluster service.
+
+Build it from the backend module:
+
+```powershell
+cd B:\CyberMesh\backend
+go build -o bin/kubectl-cybermesh.exe ./cmd/kubectl-cybermesh
+```
+
+For Linux:
+
+```powershell
+cd B:\CyberMesh\backend
+$env:CGO_ENABLED=0
+$env:GOOS="linux"
+$env:GOARCH="amd64"
+go build -o bin/kubectl-cybermesh ./cmd/kubectl-cybermesh
+```
+
+If the binary is placed on `PATH` as `kubectl-cybermesh` or `kubectl-cybermesh.exe`, kubectl will discover it automatically and you can run:
+
+```bash
+kubectl cybermesh version
+kubectl cybermesh trace policy <policy_id>
+```
+
+Defaults:
+
+- Base URL: `https://api.cybermesh.qzz.io`
+- Override with `--base-url` or `CYBERMESH_BASE_URL`
+- Tenant can be supplied with `--tenant` or `CYBERMESH_TENANT`
+
+The plugin talks to the existing backend REST API and does not require a Docker image rollout.
 
 ### Frontend
 
@@ -139,6 +175,21 @@ docker build -f docker/ai-service/Dockerfile -t asia-southeast1-docker.pkg.dev/c
 docker push asia-southeast1-docker.pkg.dev/cybermesh-476310/cybermesh-repo/cybermesh-backend:latest
 docker push asia-southeast1-docker.pkg.dev/cybermesh-476310/cybermesh-repo/cybermesh-frontend:latest
 docker push asia-southeast1-docker.pkg.dev/cybermesh-476310/cybermesh-repo/cybermesh-ai-service:latest
+```
+
+### Plugin Build
+
+```powershell
+cd B:\CyberMesh\backend
+go build -o bin/kubectl-cybermesh.exe ./cmd/kubectl-cybermesh
+```
+
+Optional Linux build:
+
+```powershell
+cd B:\CyberMesh\backend
+$env:CGO_ENABLED=0; $env:GOOS="linux"; $env:GOARCH="amd64"
+go build -o bin/kubectl-cybermesh ./cmd/kubectl-cybermesh
 ```
 
 ---
