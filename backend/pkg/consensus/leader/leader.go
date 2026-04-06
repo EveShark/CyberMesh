@@ -230,7 +230,35 @@ func (pm *Pacemaker) run(ctx context.Context) {
 func (pm *Pacemaker) handleTimeout(ctx context.Context) {
 	pm.mu.Lock()
 	view := pm.currentView
+	timeout := pm.timeout
+	lastViewTime := pm.lastViewTime
 	pm.mu.Unlock()
+
+	sinceLastAdvance := time.Duration(0)
+	if !lastViewTime.IsZero() {
+		sinceLastAdvance = time.Since(lastViewTime)
+	}
+
+	// Guard against stale timer firings right after a view transition. Without this,
+	// a late timer tick from the previous view can trigger an unnecessary timeout
+	// increase and extra view-change churn.
+	staleWindow := timeout / 4
+	if staleWindow < 100*time.Millisecond {
+		staleWindow = 100 * time.Millisecond
+	}
+	if staleWindow > 750*time.Millisecond {
+		staleWindow = 750 * time.Millisecond
+	}
+	if sinceLastAdvance > 0 && sinceLastAdvance < staleWindow {
+		pm.mu.Lock()
+		pm.resetTimerLocked()
+		pm.mu.Unlock()
+		pm.logger.DebugContext(ctx, "ignoring stale timeout tick near recent view advance",
+			"view", view,
+			"since_last_view_advance", sinceLastAdvance,
+			"stale_window", staleWindow)
+		return
+	}
 
 	pm.logger.WarnContext(ctx, "view timeout",
 		"view", view,
@@ -242,9 +270,28 @@ func (pm *Pacemaker) handleTimeout(ctx context.Context) {
 		"timeout": pm.timeout.String(),
 	})
 
-	// Increase timeout (AIMD)
-	if pm.config.EnableAIMD {
+	// Increase timeout (AIMD) only when timeout likely reflects real lack of
+	// progress. If a view advanced recently, increasing timeout amplifies tails.
+	shouldIncreaseTimeout := true
+	// Only suppress timeout growth for very recent progress. A larger window
+	// under burst can keep timeout too low and trigger repeated churn.
+	progressWindow := timeout / 8
+	if progressWindow < 100*time.Millisecond {
+		progressWindow = 100 * time.Millisecond
+	}
+	if progressWindow > 500*time.Millisecond {
+		progressWindow = 500 * time.Millisecond
+	}
+	if sinceLastAdvance > 0 && sinceLastAdvance < progressWindow {
+		shouldIncreaseTimeout = false
+	}
+	if pm.config.EnableAIMD && shouldIncreaseTimeout {
 		pm.increaseTimeout()
+	} else if pm.config.EnableAIMD && !shouldIncreaseTimeout {
+		pm.logger.DebugContext(ctx, "skipping AIMD timeout increase due to recent view progress",
+			"view", view,
+			"since_last_view_advance", sinceLastAdvance,
+			"progress_window", progressWindow)
 	}
 
 	// Trigger view change
@@ -760,19 +807,23 @@ func (pm *Pacemaker) broadcastCatchupViewChange(ctx context.Context, oldView, ne
 	}
 
 	vcMsg := existing
-	if vcMsg == nil {
-		var err error
+	var err error
+	if existing == nil {
 		vcMsg, err = pm.createViewChangeMsg(ctx, oldView, newView)
-		if err != nil {
-			pm.mu.Unlock()
-			pm.logger.WarnContext(ctx, "failed to create catchup view change",
-				"error", err,
-				"old_view", oldView,
-				"new_view", newView)
-			return
-		}
-		pm.viewChanges[newView][localID] = vcMsg
+	} else {
+		// Refresh timestamp/signature for rebroadcast so peers do not reject
+		// catch-up view-change messages on clock-skew age checks.
+		vcMsg, err = pm.rebuildViewChangeForRebroadcast(ctx, existing, oldView, newView)
 	}
+	if err != nil {
+		pm.mu.Unlock()
+		pm.logger.WarnContext(ctx, "failed to create catchup view change",
+			"error", err,
+			"old_view", oldView,
+			"new_view", newView)
+		return
+	}
+	pm.viewChanges[newView][localID] = vcMsg
 
 	// Update retry tracking
 	if state.attempts == 0 {
@@ -902,7 +953,18 @@ func (pm *Pacemaker) decreaseTimeout() {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
-	newTimeout := pm.timeout - pm.config.TimeoutDecreaseDelta
+	// Recover faster from timeout inflation during churn by combining additive
+	// decrease with a proportional drop. This preserves stability near MinTimeout
+	// while preventing long-lived inflated timeout tails.
+	propStep := pm.timeout / 5 // 20% decrease
+	if propStep < time.Millisecond {
+		propStep = time.Millisecond
+	}
+	step := pm.config.TimeoutDecreaseDelta
+	if propStep > step {
+		step = propStep
+	}
+	newTimeout := pm.timeout - step
 	if newTimeout < pm.config.MinTimeout {
 		newTimeout = pm.config.MinTimeout
 	}
@@ -925,6 +987,17 @@ func (pm *Pacemaker) addJitter(duration time.Duration) time.Duration {
 // Helper functions
 
 func (pm *Pacemaker) createViewChangeMsg(ctx context.Context, oldView, newView uint64) (*ViewChangeMsg, error) {
+	return pm.buildViewChangeMsg(ctx, oldView, newView, pm.highestQC)
+}
+
+func (pm *Pacemaker) rebuildViewChangeForRebroadcast(ctx context.Context, existing *ViewChangeMsg, oldView, newView uint64) (*ViewChangeMsg, error) {
+	if existing == nil {
+		return pm.buildViewChangeMsg(ctx, oldView, newView, pm.highestQC)
+	}
+	return pm.buildViewChangeMsg(ctx, oldView, newView, existing.HighestQC)
+}
+
+func (pm *Pacemaker) buildViewChangeMsg(ctx context.Context, oldView, newView uint64, highestQC QC) (*ViewChangeMsg, error) {
 	vcMsg := &ViewChangeMsg{
 		OldView:   oldView,
 		NewView:   newView,
@@ -932,8 +1005,8 @@ func (pm *Pacemaker) createViewChangeMsg(ctx context.Context, oldView, newView u
 		SenderID:  pm.crypto.GetKeyID(),
 		Timestamp: time.Now(),
 	}
-	if !isNilQC(pm.highestQC) {
-		vcMsg.HighestQC = pm.highestQC
+	if !isNilQC(highestQC) {
+		vcMsg.HighestQC = highestQC
 	}
 
 	signBytes := pm.viewChangeSignBytes(vcMsg)

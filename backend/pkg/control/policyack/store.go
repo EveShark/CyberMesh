@@ -10,9 +10,13 @@ import (
 	"time"
 
 	"backend/pkg/control/lifecycleaudit"
+	"backend/pkg/observability"
 	"backend/pkg/control/policystate"
 	"backend/pkg/utils"
 	pb "backend/proto"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type Store struct {
@@ -141,13 +145,32 @@ func NewStore(db *sql.DB) (*Store, error) {
 }
 
 func (s *Store) Upsert(ctx context.Context, evt *pb.PolicyAckEvent, observedAt time.Time) error {
+	policyID := ""
+	result := ""
+	if evt != nil {
+		policyID = strings.TrimSpace(evt.GetPolicyId())
+		result = strings.TrimSpace(evt.GetResult())
+	}
+	ctx, span := observability.Tracer("backend/policyack").Start(
+		ctx,
+		"backend.policyack.store_upsert",
+		trace.WithAttributes(
+			attribute.String("policy.id", policyID),
+			attribute.String("ack.result", result),
+		),
+	)
+	defer span.End()
 	if s == nil || s.db == nil {
+		span.SetStatus(codes.Error, "store_not_initialized")
 		return fmt.Errorf("policy ack store: not initialized")
 	}
 	if evt == nil {
+		span.SetStatus(codes.Error, "event_nil")
 		return fmt.Errorf("policy ack store: event nil")
 	}
 	if err := s.EnsureSchema(ctx); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "ensure_schema_failed")
 		return fmt.Errorf("policy ack store: ensure schema failed: %w", err)
 	}
 
@@ -164,12 +187,16 @@ func (s *Store) Upsert(ctx context.Context, evt *pb.PolicyAckEvent, observedAt t
 	}
 
 	if err := s.insertEvent(ctx, evt, appliedAt, ackedAt, observedAt.UTC()); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "insert_event_failed")
 		return fmt.Errorf("policy ack store: insert event failed: %w", err)
 	}
 
 	ackQuery, ackArgs := s.buildPolicyAcksUpsert(evt, appliedAt, ackedAt, observedAt.UTC())
 	_, err := s.db.ExecContext(ctx, ackQuery, ackArgs...)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "acks_upsert_failed")
 		return fmt.Errorf("policy ack store: upsert failed: %w", err)
 	}
 	if !isTerminalAckResult(evt.Result) {
@@ -180,12 +207,20 @@ func (s *Store) Upsert(ctx context.Context, evt *pb.PolicyAckEvent, observedAt t
 	aiEventTsMs, sourceEventTsMs, publishedAt, ackedAtRow, mode, corrErr := s.correlateOutbox(ctx, evt, ackedAt, observedAt.UTC())
 	s.stats.correlationLatency.Observe(float64(time.Since(corrStart).Milliseconds()))
 	if corrErr != nil {
+		span.RecordError(corrErr)
 		if isOutboxMissingErr(corrErr) {
+			span.SetStatus(codes.Ok, "outbox_missing")
 			return nil
 		}
 		s.stats.correlationErrors.Add(1)
+		span.SetStatus(codes.Error, "correlate_outbox_failed")
 		return fmt.Errorf("policy ack store: correlate outbox failed: %w", corrErr)
 	}
+	span.SetAttributes(
+		attribute.String("ack.correlation_mode", string(mode)),
+		attribute.Bool("ack.published_at_valid", publishedAt.Valid),
+		attribute.Bool("ack.acked_at_valid", ackedAtRow.Valid),
+	)
 	switch mode {
 	case correlationCommand:
 		s.stats.correlationCommand.Add(1)
@@ -260,6 +295,8 @@ func (s *Store) Upsert(ctx context.Context, evt *pb.PolicyAckEvent, observedAt t
 	}
 
 	if err := policystate.Refresh(ctx, s.db, s.db, evt.PolicyId); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "policy_state_refresh_failed")
 		return fmt.Errorf("policy ack store: refresh policy state failed: %w", err)
 	}
 	if meta, metaErr := s.loadAckedLifecycleMeta(ctx, evt); metaErr == nil && strings.TrimSpace(meta.OutboxID) != "" {
@@ -286,6 +323,7 @@ func (s *Store) Upsert(ctx context.Context, evt *pb.PolicyAckEvent, observedAt t
 		}
 	}
 
+	span.SetStatus(codes.Ok, "ack_upserted")
 	return nil
 }
 
@@ -404,12 +442,6 @@ func (s *Store) correlateOutbox(ctx context.Context, evt *pb.PolicyAckEvent, ack
 		if err == nil {
 			return aiTs, sourceTs, pubAt, ackAt, correlationCommand, nil
 		}
-		if err == sql.ErrNoRows && ackedAt.Valid {
-			aiTs, sourceTs, pubAt, ackAt, err = s.correlateByCommandIDNoCutoff(ctx, evt.PolicyId, commandID, evt.Result, evt.Reason, evt.ControllerInstance, ackedAt)
-			if err == nil {
-				return aiTs, sourceTs, pubAt, ackAt, correlationCommand, nil
-			}
-		}
 		if err != sql.ErrNoRows && !isOutboxCommandIDColumnMissingErr(err) {
 			return sql.NullInt64{}, sql.NullInt64{}, sql.NullTime{}, sql.NullTime{}, correlationNone, err
 		}
@@ -419,12 +451,6 @@ func (s *Store) correlateOutbox(ctx context.Context, evt *pb.PolicyAckEvent, ack
 		aiTs, sourceTs, pubAt, ackAt, err := s.correlateExact(ctx, evt.PolicyId, evt.RuleHash, traceID, evt.Result, evt.Reason, evt.ControllerInstance, ackedAt, exactCutoff)
 		if err == nil {
 			return aiTs, sourceTs, pubAt, ackAt, correlationExact, nil
-		}
-		if err == sql.ErrNoRows && ackedAt.Valid {
-			aiTs, sourceTs, pubAt, ackAt, err = s.correlateExactNoCutoff(ctx, evt.PolicyId, evt.RuleHash, traceID, evt.Result, evt.Reason, evt.ControllerInstance, ackedAt)
-			if err == nil {
-				return aiTs, sourceTs, pubAt, ackAt, correlationExact, nil
-			}
 		}
 		if err != sql.ErrNoRows {
 			return sql.NullInt64{}, sql.NullInt64{}, sql.NullTime{}, sql.NullTime{}, correlationNone, err
@@ -487,38 +513,6 @@ func (s *Store) correlateByCommandID(ctx context.Context, policyID, commandID, r
 	return aiEventTsMs, sourceEventTsMs, publishedAt, ackedAtRow, err
 }
 
-func (s *Store) correlateByCommandIDNoCutoff(ctx context.Context, policyID, commandID, result, reason, controller string, ackedAt sql.NullTime) (sql.NullInt64, sql.NullInt64, sql.NullTime, sql.NullTime, error) {
-	var aiEventTsMs sql.NullInt64
-	var sourceEventTsMs sql.NullInt64
-	var publishedAt sql.NullTime
-	var ackedAtRow sql.NullTime
-	err := s.db.QueryRowContext(ctx, `
-		WITH chosen AS (
-			SELECT id, ai_event_ts_ms, source_event_ts_ms, published_at
-			FROM control_policy_outbox
-			WHERE policy_id = $1
-			  AND command_id = $2
-			  AND status IN ('publishing', 'published', 'acked')
-			ORDER BY created_at DESC
-			LIMIT 1
-		)
-		UPDATE control_policy_outbox
-		SET status='acked',
-			ack_result=$3,
-			ack_reason=$4,
-			ack_controller=$5,
-			published_at=COALESCE(published_at, COALESCE($6, now())),
-			acked_at=COALESCE($6, now()),
-			updated_at=now()
-		WHERE id IN (SELECT id FROM chosen)
-		RETURNING (SELECT ai_event_ts_ms FROM chosen), (SELECT source_event_ts_ms FROM chosen), (SELECT published_at FROM chosen), acked_at
-	`, policyID, commandID, result, reason, controller, ackedAt).Scan(&aiEventTsMs, &sourceEventTsMs, &publishedAt, &ackedAtRow)
-	if err != nil && isSourceEventColumnMissingErr(err) {
-		return s.correlateByCommandIDLegacyNoCutoff(ctx, policyID, commandID, result, reason, controller, ackedAt)
-	}
-	return aiEventTsMs, sourceEventTsMs, publishedAt, ackedAtRow, err
-}
-
 func (s *Store) correlateExact(ctx context.Context, policyID string, ruleHash []byte, traceID, result, reason, controller string, ackedAt sql.NullTime, cutoff time.Time) (sql.NullInt64, sql.NullInt64, sql.NullTime, sql.NullTime, error) {
 	var aiEventTsMs sql.NullInt64
 	var sourceEventTsMs sql.NullInt64
@@ -549,39 +543,6 @@ func (s *Store) correlateExact(ctx context.Context, policyID string, ruleHash []
 	`, policyID, ruleHash, traceID, result, reason, controller, ackedAt, cutoff).Scan(&aiEventTsMs, &sourceEventTsMs, &publishedAt, &ackedAtRow)
 	if err != nil && isSourceEventColumnMissingErr(err) {
 		return s.correlateExactLegacy(ctx, policyID, ruleHash, traceID, result, reason, controller, ackedAt, cutoff)
-	}
-	return aiEventTsMs, sourceEventTsMs, publishedAt, ackedAtRow, err
-}
-
-func (s *Store) correlateExactNoCutoff(ctx context.Context, policyID string, ruleHash []byte, traceID, result, reason, controller string, ackedAt sql.NullTime) (sql.NullInt64, sql.NullInt64, sql.NullTime, sql.NullTime, error) {
-	var aiEventTsMs sql.NullInt64
-	var sourceEventTsMs sql.NullInt64
-	var publishedAt sql.NullTime
-	var ackedAtRow sql.NullTime
-	err := s.db.QueryRowContext(ctx, `
-		WITH chosen AS (
-			SELECT id, ai_event_ts_ms, source_event_ts_ms, published_at
-			FROM control_policy_outbox
-			WHERE policy_id = $1
-			  AND rule_hash = $2
-			  AND trace_id = $3
-			  AND status IN ('publishing', 'published', 'acked')
-			ORDER BY created_at DESC
-			LIMIT 1
-		)
-		UPDATE control_policy_outbox
-		SET status='acked',
-			ack_result=$4,
-			ack_reason=$5,
-			ack_controller=$6,
-			published_at=COALESCE(published_at, COALESCE($7, now())),
-			acked_at=COALESCE($7, now()),
-			updated_at=now()
-		WHERE id IN (SELECT id FROM chosen)
-		RETURNING (SELECT ai_event_ts_ms FROM chosen), (SELECT source_event_ts_ms FROM chosen), (SELECT published_at FROM chosen), acked_at
-	`, policyID, ruleHash, traceID, result, reason, controller, ackedAt).Scan(&aiEventTsMs, &sourceEventTsMs, &publishedAt, &ackedAtRow)
-	if err != nil && isSourceEventColumnMissingErr(err) {
-		return s.correlateExactLegacyNoCutoff(ctx, policyID, ruleHash, traceID, result, reason, controller, ackedAt)
 	}
 	return aiEventTsMs, sourceEventTsMs, publishedAt, ackedAtRow, err
 }
@@ -708,63 +669,6 @@ func (s *Store) correlateByCommandIDLegacy(ctx context.Context, policyID, comman
 		WHERE id IN (SELECT id FROM chosen)
 		RETURNING (SELECT ai_event_ts_ms FROM chosen), (SELECT published_at FROM chosen), acked_at
 	`, policyID, commandID, result, reason, controller, ackedAt, cutoff).Scan(&aiEventTsMs, &publishedAt, &ackedAtRow)
-	return aiEventTsMs, sql.NullInt64{}, publishedAt, ackedAtRow, err
-}
-
-func (s *Store) correlateByCommandIDLegacyNoCutoff(ctx context.Context, policyID, commandID, result, reason, controller string, ackedAt sql.NullTime) (sql.NullInt64, sql.NullInt64, sql.NullTime, sql.NullTime, error) {
-	var aiEventTsMs sql.NullInt64
-	var publishedAt sql.NullTime
-	var ackedAtRow sql.NullTime
-	err := s.db.QueryRowContext(ctx, `
-		WITH chosen AS (
-			SELECT id, ai_event_ts_ms, published_at
-			FROM control_policy_outbox
-			WHERE policy_id = $1
-			  AND command_id = $2
-			  AND status IN ('publishing', 'published', 'acked')
-			ORDER BY created_at DESC
-			LIMIT 1
-		)
-		UPDATE control_policy_outbox
-		SET status='acked',
-			ack_result=$3,
-			ack_reason=$4,
-			ack_controller=$5,
-			published_at=COALESCE(published_at, COALESCE($6, now())),
-			acked_at=COALESCE($6, now()),
-			updated_at=now()
-		WHERE id IN (SELECT id FROM chosen)
-		RETURNING (SELECT ai_event_ts_ms FROM chosen), (SELECT published_at FROM chosen), acked_at
-	`, policyID, commandID, result, reason, controller, ackedAt).Scan(&aiEventTsMs, &publishedAt, &ackedAtRow)
-	return aiEventTsMs, sql.NullInt64{}, publishedAt, ackedAtRow, err
-}
-
-func (s *Store) correlateExactLegacyNoCutoff(ctx context.Context, policyID string, ruleHash []byte, traceID, result, reason, controller string, ackedAt sql.NullTime) (sql.NullInt64, sql.NullInt64, sql.NullTime, sql.NullTime, error) {
-	var aiEventTsMs sql.NullInt64
-	var publishedAt sql.NullTime
-	var ackedAtRow sql.NullTime
-	err := s.db.QueryRowContext(ctx, `
-		WITH chosen AS (
-			SELECT id, ai_event_ts_ms, published_at
-			FROM control_policy_outbox
-			WHERE policy_id = $1
-			  AND rule_hash = $2
-			  AND trace_id = $3
-			  AND status IN ('publishing', 'published', 'acked')
-			ORDER BY created_at DESC
-			LIMIT 1
-		)
-		UPDATE control_policy_outbox
-		SET status='acked',
-			ack_result=$4,
-			ack_reason=$5,
-			ack_controller=$6,
-			published_at=COALESCE(published_at, COALESCE($7, now())),
-			acked_at=COALESCE($7, now()),
-			updated_at=now()
-		WHERE id IN (SELECT id FROM chosen)
-		RETURNING (SELECT ai_event_ts_ms FROM chosen), (SELECT published_at FROM chosen), acked_at
-	`, policyID, ruleHash, traceID, result, reason, controller, ackedAt).Scan(&aiEventTsMs, &publishedAt, &ackedAtRow)
 	return aiEventTsMs, sql.NullInt64{}, publishedAt, ackedAtRow, err
 }
 

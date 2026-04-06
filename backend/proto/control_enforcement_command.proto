@@ -18,7 +18,7 @@ message EnforcementCommandEvent {
   string policy_id = 6;
 
   // Command semantics
-  string action_type = 7; // drop | reject | remove | force_reauth | disable_export | freeze_user | freeze_tenant | throttle_action
+  string action_type = 7; // drop | reject | remove | force_reauth | disable_export | freeze_user | freeze_tenant | throttle_action | disable_ai_api_for_scope
   string control_action = 8; // add | remove | approve | reject
   string rule_type = 9;
   bytes rule_hash = 10;

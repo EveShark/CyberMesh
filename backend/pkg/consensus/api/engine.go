@@ -80,6 +80,8 @@ type ConsensusEngine struct {
 
 	consensusActive bool
 	activationMu    sync.Mutex
+	lastSubmitView  uint64
+	lastSubmitAt    time.Time
 
 	// Network publisher (optional)
 	net NetworkPublisher
@@ -100,6 +102,10 @@ type ConsensusEngine struct {
 	activationActiveWindow  time.Duration
 	activationForce         bool
 	activationSeenGates     bool
+
+	// Relay guard for peer proposals: each proposal hash is relayed at most once
+	// per node to improve fanout without re-broadcast storms.
+	relayedProposalHashes sync.Map // key string(hash[:]) -> struct{}
 }
 
 type leaderHandshakeState struct {
@@ -373,6 +379,7 @@ func NewConsensusEngine(
 		stopCh:            make(chan struct{}),
 		readyValidators:   make(map[ctypes.ValidatorID]time.Time),
 		genesisBackend:    genesisBackend,
+		lastSubmitView:    ^uint64(0),
 	}
 
 	// Default to a no-op network publisher so single-node deployments continue running
@@ -434,6 +441,10 @@ func (e *ConsensusEngine) initializeComponents() error {
 		MaxVotesPerView:   e.configMgr.GetInt("CONSENSUS_MAX_VOTES_PER_VIEW", 10000),
 		MaxQCs:            e.configMgr.GetInt("CONSENSUS_MAX_QCS", 1000),
 		MaxEvidence:       e.configMgr.GetInt("CONSENSUS_MAX_EVIDENCE", 10000),
+		MaxProposalSize:   encoderConfig.MaxProposalSize,
+		MaxVoteSize:       encoderConfig.MaxVoteSize,
+		MaxQCSize:         encoderConfig.MaxQCSize,
+		MaxEvidenceSize:   encoderConfig.MaxEvidenceSize,
 		EnablePersistence: e.configMgr.GetBool("CONSENSUS_ENABLE_PERSISTENCE", true),
 		PersistInterval:   e.configMgr.GetDuration("CONSENSUS_PERSIST_INTERVAL", 10*time.Second),
 		AutoPrune:         e.configMgr.GetBool("CONSENSUS_AUTO_PRUNE", true),
@@ -798,8 +809,19 @@ func (e *ConsensusEngine) SubmitBlock(ctx context.Context, block Block) error {
 	}
 
 	if !isLeader {
-		return fmt.Errorf("not the leader for view %d", currentView)
+		return fmt.Errorf("%w: not the leader for view %d", ErrLeaderLost, currentView)
 	}
+	e.mu.Lock()
+	if e.lastSubmitView == currentView {
+		e.mu.Unlock()
+		e.logger.WarnContext(ctx, "duplicate local submit blocked",
+			"view", currentView,
+			"height", block.GetHeight())
+		return fmt.Errorf("%w: duplicate local submit blocked for view %d", ErrAlreadyVotedView, currentView)
+	}
+	e.lastSubmitView = currentView
+	e.lastSubmitAt = time.Now()
+	e.mu.Unlock()
 	if eligible, reason := e.IsLocalLeaderEligible(ctx, currentView); !eligible {
 		if reason == "" {
 			reason = "leader ineligible"
@@ -808,7 +830,7 @@ func (e *ConsensusEngine) SubmitBlock(ctx context.Context, block Block) error {
 			"view", currentView,
 			"reason", reason,
 		)
-		return fmt.Errorf("leader ineligible to propose in view %d: %s", currentView, reason)
+		return fmt.Errorf("%w: leader ineligible to propose in view %d: %s", ErrLeaderLost, currentView, reason)
 	}
 
 	if !e.config.EnableProposing {
@@ -840,10 +862,31 @@ func (e *ConsensusEngine) SubmitBlock(ctx context.Context, block Block) error {
 		"proposal_height", proposal.Height,
 		"proposal_view", proposal.View)
 
+	// Proposal was assembled for currentView. If view advanced before self-process,
+	// this proposal is stale and should not be retried in the same call.
+	liveView := e.pacemaker.GetCurrentView()
+	if liveView != proposal.View {
+		return fmt.Errorf("%w: proposal_view=%d current_view=%d", ErrStaleProposalView, proposal.View, liveView)
+	}
+	isLeader, err = e.rotation.IsLeader(ctx, e.config.NodeID, liveView)
+	if err != nil {
+		return fmt.Errorf("failed to re-check leader status: %w", err)
+	}
+	if !isLeader {
+		return fmt.Errorf("%w: not the leader for view %d", ErrLeaderLost, liveView)
+	}
+
 	e.metrics.incrementProposalsSent()
 
 	// Process our own proposal
 	if err := e.hotstuff.OnProposal(ctx, proposal); err != nil {
+		msg := strings.ToLower(err.Error())
+		if strings.Contains(msg, "proposal view") && strings.Contains(msg, "less than current view") {
+			return fmt.Errorf("%w: %v", ErrStaleProposalView, err)
+		}
+		if strings.Contains(msg, "already voted in view") {
+			return fmt.Errorf("%w: %v", ErrAlreadyVotedView, err)
+		}
 		return fmt.Errorf("failed to process proposal: %w", err)
 	}
 
@@ -1145,6 +1188,19 @@ func (e *ConsensusEngine) OnProposal(proposal interface{}) error {
 			p = &v
 		}
 		if p != nil {
+			liveView := e.pacemaker.GetCurrentView()
+			if p.View != liveView {
+				e.logger.DebugContext(ctx, "skip proposal publish: stale proposal view",
+					"proposal_view", p.View,
+					"live_view", liveView)
+				return nil
+			}
+			// Liveness guard: relay peer proposals at most once per hash.
+			// This preserves gossip fanout in sparse meshes without unbounded
+			// same-view re-broadcast storms.
+			if p.ProposerID != e.config.NodeID && !e.markProposalRelayOnce(p.BlockHash) {
+				return nil
+			}
 			if data, err := e.encoder.Encode(p); err == nil {
 				pubTopic := e.topicFor(messages.TypeProposal)
 				if perr := e.net.Publish(ctx, pubTopic, data); perr != nil {
@@ -1159,6 +1215,14 @@ func (e *ConsensusEngine) OnProposal(proposal interface{}) error {
 		}
 	}
 	return nil
+}
+
+func (e *ConsensusEngine) markProposalRelayOnce(hash messages.BlockHash) bool {
+	key := string(hash[:])
+	if _, loaded := e.relayedProposalHashes.LoadOrStore(key, struct{}{}); loaded {
+		return false
+	}
+	return true
 }
 
 // OnVote is called when a vote is cast
@@ -1264,6 +1328,43 @@ func (e *ConsensusEngine) GetCurrentView() uint64 {
 // GetCurrentHeight returns the current block height
 func (e *ConsensusEngine) GetCurrentHeight() uint64 {
 	return e.pacemaker.GetCurrentHeight()
+}
+
+// TriggerViewChange requests a local pacemaker view change.
+// This is used by proposer-side safety guards when progress is blocked
+// inside a view (for example, already-voted conflict on a different block hash).
+func (e *ConsensusEngine) TriggerViewChange(ctx context.Context, reason string) error {
+	if e == nil || e.pacemaker == nil {
+		return fmt.Errorf("consensus pacemaker unavailable")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if reason == "" {
+		reason = "unspecified"
+	}
+	view := e.pacemaker.GetCurrentView()
+	e.logger.WarnContext(ctx, "triggering local view change",
+		"reason", reason,
+		"current_view", view)
+	if err := e.pacemaker.TriggerViewChange(ctx); err != nil {
+		return fmt.Errorf("trigger view change from view %d: %w", view, err)
+	}
+	return nil
+}
+
+// RecoverProposalWindow attempts to reconcile consensus replay-window state from
+// durable storage and synchronize pacemaker height/view with HotStuff.
+func (e *ConsensusEngine) RecoverProposalWindow(ctx context.Context, proposalHeight uint64) (bool, uint64, error) {
+	if e == nil || e.hotstuff == nil || e.pacemaker == nil {
+		return false, 0, fmt.Errorf("consensus recovery unavailable")
+	}
+	recovered, targetHeight, err := e.hotstuff.RecoverProposalWindow(ctx, proposalHeight)
+	if err != nil {
+		return false, 0, err
+	}
+	e.syncPacemakerWithHotStuff(ctx, "proposal_window_recovery")
+	return recovered, targetHeight, nil
 }
 
 // GetCurrentLeader returns the current leader

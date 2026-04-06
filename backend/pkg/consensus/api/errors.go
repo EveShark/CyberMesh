@@ -2,34 +2,47 @@ package api
 
 import (
 	"errors"
-	"fmt"
+	"strings"
 )
 
-// InvalidBlockError indicates that a block is deterministically invalid at the application/state layer.
-// It must abort commit (safety) but must not halt the entire consensus engine (liveness).
-type InvalidBlockError struct {
-	Cause error
+var (
+	// ErrStaleProposalView indicates proposal processing used an outdated view.
+	ErrStaleProposalView = errors.New("consensus stale proposal view")
+	// ErrAlreadyVotedView indicates the node already voted in the proposal view.
+	ErrAlreadyVotedView = errors.New("consensus already voted in view")
+	// ErrLeaderLost indicates local leadership was lost during submit flow.
+	ErrLeaderLost = errors.New("consensus leader lost")
+)
+
+func IsStaleProposalError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrStaleProposalView) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "proposal view") && strings.Contains(msg, "less than current view")
 }
 
-func (e *InvalidBlockError) Error() string {
-	if e == nil {
-		return "invalid block"
+func IsAlreadyVotedError(err error) bool {
+	if err == nil {
+		return false
 	}
-	if e.Cause == nil {
-		return "invalid block"
+	if errors.Is(err, ErrAlreadyVotedView) {
+		return true
 	}
-	return fmt.Sprintf("invalid block: %v", e.Cause)
+	return strings.Contains(strings.ToLower(err.Error()), "already voted in view")
 }
 
-func (e *InvalidBlockError) Unwrap() error {
-	if e == nil {
-		return nil
+func IsLeaderLostError(err error) bool {
+	if err == nil {
+		return false
 	}
-	return e.Cause
+	if errors.Is(err, ErrLeaderLost) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "not the leader for view") || strings.Contains(msg, "leader ineligible")
 }
 
-// IsInvalidBlock reports whether err (possibly wrapped) represents an InvalidBlockError.
-func IsInvalidBlock(err error) bool {
-	var ibe *InvalidBlockError
-	return errors.As(err, &ibe)
-}

@@ -3,6 +3,7 @@ package wiring
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strconv"
@@ -119,6 +120,20 @@ type Service struct {
 	replayRefreshInterval                       time.Duration
 	replayRefreshHeightWindow                   uint64
 	replayRefreshMaxHeightsTick                 int
+	lifecycleMode                               string
+	lifecycleRollbackEnabled                    bool
+	lifecycleCompactionWindow                   time.Duration
+	lifecycleCompactionMu                       sync.Mutex
+	lifecycleCompactionState                    map[string]lifecycleIntentState
+	lifecycleCompactionLastSweep                time.Time
+	lifecycleCompactionSweepInterval            time.Duration
+	lifecyclePostAdmitEvictions                 map[string]lifecycleEvictionPlan
+	lifecyclePreAdmitAllowed                    uint64
+	lifecycleMempoolAddSuccess                  uint64
+	lifecycleMempoolAddFailure                  uint64
+	lifecycleCompactionRejected                 uint64
+	lifecyclePostAdmitEvicted                   uint64
+	lifecycleCompactionSuperseded               uint64
 	policyOutboxDispatcher                      *policyoutbox.Dispatcher
 	policyOutboxStore                           *policyoutbox.Store
 	policyAckCons                               *policyack.Consumer
@@ -139,6 +154,7 @@ type Service struct {
 	lastProposedView     uint64   // Last view we proposed in (debug visibility)
 	lastProposedHeight   uint64   // Last height we proposed (for cooldown logging)
 	lastProposalTime     time.Time
+	proposalBlockedView  uint64 // View temporarily blocked after already-voted safety guard fires.
 	proposalCooldown     time.Duration
 	backlogCooldown      time.Duration
 	policyFastCooldown   time.Duration
@@ -270,14 +286,16 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 		policyFastCooldown: cfg.PolicyFastCooldown,
 		backlogTxThreshold: cfg.BacklogTxThreshold,
 		// startTime will be set in Start() after genesis completes
-		genesisGracePeriod:     cfg.GenesisGracePeriod,
-		proposedTxHold:         make(map[[32]byte]time.Time),
-		proposeTriggerCh:       make(chan struct{}, 1),
-		proposeTriggerLogEvery: 100,
-		persistBackfillPending: make(map[uint64]pendingPersistenceEntry),
-		persistTakeoverSeen:    make(map[uint64]time.Time),
-		replayCommittedTx:      make(map[[32]byte]time.Time),
-		policyTraceCollector:   policytrace.NewCollector(4096, 64),
+		genesisGracePeriod:          cfg.GenesisGracePeriod,
+		proposedTxHold:              make(map[[32]byte]time.Time),
+		proposeTriggerCh:            make(chan struct{}, 1),
+		proposeTriggerLogEvery:      100,
+		persistBackfillPending:      make(map[uint64]pendingPersistenceEntry),
+		persistTakeoverSeen:         make(map[uint64]time.Time),
+		replayCommittedTx:           make(map[[32]byte]time.Time),
+		lifecycleCompactionState:    make(map[string]lifecycleIntentState),
+		lifecyclePostAdmitEvictions: make(map[string]lifecycleEvictionPlan),
+		policyTraceCollector:        policytrace.NewCollector(4096, 64),
 	}
 	s.persistDetachedCtx, s.persistDetachedCancel = context.WithCancel(context.Background())
 	defer func() {
@@ -379,6 +397,10 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 	s.replayRefreshInterval = 30 * time.Second
 	s.replayRefreshHeightWindow = 512
 	s.replayRefreshMaxHeightsTick = 32
+	s.lifecycleMode = "enforce"
+	s.lifecycleRollbackEnabled = true
+	s.lifecycleCompactionWindow = 30 * time.Second
+	s.lifecycleCompactionSweepInterval = 5 * time.Second
 	if cfg.ConfigManager != nil {
 		source := strings.ToLower(strings.TrimSpace(cfg.ConfigManager.GetString("CONTROL_POLICY_PUBLISH_SOURCE", "both")))
 		switch source {
@@ -541,6 +563,26 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 		if s.replayRefreshMaxHeightsTick <= 0 {
 			s.replayRefreshMaxHeightsTick = 32
 		}
+		lifecycleMode := strings.ToLower(strings.TrimSpace(cfg.ConfigManager.GetString("LIFECYCLE_MODE", "enforce")))
+		switch lifecycleMode {
+		case "off", "audit", "enforce":
+			s.lifecycleMode = lifecycleMode
+		default:
+			s.lifecycleMode = "enforce"
+			if log != nil {
+				log.Warn("Invalid LIFECYCLE_MODE; defaulting to enforce",
+					utils.ZapString("value", lifecycleMode))
+			}
+		}
+		s.lifecycleRollbackEnabled = cfg.ConfigManager.GetBool("LIFECYCLE_ROLLBACK_ENABLED", true)
+		s.lifecycleCompactionWindow = cfg.ConfigManager.GetDuration("LIFECYCLE_COMPACTION_WINDOW", 30*time.Second)
+		if s.lifecycleCompactionWindow < 0 {
+			s.lifecycleCompactionWindow = 0
+		}
+		s.lifecycleCompactionSweepInterval = cfg.ConfigManager.GetDuration("LIFECYCLE_COMPACTION_SWEEP_INTERVAL", 5*time.Second)
+		if s.lifecycleCompactionSweepInterval < 0 {
+			s.lifecycleCompactionSweepInterval = 0
+		}
 		if log != nil {
 			log.Info("Configured persistence writer mode",
 				utils.ZapString("persist_writer_mode", s.persistWriterMode),
@@ -572,7 +614,11 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 				utils.ZapBool("tx_replay_refresh_leader_only", s.replayRefreshLeaderOnly),
 				utils.ZapDuration("tx_replay_refresh_interval", s.replayRefreshInterval),
 				utils.ZapUint64("tx_replay_refresh_height_window", s.replayRefreshHeightWindow),
-				utils.ZapInt("tx_replay_refresh_max_heights_per_tick", s.replayRefreshMaxHeightsTick))
+				utils.ZapInt("tx_replay_refresh_max_heights_per_tick", s.replayRefreshMaxHeightsTick),
+				utils.ZapString("lifecycle_mode", s.lifecycleMode),
+				utils.ZapBool("lifecycle_rollback_enabled", s.lifecycleRollbackEnabled),
+				utils.ZapDuration("lifecycle_compaction_window", s.lifecycleCompactionWindow),
+				utils.ZapDuration("lifecycle_compaction_sweep_interval", s.lifecycleCompactionSweepInterval))
 		}
 	}
 	if s.persistDirectFallbackMaxInFlight <= 0 {
@@ -599,6 +645,7 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 	// Ensure first proposal in view 0 isn't suppressed by cooldown guard
 	s.lastProposedView = ^uint64(0)
 	s.lastProposedHeight = ^uint64(0)
+	s.proposalBlockedView = ^uint64(0)
 
 	// Initialize Kafka producer if enabled (must be before persistence worker)
 	var kafkaProducer *kafka.Producer
@@ -920,12 +967,20 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 			if s.shouldRejectReplayOnAdmit(tx, time.Now()) {
 				return kafka.ErrReplayRejected
 			}
+			if err := s.enforceLifecyclePreAdmit(topic, tx); err != nil {
+				return err
+			}
 			return nil
 		})
+		kafkaConsumer.SetLifecycleAdmissionMode(s.lifecycleMode, s.lifecycleRollbackEnabled)
 		s.kafkaConsumer = kafkaConsumer
-		s.kafkaConsumer.SetPostAdmitHook(func(topic string, _ state.Transaction) {
+		s.kafkaConsumer.SetPostAdmitHook(func(topic string, tx state.Transaction) {
+			s.applyLifecyclePostAdmit(topic, tx)
 			// Wake proposer promptly after new mempool admissions.
 			s.notifyProposeTrigger("kafka_admit")
+		})
+		s.kafkaConsumer.SetAdmitFailedHook(func(topic string, tx state.Transaction, _ error) {
+			s.handleLifecycleAdmitFailed(topic, tx)
 		})
 
 		// Best-effort topic validation: warn if topics missing or have no partitions
@@ -1203,23 +1258,32 @@ func (s *Service) Start(ctx context.Context) error {
 		}
 	}
 
-	// Bootstrap the replay filter from durable storage before Kafka consumption starts.
-	// This closes the restart window where already-committed transactions could be
-	// re-admitted and proposed again before the periodic refresh loop runs.
+	// Bootstrap replay filter from durable storage as best-effort async work.
+	// Startup must remain non-blocking so validator API/readiness comes up even
+	// if cloud DB is slow under load.
 	if s.replayFilterEnabled && s.replayRefreshEnabled && s.persistWorker != nil {
-		bootstrapCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err := s.bootstrapReplayFilterFromDB(bootstrapCtx)
-		cancel()
-		if err != nil {
-			if s.persistWorker != nil {
-				_ = s.persistWorker.Stop()
+		go func() {
+			bootstrapCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			err := s.bootstrapReplayFilterFromDB(bootstrapCtx)
+			if err == nil {
+				if s.log != nil {
+					s.log.InfoContext(ctx, "Replay filter bootstrapped from storage",
+						utils.ZapUint64("entries", uint64(s.replayFilterSize())))
+				}
+				return
 			}
-			return fmt.Errorf("failed to bootstrap replay filter from storage: %w", err)
-		}
-		if s.log != nil {
-			s.log.InfoContext(ctx, "Replay filter bootstrapped from storage",
-				utils.ZapUint64("entries", uint64(s.replayFilterSize())))
-		}
+			// Fail-open on timeout/error and rely on periodic refresh loop.
+			if s.log != nil {
+				if errors.Is(err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(err.Error()), "timeout") {
+					s.log.WarnContext(ctx, "Replay filter bootstrap timed out; continuing with refresh loop",
+						utils.ZapError(err))
+					return
+				}
+				s.log.WarnContext(ctx, "Replay filter bootstrap failed; continuing with refresh loop",
+					utils.ZapError(err))
+			}
+		}()
 	}
 
 	// Start Kafka consumer if configured
@@ -1468,6 +1532,10 @@ func (s *Service) GetCommitPathStats() (apiserver.CommitPathStats, bool) {
 	if s.persistWorker != nil {
 		workerTiming = s.persistWorker.GetTimingStats()
 	}
+	builderStats := block.BuilderStats{}
+	if s.builder != nil {
+		builderStats = s.builder.Stats()
+	}
 	return apiserver.CommitPathStats{
 		LogSampleEvery:                       s.commitLogEveryN,
 		LogsSuppressed:                       atomic.LoadUint64(&s.commitLogsSuppressed),
@@ -1510,6 +1578,16 @@ func (s *Service) GetCommitPathStats() (apiserver.CommitPathStats, bool) {
 		PersistExecuteProposer:               atomic.LoadUint64(&s.persistExecuteProposer),
 		PersistExecuteNonProposer:            atomic.LoadUint64(&s.persistExecuteNonProposer),
 		PersistExecuteDroppedNonOwner:        atomic.LoadUint64(&s.persistExecuteDroppedNonOwner),
+		LifecyclePreAdmitAllowed:             atomic.LoadUint64(&s.lifecyclePreAdmitAllowed),
+		LifecycleMempoolAddSuccess:           atomic.LoadUint64(&s.lifecycleMempoolAddSuccess),
+		LifecycleMempoolAddFailure:           atomic.LoadUint64(&s.lifecycleMempoolAddFailure),
+		LifecycleCompactionRejected:          atomic.LoadUint64(&s.lifecycleCompactionRejected),
+		LifecyclePostAdmitEvicted:            atomic.LoadUint64(&s.lifecyclePostAdmitEvicted),
+		LifecycleCompactionSuperseded:        atomic.LoadUint64(&s.lifecycleCompactionSuperseded),
+		BuilderP0ReservedPickTotal:           builderStats.P0ReservedPickTotal,
+		BuilderFairSharePickTotal:            builderStats.FairSharePickTotal,
+		BuilderFairShareRoundsTotal:          builderStats.FairShareRoundsTotal,
+		BuilderFairShareStarvedTotal:         builderStats.FairShareStarvedTotal,
 		ApplyBlockRuns:                       metricsSnap.ApplyBlockRuns,
 		ApplyBlockEventTxs:                   metricsSnap.ApplyBlockEventTxs,
 		ApplyBlockEvidenceTxs:                metricsSnap.ApplyBlockEvidenceTxs,

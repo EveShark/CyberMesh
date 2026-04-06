@@ -85,6 +85,16 @@ type CommitPathStats struct {
 	PersistExecuteProposer               uint64
 	PersistExecuteNonProposer            uint64
 	PersistExecuteDroppedNonOwner        uint64
+	LifecyclePreAdmitAllowed             uint64
+	LifecycleMempoolAddSuccess           uint64
+	LifecycleMempoolAddFailure           uint64
+	LifecycleCompactionRejected          uint64
+	LifecyclePostAdmitEvicted            uint64
+	LifecycleCompactionSuperseded        uint64
+	BuilderP0ReservedPickTotal           uint64
+	BuilderFairSharePickTotal            uint64
+	BuilderFairShareRoundsTotal          uint64
+	BuilderFairShareStarvedTotal         uint64
 	ApplyBlockRuns                       uint64
 	ApplyBlockEventTxs                   uint64
 	ApplyBlockEvidenceTxs                uint64

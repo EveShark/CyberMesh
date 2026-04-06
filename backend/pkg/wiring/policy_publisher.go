@@ -74,6 +74,7 @@ var supportedPolicyActions = map[string]struct{}{
 	"freeze_user":     {},
 	"freeze_tenant":   {},
 	"throttle_action": {},
+	"disable_ai_api_for_scope": {},
 	"rate_limit":      {},
 }
 

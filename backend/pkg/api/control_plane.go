@@ -16,7 +16,11 @@ import (
 
 	"backend/pkg/control/policyoutbox"
 	"backend/pkg/control/policytrace"
+	"backend/pkg/observability"
 	"backend/pkg/utils"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -774,8 +778,22 @@ func (s *Server) handleControlOutboxGet(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleControlTraceList(w http.ResponseWriter, r *http.Request) {
+	ctx, span := observability.Tracer("backend/control-plane").Start(
+		r.Context(),
+		"backend.control.trace_list",
+		trace.WithAttributes(
+			attribute.String("http.method", r.Method),
+			attribute.String("http.route", "/control/trace"),
+			attribute.String("query.policy_id", strings.TrimSpace(r.URL.Query().Get("policy_id"))),
+			attribute.String("query.trace_id", strings.TrimSpace(r.URL.Query().Get("trace_id"))),
+		),
+	)
+	defer span.End()
+	r = r.WithContext(ctx)
 	const endpointName = "control.trace.list"
 	if err := s.checkControlBreaker(endpointName); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "control_breaker_open")
 		writeErrorResponse(w, r, "CONTROL_API_CIRCUIT_OPEN", "trace endpoint temporarily unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -934,6 +952,8 @@ func (s *Server) handleControlTraceList(w http.ResponseWriter, r *http.Request) 
 	defer cancel()
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "trace_query_failed")
 		s.noteControlTimeout(err, false)
 		writeErrorResponse(w, r, "TRACE_QUERY_FAILED", "failed to query trace rows", http.StatusInternalServerError)
 		s.recordControlBreakerFailure(endpointName)
@@ -959,6 +979,8 @@ func (s *Server) handleControlTraceList(w http.ResponseWriter, r *http.Request) 
 		items = append(items, outboxRowToDTO(row))
 	}
 	if err := rows.Err(); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "trace_iteration_failed")
 		s.noteControlTimeout(err, false)
 		writeErrorResponse(w, r, "TRACE_ITERATION_FAILED", "failed to iterate trace rows", http.StatusInternalServerError)
 		s.recordControlBreakerFailure(endpointName)
@@ -976,12 +998,26 @@ func (s *Server) handleControlTraceList(w http.ResponseWriter, r *http.Request) 
 		Rows:       items,
 		Pagination: controlListMeta{Limit: limit, NextCursor: nextCursor},
 	}), http.StatusOK)
+	span.SetAttributes(attribute.Int("trace.rows", len(items)))
+	span.SetStatus(codes.Ok, "trace_list_ok")
 	s.recordControlBreakerSuccess(endpointName)
 }
 
 func (s *Server) handleControlTraceByPolicy(w http.ResponseWriter, r *http.Request) {
+	ctx, span := observability.Tracer("backend/control-plane").Start(
+		r.Context(),
+		"backend.control.trace_by_policy",
+		trace.WithAttributes(
+			attribute.String("http.method", r.Method),
+			attribute.String("http.route", "/control/trace/{policy_id}"),
+		),
+	)
+	defer span.End()
+	r = r.WithContext(ctx)
 	const endpointName = "control.trace.by_policy"
 	if err := s.checkControlBreaker(endpointName); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "control_breaker_open")
 		writeErrorResponse(w, r, "CONTROL_API_CIRCUIT_OPEN", "trace endpoint temporarily unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -992,7 +1028,9 @@ func (s *Server) handleControlTraceByPolicy(w http.ResponseWriter, r *http.Reque
 	}
 	prefix := strings.TrimSuffix(s.config.BasePath, "/") + "/control/trace/"
 	policyID := strings.Trim(strings.TrimPrefix(r.URL.Path, prefix), "/")
+	span.SetAttributes(attribute.String("policy.id", policyID))
 	if policyID == "" {
+		span.SetStatus(codes.Error, "invalid_policy_id")
 		writeErrorResponse(w, r, "INVALID_POLICY_ID", "policy_id is required", http.StatusBadRequest)
 		return
 	}
@@ -1035,6 +1073,8 @@ func (s *Server) handleControlTraceByPolicy(w http.ResponseWriter, r *http.Reque
 		LIMIT 200
 	`, controlOutboxRequestIDSelectExpr(schema), controlOutboxCommandIDSelectExpr(schema), controlOutboxWorkflowIDSelectExpr(schema), controlOutboxAnomalyIDSelectExpr(schema), controlOutboxFlowIDSelectExpr(), controlOutboxSourceIDSelectExpr(), controlOutboxSourceTypeSelectExpr(), controlOutboxSensorIDSelectExpr(), controlOutboxValidatorIDSelectExpr(), controlOutboxScopeIdentifierSelectExpr(), controlOutboxSentinelSelectExpr(schema), outboxWhere), outboxArgs...)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "trace_outbox_query_failed")
 		s.noteControlTimeout(err, false)
 		writeErrorResponse(w, r, "TRACE_OUTBOX_QUERY_FAILED", "failed to query trace outbox rows", http.StatusInternalServerError)
 		s.recordControlBreakerFailure(endpointName)
@@ -1054,6 +1094,8 @@ func (s *Server) handleControlTraceByPolicy(w http.ResponseWriter, r *http.Reque
 			&row.AckResult, &row.AckReason, &row.AckController, &row.AckedAt,
 			&row.CreatedAt, &row.UpdatedAt, &row.RuleHash,
 		); scanErr != nil {
+			span.RecordError(scanErr)
+			span.SetStatus(codes.Error, "trace_outbox_scan_failed")
 			writeErrorResponse(w, r, "TRACE_OUTBOX_SCAN_FAILED", "failed to read trace outbox row", http.StatusInternalServerError)
 			s.recordControlBreakerFailure(endpointName)
 			return
@@ -1083,6 +1125,8 @@ func (s *Server) handleControlTraceByPolicy(w http.ResponseWriter, r *http.Reque
 		LIMIT 200
 	`, controlAckEventIDSelectExpr(schema), controlAckRequestIDSelectExpr(schema), controlAckCommandIDSelectExpr(schema), controlAckWorkflowIDSelectExpr(schema), controlAckTraceSelectExpr(schema), controlAckSourceEventSelectExpr(schema), controlAckSentinelEventSelectExpr(schema), ackWhere), ackArgs...)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "trace_acks_query_failed")
 		s.noteControlTimeout(err, false)
 		writeErrorResponse(w, r, "TRACE_ACKS_QUERY_FAILED", "failed to query trace acks", http.StatusInternalServerError)
 		s.recordControlBreakerFailure(endpointName)
@@ -1103,6 +1147,8 @@ func (s *Server) handleControlTraceByPolicy(w http.ResponseWriter, r *http.Reque
 			&row.RuleHash, &row.ProducerID,
 			&row.ObservedAt,
 		); scanErr != nil {
+			span.RecordError(scanErr)
+			span.SetStatus(codes.Error, "trace_acks_scan_failed")
 			writeErrorResponse(w, r, "TRACE_ACKS_SCAN_FAILED", "failed to read trace ack row", http.StatusInternalServerError)
 			s.recordControlBreakerFailure(endpointName)
 			return
@@ -1131,6 +1177,12 @@ func (s *Server) handleControlTraceByPolicy(w http.ResponseWriter, r *http.Reque
 		RuntimeMarkers:  runtimeMarkers,
 		Materialized:    materialized,
 	}), http.StatusOK)
+	span.SetAttributes(
+		attribute.Int("trace.outbox_rows", len(outbox)),
+		attribute.Int("trace.ack_rows", len(acks)),
+		attribute.Int("trace.runtime_markers", len(runtimeMarkers)),
+	)
+	span.SetStatus(codes.Ok, "trace_by_policy_ok")
 	s.recordControlBreakerSuccess(endpointName)
 }
 

@@ -13,7 +13,11 @@ import (
 	"time"
 
 	"backend/pkg/control/policytrace"
+	"backend/pkg/observability"
 	"backend/pkg/utils"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type Publisher interface {
@@ -103,6 +107,10 @@ type Dispatcher struct {
 	publishScopeFallback uint64
 	publishResultTotals  map[string]uint64
 	publishPartitions    map[string]uint64
+	connectCooldownMu    sync.Mutex
+	connectCooldownUntil map[string]time.Time
+	connectFailureStreak map[string]int
+	connectCooldownSkips uint64
 }
 
 type leaseRenewState struct {
@@ -269,8 +277,16 @@ func NewDispatcher(cfg Config, store storeOps, pub Publisher, logger *utils.Logg
 	if cfg.MaxInFlight <= 0 {
 		cfg.MaxInFlight = 16
 	}
+	configuredMarkWorkers := cfg.MarkWorkers
 	if cfg.MarkWorkers <= 0 {
 		cfg.MarkWorkers = maxInt(1, cfg.MaxInFlight/2)
+	}
+	// Guard against over-parallel mark fanout overwhelming cloud DB connections.
+	// Marking is DB-write heavy; effective parallelism should scale with held shards,
+	// not arbitrary large static values.
+	markWorkersCeil := maxInt(4, cfg.MaxLeaseShards*6)
+	if cfg.MarkWorkers > markWorkersCeil {
+		cfg.MarkWorkers = markWorkersCeil
 	}
 	if cfg.InternalQueue <= 0 {
 		cfg.InternalQueue = maxInt(64, cfg.MaxInFlight*4)
@@ -294,6 +310,12 @@ func NewDispatcher(cfg Config, store storeOps, pub Publisher, logger *utils.Logg
 		cfg.LogThrottle = 5 * time.Second
 	}
 	if logger != nil {
+		if configuredMarkWorkers > 0 && configuredMarkWorkers != cfg.MarkWorkers {
+			logger.Warn("Policy outbox mark workers clamped to DB-safe ceiling",
+				utils.ZapInt("configured_mark_workers", configuredMarkWorkers),
+				utils.ZapInt("effective_mark_workers", cfg.MarkWorkers),
+				utils.ZapInt("max_lease_shards", cfg.MaxLeaseShards))
+		}
 		logger.Info("Policy outbox shard compatibility mode configured",
 			utils.ZapBool("dispatch_shard_compat", cfg.DispatchShardCompat))
 	}
@@ -345,6 +367,8 @@ func NewDispatcher(cfg Config, store storeOps, pub Publisher, logger *utils.Logg
 		publishScopeRoutes:  make(map[string]uint64),
 		publishResultTotals: make(map[string]uint64),
 		publishPartitions:   make(map[string]uint64),
+		connectCooldownUntil: make(map[string]time.Time),
+		connectFailureStreak: make(map[string]int),
 	}, nil
 }
 
@@ -645,6 +669,55 @@ func (d *Dispatcher) clearLeaseState(leaseKey string) {
 	delete(d.leaseState, leaseKey)
 }
 
+const (
+	claimConnectCooldownBase = 500 * time.Millisecond
+	claimConnectCooldownMax  = 8 * time.Second
+)
+
+func (d *Dispatcher) isShardInConnectCooldown(shard string, now time.Time) bool {
+	if d == nil || shard == "" {
+		return false
+	}
+	d.connectCooldownMu.Lock()
+	defer d.connectCooldownMu.Unlock()
+	until, ok := d.connectCooldownUntil[shard]
+	if !ok {
+		return false
+	}
+	if now.Before(until) {
+		return true
+	}
+	delete(d.connectCooldownUntil, shard)
+	d.connectFailureStreak[shard] = 0
+	return false
+}
+
+func (d *Dispatcher) noteShardConnectFailure(shard string, now time.Time) time.Duration {
+	if d == nil || shard == "" {
+		return 0
+	}
+	d.connectCooldownMu.Lock()
+	defer d.connectCooldownMu.Unlock()
+	strikes := d.connectFailureStreak[shard] + 1
+	d.connectFailureStreak[shard] = strikes
+	cooldown := claimConnectCooldownBase << minInt(strikes-1, 6)
+	if cooldown > claimConnectCooldownMax {
+		cooldown = claimConnectCooldownMax
+	}
+	d.connectCooldownUntil[shard] = now.Add(cooldown)
+	return cooldown
+}
+
+func (d *Dispatcher) clearShardConnectFailure(shard string) {
+	if d == nil || shard == "" {
+		return
+	}
+	d.connectCooldownMu.Lock()
+	defer d.connectCooldownMu.Unlock()
+	delete(d.connectCooldownUntil, shard)
+	d.connectFailureStreak[shard] = 0
+}
+
 func (d *Dispatcher) releaseLeaseBestEffort(ctx context.Context, leaseKey string, epoch int64, deadline time.Time, shard string) {
 	if d == nil || d.store == nil || leaseKey == "" || epoch <= 0 {
 		return
@@ -663,11 +736,25 @@ func (d *Dispatcher) releaseLeaseBestEffort(ctx context.Context, leaseKey string
 }
 
 func (d *Dispatcher) tick(ctx context.Context, wakeAtNs int64) tickOutcome {
+	ctx, span := observability.Tracer("backend/policyoutbox").Start(
+		ctx,
+		"backend.outbox.tick",
+		trace.WithAttributes(
+			attribute.Int64("outbox.wake_at_ns", wakeAtNs),
+			attribute.Int("outbox.drain_batches", d.cfg.DrainMaxBatches),
+			attribute.Int("outbox.batch_size", d.cfg.BatchSize),
+		),
+	)
+	defer span.End()
 	tickStart := time.Now()
 	outcome := tickOutcome{}
 	defer func() {
 		atomic.AddUint64(&d.ticksTotal, 1)
 		d.tickLatency.Observe(float64(time.Since(tickStart).Milliseconds()))
+		span.SetAttributes(
+			attribute.Int("outbox.claimed_rows", outcome.claimedRows),
+			attribute.Float64("outbox.tick_duration_ms", float64(time.Since(tickStart).Milliseconds())),
+		)
 	}()
 
 	if d.cfg.RefreshSafeMode != nil {
@@ -695,6 +782,11 @@ func (d *Dispatcher) tick(ctx context.Context, wakeAtNs int64) tickOutcome {
 			if heldShards[i].disabled {
 				continue
 			}
+			if d.isShardInConnectCooldown(heldShards[i].shard, time.Now()) {
+				atomic.AddUint64(&d.connectCooldownSkips, 1)
+				heldShards[i].disabled = true
+				continue
+			}
 			if d.cfg.DrainMaxDuration > 0 && time.Now().After(deadline) {
 				break
 			}
@@ -715,7 +807,11 @@ func (d *Dispatcher) tick(ctx context.Context, wakeAtNs int64) tickOutcome {
 					activeShards++
 				}
 			}
-			claimBudget := d.claimTimeoutForShard(deadline, activeShards)
+			// Use a stable per-claim budget that is not compressed by elapsed tick time.
+			// Tight coupling to tick-remaining time can force premature local timeouts
+			// under cloud DB jitter/backpressure even when the query would succeed with
+			// the configured claim budget.
+			claimBudget := d.claimTimeoutForShard(time.Time{}, activeShards)
 			claimStart := time.Now()
 			claimCtx, claimCancel := context.WithTimeout(ctx, claimBudget)
 			rows, err := d.store.ClaimPending(claimCtx, d.holder, heldShards[i].epoch, batchSize, d.cfg.ReclaimAfter, heldShards[i].leaseKey, heldShards[i].shard, d.cfg.DispatchShardCount, d.cfg.DispatchShardCompat)
@@ -723,6 +819,10 @@ func (d *Dispatcher) tick(ctx context.Context, wakeAtNs int64) tickOutcome {
 			claimMs := float64(time.Since(claimStart).Milliseconds())
 			d.claimLatency.Observe(claimMs)
 			if err != nil {
+				span.RecordError(err, trace.WithAttributes(
+					attribute.String("outbox.dispatch_shard", heldShards[i].shard),
+					attribute.Float64("outbox.claim_ms", claimMs),
+				))
 				timeoutErr := isTimeoutErr(err)
 				budgetExhaustedErr := errors.Is(err, errClaimBudgetExhausted)
 				connectErr := isClaimConnectErr(err)
@@ -749,13 +849,26 @@ func (d *Dispatcher) tick(ctx context.Context, wakeAtNs int64) tickOutcome {
 						utils.ZapBool("budget_exhausted", budgetExhaustedErr),
 					)
 				}
+				if connectErr {
+					span.SetStatus(codes.Error, "claim_connect_error")
+				} else if timeoutErr {
+					span.SetStatus(codes.Error, "claim_timeout")
+				} else if budgetExhaustedErr {
+					span.SetStatus(codes.Error, "claim_budget_exhausted")
+				}
 				d.adjustBatchSize(batchSize, 0, claimMs)
 				if connectErr {
 					// Cloud DB connect pressure should not trigger same-tick retries
-					// for this shard; cooldown immediately and release lease so other
-					// holders can make progress when DB pressure subsides.
+					// for this shard. Cool down this shard across ticks and avoid
+					// extra DB write pressure from best-effort lease release calls.
+					cooldown := d.noteShardConnectFailure(heldShards[i].shard, time.Now())
 					heldShards[i].disabled = true
-					d.releaseLeaseBestEffort(ctx, heldShards[i].leaseKey, heldShards[i].epoch, deadline, heldShards[i].shard)
+					d.forceLeaseRefresh(heldShards[i].leaseKey)
+					if d.logger != nil && d.shouldLog("claim", &d.lastClaimErrLogAt) {
+						d.logger.WarnContext(ctx, "policy outbox shard cooled down after connect failure",
+							utils.ZapString("dispatch_shard", heldShards[i].shard),
+							utils.ZapDuration("cooldown", cooldown))
+					}
 					continue
 				}
 				if budgetExhaustedErr {
@@ -772,15 +885,16 @@ func (d *Dispatcher) tick(ctx context.Context, wakeAtNs int64) tickOutcome {
 					continue
 				}
 				// Allow one retry for timeout errors, then disable this shard for
-				// the remainder of the tick to protect healthy shards. Also release
-				// the lease best-effort so another holder can take over this shard
-				// if this holder is distressed.
+				// the remainder of the tick to protect healthy shards.
+				// Do not issue lease-release DB writes in this distressed path; that
+				// additional write pressure amplifies claim timeout storms.
 				if heldShards[i].timeoutStrikes >= 2 {
 					heldShards[i].disabled = true
-					d.releaseLeaseBestEffort(ctx, heldShards[i].leaseKey, heldShards[i].epoch, deadline, heldShards[i].shard)
+					d.forceLeaseRefresh(heldShards[i].leaseKey)
 				}
 				continue
 			}
+			d.clearShardConnectFailure(heldShards[i].shard)
 			heldShards[i].timeoutStrikes = 0
 			heldShards[i].timedOutThisTick = false
 			d.adjustBatchSize(batchSize, len(rows), claimMs)
@@ -837,6 +951,10 @@ func (d *Dispatcher) acquireLeasedShards(ctx context.Context, deadline time.Time
 		if d.cfg.DrainMaxDuration > 0 && time.Now().After(deadline) {
 			break
 		}
+		if d.isShardInConnectCooldown(shard, time.Now()) {
+			atomic.AddUint64(&d.connectCooldownSkips, 1)
+			continue
+		}
 		if len(heldShards)+len(pending) >= maxHeld {
 			break
 		}
@@ -875,7 +993,9 @@ func (d *Dispatcher) acquireLeasedShards(ctx context.Context, deadline time.Time
 		go func(job leasedShard) {
 			defer wg.Done()
 			atomic.AddUint64(&d.leaseAcquireAttempts, 1)
-			leaseCtx, leaseCancel := context.WithTimeout(ctx, d.leaseAcquireTimeout(deadline))
+			// Keep lease-acquire timeout independent from elapsed tick time so we do
+			// not self-inflict short lease timeouts during long/slow drain ticks.
+			leaseCtx, leaseCancel := context.WithTimeout(ctx, d.leaseAcquireTimeout(time.Time{}))
 			leaseStart := time.Now()
 			acquired, epoch, err := d.store.TryAcquireLease(leaseCtx, job.leaseKey, d.holder, d.cfg.LeaseTTL)
 			d.leaseAcquireLatency.Observe(float64(time.Since(leaseStart).Milliseconds()))
@@ -884,6 +1004,9 @@ func (d *Dispatcher) acquireLeasedShards(ctx context.Context, deadline time.Time
 				atomic.AddUint64(&d.leaseAcquireErrors, 1)
 				if isTimeoutErr(err) {
 					atomic.AddUint64(&d.leaseAcquireTimeouts, 1)
+				}
+				if isClaimConnectErr(err) {
+					d.noteShardConnectFailure(job.shard, time.Now())
 				}
 				if d.logger != nil && d.shouldLog("lease", &d.lastLeaseErrLogAt) {
 					d.logger.WarnContext(ctx, "policy outbox lease acquire failed", utils.ZapError(err), utils.ZapString("dispatch_shard", job.shard))
@@ -903,6 +1026,7 @@ func (d *Dispatcher) acquireLeasedShards(ctx context.Context, deadline time.Time
 				return
 			}
 			atomic.AddUint64(&d.leaseAcquireSuccess, 1)
+			d.clearShardConnectFailure(job.shard)
 			atomic.StoreInt64(&d.lastLeaseEpoch, epoch)
 			d.recordLeaseRenewed(job.leaseKey, epoch, time.Now())
 			resultsCh <- leaseAcquireResult{
@@ -1007,6 +1131,16 @@ type markTask struct {
 }
 
 func (d *Dispatcher) publishRow(ctx context.Context, row Row, deadline time.Time) (markTask, bool) {
+	ctx, span := observability.Tracer("backend/policyoutbox").Start(
+		ctx,
+		"backend.outbox.publish",
+		trace.WithAttributes(
+			attribute.String("policy.id", row.PolicyID),
+			attribute.String("outbox.id", row.ID),
+			attribute.Int64("block.height", int64(row.BlockHeight)),
+		),
+	)
+	defer span.End()
 	opCtx := ctx
 	cancel := func() {}
 	if d.cfg.DrainMaxDuration > 0 {
@@ -1036,6 +1170,8 @@ func (d *Dispatcher) publishRow(ctx context.Context, row Row, deadline time.Time
 	}
 	_, partition, offset, err := d.pub.PublishFromOutbox(opCtx, row.BlockHeight, row.BlockTS, row.Payload)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "publish_failed")
 		d.observePublishScope(scopeKind, "error", scopeBucketed, scopeFallback)
 		d.observePublishResult(d.cfg.PolicyTopic, "error", nil)
 		nextRetries := row.Retries + 1
@@ -1062,6 +1198,10 @@ func (d *Dispatcher) publishRow(ctx context.Context, row Row, deadline time.Time
 			pubStart:    start,
 		}, true
 	}
+	span.SetAttributes(
+		attribute.Int64("messaging.kafka.partition", int64(partition)),
+		attribute.Int64("messaging.kafka.offset", offset),
+	)
 	d.observePublishScope(scopeKind, "success", scopeBucketed, scopeFallback)
 	d.observePublishResult(d.cfg.PolicyTopic, "success", &partition)
 	publishAck := time.Now().UnixMilli()
@@ -1167,6 +1307,16 @@ func (d *Dispatcher) recordStageMarker(stage string, row Row, tsMs int64, partit
 }
 
 func (d *Dispatcher) handleMarkTask(ctx context.Context, task markTask, deadline time.Time) {
+	ctx, span := observability.Tracer("backend/policyoutbox").Start(
+		ctx,
+		"backend.outbox.mark",
+		trace.WithAttributes(
+			attribute.String("outbox.id", task.row.ID),
+			attribute.String("policy.id", task.row.PolicyID),
+			attribute.Int("mark.kind", int(task.kind)),
+		),
+	)
+	defer span.End()
 	opCtx := ctx
 	cancel := func() {}
 	if d.cfg.DrainMaxDuration > 0 {
@@ -1182,6 +1332,8 @@ func (d *Dispatcher) handleMarkTask(ctx context.Context, task markTask, deadline
 		markCancel()
 		d.markLatency.Observe(float64(time.Since(markStart).Milliseconds()))
 		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "mark_published_failed")
 			if strings.Contains(err.Error(), "fenced/no-op") {
 				atomic.AddUint64(&d.fencedFailures, 1)
 				d.forceLeaseRefresh(d.leaseKeyForRow(task.row))
@@ -1250,6 +1402,10 @@ func (d *Dispatcher) handleMarkTask(ctx context.Context, task markTask, deadline
 	case markTaskRetry:
 		markStart := time.Now()
 		err := d.store.MarkRetry(opCtx, task.row.ID, d.holder, task.row.LeaseEpoch, task.retries, task.nextRetryAt, task.errMsg)
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "mark_retry_failed")
+		}
 		d.markLatency.Observe(float64(time.Since(markStart).Milliseconds()))
 		if err != nil && strings.Contains(err.Error(), "fenced/no-op") {
 			atomic.AddUint64(&d.fencedFailures, 1)
@@ -1258,6 +1414,10 @@ func (d *Dispatcher) handleMarkTask(ctx context.Context, task markTask, deadline
 	case markTaskTerminal:
 		markStart := time.Now()
 		err := d.store.MarkTerminal(opCtx, task.row.ID, d.holder, task.row.LeaseEpoch, task.retries, task.errMsg)
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "mark_terminal_failed")
+		}
 		d.markLatency.Observe(float64(time.Since(markStart).Milliseconds()))
 		if err != nil && strings.Contains(err.Error(), "fenced/no-op") {
 			atomic.AddUint64(&d.fencedFailures, 1)
@@ -1537,9 +1697,24 @@ func (d *Dispatcher) claimTimeoutForShard(deadline time.Time, activeShards int) 
 	}
 	// Preserve per-shard fairness in a sequential claim loop so one slow shard
 	// cannot consume most of the tick and delay claim turns for others.
-	fairShare := remaining / time.Duration(activeShards+1)
-	if fairShare < 400*time.Millisecond {
-		fairShare = 400 * time.Millisecond
+	// Keep per-shard timeout bounded, but avoid over-tightening by reserving an
+	// extra phantom shard. Timeouts are already isolated via timeout-strike disable.
+	fairShare := remaining / time.Duration(activeShards)
+	// Keep a dynamic lower bound so fairness does not force premature deadline
+	// failures when observed claim p95 is already above the static floor.
+	minFairShare := 400 * time.Millisecond
+	if p95Ms := d.claimLatency.Quantile(0.95); p95Ms > 0 && !math.IsNaN(p95Ms) && !math.IsInf(p95Ms, 0) {
+		adaptive := time.Duration(p95Ms)*time.Millisecond + 200*time.Millisecond
+		if adaptive > minFairShare {
+			// Cap lower-bound inflation so one transient spike cannot lock fairness.
+			if adaptive > 3*time.Second {
+				adaptive = 3 * time.Second
+			}
+			minFairShare = adaptive
+		}
+	}
+	if fairShare < minFairShare {
+		fairShare = minFairShare
 	}
 	if timeout > fairShare {
 		return fairShare

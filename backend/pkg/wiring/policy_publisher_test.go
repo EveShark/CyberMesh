@@ -3,6 +3,7 @@ package wiring
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -100,6 +101,122 @@ func TestPolicyPublisher_DedupWindowExpires(t *testing.T) {
 
 	if fp.published != 2 {
 		t.Fatalf("expected 2 published policies after dedupe window expiry, got %d", fp.published)
+	}
+}
+
+func TestPolicyPublisher_DedupWindowDoesNotSuppressDistinctCommandIDs(t *testing.T) {
+	fp := &fakePolicyProducer{}
+	pp := &policyPublisher{
+		producer:      fp,
+		enabled:       true,
+		dedupeWindow:  5 * time.Minute,
+		publishedAt:   map[string]time.Time{},
+		maxCacheSize:  1024,
+		blockDuration: time.Second,
+		rateLimiter:   newPolicyRateLimiter(0),
+	}
+
+	payloadA := []byte(`{
+	  "schema_version": 1,
+	  "policy_id": "2a222222-2222-4222-8222-222222222222",
+	  "command_id": "cmd-a",
+	  "rule_type": "block",
+	  "action": "drop",
+	  "target": { "ips": ["10.0.0.9"], "direction": "ingress", "scope": "cluster" },
+	  "guardrails": { "ttl_seconds": 60, "requires_ack": true }
+	}`)
+	payloadB := []byte(`{
+	  "schema_version": 1,
+	  "policy_id": "2a222222-2222-4222-8222-222222222222",
+	  "command_id": "cmd-b",
+	  "rule_type": "block",
+	  "action": "drop",
+	  "target": { "ips": ["10.0.0.9"], "direction": "ingress", "scope": "cluster" },
+	  "guardrails": { "ttl_seconds": 60, "requires_ack": true }
+	}`)
+
+	ctx := context.Background()
+	now := time.Now().Unix()
+	pp.Publish(ctx, 205, now, 1, [][]byte{payloadA})
+	pp.Publish(ctx, 206, now+1, 1, [][]byte{payloadB})
+
+	if fp.published != 2 {
+		t.Fatalf("expected 2 published policies for distinct command ids, got %d", fp.published)
+	}
+}
+
+func TestPolicyPublisher_DedupWindowUsesNestedIdentityFields(t *testing.T) {
+	fp := &fakePolicyProducer{}
+	pp := &policyPublisher{
+		producer:      fp,
+		enabled:       true,
+		dedupeWindow:  5 * time.Minute,
+		publishedAt:   map[string]time.Time{},
+		maxCacheSize:  1024,
+		blockDuration: time.Second,
+		rateLimiter:   newPolicyRateLimiter(0),
+	}
+
+	// command_id only exists under metadata; dedupe must still treat these as distinct.
+	payloadA := []byte(`{
+	  "schema_version": 1,
+	  "policy_id": "2b222222-2222-4222-8222-222222222222",
+	  "rule_type": "block",
+	  "action": "drop",
+	  "metadata": { "command_id": "nested-cmd-a", "request_id": "rq-a" },
+	  "target": { "ips": ["10.0.0.10"], "direction": "ingress", "scope": "cluster" },
+	  "guardrails": { "ttl_seconds": 60, "requires_ack": true }
+	}`)
+	payloadB := []byte(`{
+	  "schema_version": 1,
+	  "policy_id": "2b222222-2222-4222-8222-222222222222",
+	  "rule_type": "block",
+	  "action": "drop",
+	  "metadata": { "command_id": "nested-cmd-b", "request_id": "rq-b" },
+	  "target": { "ips": ["10.0.0.10"], "direction": "ingress", "scope": "cluster" },
+	  "guardrails": { "ttl_seconds": 60, "requires_ack": true }
+	}`)
+
+	ctx := context.Background()
+	now := time.Now().Unix()
+	pp.Publish(ctx, 207, now, 1, [][]byte{payloadA})
+	pp.Publish(ctx, 208, now+1, 1, [][]byte{payloadB})
+
+	if fp.published != 2 {
+		t.Fatalf("expected 2 published policies for distinct nested command ids, got %d", fp.published)
+	}
+}
+
+func TestPolicyPublisher_DedupeSuppressedStats(t *testing.T) {
+	fp := &fakePolicyProducer{}
+	pp := &policyPublisher{
+		producer:         fp,
+		enabled:          true,
+		dedupeWindow:     5 * time.Minute,
+		publishedAt:      map[string]time.Time{},
+		dedupeSuppressed: map[string]uint64{},
+		maxCacheSize:     1024,
+		blockDuration:    time.Second,
+		rateLimiter:      newPolicyRateLimiter(0),
+	}
+	payload := []byte(`{
+	  "schema_version": 1,
+	  "policy_id": "3c333333-3333-4333-8333-333333333333",
+	  "rule_type": "block",
+	  "action": "drop",
+	  "target": { "ips": ["10.0.0.20"], "direction": "ingress", "scope": "cluster" },
+	  "guardrails": { "ttl_seconds": 60, "requires_ack": true }
+	}`)
+	ctx := context.Background()
+	now := time.Now().Unix()
+	pp.Publish(ctx, 209, now, 1, [][]byte{payload})
+	pp.Publish(ctx, 210, now+1, 1, [][]byte{payload})
+	if fp.published != 1 {
+		t.Fatalf("expected dedupe to suppress second publish, published=%d", fp.published)
+	}
+	stats := pp.statsSnapshot()
+	if stats.DedupeSuppressedByReason["within_window"] != 1 {
+		t.Fatalf("expected within_window suppressed count=1, got=%d", stats.DedupeSuppressedByReason["within_window"])
 	}
 }
 
@@ -421,7 +538,7 @@ func TestPolicyPublisher_GuardrailRejectRecordsTraceMarker(t *testing.T) {
 	}
 }
 
-func TestPolicyPublisher_DedupWindowSkipsSemanticallyEquivalentDifferentPolicyIDs(t *testing.T) {
+func TestPolicyPublisher_DedupWindowDoesNotSuppressDifferentPolicyIDs(t *testing.T) {
 	fp := &fakePolicyProducer{}
 	pp := &policyPublisher{
 		producer:      fp,
@@ -455,8 +572,8 @@ func TestPolicyPublisher_DedupWindowSkipsSemanticallyEquivalentDifferentPolicyID
 	pp.Publish(ctx, 1001, now, 1, [][]byte{payloadA})
 	pp.Publish(ctx, 1002, now+1, 1, [][]byte{payloadB})
 
-	if fp.published != 1 {
-		t.Fatalf("expected 1 published policy for semantic duplicate, got %d", fp.published)
+	if fp.published != 2 {
+		t.Fatalf("expected 2 published policies for different policy IDs, got %d", fp.published)
 	}
 }
 
@@ -479,5 +596,212 @@ func TestPolicyPublisher_ParseAllowlistSupportsStructuredAndLegacyFlat(t *testin
 	entries := guard.Allowlist.Entries()
 	if len(entries) != 3 {
 		t.Fatalf("expected 3 normalized allowlist entries, got %d", len(entries))
+	}
+}
+
+func TestPolicyPublisher_PrepareEventEnrichesContractIDsWhenMissing(t *testing.T) {
+	pp := &policyPublisher{
+		enabled:       true,
+		blockDuration: time.Second,
+		rateLimiter:   newPolicyRateLimiter(0),
+	}
+
+	raw := []byte(`{
+	  "schema_version": 1,
+	  "policy_id": "91111111-1111-4111-8111-111111111111",
+	  "rule_type": "block",
+	  "action": "drop",
+	  "target": { "ips": ["10.1.0.8"], "direction": "ingress", "scope": "cluster" },
+	  "guardrails": { "ttl_seconds": 60, "requires_ack": true }
+	}`)
+
+	evt, _, reason, err := pp.prepareEvent(100, time.Unix(1700000000, 0).UTC(), raw)
+	if err != nil || reason != "" {
+		t.Fatalf("prepareEvent failed: reason=%s err=%v", reason, err)
+	}
+	if evt == nil {
+		t.Fatal("expected non-nil event")
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(evt.GetRuleData(), &payload); err != nil {
+		t.Fatalf("rule_data must remain valid JSON: %v", err)
+	}
+
+	get := func(key string) string {
+		v, _ := payload[key].(string)
+		return v
+	}
+	if get("command_id") == "" {
+		t.Fatal("expected command_id in top-level rule_data")
+	}
+	if get("request_id") == "" {
+		t.Fatal("expected request_id in top-level rule_data")
+	}
+	if get("trace_id") == "" {
+		t.Fatal("expected trace_id in top-level rule_data")
+	}
+	if get("idempotency_key") == "" {
+		t.Fatal("expected idempotency_key in top-level rule_data")
+	}
+
+	traceMap, _ := payload["trace"].(map[string]interface{})
+	if traceMap == nil {
+		t.Fatal("expected trace object in enriched rule_data")
+	}
+	if traceID, _ := traceMap["trace_id"].(string); traceID == "" {
+		t.Fatal("expected trace.trace_id in enriched rule_data")
+	}
+	if traceID, _ := traceMap["id"].(string); traceID == "" {
+		t.Fatal("expected trace.id in enriched rule_data")
+	}
+
+	metaMap, _ := payload["metadata"].(map[string]interface{})
+	if metaMap == nil {
+		t.Fatal("expected metadata object in enriched rule_data")
+	}
+	if commandID, _ := metaMap["command_id"].(string); commandID == "" {
+		t.Fatal("expected metadata.command_id in enriched rule_data")
+	}
+}
+
+func TestPolicyPublisher_PublishFromOutboxAcceptsAppActions(t *testing.T) {
+	tests := []struct {
+		name       string
+		action     string
+		payload    string
+		wantAction string
+	}{
+		{
+			name:       "force_reauth",
+			action:     "force_reauth",
+			wantAction: "add",
+			payload:    `{"schema_version":1,"policy_id":"93333333-3333-4333-8333-333333333333","rule_type":"block","action":"force_reauth","target":{"scope":"tenant","selectors":{"tenant_id":"tenant-a","user_id":"user-a"}},"guardrails":{"ttl_seconds":60,"requires_ack":true}}`,
+		},
+		{
+			name:       "disable_export",
+			action:     "disable_export",
+			wantAction: "add",
+			payload:    `{"schema_version":1,"policy_id":"94444444-4444-4444-8444-444444444444","rule_type":"block","action":"disable_export","target":{"scope":"tenant","selectors":{"tenant_id":"tenant-a"}},"guardrails":{"ttl_seconds":60,"requires_ack":true}}`,
+		},
+		{
+			name:       "freeze_user",
+			action:     "freeze_user",
+			wantAction: "add",
+			payload:    `{"schema_version":1,"policy_id":"95555555-5555-4555-8555-555555555555","rule_type":"block","action":"freeze_user","target":{"scope":"tenant","selectors":{"tenant_id":"tenant-a","user_id":"u1"}},"guardrails":{"ttl_seconds":60,"requires_ack":true}}`,
+		},
+		{
+			name:       "freeze_tenant",
+			action:     "freeze_tenant",
+			wantAction: "add",
+			payload:    `{"schema_version":1,"policy_id":"96666666-6666-4666-8666-666666666666","rule_type":"block","action":"freeze_tenant","target":{"scope":"tenant","selectors":{"tenant_id":"tenant-a"}},"guardrails":{"ttl_seconds":60,"requires_ack":true}}`,
+		},
+		{
+			name:       "throttle_action",
+			action:     "throttle_action",
+			wantAction: "add",
+			payload:    `{"schema_version":1,"policy_id":"97777777-7777-4777-8777-777777777777","rule_type":"block","action":"throttle_action","target":{"scope":"tenant","selectors":{"tenant_id":"tenant-a"}},"guardrails":{"ttl_seconds":60,"requires_ack":true}}`,
+		},
+		{
+			name:       "rate_limit",
+			action:     "rate_limit",
+			wantAction: "add",
+			payload:    `{"schema_version":1,"policy_id":"98888888-8888-4888-8888-888888888888","rule_type":"block","action":"rate_limit","target":{"scope":"tenant","selectors":{"tenant_id":"tenant-a"}},"guardrails":{"ttl_seconds":60,"requires_ack":true}}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fp := &fakePolicyProducer{}
+			pp := &policyPublisher{
+				producer:      fp,
+				enabled:       true,
+				topic:         "control.policy.v2",
+				dedupeWindow:  5 * time.Minute,
+				publishedAt:   map[string]time.Time{},
+				maxCacheSize:  1024,
+				blockDuration: time.Second,
+				rateLimiter:   newPolicyRateLimiter(0),
+			}
+			if _, _, _, err := pp.PublishFromOutbox(context.Background(), 700, time.Now().Unix(), []byte(tc.payload)); err != nil {
+				t.Fatalf("PublishFromOutbox(%s) failed: %v", tc.action, err)
+			}
+			if len(fp.events) != 1 {
+				t.Fatalf("expected one policy event, got %d", len(fp.events))
+			}
+			if got := fp.events[0].GetAction(); got != tc.wantAction {
+				t.Fatalf("expected control action %s for %s, got %q", tc.wantAction, tc.action, got)
+			}
+		})
+	}
+}
+
+func TestPolicyPublisher_GatewayNamespaceRejectsIngressForDirectionalAction(t *testing.T) {
+	fp := &fakePolicyProducer{}
+	pp := &policyPublisher{
+		producer:      fp,
+		enabled:       true,
+		topic:         "control.policy.v2",
+		gatewayNS:     "cybermesh-gateway",
+		guardrailHits: map[string]uint64{},
+		dedupeWindow:  5 * time.Minute,
+		publishedAt:   map[string]time.Time{},
+		maxCacheSize:  1024,
+		blockDuration: time.Second,
+		rateLimiter:   newPolicyRateLimiter(0),
+	}
+
+	payload := []byte(`{
+	  "schema_version": 1,
+	  "policy_id": "9a111111-1111-4111-8111-111111111111",
+	  "rule_type": "block",
+	  "action": "drop",
+	  "target": {
+	    "ips": ["10.0.0.11"],
+	    "direction": "ingress",
+	    "scope": "namespace",
+	    "selectors": {"namespace": "cybermesh-gateway"}
+	  },
+	  "guardrails": { "ttl_seconds": 60, "requires_ack": true }
+	}`)
+
+	_, _, _, err := pp.PublishFromOutbox(context.Background(), 801, time.Now().Unix(), payload)
+	if err == nil {
+		t.Fatalf("expected gateway directional guardrail error")
+	}
+	if got := err.Error(); got == "" || !strings.Contains(got, "direction") {
+		t.Fatalf("expected direction-related error, got %q", got)
+	}
+}
+
+func TestPolicyPublisher_GatewayNamespaceAllowsAppActionWithoutDirection(t *testing.T) {
+	fp := &fakePolicyProducer{}
+	pp := &policyPublisher{
+		producer:      fp,
+		enabled:       true,
+		topic:         "control.policy.v2",
+		gatewayNS:     "cybermesh-gateway",
+		guardrailHits: map[string]uint64{},
+		dedupeWindow:  5 * time.Minute,
+		publishedAt:   map[string]time.Time{},
+		maxCacheSize:  1024,
+		blockDuration: time.Second,
+		rateLimiter:   newPolicyRateLimiter(0),
+	}
+
+	payload := []byte(`{
+	  "schema_version": 1,
+	  "policy_id": "9a222222-2222-4222-8222-222222222222",
+	  "rule_type": "block",
+	  "action": "force_reauth",
+	  "target": {
+	    "scope": "namespace",
+	    "selectors": {"namespace": "cybermesh-gateway", "tenant_id": "tenant-a", "user_id": "u1"}
+	  },
+	  "guardrails": { "ttl_seconds": 60, "requires_ack": true }
+	}`)
+
+	if _, _, _, err := pp.PublishFromOutbox(context.Background(), 802, time.Now().Unix(), payload); err != nil {
+		t.Fatalf("expected app action to pass gateway namespace guardrail, got %v", err)
 	}
 }

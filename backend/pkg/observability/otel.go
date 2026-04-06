@@ -44,6 +44,16 @@ func InitFromEnv(ctx context.Context, serviceName string) (func(context.Context)
 			sampleRatio = parsed
 		}
 	}
+	if protocol := strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_PROTOCOL")); protocol != "" &&
+		!strings.EqualFold(protocol, "http/protobuf") &&
+		!strings.EqualFold(protocol, "http") {
+		return nil, fmt.Errorf("unsupported OTEL_EXPORTER_OTLP_PROTOCOL %q (only http/protobuf is supported)", protocol)
+	}
+
+	effectiveServiceName := strings.TrimSpace(os.Getenv("OTEL_SERVICE_NAME"))
+	if effectiveServiceName == "" {
+		effectiveServiceName = serviceName
+	}
 
 	opts := []otlptracehttp.Option{
 		otlptracehttp.WithEndpoint(parsedEndpoint.Host),
@@ -61,7 +71,7 @@ func InitFromEnv(ctx context.Context, serviceName string) (func(context.Context)
 	res, err := resource.New(ctx,
 		resource.WithFromEnv(),
 		resource.WithAttributes(
-			semconv.ServiceNameKey.String(serviceName),
+			semconv.ServiceNameKey.String(effectiveServiceName),
 			attribute.String("telemetry.sdk.language", "go"),
 		),
 	)

@@ -314,10 +314,19 @@ func main() {
 	}
 
 	store := state.NewMemStore()
+	maxTxs := cfgMgr.GetInt("MEMPOOL_MAX_TXS", 1000)
+	maxBytes := cfgMgr.GetInt("MEMPOOL_MAX_BYTES", 10*1024*1024)
+	maxTxsP0 := cfgMgr.GetInt("MEMPOOL_MAX_TXS_P0", 0)
+	maxTxsP1 := cfgMgr.GetInt("MEMPOOL_MAX_TXS_P1", 0)
+	maxTxsP2 := cfgMgr.GetInt("MEMPOOL_MAX_TXS_P2", 0)
+	maxTxsP0, maxTxsP1, maxTxsP2 = sanitizeMempoolClassCaps(logger, maxTxs, maxTxsP0, maxTxsP1, maxTxsP2)
 
 	memCfg := mempool.Config{
-		MaxTxs:        cfgMgr.GetInt("MEMPOOL_MAX_TXS", 1000),
-		MaxBytes:      cfgMgr.GetInt("MEMPOOL_MAX_BYTES", 10*1024*1024),
+		MaxTxs:        maxTxs,
+		MaxBytes:      maxBytes,
+		MaxTxsP0:      maxTxsP0,
+		MaxTxsP1:      maxTxsP1,
+		MaxTxsP2:      maxTxsP2,
 		NonceTTL:      cfgMgr.GetDuration("MEMPOOL_NONCE_TTL", 15*time.Minute),
 		Skew:          cfgMgr.GetDuration("MEMPOOL_SKEW_TOLERANCE", 5*time.Minute),
 		RatePerSecond: cfgMgr.GetInt("MEMPOOL_RATE_PER_SECOND", 1000),
@@ -352,11 +361,46 @@ func main() {
 		MinMempoolTxs:            cfgMgr.GetInt("BLOCK_MIN_MEMPOOL_TXS", 1),
 		BuildInterval:            cfgMgr.GetDuration("BLOCK_BUILD_INTERVAL", 500*time.Millisecond),
 		PolicyPriorityMinTxs:     cfgMgr.GetInt("BLOCK_POLICY_PRIORITY_MIN_TXS", 0),
+		P0PriorityMinTxs:         cfgMgr.GetInt("BLOCK_P0_PRIORITY_MIN_TXS", 0),
 		MempoolCapacity:          cfgMgr.GetInt("MEMPOOL_MAX_TXS", 2000),
 		BackpressureThreshold:    cfgMgr.GetFloat64("MEMPOOL_BACKPRESSURE_THRESHOLD", 0.8),
 		LatencyThresholdSeconds:  int64(cfgMgr.GetInt("MEMPOOL_LATENCY_THRESHOLD_SECONDS", 60)),
 		MaxTxsBackpressure:       cfgMgr.GetInt("BLOCK_MAX_TXS_BACKPRESSURE", 320),
 		MaxTxsLatency:            cfgMgr.GetInt("BLOCK_MAX_TXS_LATENCY", 400),
+		FairShareEnabled:         cfgMgr.GetBool("BLOCK_FAIR_SHARE_ENABLED", true),
+		FairShareMaxPerProducer:  cfgMgr.GetInt("BLOCK_FAIR_SHARE_MAX_PER_PRODUCER", 1),
+	}
+	// Keep consensus proposal encoder limit aligned with block sizing.
+	// Without this, proposer can repeatedly fail with:
+	// "encode proposal: proposal size ... exceeds limit ...", stalling commits.
+	minProposalBytes := blockCfg.MaxBlockBytes + blockCfg.ProposalSizeReserveBytes + (512 * 1024)
+	configuredProposalBytes := cfgMgr.GetInt("CONSENSUS_MAX_PROPOSAL_SIZE", 1<<20)
+	if configuredProposalBytes < minProposalBytes {
+		logger.Warn("CONSENSUS_MAX_PROPOSAL_SIZE is too small for current block sizing; auto-adjusting",
+			utils.ZapInt("configured_bytes", configuredProposalBytes),
+			utils.ZapInt("required_min_bytes", minProposalBytes),
+			utils.ZapInt("block_max_bytes", blockCfg.MaxBlockBytes),
+			utils.ZapInt("proposal_reserve_bytes", blockCfg.ProposalSizeReserveBytes))
+		if err := cfgMgr.Set("CONSENSUS_MAX_PROPOSAL_SIZE", strconv.Itoa(minProposalBytes)); err != nil {
+			logger.Warn("failed to auto-set CONSENSUS_MAX_PROPOSAL_SIZE; proposal encoding may fail",
+				utils.ZapError(err))
+		}
+		configuredProposalBytes = minProposalBytes
+	}
+	// Keep P2P transport frame limit aligned with consensus proposal size.
+	// Otherwise proposals can pass encoding/storage but fail at publish:
+	// "message size ... exceeds maximum ...".
+	requiredP2PMessageBytes := configuredProposalBytes + (512 * 1024)
+	configuredP2PMessageBytes := cfgMgr.GetInt("P2P_MAX_MESSAGE_SIZE", 1024*1024)
+	if configuredP2PMessageBytes < requiredP2PMessageBytes {
+		logger.Warn("P2P_MAX_MESSAGE_SIZE is too small for consensus proposals; auto-adjusting",
+			utils.ZapInt("configured_bytes", configuredP2PMessageBytes),
+			utils.ZapInt("required_min_bytes", requiredP2PMessageBytes),
+			utils.ZapInt("consensus_max_proposal_size", configuredProposalBytes))
+		if err := cfgMgr.Set("P2P_MAX_MESSAGE_SIZE", strconv.Itoa(requiredP2PMessageBytes)); err != nil {
+			logger.Warn("failed to auto-set P2P_MAX_MESSAGE_SIZE; proposal publish may fail",
+				utils.ZapError(err))
+		}
 	}
 	builder := block.NewBuilder(blockCfg, mp, store, logger)
 
@@ -1118,13 +1162,41 @@ func buildWiringConfig(
 
 	dsn := strings.TrimSpace(cfgMgr.GetString("DB_DSN", ""))
 	if dsn != "" {
-		conn, err := cockroach.NewConnection(ctx, &cockroach.ConnectionConfig{
-			ConfigManager: cfgMgr,
-			Logger:        logger,
-			DSN:           dsn,
-		})
-		if err != nil {
-			return wiring.Config{}, nil, nil, nil, fmt.Errorf("cockroach connection failed: %w", err)
+		connectRetryMax := cfgMgr.GetInt("DB_CONNECT_RETRY_MAX", 6)
+		if connectRetryMax < 1 {
+			connectRetryMax = 1
+		}
+		connectRetryBackoff := cfgMgr.GetDuration("DB_CONNECT_RETRY_BACKOFF", 2*time.Second)
+		if connectRetryBackoff <= 0 {
+			connectRetryBackoff = 2 * time.Second
+		}
+
+		var (
+			conn *sql.DB
+			err  error
+		)
+		for attempt := 1; attempt <= connectRetryMax; attempt++ {
+			conn, err = cockroach.NewConnection(ctx, &cockroach.ConnectionConfig{
+				ConfigManager: cfgMgr,
+				Logger:        logger,
+				DSN:           dsn,
+			})
+			if err == nil {
+				break
+			}
+			if attempt == connectRetryMax {
+				return wiring.Config{}, nil, nil, nil, fmt.Errorf("cockroach connection failed after %d attempts: %w", connectRetryMax, err)
+			}
+			logger.Warn("cockroach connection attempt failed; retrying",
+				utils.ZapInt("attempt", attempt),
+				utils.ZapInt("max_attempts", connectRetryMax),
+				utils.ZapDuration("backoff", connectRetryBackoff),
+				utils.ZapError(err))
+			select {
+			case <-ctx.Done():
+				return wiring.Config{}, nil, nil, nil, fmt.Errorf("cockroach connection cancelled: %w", ctx.Err())
+			case <-time.After(connectRetryBackoff):
+			}
 		}
 
 		adapterCfg := &cockroach.AdapterConfig{

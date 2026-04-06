@@ -735,6 +735,22 @@ func (hs *HotStuff) checkCommitRule(ctx context.Context, qc types.QC) error {
 	qcHash := qc.GetBlockHash()
 	currentProposal := hs.storage.GetProposal(qcHash)
 	if currentProposal == nil {
+		recovered, err := hs.storage.GetProposalOrRecover(ctx, qcHash)
+		if err != nil {
+			hs.logger.WarnContext(ctx, "proposal recovery for qc block failed",
+				"qc_view", qc.GetView(),
+				"qc_height", qc.GetHeight(),
+				"block_hash", fmt.Sprintf("%x", qcHash[:8]),
+				"error", err)
+		} else if recovered != nil {
+			currentProposal = recovered
+			hs.logger.InfoContext(ctx, "recovered missing proposal for qc block from durable storage",
+				"qc_view", qc.GetView(),
+				"qc_height", qc.GetHeight(),
+				"block_hash", fmt.Sprintf("%x", qcHash[:8]))
+		}
+	}
+	if currentProposal == nil {
 		hs.logger.WarnContext(ctx, "cannot evaluate commit rule: missing proposal for qc block",
 			"qc_view", qc.GetView(),
 			"qc_height", qc.GetHeight(),
@@ -755,6 +771,20 @@ func (hs *HotStuff) checkCommitRule(ctx context.Context, qc types.QC) error {
 				"commit_height", hs.lockedQC.GetHeight())
 			hs.emitPolicyStageForStoredProposal(lockedHash, "t_2chain_commit_satisfied", time.Now().UnixMilli())
 			proposal := hs.storage.GetProposal(lockedHash)
+			if proposal == nil {
+				recovered, err := hs.storage.GetProposalOrRecover(ctx, lockedHash)
+				if err != nil {
+					hs.logger.WarnContext(ctx, "proposal recovery for committed block failed",
+						"commit_height", hs.lockedQC.GetHeight(),
+						"block_hash", fmt.Sprintf("%x", lockedHash[:8]),
+						"error", err)
+				} else if recovered != nil {
+					proposal = recovered
+					hs.logger.InfoContext(ctx, "recovered missing proposal for committed block from durable storage",
+						"commit_height", hs.lockedQC.GetHeight(),
+						"block_hash", fmt.Sprintf("%x", lockedHash[:8]))
+				}
+			}
 			if proposal == nil {
 				hs.logger.ErrorContext(ctx, "cannot find proposal for committed block")
 				return fmt.Errorf("cannot find proposal for committed block")
@@ -1357,6 +1387,29 @@ func (hs *HotStuff) GetLockedQC() types.QC {
 // re-establishing consensus from a durable committed tip.
 func (hs *HotStuff) CanRestartBootstrap(parentHash types.BlockHash, proposalHeight uint64) bool {
 	return hs.storage.AllowRestartBootstrap(parentHash, proposalHeight)
+}
+
+// RecoverProposalWindow refreshes replay-window state from durable tip and aligns
+// HotStuff height with committed height when storage catches up.
+func (hs *HotStuff) RecoverProposalWindow(ctx context.Context, proposalHeight uint64) (bool, uint64, error) {
+	if hs == nil || hs.storage == nil {
+		return false, 0, fmt.Errorf("hotstuff storage unavailable")
+	}
+	_ = ctx
+	recovered, err := hs.storage.ReconcileReplayWindow(proposalHeight, true)
+	if err != nil {
+		return false, 0, err
+	}
+	lastCommitted := hs.storage.GetLastCommittedHeight()
+	targetHeight := lastCommitted + 1
+
+	hs.mu.Lock()
+	if targetHeight > hs.currentHeight {
+		hs.currentHeight = targetHeight
+	}
+	hs.mu.Unlock()
+
+	return recovered, targetHeight, nil
 }
 
 // AdvanceView advances the consensus to a new view

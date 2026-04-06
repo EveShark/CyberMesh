@@ -49,6 +49,12 @@ type Storage struct {
 	mu sync.RWMutex
 }
 
+const (
+	replayRecoverThrottleWindow = 500 * time.Millisecond
+	replayRecoverTimeoutFast    = 1500 * time.Millisecond
+	replayRecoverTimeoutForce   = 5 * time.Second
+)
+
 type voteBackend interface {
 	SaveVote(ctx context.Context, view uint64, height uint64, voter []byte, blockHash []byte, voteHash []byte, data []byte) error
 }
@@ -69,6 +75,10 @@ type StorageConfig struct {
 	MaxVotesPerView   int
 	MaxQCs            int
 	MaxEvidence       int
+	MaxProposalSize   int
+	MaxVoteSize       int
+	MaxQCSize         int
+	MaxEvidenceSize   int
 	EnablePersistence bool
 	PersistInterval   time.Duration
 	AutoPrune         bool
@@ -83,6 +93,10 @@ func DefaultStorageConfig() *StorageConfig {
 		MaxVotesPerView:   10000,
 		MaxQCs:            1000,
 		MaxEvidence:       10000,
+		MaxProposalSize:   1 << 20,
+		MaxVoteSize:       10 << 10,
+		MaxQCSize:         100 << 10,
+		MaxEvidenceSize:   200 << 10,
 		EnablePersistence: true,
 		PersistInterval:   10 * time.Second,
 		AutoPrune:         true,
@@ -124,6 +138,18 @@ func NewStorage(
 	}
 
 	limits := messages.DefaultEncoderConfig()
+	if config.MaxProposalSize > 0 {
+		limits.MaxProposalSize = config.MaxProposalSize
+	}
+	if config.MaxVoteSize > 0 {
+		limits.MaxVoteSize = config.MaxVoteSize
+	}
+	if config.MaxQCSize > 0 {
+		limits.MaxQCSize = config.MaxQCSize
+	}
+	if config.MaxEvidenceSize > 0 {
+		limits.MaxEvidenceSize = config.MaxEvidenceSize
+	}
 
 	backgroundCtx := context.Background()
 
@@ -161,12 +187,17 @@ func (s *Storage) Start(ctx context.Context) error {
 
 	// Load persisted state from backend
 	if s.config.EnablePersistence && s.backend != nil {
-		if err := s.restoreCommittedState(ctx); err != nil {
+		restoreCommittedCtx, cancelCommitted := context.WithTimeout(ctx, 5*time.Second)
+		if err := s.restoreCommittedState(restoreCommittedCtx); err != nil {
 			s.logger.WarnContext(ctx, "failed to restore committed state", "error", err)
 		}
-		if err := s.restoreReplayWindow(ctx); err != nil {
+		cancelCommitted()
+
+		restoreReplayCtx, cancelReplay := context.WithTimeout(ctx, 8*time.Second)
+		if err := s.restoreReplayWindow(restoreReplayCtx); err != nil {
 			s.logger.WarnContext(ctx, "failed to restore replay window", "error", err)
 		}
+		cancelReplay()
 	}
 
 	// Start persistence worker
@@ -444,7 +475,9 @@ func (s *Storage) StoreProposal(p *messages.Proposal) error {
 		if windowSize == 0 {
 			windowSize = 1
 		}
-		forceRecover := p.Height > s.lastCommitted+(windowSize*2)
+		// If proposal height is outside the configured replay window, force a durable
+		// tip reconcile immediately so we do not spin on stale in-memory committed height.
+		forceRecover := p.Height > s.lastCommitted+windowSize
 		recovered, recoverErr := s.tryReconcileReplayWindowLocked(p.Height, forceRecover)
 		if recoverErr != nil {
 			s.replayWindowRecoverFailureCount++
@@ -461,6 +494,15 @@ func (s *Storage) StoreProposal(p *messages.Proposal) error {
 			s.replayWindowRecoverSuccessCount++
 		} else if recovered {
 			s.replayWindowRecoverFailureCount++
+		}
+		if !recovered && recoverErr == nil && s.logger != nil {
+			s.logger.WarnContext(s.backgroundCtx, "replay window reconcile did not advance committed height",
+				"proposal_height", p.Height,
+				"last_committed", s.lastCommitted,
+				"window_start", s.lastCommitted+1,
+				"window_end", s.lastCommitted+windowSize,
+				"force", forceRecover,
+			)
 		}
 		if !s.isWithinWindow(p.Height) {
 			return fmt.Errorf("proposal height %d outside replay window [%d, %d]",
@@ -507,7 +549,7 @@ func (s *Storage) tryReconcileReplayWindowLocked(proposalHeight uint64, force bo
 	}
 	now := time.Now()
 	// Guard repeated expensive backend lookups during hot reject loops.
-	if !force && !s.lastReplayWindowRecoverAttemptAt.IsZero() && now.Sub(s.lastReplayWindowRecoverAttemptAt) < 500*time.Millisecond {
+	if !force && !s.lastReplayWindowRecoverAttemptAt.IsZero() && now.Sub(s.lastReplayWindowRecoverAttemptAt) < replayRecoverThrottleWindow {
 		return false, nil
 	}
 	s.lastReplayWindowRecoverAttemptAt = now
@@ -517,9 +559,9 @@ func (s *Storage) tryReconcileReplayWindowLocked(proposalHeight uint64, force bo
 		recoverCtx = context.Background()
 	}
 	var cancel context.CancelFunc
-	timeout := 750 * time.Millisecond
+	timeout := replayRecoverTimeoutFast
 	if force {
-		timeout = 3 * time.Second
+		timeout = replayRecoverTimeoutForce
 	}
 	recoverCtx, cancel = context.WithTimeout(recoverCtx, timeout)
 	defer cancel()
@@ -555,12 +597,76 @@ func (s *Storage) tryReconcileReplayWindowLocked(proposalHeight uint64, force bo
 	return true, nil
 }
 
+// ReconcileReplayWindow force-refreshes in-memory replay-window committed height from
+// durable storage tip. It returns true when committed height advanced.
+func (s *Storage) ReconcileReplayWindow(proposalHeight uint64, force bool) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.tryReconcileReplayWindowLocked(proposalHeight, force)
+}
+
 // GetProposal retrieves a proposal by block hash
 func (s *Storage) GetProposal(hash BlockHash) *messages.Proposal {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	return s.proposals[hash]
+}
+
+// GetProposalOrRecover returns a proposal from memory, or attempts one bounded
+// load from durable storage when missing. On successful recovery it rehydrates
+// the replay cache for subsequent accesses.
+func (s *Storage) GetProposalOrRecover(ctx context.Context, hash BlockHash) (*messages.Proposal, error) {
+	if p := s.GetProposal(hash); p != nil {
+		return p, nil
+	}
+
+	s.mu.RLock()
+	backend := s.backend
+	s.mu.RUnlock()
+	if backend == nil {
+		return nil, nil
+	}
+
+	recoverCtx := ctx
+	if recoverCtx == nil {
+		recoverCtx = context.Background()
+	}
+	if _, hasDeadline := recoverCtx.Deadline(); !hasDeadline {
+		timeout := 2 * time.Second
+		var cancel context.CancelFunc
+		recoverCtx, cancel = context.WithTimeout(recoverCtx, timeout)
+		defer cancel()
+	}
+
+	raw, err := backend.LoadProposal(recoverCtx, hash[:])
+	if err != nil {
+		return nil, fmt.Errorf("load proposal from backend: %w", err)
+	}
+	if len(raw) == 0 {
+		return nil, nil
+	}
+
+	proposal, err := s.decodeProposal(raw)
+	if err != nil {
+		return nil, fmt.Errorf("decode recovered proposal: %w", err)
+	}
+	if proposal == nil {
+		return nil, nil
+	}
+	if proposal.BlockHash != hash {
+		return nil, fmt.Errorf("recovered proposal hash mismatch")
+	}
+
+	s.mu.Lock()
+	// Another goroutine may have restored the same proposal while we were loading.
+	if existing := s.proposals[hash]; existing != nil {
+		s.mu.Unlock()
+		return existing, nil
+	}
+	s.proposals[hash] = proposal
+	s.mu.Unlock()
+	return proposal, nil
 }
 
 // StoreVote stores a vote

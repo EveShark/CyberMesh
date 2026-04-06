@@ -618,6 +618,56 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 		fmt.Fprintf(w, "# HELP kafka_consumer_replay_rejected_admit_total Total messages rejected at pre-admit replay guard.\n")
 		fmt.Fprintf(w, "# TYPE kafka_consumer_replay_rejected_admit_total counter\n")
 		fmt.Fprintf(w, "kafka_consumer_replay_rejected_admit_total %d\n", consStats.ReplayRejectedAdmit)
+		fmt.Fprintf(w, "# HELP kafka_consumer_lifecycle_mode Current lifecycle mode (1 for active mode label).\n")
+		fmt.Fprintf(w, "# TYPE kafka_consumer_lifecycle_mode gauge\n")
+		mode := consStats.LifecycleMode
+		if mode == "" {
+			mode = "enforce"
+		}
+		fmt.Fprintf(w, "kafka_consumer_lifecycle_mode{mode=\"%s\"} 1\n", sanitizeLabelValue(mode))
+		fmt.Fprintf(w, "# HELP kafka_consumer_lifecycle_rollback_enabled Whether rollback lifecycle intents are enabled (1 enabled, 0 disabled).\n")
+		fmt.Fprintf(w, "# TYPE kafka_consumer_lifecycle_rollback_enabled gauge\n")
+		rollbackEnabled := 0
+		if consStats.LifecycleRollbackEnabled {
+			rollbackEnabled = 1
+		}
+		fmt.Fprintf(w, "kafka_consumer_lifecycle_rollback_enabled %d\n", rollbackEnabled)
+		fmt.Fprintf(w, "# HELP kafka_consumer_pre_admit_rejected_total Total pre-admit rejections by reason.\n")
+		fmt.Fprintf(w, "# TYPE kafka_consumer_pre_admit_rejected_total counter\n")
+		preAdmitReasons := []string{
+			"lifecycle_mode_off",
+			"lifecycle_mode_audit",
+			"lifecycle_rollback_disabled",
+			"lifecycle_policy_id_missing",
+			"lifecycle_compact_stale",
+			"lifecycle_compact_duplicate",
+			"lifecycle_compact_superseded",
+			"other",
+			"unknown",
+		}
+		for _, reason := range preAdmitReasons {
+			count := uint64(0)
+			if consStats.PreAdmitRejected != nil {
+				count = consStats.PreAdmitRejected[reason]
+			}
+			fmt.Fprintf(w, "kafka_consumer_pre_admit_rejected_total{reason=\"%s\"} %d\n", sanitizeLabelValue(reason), count)
+		}
+		fmt.Fprintf(w, "# HELP kafka_consumer_class_admitted_total Total mempool admissions by priority class.\n")
+		fmt.Fprintf(w, "# TYPE kafka_consumer_class_admitted_total counter\n")
+		fmt.Fprintf(w, "# HELP kafka_consumer_class_rejected_total Total mempool class-cap rejections by class.\n")
+		fmt.Fprintf(w, "# TYPE kafka_consumer_class_rejected_total counter\n")
+		for _, class := range []string{"p0", "p1", "p2"} {
+			admitted := uint64(0)
+			rejected := uint64(0)
+			if consStats.ClassAdmitted != nil {
+				admitted = consStats.ClassAdmitted[class]
+			}
+			if consStats.ClassRejected != nil {
+				rejected = consStats.ClassRejected[class]
+			}
+			fmt.Fprintf(w, "kafka_consumer_class_admitted_total{class=\"%s\"} %d\n", class, admitted)
+			fmt.Fprintf(w, "kafka_consumer_class_rejected_total{class=\"%s\"} %d\n", class, rejected)
+		}
 		if consStats.IngestLatencyCount > 0 {
 			fmt.Fprintf(w, "# HELP kafka_consumer_ingest_latency_seconds Histogram of Kafka consumer ingest latency in seconds.\n")
 			fmt.Fprintf(w, "# TYPE kafka_consumer_ingest_latency_seconds histogram\n")
@@ -747,6 +797,26 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 			fmt.Fprintf(w, "control_persist_execute_total{role=\"proposer\",decision=\"allowed\"} %d\n", commitStats.PersistExecuteProposer)
 			fmt.Fprintf(w, "control_persist_execute_total{role=\"non_proposer\",decision=\"allowed\"} %d\n", commitStats.PersistExecuteNonProposer)
 			fmt.Fprintf(w, "control_persist_execute_total{role=\"non_proposer\",decision=\"dropped_non_owner\"} %d\n", commitStats.PersistExecuteDroppedNonOwner)
+			fmt.Fprintf(w, "# HELP control_lifecycle_compaction_total Total lifecycle admission/compaction outcomes.\n")
+			fmt.Fprintf(w, "# TYPE control_lifecycle_compaction_total counter\n")
+			fmt.Fprintf(w, "control_lifecycle_compaction_total{result=\"pre_admit_allowed\"} %d\n", commitStats.LifecyclePreAdmitAllowed)
+			fmt.Fprintf(w, "control_lifecycle_compaction_total{result=\"mempool_add_success\"} %d\n", commitStats.LifecycleMempoolAddSuccess)
+			fmt.Fprintf(w, "control_lifecycle_compaction_total{result=\"mempool_add_failure\"} %d\n", commitStats.LifecycleMempoolAddFailure)
+			fmt.Fprintf(w, "control_lifecycle_compaction_total{result=\"rejected\"} %d\n", commitStats.LifecycleCompactionRejected)
+			fmt.Fprintf(w, "control_lifecycle_compaction_total{result=\"post_admit_evicted\"} %d\n", commitStats.LifecyclePostAdmitEvicted)
+			fmt.Fprintf(w, "control_lifecycle_compaction_total{result=\"superseded\"} %d\n", commitStats.LifecycleCompactionSuperseded)
+			fmt.Fprintf(w, "# HELP control_builder_p0_reserved_pick_total Total critical (P0) policy transactions selected due to reservation path.\n")
+			fmt.Fprintf(w, "# TYPE control_builder_p0_reserved_pick_total counter\n")
+			fmt.Fprintf(w, "control_builder_p0_reserved_pick_total %d\n", commitStats.BuilderP0ReservedPickTotal)
+			fmt.Fprintf(w, "# HELP control_builder_fairshare_pick_total Total transactions selected through fair-share scheduling rounds.\n")
+			fmt.Fprintf(w, "# TYPE control_builder_fairshare_pick_total counter\n")
+			fmt.Fprintf(w, "control_builder_fairshare_pick_total %d\n", commitStats.BuilderFairSharePickTotal)
+			fmt.Fprintf(w, "# HELP control_builder_fairshare_rounds_total Total fair-share scheduling rounds executed.\n")
+			fmt.Fprintf(w, "# TYPE control_builder_fairshare_rounds_total counter\n")
+			fmt.Fprintf(w, "control_builder_fairshare_rounds_total %d\n", commitStats.BuilderFairShareRoundsTotal)
+			fmt.Fprintf(w, "# HELP control_builder_fairshare_starved_total Total producer starvation observations during fair-share fill.\n")
+			fmt.Fprintf(w, "# TYPE control_builder_fairshare_starved_total counter\n")
+			fmt.Fprintf(w, "control_builder_fairshare_starved_total %d\n", commitStats.BuilderFairShareStarvedTotal)
 			fmt.Fprintf(w, "# HELP control_apply_block_runs_total Total ApplyBlock executions observed by the wiring layer.\n")
 			fmt.Fprintf(w, "# TYPE control_apply_block_runs_total counter\n")
 			fmt.Fprintf(w, "control_apply_block_runs_total %d\n", commitStats.ApplyBlockRuns)
@@ -1415,11 +1485,33 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 
 	// Mempool metrics (if available)
 	if s.mempool != nil {
-		// Mempool doesn't expose metrics interface in current implementation
-		// In production, you'd want to add a GetMetrics() method to mempool
 		fmt.Fprintf(w, "# HELP mempool_available Mempool availability (1=available, 0=unavailable)\n")
 		fmt.Fprintf(w, "# TYPE mempool_available gauge\n")
 		fmt.Fprintf(w, "mempool_available 1\n")
+		count, bytes, oldestTs := s.mempool.StatsDetailed()
+		fmt.Fprintf(w, "# HELP mempool_transactions Current mempool transaction count.\n")
+		fmt.Fprintf(w, "# TYPE mempool_transactions gauge\n")
+		fmt.Fprintf(w, "mempool_transactions %d\n", count)
+		fmt.Fprintf(w, "# HELP mempool_size_bytes Current mempool payload size in bytes.\n")
+		fmt.Fprintf(w, "# TYPE mempool_size_bytes gauge\n")
+		fmt.Fprintf(w, "mempool_size_bytes %d\n", bytes)
+		if oldestTs > 0 {
+			ageMs := time.Now().UnixMilli() - (oldestTs * 1000)
+			if ageMs < 0 {
+				ageMs = 0
+			}
+			fmt.Fprintf(w, "# HELP mempool_oldest_tx_age_ms Age of oldest mempool transaction in milliseconds.\n")
+			fmt.Fprintf(w, "# TYPE mempool_oldest_tx_age_ms gauge\n")
+			fmt.Fprintf(w, "mempool_oldest_tx_age_ms %d\n", ageMs)
+		}
+		classStats := s.mempool.ClassStats()
+		if len(classStats) > 0 {
+			fmt.Fprintf(w, "# HELP mempool_class_depth Current mempool depth by priority class.\n")
+			fmt.Fprintf(w, "# TYPE mempool_class_depth gauge\n")
+			for class, depth := range classStats {
+				fmt.Fprintf(w, "mempool_class_depth{class=\"%s\"} %d\n", sanitizeLabelValue(class), depth)
+			}
+		}
 	}
 
 	// Storage metrics

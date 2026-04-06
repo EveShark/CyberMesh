@@ -9,12 +9,28 @@ import (
 	"time"
 
 	"backend/pkg/block"
+	consensusapi "backend/pkg/consensus/api"
 	"backend/pkg/consensus/messages"
 	"backend/pkg/control/policytrace"
 	"backend/pkg/state"
 	"backend/pkg/utils"
 	"go.uber.org/zap"
 )
+
+func isReplayWindowErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "outside replay window")
+}
+
+func isNotLeaderErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "not the leader for view")
+}
 
 func effectiveProposalCooldown(
 	base time.Duration,
@@ -66,9 +82,25 @@ func (s *Service) runProposer(ctx context.Context) {
 		case <-s.stopCh:
 			return
 		case <-s.proposeTriggerCh:
+			s.drainProposeTriggerQueue(64)
 			s.tryPropose(ctx)
 		case <-t.C:
+			s.drainProposeTriggerQueue(64)
 			s.tryPropose(ctx)
+		}
+	}
+}
+
+func (s *Service) drainProposeTriggerQueue(maxDrain int) {
+	if s == nil || s.proposeTriggerCh == nil || maxDrain <= 0 {
+		return
+	}
+	for i := 0; i < maxDrain; i++ {
+		select {
+		case <-s.proposeTriggerCh:
+			// coalesce bursty triggers into the upcoming single tryPropose call
+		default:
+			return
 		}
 	}
 }
@@ -130,7 +162,30 @@ func (s *Service) tryPropose(ctx context.Context) {
 	lastView := s.lastProposedView
 	lastHeight := s.lastProposedHeight
 	lastTime := s.lastProposalTime
+	blockedView := s.proposalBlockedView
+	if blockedView != ^uint64(0) && blockedView != currentView {
+		s.proposalBlockedView = ^uint64(0)
+		blockedView = ^uint64(0)
+	}
 	s.mu.Unlock()
+	if blockedView == currentView {
+		s.log.DebugContext(ctx, "skipping proposal: already-voted guard blocked current view",
+			utils.ZapUint64("view", currentView),
+			utils.ZapUint64("height", currentHeight))
+		return
+	}
+	// Liveness/safety gate: never attempt a second proposal in the same view from
+	// this node. SubmitBlock already performs bounded in-call retries; additional
+	// external attempts in the same view create competing block hashes and trigger
+	// "already voted in view" conflicts.
+	if lastView == currentView {
+		s.log.DebugContext(ctx, "skipping proposal: same-view proposal already attempted",
+			utils.ZapUint64("view", currentView),
+			utils.ZapUint64("height", currentHeight),
+			utils.ZapUint64("last_height", lastHeight),
+			utils.ZapTime("last_proposal_time", lastTime))
+		return
+	}
 	effectiveCooldown := effectiveProposalCooldown(
 		cooldownWindow,
 		s.backlogCooldown,
@@ -378,7 +433,101 @@ func (s *Service) tryPropose(ctx context.Context) {
 	const maxRetries = 3
 	backoff := 50 * time.Millisecond
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		liveView := s.eng.GetCurrentView()
+		if liveView != currentView {
+			s.log.WarnContext(ctx, "[PROPOSER] aborting stale proposal attempt due to view change",
+				utils.ZapUint64("proposal_view", currentView),
+				utils.ZapUint64("live_view", liveView),
+				utils.ZapUint64("height", height),
+				utils.ZapInt("attempt", attempt+1))
+			s.metrics.IncrementProposalsFailed()
+			return
+		}
+		leaderNow, leaderErr := s.eng.IsLeader(ctx)
+		if leaderErr != nil {
+			s.log.WarnContext(ctx, "[PROPOSER] leadership re-check failed before submit",
+				utils.ZapError(leaderErr),
+				utils.ZapUint64("view", currentView),
+				utils.ZapUint64("height", height))
+			s.metrics.IncrementProposalsFailed()
+			return
+		}
+		if !leaderNow {
+			s.log.WarnContext(ctx, "[PROPOSER] aborting proposal attempt after leadership loss",
+				utils.ZapUint64("view", currentView),
+				utils.ZapUint64("height", height),
+				utils.ZapInt("attempt", attempt+1))
+			s.metrics.IncrementProposalsFailed()
+			return
+		}
 		if err := s.eng.SubmitBlock(ctx, blk); err != nil {
+			if consensusapi.IsStaleProposalError(err) {
+				s.metrics.IncrementProposalsFailed()
+				s.log.WarnContext(ctx, "[PROPOSER] submit aborted for stale proposal view",
+					utils.ZapError(err),
+					utils.ZapUint64("height", height),
+					utils.ZapInt("attempt", attempt+1))
+				return
+			}
+			if consensusapi.IsAlreadyVotedError(err) {
+				s.metrics.IncrementProposalsFailed()
+				s.log.WarnContext(ctx, "[PROPOSER] submit aborted after already-voted guard",
+					utils.ZapError(err),
+					utils.ZapUint64("height", height),
+					utils.ZapInt("attempt", attempt+1))
+				s.mu.Lock()
+				s.proposalBlockedView = currentView
+				s.mu.Unlock()
+				// Safety guard fired: this node already voted a different block in
+				// this view. Staying in the same view and re-proposing only burns
+				// cycles; request a local view change to restore liveness.
+				if vcErr := s.eng.TriggerViewChange(ctx, "already_voted_guard"); vcErr != nil {
+					s.log.WarnContext(ctx, "[PROPOSER] local view-change trigger failed after already-voted guard",
+						utils.ZapError(vcErr),
+						utils.ZapUint64("view", currentView),
+						utils.ZapUint64("height", height))
+				} else {
+					s.log.InfoContext(ctx, "[PROPOSER] local view-change trigger sent after already-voted guard",
+						utils.ZapUint64("view", currentView),
+						utils.ZapUint64("height", height))
+				}
+				return
+			}
+			if isNotLeaderErr(err) {
+				// Leadership flipped during submit; retrying immediately only adds
+				// useless load and delays the next valid leader's proposal.
+				s.metrics.IncrementProposalsFailed()
+				s.log.WarnContext(ctx, "[PROPOSER] submit aborted after leadership loss",
+					utils.ZapError(err),
+					utils.ZapUint64("height", height),
+					utils.ZapInt("attempt", attempt+1))
+				return
+			}
+			if isReplayWindowErr(err) {
+				recovered, targetHeight, recErr := s.eng.RecoverProposalWindow(ctx, height)
+				if recErr != nil {
+					s.log.WarnContext(ctx, "[PROPOSER] replay-window recovery failed",
+						utils.ZapError(recErr),
+						utils.ZapUint64("height", height),
+						utils.ZapInt("attempt", attempt+1))
+				} else {
+					s.log.WarnContext(ctx, "[PROPOSER] replay-window recovery attempted",
+						utils.ZapUint64("height", height),
+						utils.ZapUint64("target_height", targetHeight),
+						utils.ZapBool("recovered", recovered),
+						utils.ZapInt("attempt", attempt+1))
+				}
+				// Recovery failed or did not advance height: avoid immediate hot-loop
+				// retries in this call; next proposer tick will re-evaluate fresh state.
+				if recErr != nil || !recovered {
+					s.metrics.IncrementProposalsFailed()
+					s.log.ErrorContext(ctx, "[PROPOSER] submit block failed after replay-window recovery",
+						utils.ZapError(err),
+						utils.ZapUint64("height", height),
+						utils.ZapInt("attempt", attempt+1))
+					return
+				}
+			}
 			if attempt < maxRetries-1 {
 				s.log.WarnContext(ctx, "[PROPOSER] submit block failed, retrying",
 					utils.ZapError(err),

@@ -20,6 +20,7 @@ const (
 	maxClaimAttemptsHard         = 3
 	minClaimAttemptBudget        = 50 * time.Millisecond
 	reclaimPhaseMinBudget        = 400 * time.Millisecond
+	reclaimAttemptMinInterval    = 1500 * time.Millisecond
 	compatPhaseMaxBudget         = 300 * time.Millisecond
 	markPublishedRecoveryBudget  = 30 * time.Second
 	markPublishedRecoveryPerTry  = 10 * time.Second
@@ -38,6 +39,9 @@ type Store struct {
 	hasSentinelColumn bool
 	hasDispatchShard  bool
 	reclaimTimeouts   uint64
+	reclaimMu         sync.Mutex
+	reclaimAttemptAt  map[string]time.Time
+	reclaimMinInterval time.Duration
 	backlogSummaryMu  sync.Mutex
 	backlogSummaryAt  time.Time
 	backlogSummaryTTL time.Duration
@@ -51,6 +55,7 @@ func NewStore(db *sql.DB) (*Store, error) {
 	return &Store{
 		db:                db,
 		backlogSummaryTTL: 30 * time.Second,
+		reclaimMinInterval: reclaimAttemptMinInterval,
 	}, nil
 }
 
@@ -401,64 +406,46 @@ func (s *Store) ClaimPending(ctx context.Context, holderID string, epoch int64, 
 			reclaimNullCompatQuery = buildClaimQuery(compatFrom, compatNullReclaimDispatchPredicate, reclaimClauseCompat)
 		}
 	}
-	requestSelect := "''"
-	if s.hasRequestColumn {
-		requestSelect = "COALESCE(request_id, '')"
-	}
-	commandSelect := "''"
-	if s.hasCommandColumn {
-		commandSelect = "COALESCE(command_id, '')"
-	}
-	workflowSelect := "''"
-	if s.hasWorkflowColumn {
-		workflowSelect = "COALESCE(workflow_id, '')"
-	}
-	returningClause := ""
+	sourceEventTSSelect := "0::INT8"
 	if s.hasSourceColumns {
-		if s.hasSentinelColumn {
-			returningClause = `
-		RETURNING id::STRING, COALESCE(dispatch_shard, '` + dispatchShardLabel(0) + `'), block_height, block_ts, CAST(EXTRACT(EPOCH FROM created_at) * 1000 AS INT8), tx_index, policy_id, ` + requestSelect + `, ` + commandSelect + `, ` + workflowSelect + `, COALESCE(trace_id, ''), COALESCE(ai_event_ts_ms, 0), COALESCE(source_event_id, ''), COALESCE(source_event_ts_ms, 0), COALESCE(sentinel_event_id, ''), rule_hash, payload, status, retries, lease_epoch`
-		} else {
-			returningClause = `
-		RETURNING id::STRING, COALESCE(dispatch_shard, '` + dispatchShardLabel(0) + `'), block_height, block_ts, CAST(EXTRACT(EPOCH FROM created_at) * 1000 AS INT8), tx_index, policy_id, ` + requestSelect + `, ` + commandSelect + `, ` + workflowSelect + `, COALESCE(trace_id, ''), COALESCE(ai_event_ts_ms, 0), COALESCE(source_event_id, ''), COALESCE(source_event_ts_ms, 0), rule_hash, payload, status, retries, lease_epoch`
-		}
-	} else {
-		returningClause = `
-		RETURNING id::STRING, COALESCE(dispatch_shard, '` + dispatchShardLabel(0) + `'), block_height, block_ts, CAST(EXTRACT(EPOCH FROM created_at) * 1000 AS INT8), tx_index, policy_id, ` + requestSelect + `, ` + commandSelect + `, ` + workflowSelect + `, COALESCE(trace_id, ''), COALESCE(ai_event_ts_ms, 0), rule_hash, payload, status, retries, lease_epoch`
+		sourceEventTSSelect = "COALESCE(source_event_ts_ms, 0)"
 	}
+	// Keep claim RETURNING minimal to reduce timeout risk on the lock+update path.
+	// Only include fields required by publish/mark/latency markers.
+	returningClause := `
+		RETURNING id::STRING, COALESCE(dispatch_shard, '` + dispatchShardLabel(0) + `'), block_height, block_ts, CAST(EXTRACT(EPOCH FROM created_at) * 1000 AS INT8), policy_id, COALESCE(trace_id, ''), COALESCE(ai_event_ts_ms, 0), ` + sourceEventTSSelect + `, payload, retries, lease_epoch`
 	pendingQuery += returningClause
 	reclaimQuery += returningClause
 	if shardCompat {
 		pendingCompatQuery += returningClause
 		reclaimCompatQuery += returningClause
+		if pendingNullCompatQuery != "" {
+			pendingNullCompatQuery += returningClause
+		}
+		if reclaimNullCompatQuery != "" {
+			reclaimNullCompatQuery += returningClause
+		}
 	}
 	totalBudget := remainingContextBudget(ctx)
 	pendingBudget := time.Duration(0)
 	compatBudget := time.Duration(0)
-	reclaimBudget := time.Duration(0)
 	if totalBudget > 0 {
-		reclaimBudget = minDuration(reclaimPhaseMinBudget, totalBudget/3)
-		if reclaimBudget < minClaimAttemptBudget {
-			reclaimBudget = minDuration(minClaimAttemptBudget, totalBudget)
-		}
-		pendingBudget = totalBudget - reclaimBudget
-		if pendingBudget < minClaimAttemptBudget {
-			pendingBudget = minClaimAttemptBudget
-		}
+		// Keep fresh-claim path first-class. Do not pre-reserve reclaim budget
+		// up front, otherwise fresh pending claims lose timeout budget during load.
+		pendingBudget = totalBudget
 		if shardCompat {
-			compatBudget = minDuration(compatPhaseMaxBudget, pendingBudget/3)
-			if compatBudget < minClaimAttemptBudget {
-				compatBudget = minClaimAttemptBudget
+			compatCandidate := minDuration(compatPhaseMaxBudget, pendingBudget/3)
+			// Only allocate compat phase when enough headroom exists; otherwise
+			// keep full budget for strict-shard fresh claims.
+			if compatCandidate >= minClaimAttemptBudget && pendingBudget > (minClaimAttemptBudget+compatCandidate) {
+				compatBudget = compatCandidate
+				pendingBudget -= compatBudget
 			}
-			if compatBudget > pendingBudget {
-				compatBudget = pendingBudget
-			}
-			pendingBudget -= compatBudget
 		}
 	}
 
-	var claimRowsWithTimeout func(parent context.Context, query string, args []any, timeout time.Duration, detached bool) ([]Row, error)
-	claimRowsWithTimeout = func(parent context.Context, query string, args []any, timeout time.Duration, detached bool) ([]Row, error) {
+	var claimRowsWithTimeout func(parent context.Context, phase string, query string, args []any, timeout time.Duration, detached bool) ([]Row, error)
+	claimRowsWithTimeout = func(parent context.Context, phase string, query string, args []any, timeout time.Duration, detached bool) ([]Row, error) {
 		attemptCtx := parent
 		cancel := func() {}
 		if timeout > 0 {
@@ -481,11 +468,11 @@ func (s *Store) ClaimPending(ctx context.Context, holderID string, epoch int64, 
 		maxAttempts := claimMaxAttemptsForTimeout(timeout)
 		for attempt := 1; attempt <= maxAttempts; attempt++ {
 			if detached && parent != nil && errors.Is(parent.Err(), context.Canceled) {
-				return nil, fmt.Errorf("policy outbox: claim pending: %w", context.Canceled)
+				return nil, fmt.Errorf("policy outbox: claim pending phase=%s: %w", phase, context.Canceled)
 			}
 			if isBudgetNearlyExhausted(attemptCtx, minClaimAttemptBudget) {
 				budgetErr := errors.Join(errClaimBudgetExhausted, context.DeadlineExceeded, lastErr)
-				return nil, fmt.Errorf("policy outbox: claim pending: %w", budgetErr)
+				return nil, fmt.Errorf("policy outbox: claim pending phase=%s: %w", phase, budgetErr)
 			}
 			out, err := s.claimPendingOnce(attemptCtx, query, args...)
 			if err == nil {
@@ -515,20 +502,32 @@ func (s *Store) ClaimPending(ctx context.Context, holderID string, epoch int64, 
 			select {
 			case <-attemptCtx.Done():
 				timer.Stop()
-				return nil, fmt.Errorf("policy outbox: claim pending: %w", attemptCtx.Err())
+				return nil, fmt.Errorf("policy outbox: claim pending phase=%s: %w", phase, attemptCtx.Err())
 			case <-timer.C:
 			}
 			if detached && parent != nil && errors.Is(parent.Err(), context.Canceled) {
-				return nil, fmt.Errorf("policy outbox: claim pending: %w", context.Canceled)
+				return nil, fmt.Errorf("policy outbox: claim pending phase=%s: %w", phase, context.Canceled)
 			}
 		}
-		return nil, lastErr
+		return nil, fmt.Errorf("policy outbox: claim pending phase=%s: %w", phase, lastErr)
 	}
 	claimRows := func(query string, args []any) ([]Row, error) {
-		return claimRowsWithTimeout(ctx, query, args, pendingBudget, false)
+		return claimRowsWithTimeout(ctx, "strict_pending", query, args, pendingBudget, false)
 	}
 	claimCompatRows := func(query string, args []any) ([]Row, error) {
-		return claimRowsWithTimeout(ctx, query, args, compatBudget, false)
+		return claimRowsWithTimeout(ctx, "compat_pending", query, args, compatBudget, false)
+	}
+	reclaimBudgetFromRemaining := func() time.Duration {
+		remaining := remainingContextBudget(ctx)
+		if remaining <= minClaimAttemptBudget {
+			return 0
+		}
+		// Reclaim is best-effort and should never dominate fresh claim budget.
+		budget := minDuration(reclaimPhaseMinBudget, remaining/2)
+		if budget < minClaimAttemptBudget {
+			budget = minDuration(minClaimAttemptBudget, remaining)
+		}
+		return budget
 	}
 
 	setClaimLimit := func(args []any, n int) []any {
@@ -563,7 +562,15 @@ func (s *Store) ClaimPending(ctx context.Context, holderID string, epoch int64, 
 		}
 	}
 
-	reclaimRows, reclaimErr := claimRowsWithTimeout(ctx, reclaimQuery, setClaimLimit(reclaimArgs, limit), reclaimBudget, true)
+	if !s.shouldAttemptReclaim(dispatchShard, time.Now()) {
+		return nil, nil
+	}
+
+	reclaimBudget := reclaimBudgetFromRemaining()
+	if reclaimBudget <= 0 {
+		return nil, nil
+	}
+	reclaimRows, reclaimErr := claimRowsWithTimeout(ctx, "strict_reclaim", reclaimQuery, setClaimLimit(reclaimArgs, limit), reclaimBudget, false)
 	if reclaimErr != nil && !isClaimTimeoutErr(reclaimErr) {
 		return nil, reclaimErr
 	}
@@ -575,7 +582,11 @@ func (s *Store) ClaimPending(ctx context.Context, holderID string, epoch int64, 
 		return reclaimRows, nil
 	}
 
-	compatReclaimRows, compatReclaimErr := claimRowsWithTimeout(ctx, reclaimCompatQuery, setClaimLimit(reclaimCompatArgs, limit), reclaimBudget, true)
+	reclaimBudget = reclaimBudgetFromRemaining()
+	if reclaimBudget <= 0 {
+		return nil, nil
+	}
+	compatReclaimRows, compatReclaimErr := claimRowsWithTimeout(ctx, "compat_reclaim", reclaimCompatQuery, setClaimLimit(reclaimCompatArgs, limit), reclaimBudget, false)
 	if compatReclaimErr != nil && !isClaimTimeoutErr(compatReclaimErr) {
 		return nil, compatReclaimErr
 	}
@@ -586,7 +597,7 @@ func (s *Store) ClaimPending(ctx context.Context, holderID string, epoch int64, 
 	if len(compatReclaimRows) > 0 || reclaimNullCompatQuery == "" {
 		return compatReclaimRows, nil
 	}
-	compatReclaimRows, compatReclaimErr = claimRowsWithTimeout(ctx, reclaimNullCompatQuery, setClaimLimit(reclaimCompatArgs, limit), reclaimBudget, true)
+	compatReclaimRows, compatReclaimErr = claimRowsWithTimeout(ctx, "compat_reclaim_null", reclaimNullCompatQuery, setClaimLimit(reclaimCompatArgs, limit), reclaimBudget, false)
 	if compatReclaimErr != nil && !isClaimTimeoutErr(compatReclaimErr) {
 		return nil, compatReclaimErr
 	}
@@ -595,6 +606,30 @@ func (s *Store) ClaimPending(ctx context.Context, holderID string, epoch int64, 
 		return nil, nil
 	}
 	return compatReclaimRows, nil
+}
+
+func (s *Store) shouldAttemptReclaim(dispatchShard string, now time.Time) bool {
+	if s == nil {
+		return true
+	}
+	interval := s.reclaimMinInterval
+	if interval <= 0 {
+		return true
+	}
+	key := strings.TrimSpace(dispatchShard)
+	if key == "" {
+		key = dispatchShardLabel(0)
+	}
+	s.reclaimMu.Lock()
+	defer s.reclaimMu.Unlock()
+	if s.reclaimAttemptAt == nil {
+		s.reclaimAttemptAt = make(map[string]time.Time)
+	}
+	if last := s.reclaimAttemptAt[key]; !last.IsZero() && now.Sub(last) < interval {
+		return false
+	}
+	s.reclaimAttemptAt[key] = now
+	return true
 }
 
 func (s *Store) claimPendingOnce(ctx context.Context, query string, args ...any) ([]Row, error) {
@@ -614,21 +649,9 @@ func (s *Store) claimPendingOnce(ctx context.Context, query string, args ...any)
 	for rows.Next() {
 		var r Row
 		var scanErr error
-		if s.hasSourceColumns {
-			if s.hasSentinelColumn {
-				scanErr = rows.Scan(
-					&r.ID, &r.DispatchShard, &r.BlockHeight, &r.BlockTS, &r.CreatedAtMs, &r.TxIndex, &r.PolicyID, &r.RequestID, &r.CommandID, &r.WorkflowID, &r.TraceID, &r.AIEventTsMs, &r.SourceEventID, &r.SourceEventTsMs, &r.SentinelEventID, &r.RuleHash, &r.Payload, &r.Status, &r.Retries, &r.LeaseEpoch,
-				)
-			} else {
-				scanErr = rows.Scan(
-					&r.ID, &r.DispatchShard, &r.BlockHeight, &r.BlockTS, &r.CreatedAtMs, &r.TxIndex, &r.PolicyID, &r.RequestID, &r.CommandID, &r.WorkflowID, &r.TraceID, &r.AIEventTsMs, &r.SourceEventID, &r.SourceEventTsMs, &r.RuleHash, &r.Payload, &r.Status, &r.Retries, &r.LeaseEpoch,
-				)
-			}
-		} else {
-			scanErr = rows.Scan(
-				&r.ID, &r.DispatchShard, &r.BlockHeight, &r.BlockTS, &r.CreatedAtMs, &r.TxIndex, &r.PolicyID, &r.RequestID, &r.CommandID, &r.WorkflowID, &r.TraceID, &r.AIEventTsMs, &r.RuleHash, &r.Payload, &r.Status, &r.Retries, &r.LeaseEpoch,
-			)
-		}
+		scanErr = rows.Scan(
+			&r.ID, &r.DispatchShard, &r.BlockHeight, &r.BlockTS, &r.CreatedAtMs, &r.PolicyID, &r.TraceID, &r.AIEventTsMs, &r.SourceEventTsMs, &r.Payload, &r.Retries, &r.LeaseEpoch,
+		)
 		if scanErr != nil {
 			return nil, fmt.Errorf("policy outbox: claim scan: %w", scanErr)
 		}
@@ -817,6 +840,12 @@ func (s *Store) MarkPublished(ctx context.Context, id, holderID string, epoch in
 		return fmt.Errorf("policy outbox: mark published lease key required")
 	}
 	res, err := s.markPublishedOnce(ctx, id, holderID, epoch, topic, partition, offset)
+	// Cloud connect/dial failures are load-shedding signals, not useful retry
+	// candidates in this hot path. Fail fast so dispatcher-level cooling can
+	// reduce pressure instead of amplifying with per-row recovery loops.
+	if err != nil && isClaimConnectErr(err) {
+		return fmt.Errorf("policy outbox: mark published: %w", err)
+	}
 	if err != nil && shouldRecoverMarkPublished(err, ctx) {
 		recoveryUntil := time.Now().Add(markPublishedRecoveryBudget)
 		backoff := 150 * time.Millisecond
@@ -950,6 +979,9 @@ func (s *Store) markPublishedFinalizeOnce(ctx context.Context, id, holderID stri
 
 func shouldRecoverMarkPublished(err error, ctx context.Context) bool {
 	if err == nil {
+		return false
+	}
+	if isClaimConnectErr(err) {
 		return false
 	}
 	if ctx != nil && ctx.Err() != nil {
@@ -1223,6 +1255,16 @@ func (s *Store) backlogSummaryStats(ctx context.Context) (BacklogStats, error) {
 		&summary.TerminalRows,
 	)
 	if err != nil {
+		// Fail open with last known summary to keep control-plane backlog endpoints
+		// responsive under transient DB pressure.
+		s.backlogSummaryMu.Lock()
+		snapshot := s.backlogSummary
+		cachedAt := s.backlogSummaryAt
+		s.backlogSummaryMu.Unlock()
+		if !cachedAt.IsZero() {
+			snapshot.BacklogCacheAgeMs = time.Since(cachedAt).Milliseconds()
+			return snapshot, nil
+		}
 		return BacklogStats{}, fmt.Errorf("policy outbox: backlog summary stats: %w", err)
 	}
 

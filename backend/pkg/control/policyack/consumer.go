@@ -16,6 +16,9 @@ import (
 	pb "backend/proto"
 	"github.com/IBM/sarama"
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -335,14 +338,28 @@ func (h *handler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.Co
 var errPermanent = errors.New("permanent")
 
 func (c *Consumer) process(ctx context.Context, msg *sarama.ConsumerMessage) error {
+	ctx, span := observability.Tracer("backend/policyack").Start(
+		ctx,
+		"backend.policyack.consume",
+		trace.WithAttributes(
+			attribute.String("messaging.system", "kafka"),
+			attribute.String("messaging.destination", msg.Topic),
+			attribute.Int64("messaging.kafka.partition", int64(msg.Partition)),
+			attribute.Int64("messaging.kafka.offset", msg.Offset),
+		),
+	)
+	defer span.End()
 	var ack pb.PolicyAckEvent
 	if err := proto.Unmarshal(msg.Value, &ack); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "ack_unmarshal_failed")
 		c.rejectedTotal.Add(1)
 		c.sendDLQ(ctx, msg, "unmarshal_failed", err)
 		return fmt.Errorf("%w: policy ack unmarshal: %v", errPermanent, err)
 	}
 
 	if strings.TrimSpace(ack.PolicyId) == "" || strings.TrimSpace(ack.ControllerInstance) == "" {
+		span.SetStatus(codes.Error, "invalid_required_fields")
 		c.rejectedTotal.Add(1)
 		c.sendDLQ(ctx, msg, "invalid_required_fields", fmt.Errorf("policy_id/controller_instance required"))
 		return fmt.Errorf("%w: invalid required fields", errPermanent)
@@ -375,11 +392,17 @@ func (c *Consumer) process(ctx context.Context, msg *sarama.ConsumerMessage) err
 
 	res, cls, ok := normalizeAckOutcome(strings.TrimSpace(ack.Result), strings.TrimSpace(ack.ErrorCode), strings.TrimSpace(ack.Reason))
 	if !ok {
+		span.SetStatus(codes.Error, "invalid_ack_result")
 		c.rejectedTotal.Add(1)
 		c.sendDLQ(ctx, msg, "invalid_result", fmt.Errorf("result=%q", ack.Result))
 		return fmt.Errorf("%w: invalid result", errPermanent)
 	}
 	ack.Result = res
+	span.SetAttributes(
+		attribute.String("policy.id", strings.TrimSpace(ack.PolicyId)),
+		attribute.String("ack.result", res),
+		attribute.String("ack.class", cls),
+	)
 	if strings.TrimSpace(ack.ErrorCode) == "" {
 		ack.ErrorCode = cls
 	}
@@ -413,6 +436,7 @@ func (c *Consumer) process(ctx context.Context, msg *sarama.ConsumerMessage) err
 	var last error
 	for attempt := 1; attempt <= c.cfg.StoreRetryMax; attempt++ {
 		if err := c.store.Upsert(ctx, &ack, time.Now().UTC()); err != nil {
+			span.RecordError(err, trace.WithAttributes(attribute.Int("retry.attempt", attempt)))
 			last = err
 			c.storeRetryAttempts.Add(1)
 			if c.log != nil && c.shouldLog(&c.lastStoreWarnLogNs) {
@@ -431,6 +455,7 @@ func (c *Consumer) process(ctx context.Context, msg *sarama.ConsumerMessage) err
 			continue
 		}
 		c.processedTotal.Add(1)
+		span.SetStatus(codes.Ok, "ack_persisted")
 		c.transientFailureStreak.Store(0)
 		if c.audit != nil {
 			_ = c.audit.Info("policy_ack_persisted", map[string]interface{}{
@@ -464,6 +489,7 @@ func (c *Consumer) process(ctx context.Context, msg *sarama.ConsumerMessage) err
 
 	// Exhausted retries: treat as transient so we don't drop data.
 	c.storeRetryExhausted.Add(1)
+	span.SetStatus(codes.Error, "store_retry_exhausted")
 	if last != nil {
 		return fmt.Errorf("policy ack store retries exhausted: %w", last)
 	}

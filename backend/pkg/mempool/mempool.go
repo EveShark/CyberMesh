@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,29 +16,47 @@ import (
 )
 
 var (
-	ErrDuplicate   = errors.New("duplicate transaction")
-	ErrRateLimited = errors.New("producer rate limited")
-	ErrMempoolFull = errors.New("mempool at capacity")
-	ErrInvalidTx   = errors.New("invalid transaction")
+	ErrDuplicate         = errors.New("duplicate transaction")
+	ErrRateLimited       = errors.New("producer rate limited")
+	ErrMempoolFull       = errors.New("mempool at capacity")
+	ErrPriorityClassFull = errors.New("mempool priority class at capacity")
+	ErrInvalidTx         = errors.New("invalid transaction")
 )
 
 type Config struct {
 	MaxTxs        int
 	MaxBytes      int
+	MaxTxsP0      int
+	MaxTxsP1      int
+	MaxTxsP2      int
 	NonceTTL      time.Duration
 	Skew          time.Duration
 	RatePerSecond int
 }
 
 type entry struct {
-	Tx         state.Transaction
-	Hash       [32]byte
-	ProducerID []byte
-	Nonce      []byte
-	Severity   uint8
-	Confidence float64
-	Ts         int64
-	Size       int
+	Tx            state.Transaction
+	Hash          [32]byte
+	ProducerID    []byte
+	Nonce         []byte
+	Severity      uint8
+	Confidence    float64
+	PriorityClass string
+	Ts            int64
+	Size          int
+}
+
+type ErrClassFull struct {
+	Class string
+}
+
+func (e ErrClassFull) Error() string {
+	className := normalizePriorityClass(e.Class)
+	return "mempool priority class " + className + " at capacity"
+}
+
+func (e ErrClassFull) Is(target error) bool {
+	return target == ErrPriorityClassFull
 }
 
 // ProducerNonce identifies a tx by producer_id + nonce envelope identity.
@@ -48,6 +67,9 @@ type ProducerNonce struct {
 
 // priority ordering: higher severity, higher confidence, earlier ts, lexicographic hash
 func lessPriority(a, b *entry) bool {
+	if classRank(a.PriorityClass) != classRank(b.PriorityClass) {
+		return classRank(a.PriorityClass) > classRank(b.PriorityClass)
+	}
 	if a.Severity != b.Severity {
 		return a.Severity > b.Severity
 	}
@@ -102,14 +124,15 @@ type producerState struct {
 }
 
 type Mempool struct {
-	mu        sync.RWMutex
-	log       *utils.Logger
-	trace     *policytrace.Collector
-	cfg       Config
-	entries   map[string]*entry         // hexdigest(hash) -> entry
-	total     int                       // bytes
-	evictHeap minHeap                   // eviction heap (lowest priority at root)
-	prod      map[string]*producerState // hex(producerID) -> state
+	mu          sync.RWMutex
+	log         *utils.Logger
+	trace       *policytrace.Collector
+	cfg         Config
+	entries     map[string]*entry         // hexdigest(hash) -> entry
+	total       int                       // bytes
+	evictHeap   minHeap                   // eviction heap (lowest priority at root)
+	prod        map[string]*producerState // hex(producerID) -> state
+	classCounts map[string]int
 }
 
 func (m *Mempool) ProducerCount() int {
@@ -181,6 +204,11 @@ func New(cfg Config, log *utils.Logger) *Mempool {
 		entries:   make(map[string]*entry),
 		evictHeap: h,
 		prod:      make(map[string]*producerState),
+		classCounts: map[string]int{
+			"p0": 0,
+			"p1": 0,
+			"p2": 0,
+		},
 	}
 }
 
@@ -203,8 +231,9 @@ func (m *Mempool) cleanupNonces(now time.Time, ps *producerState) {
 }
 
 type AdmissionMeta struct {
-	Severity   uint8
-	Confidence float64
+	Severity      uint8
+	Confidence    float64
+	PriorityClass string
 }
 
 // Add admits a transaction with strict checks and bounded eviction
@@ -273,14 +302,27 @@ func (m *Mempool) Add(tx state.Transaction, meta AdmissionMeta, now time.Time) e
 	}
 
 	e := &entry{
-		Tx:         tx,
-		Hash:       h,
-		ProducerID: env.ProducerID,
-		Nonce:      env.Nonce,
-		Severity:   meta.Severity,
-		Confidence: meta.Confidence,
-		Ts:         tx.Timestamp(),
-		Size:       len(tx.Payload()),
+		Tx:            tx,
+		Hash:          h,
+		ProducerID:    env.ProducerID,
+		Nonce:         env.Nonce,
+		Severity:      meta.Severity,
+		Confidence:    meta.Confidence,
+		PriorityClass: normalizePriorityClass(meta.PriorityClass),
+		Ts:            tx.Timestamp(),
+		Size:          len(tx.Payload()),
+	}
+	if classCap := m.classCap(e.PriorityClass); classCap > 0 && m.classCounts[e.PriorityClass] >= classCap {
+		victimKey, victim := m.weakestInClassLocked(e.PriorityClass)
+		if victim == nil || !lessPriority(e, victim) {
+			return ErrClassFull{Class: e.PriorityClass}
+		}
+		delete(m.entries, victimKey)
+		m.total -= victim.Size
+		m.decClassCount(victim.PriorityClass)
+		// Replacement-heavy workloads can accumulate stale heap nodes when we
+		// delete directly from entries. Rebuild now to keep eviction costs stable.
+		m.rebuildEvictHeapLocked()
 	}
 
 	// Ensure capacity by evicting lowest priority as needed
@@ -301,6 +343,7 @@ func (m *Mempool) Add(tx state.Transaction, meta AdmissionMeta, now time.Time) e
 		heap.Pop(&m.evictHeap)
 		delete(m.entries, vkey)
 		m.total -= victim.Size
+		m.decClassCount(victim.PriorityClass)
 		needBytes = m.total + e.Size - m.cfg.MaxBytes
 		needCount = len(m.entries) + 1 - m.cfg.MaxTxs
 	}
@@ -317,6 +360,7 @@ func (m *Mempool) Add(tx state.Transaction, meta AdmissionMeta, now time.Time) e
 	m.entries[key] = e
 	m.total += e.Size
 	heap.Push(&m.evictHeap, e)
+	m.classCounts[e.PriorityClass]++
 	ps.nonces[nonce] = now.Add(m.cfg.NonceTTL)
 	return nil
 }
@@ -355,6 +399,7 @@ func (m *Mempool) Remove(hashes ...[32]byte) {
 		if e, ok := m.entries[key]; ok {
 			delete(m.entries, key)
 			m.total -= e.Size
+			m.decClassCount(e.PriorityClass)
 		}
 	}
 	// rebuild eviction heap to drop stale pointers (costly but safe and deterministic)
@@ -390,6 +435,7 @@ func (m *Mempool) RemoveByProducerNonces(keys []ProducerNonce) {
 		if _, ok := set[id]; ok {
 			delete(m.entries, key)
 			m.total -= e.Size
+			m.decClassCount(e.PriorityClass)
 			removed = true
 		}
 	}
@@ -397,10 +443,7 @@ func (m *Mempool) RemoveByProducerNonces(keys []ProducerNonce) {
 		return
 	}
 	// Rebuild eviction heap to drop stale pointers.
-	m.evictHeap = make(minHeap, 0, len(m.entries))
-	for _, e := range m.entries {
-		heap.Push(&m.evictHeap, e)
-	}
+	m.rebuildEvictHeapLocked()
 }
 
 // Stats returns current stats snapshot
@@ -424,4 +467,80 @@ func (m *Mempool) StatsDetailed() (count int, bytes int, oldestTimestamp int64) 
 		}
 	}
 	return
+}
+
+// ClassStats returns current transaction counts per priority class.
+func (m *Mempool) ClassStats() map[string]int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make(map[string]int, len(m.classCounts))
+	for k, v := range m.classCounts {
+		out[k] = v
+	}
+	return out
+}
+
+func (m *Mempool) classCap(class string) int {
+	switch normalizePriorityClass(class) {
+	case "p0":
+		return m.cfg.MaxTxsP0
+	case "p1":
+		return m.cfg.MaxTxsP1
+	default:
+		return m.cfg.MaxTxsP2
+	}
+}
+
+func (m *Mempool) decClassCount(class string) {
+	normalized := normalizePriorityClass(class)
+	if m.classCounts[normalized] > 0 {
+		m.classCounts[normalized]--
+	}
+}
+
+func normalizePriorityClass(class string) string {
+	switch strings.ToLower(strings.TrimSpace(class)) {
+	case "p0":
+		return "p0"
+	case "p1":
+		return "p1"
+	default:
+		return "p2"
+	}
+}
+
+func classRank(class string) int {
+	switch normalizePriorityClass(class) {
+	case "p0":
+		return 3
+	case "p1":
+		return 2
+	default:
+		return 1
+	}
+}
+
+func (m *Mempool) weakestInClassLocked(class string) (string, *entry) {
+	class = normalizePriorityClass(class)
+	var (
+		weakestKey string
+		weakest    *entry
+	)
+	for key, candidate := range m.entries {
+		if candidate == nil || normalizePriorityClass(candidate.PriorityClass) != class {
+			continue
+		}
+		if weakest == nil || lessPriority(weakest, candidate) {
+			weakest = candidate
+			weakestKey = key
+		}
+	}
+	return weakestKey, weakest
+}
+
+func (m *Mempool) rebuildEvictHeapLocked() {
+	m.evictHeap = make(minHeap, 0, len(m.entries))
+	for _, e := range m.entries {
+		heap.Push(&m.evictHeap, e)
+	}
 }

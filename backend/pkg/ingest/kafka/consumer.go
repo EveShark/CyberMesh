@@ -18,6 +18,9 @@ import (
 	"backend/pkg/utils"
 
 	"github.com/IBM/sarama"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var (
@@ -50,6 +53,9 @@ type Consumer struct {
 	messagesRetried     uint64
 	transientFailures   uint64
 	replayRejectedAdmit uint64
+	preAdmitRejected    map[string]uint64
+	classAdmitted       map[string]uint64
+	classRejected       map[string]uint64
 	groupID             string
 	partitionOffsets    map[string]int64
 	partitionLag        map[string]int64
@@ -66,9 +72,12 @@ type Consumer struct {
 	retryBackoffMax  time.Duration
 
 	// Optional callback invoked after successful mempool admission.
-	onPreAdmit func(topic string, tx state.Transaction) error
-	onAdmitted func(topic string, tx state.Transaction)
-	trace      *policytrace.Collector
+	onPreAdmit               func(topic string, tx state.Transaction) error
+	onAdmitted               func(topic string, tx state.Transaction)
+	onAdmitFailed            func(topic string, tx state.Transaction, cause error)
+	trace                    *policytrace.Collector
+	lifecycleMode            string
+	lifecycleRollbackEnabled bool
 }
 
 // ConsumerConfig holds configuration for creating a consumer
@@ -123,22 +132,27 @@ func NewConsumer(ctx context.Context, cfg ConsumerConfig, saramaCfg *sarama.Conf
 	consumerCtx, cancel := context.WithCancel(ctx)
 
 	c := &Consumer{
-		consumerGroup:      consumerGroup,
-		topics:             cfg.Topics,
-		mempool:            mp,
-		verifierCfg:        cfg.VerifierCfg,
-		logger:             logger,
-		audit:              audit,
-		dlqProducer:        dlqProducer,
-		dlqTopic:           cfg.DLQTopic,
-		ctx:                consumerCtx,
-		cancel:             cancel,
-		closed:             false,
-		groupID:            cfg.GroupID,
-		partitionOffsets:   make(map[string]int64),
-		partitionLag:       make(map[string]int64),
-		partitionHighwater: make(map[string]int64),
-		topicPartitions:    make(map[string]int),
+		consumerGroup:            consumerGroup,
+		topics:                   cfg.Topics,
+		mempool:                  mp,
+		verifierCfg:              cfg.VerifierCfg,
+		logger:                   logger,
+		audit:                    audit,
+		dlqProducer:              dlqProducer,
+		dlqTopic:                 cfg.DLQTopic,
+		ctx:                      consumerCtx,
+		cancel:                   cancel,
+		closed:                   false,
+		groupID:                  cfg.GroupID,
+		partitionOffsets:         make(map[string]int64),
+		partitionLag:             make(map[string]int64),
+		partitionHighwater:       make(map[string]int64),
+		topicPartitions:          make(map[string]int),
+		preAdmitRejected:         make(map[string]uint64),
+		classAdmitted:            make(map[string]uint64),
+		classRejected:            make(map[string]uint64),
+		lifecycleMode:            "enforce",
+		lifecycleRollbackEnabled: true,
 	}
 	c.ingestLatencyHist = utils.NewLatencyHistogram([]float64{5, 20, 50, 100, 250, 500, 1000, math.Inf(1)})
 	c.processLatencyHist = utils.NewLatencyHistogram([]float64{1, 5, 20, 50, 100, 250, 500, math.Inf(1)})
@@ -477,6 +491,18 @@ func classifyProcessError(err error) (consumercontract.ErrorClass, bool) {
 
 // processMessage handles a single Kafka message: decode → verify → mempool.Admit
 func (c *Consumer) processMessage(ctx context.Context, session sarama.ConsumerGroupSession, message *sarama.ConsumerMessage) error {
+	ctx, span := observability.Tracer("backend/ingest-kafka").Start(
+		ctx,
+		"backend.ingest.kafka.process",
+		trace.WithAttributes(
+			attribute.String("messaging.system", "kafka"),
+			attribute.String("messaging.destination", message.Topic),
+			attribute.Int64("messaging.kafka.partition", int64(message.Partition)),
+			attribute.Int64("messaging.kafka.offset", message.Offset),
+		),
+	)
+	defer span.End()
+
 	if c.logger != nil {
 		c.logger.Info("[DEBUG] processMessage() CALLED",
 			utils.ZapString("topic", message.Topic),
@@ -539,10 +565,13 @@ func (c *Consumer) processMessage(ctx context.Context, session sarama.ConsumerGr
 			c.logger.WarnContext(ctx, "Unknown Kafka topic",
 				utils.ZapString("topic", message.Topic))
 		}
+		span.SetStatus(codes.Error, "unknown_topic")
 		return fmt.Errorf("unknown topic: %s", message.Topic)
 	}
 
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "decode_or_verify_failed")
 		if c.logger != nil {
 			c.logger.Info("[DEBUG] Handler returned error, routing to DLQ",
 				utils.ZapError(err))
@@ -565,6 +594,13 @@ func (c *Consumer) processMessage(ctx context.Context, session sarama.ConsumerGr
 	}
 	now := time.Now()
 	if err := c.emitPreAdmit(message.Topic, tx); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "preadmit_rejected")
+		if reason, ok := PreAdmitReason(err); ok {
+			c.incrementPreAdmitRejected(reason)
+		} else {
+			c.incrementPreAdmitRejected("other")
+		}
 		if errors.Is(err, ErrReplayRejected) {
 			c.incrementReplayRejectedAdmit()
 		}
@@ -583,6 +619,12 @@ func (c *Consumer) processMessage(ctx context.Context, session sarama.ConsumerGr
 		return err
 	}
 	if err := c.mempool.Add(tx, meta, now); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "mempool_add_failed")
+		c.emitAdmitFailed(message.Topic, tx, err)
+		if class, ok := mempool.ClassFullReason(err); ok {
+			c.incrementClassRejected(class)
+		}
 		if c.logger != nil {
 			c.logger.Info("[DEBUG] mempool.Add() returned ERROR",
 				utils.ZapError(err))
@@ -605,6 +647,8 @@ func (c *Consumer) processMessage(ctx context.Context, session sarama.ConsumerGr
 		// But also don't send to DLQ (it's not a message error)
 		return err
 	}
+	c.incrementClassAdmitted(meta.PriorityClass)
+	span.SetAttributes(attribute.String("mempool.priority_class", meta.PriorityClass))
 
 	if message.Topic == "ai.policy.v1" {
 		if ptx, ok := tx.(*state.PolicyTx); ok {
@@ -621,6 +665,7 @@ func (c *Consumer) processMessage(ctx context.Context, session sarama.ConsumerGr
 	}
 
 	// Success
+	span.SetStatus(codes.Ok, "admitted")
 	return nil
 }
 
@@ -644,12 +689,35 @@ func (c *Consumer) SetPostAdmitHook(hook func(topic string, tx state.Transaction
 	c.mu.Unlock()
 }
 
+// SetAdmitFailedHook installs a callback invoked when mempool admission fails.
+func (c *Consumer) SetAdmitFailedHook(hook func(topic string, tx state.Transaction, cause error)) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.onAdmitFailed = hook
+	c.mu.Unlock()
+}
+
 func (c *Consumer) SetTraceCollector(trace *policytrace.Collector) {
 	if c == nil {
 		return
 	}
 	c.mu.Lock()
 	c.trace = trace
+	c.mu.Unlock()
+}
+
+func (c *Consumer) SetLifecycleAdmissionMode(mode string, rollbackEnabled bool) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.lifecycleMode = strings.ToLower(strings.TrimSpace(mode))
+	if c.lifecycleMode == "" {
+		c.lifecycleMode = "enforce"
+	}
+	c.lifecycleRollbackEnabled = rollbackEnabled
 	c.mu.Unlock()
 }
 
@@ -722,6 +790,26 @@ func (c *Consumer) emitAdmitted(topic string, tx state.Transaction) {
 	hook(topic, tx)
 }
 
+func (c *Consumer) emitAdmitFailed(topic string, tx state.Transaction, cause error) {
+	if c == nil {
+		return
+	}
+	c.mu.RLock()
+	hook := c.onAdmitFailed
+	c.mu.RUnlock()
+	if hook == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil && c.logger != nil {
+			c.logger.Warn("admit-failed hook panicked",
+				utils.ZapString("topic", topic),
+				utils.ZapString("panic", fmt.Sprintf("%v", r)))
+		}
+	}()
+	hook(topic, tx, cause)
+}
+
 // processAnomalyMessage decodes and verifies ai.anomalies.v1 message
 func (c *Consumer) processAnomalyMessage(message *sarama.ConsumerMessage) (state.Transaction, mempool.AdmissionMeta, error) {
 	if c.logger != nil {
@@ -783,11 +871,12 @@ func (c *Consumer) processAnomalyMessage(message *sarama.ConsumerMessage) (state
 
 	// Extract metadata for mempool prioritization
 	meta := mempool.AdmissionMeta{
-		Severity:   msg.Severity,
-		Confidence: msg.Confidence,
+		Severity:      msg.Severity,
+		Confidence:    msg.Confidence,
+		PriorityClass: "p2",
 	}
 
-	return tx, meta, nil
+	return tx, mempool.ComputeMeta(tx, meta), nil
 }
 
 // processEvidenceMessage decodes and verifies ai.evidence.v1 message
@@ -821,11 +910,12 @@ func (c *Consumer) processEvidenceMessage(message *sarama.ConsumerMessage) (stat
 
 	// Evidence has no severity/confidence - use default
 	meta := mempool.AdmissionMeta{
-		Severity:   5,   // Medium severity
-		Confidence: 1.0, // Full confidence (cryptographically verified)
+		Severity:      5,   // Medium severity
+		Confidence:    1.0, // Full confidence (cryptographically verified)
+		PriorityClass: "p2",
 	}
 
-	return tx, meta, nil
+	return tx, mempool.ComputeMeta(tx, meta), nil
 }
 
 // processPolicyMessage decodes and verifies ai.policy.v1 message
@@ -869,11 +959,12 @@ func (c *Consumer) processPolicyMessage(message *sarama.ConsumerMessage) (state.
 
 	// Policy has high priority
 	meta := mempool.AdmissionMeta{
-		Severity:   8,   // High severity (policy changes are critical)
-		Confidence: 1.0, // Full confidence (cryptographically verified)
+		Severity:      8,   // High severity (policy changes are critical)
+		Confidence:    1.0, // Full confidence (cryptographically verified)
+		PriorityClass: classifyPolicyPriorityClass(msg.Action, msg.Params),
 	}
 
-	return tx, meta, nil
+	return tx, mempool.ComputeMeta(tx, meta), nil
 }
 
 func extractPolicyStageIdentity(payload []byte) (string, string) {
@@ -915,6 +1006,64 @@ func extractPolicyStageIdentity(payload []byte) (string, string) {
 		}
 	}
 	return policyID, traceID
+}
+
+func classifyPolicyPriorityClass(action string, params []byte) string {
+	act := strings.ToLower(strings.TrimSpace(action))
+	controlAction := ""
+	if len(params) > 0 {
+		var root map[string]interface{}
+		if err := json.Unmarshal(params, &root); err == nil {
+			controlAction = strings.ToLower(strings.TrimSpace(asString(root["control_action"])))
+			if controlAction == "" {
+				controlAction = strings.ToLower(strings.TrimSpace(asString(root["action"])))
+			}
+			if controlAction == "" {
+				if nested, ok := root["params"].(map[string]interface{}); ok {
+					controlAction = strings.ToLower(strings.TrimSpace(asString(nested["control_action"])))
+					if controlAction == "" {
+						controlAction = strings.ToLower(strings.TrimSpace(asString(nested["action"])))
+					}
+				}
+			}
+		}
+	}
+	if isCriticalPolicyAction(act, controlAction) {
+		return "p0"
+	}
+	if isMaintenancePolicyAction(act, controlAction) {
+		return "p2"
+	}
+	if act == "" {
+		return "p1"
+	}
+	return "p1"
+}
+
+func isCriticalPolicyAction(action, controlAction string) bool {
+	switch strings.ToLower(strings.TrimSpace(controlAction)) {
+	case "drop", "reject", "freeze", "block", "remove":
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case "remove", "block", "drop", "reject", "freeze":
+		return true
+	default:
+		return false
+	}
+}
+
+func isMaintenancePolicyAction(action, controlAction string) bool {
+	switch strings.ToLower(strings.TrimSpace(controlAction)) {
+	case "refresh", "suppress", "bypass", "noop", "reconcile", "ttl":
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case "refresh", "suppress", "bypass", "noop", "reconcile", "ttl":
+		return true
+	default:
+		return false
+	}
 }
 
 func asString(v interface{}) string {
@@ -1011,6 +1160,24 @@ func (c *Consumer) incrementReplayRejectedAdmit() {
 	c.mu.Unlock()
 }
 
+func (c *Consumer) incrementPreAdmitRejected(reason string) {
+	c.mu.Lock()
+	c.preAdmitRejected[sanitizeReasonKey(reason)]++
+	c.mu.Unlock()
+}
+
+func (c *Consumer) incrementClassAdmitted(class string) {
+	c.mu.Lock()
+	c.classAdmitted[normalizePriorityClass(class)]++
+	c.mu.Unlock()
+}
+
+func (c *Consumer) incrementClassRejected(class string) {
+	c.mu.Lock()
+	c.classRejected[normalizePriorityClass(class)]++
+	c.mu.Unlock()
+}
+
 func (c *Consumer) observeIngestLatency(d time.Duration) {
 	if c.ingestLatencyHist == nil {
 		return
@@ -1042,6 +1209,11 @@ func (c *Consumer) Stats() ConsumerStats {
 	stats.MessagesRetried = c.messagesRetried
 	stats.TransientFailures = c.transientFailures
 	stats.ReplayRejectedAdmit = c.replayRejectedAdmit
+	stats.PreAdmitRejected = copyCounterMap(c.preAdmitRejected)
+	stats.ClassAdmitted = copyCounterMap(c.classAdmitted)
+	stats.ClassRejected = copyCounterMap(c.classRejected)
+	stats.LifecycleMode = c.lifecycleMode
+	stats.LifecycleRollbackEnabled = c.lifecycleRollbackEnabled
 	stats.LastMessageUnix = c.lastMessageUnix
 	c.mu.RUnlock()
 	buckets, total, sum := c.ingestLatencyHist.Snapshot()
@@ -1120,27 +1292,43 @@ func copyIntMap(src map[string]int) map[string]int {
 }
 
 type ConsumerStats struct {
-	GroupID               string
-	Topics                []string
-	TopicPartitions       map[string]int
-	PartitionOffsets      map[string]int64
-	PartitionLag          map[string]int64
-	PartitionHighwater    map[string]int64
-	AssignedPartitions    int
-	MessagesConsumed      uint64
-	MessagesVerified      uint64
-	MessagesAdmitted      uint64
-	MessagesFailed        uint64
-	MessagesRetried       uint64
-	TransientFailures     uint64
-	ReplayRejectedAdmit   uint64
-	LastMessageUnix       int64
-	IngestLatencyBuckets  []utils.HistogramBucket
-	IngestLatencyP95Ms    float64
-	ProcessLatencyBuckets []utils.HistogramBucket
-	ProcessLatencyP95Ms   float64
-	IngestLatencyCount    uint64
-	IngestLatencySumMs    float64
-	ProcessLatencyCount   uint64
-	ProcessLatencySumMs   float64
+	GroupID                  string
+	Topics                   []string
+	TopicPartitions          map[string]int
+	PartitionOffsets         map[string]int64
+	PartitionLag             map[string]int64
+	PartitionHighwater       map[string]int64
+	AssignedPartitions       int
+	MessagesConsumed         uint64
+	MessagesVerified         uint64
+	MessagesAdmitted         uint64
+	MessagesFailed           uint64
+	MessagesRetried          uint64
+	TransientFailures        uint64
+	ReplayRejectedAdmit      uint64
+	PreAdmitRejected         map[string]uint64
+	ClassAdmitted            map[string]uint64
+	ClassRejected            map[string]uint64
+	LifecycleMode            string
+	LifecycleRollbackEnabled bool
+	LastMessageUnix          int64
+	IngestLatencyBuckets     []utils.HistogramBucket
+	IngestLatencyP95Ms       float64
+	ProcessLatencyBuckets    []utils.HistogramBucket
+	ProcessLatencyP95Ms      float64
+	IngestLatencyCount       uint64
+	IngestLatencySumMs       float64
+	ProcessLatencyCount      uint64
+	ProcessLatencySumMs      float64
+}
+
+func copyCounterMap(src map[string]uint64) map[string]uint64 {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]uint64, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }

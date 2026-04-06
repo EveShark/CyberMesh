@@ -14,5 +14,6 @@ func ComputeMeta(tx state.Transaction, provided AdmissionMeta) AdmissionMeta {
 	if m.Confidence > 1 {
 		m.Confidence = 1
 	}
+	m.PriorityClass = normalizePriorityClass(m.PriorityClass)
 	return m
 }
