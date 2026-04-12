@@ -3,7 +3,12 @@
  */
 export const ROUTES = {
   HOME: '/',
+  AUTH_LOGIN: '/auth/login',
+  AUTH_CALLBACK: '/auth/callback',
+  AUTH_UNAUTHORIZED: '/auth/unauthorized',
+  AUTH_SESSION_EXPIRED: '/auth/session-expired',
   DASHBOARD: '/dashboard',
+  DELEGATIONS: '/delegations',
   AI_ENGINE: '/ai-engine',
   BLOCKCHAIN: '/blockchain',
   NETWORK: '/network',

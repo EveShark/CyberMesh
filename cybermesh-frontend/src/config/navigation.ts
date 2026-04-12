@@ -5,6 +5,7 @@ import {
   AlertTriangle, 
   Blocks, 
   Network,
+  ShieldAlert,
   Settings,
   type LucideIcon 
 } from "lucide-react";
@@ -66,6 +67,13 @@ export const SIDEBAR_ITEMS: NavItem[] = [
     description: "Service health and resource monitoring"
   },
   { 
+    title: "Delegations",
+    shortTitle: "Delegation",
+    url: ROUTES.DELEGATIONS,
+    icon: ShieldAlert,
+    description: "Support access requests, approvals, and break-glass sessions"
+  },
+  {
     title: "Settings",
     shortTitle: "Settings",
     url: ROUTES.SETTINGS, 

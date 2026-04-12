@@ -8,6 +8,9 @@ interface RuntimeConfig {
   supabaseProjectId: string;
   supabaseKey: string;
   demoMode: boolean;
+  zitadelIssuer: string;
+  zitadelClientId: string;
+  zitadelEnabled: boolean;
 }
 
 let runtimeConfig: RuntimeConfig | null = null;
@@ -48,6 +51,9 @@ export async function loadRuntimeConfig(): Promise<RuntimeConfig> {
       supabaseProjectId: data.supabaseProjectId,
       supabaseKey: data.supabaseKey,
       demoMode: data.demoMode === 'true',
+      zitadelIssuer: data.zitadelIssuer || '',
+      zitadelClientId: data.zitadelClientId || '',
+      zitadelEnabled: data.zitadelEnabled === true,
     };
 
     console.info('[Config] Loaded runtime config from backend', {
@@ -65,6 +71,9 @@ export async function loadRuntimeConfig(): Promise<RuntimeConfig> {
       supabaseProjectId: import.meta.env.VITE_SUPABASE_PROJECT_ID || '',
       supabaseKey: import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY || '',
       demoMode: import.meta.env.VITE_DEMO_MODE === 'true',
+      zitadelIssuer: import.meta.env.VITE_ZITADEL_ISSUER || '',
+      zitadelClientId: import.meta.env.VITE_ZITADEL_CLIENT_ID || '',
+      zitadelEnabled: Boolean(import.meta.env.VITE_ZITADEL_ISSUER && import.meta.env.VITE_ZITADEL_CLIENT_ID),
     };
 
     return runtimeConfig;

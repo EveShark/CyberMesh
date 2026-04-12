@@ -11,6 +11,9 @@ import type { DashboardOverviewData } from "@/types/dashboard";
 import { recordApiPerformance } from "@/lib/api/performance";
 import { rateLimitedFetch, type RateLimitedFetchOptions } from "@/lib/api/rate-limiter";
 import { transformApiResponse, transformApiRequest } from "@/lib/utils/json";
+import { getAccessToken } from "@/lib/auth/oidc";
+import { getRuntimeConfig, isConfigLoaded } from "@/config/runtime";
+import { dispatchAuthBoundaryEvent } from "@/lib/auth/events";
 
 // Adapter Imports
 import { adaptAIEngine, adaptThreats, adaptNetwork, adaptBlockchain, adaptSystemHealth } from "./adapters";
@@ -70,6 +73,19 @@ export class ApiError extends Error {
     super(message);
     this.name = "ApiError";
     this.context = context;
+  }
+}
+
+function maybeDispatchAuthBoundary(status: number, path: string): void {
+  if (!isConfigLoaded() || !getRuntimeConfig().zitadelEnabled) {
+    return;
+  }
+  if (status === 401 || status === 403) {
+    dispatchAuthBoundaryEvent({
+      status,
+      path,
+      source: "api",
+    });
   }
 }
 
@@ -184,6 +200,39 @@ async function executeRequest<T>(
   // Use provided signal or our timeout controller
   const signal = externalSignal || controller.signal;
 
+  let authHeaders: HeadersInit = {};
+  if (isConfigLoaded() && getRuntimeConfig().zitadelEnabled) {
+    try {
+      const accessToken = await getAccessToken();
+      if (accessToken) {
+        authHeaders = {
+          Authorization: `Bearer ${accessToken}`,
+        };
+      } else {
+        throw new ApiError(
+          "No active hosted session",
+          401,
+          "UNAUTHENTICATED",
+          false,
+          false,
+          false
+        );
+      }
+    } catch (error) {
+      if (error instanceof ApiError) {
+        throw error;
+      }
+      throw new ApiError(
+        "Unable to acquire hosted session token",
+        401,
+        "UNAUTHENTICATED",
+        false,
+        false,
+        false
+      );
+    }
+  }
+
   const defaultHeaders: HeadersInit = {
     "Content-Type": "application/json",
   };
@@ -193,8 +242,10 @@ async function executeRequest<T>(
       ...fetchOptions,
       ...RATE_LIMIT_CONFIG,
       signal,
+      credentials: "include",
       headers: {
         ...defaultHeaders,
+        ...authHeaders,
         ...fetchOptions.headers,
       },
     });
@@ -227,10 +278,11 @@ async function executeRequest<T>(
     // Check for backend-level success
     if (!result.data.success) {
       recordApiPerformance(path, duration, "error");
+      maybeDispatchAuthBoundary(result.response?.status ?? 500, path);
       // Preserve error context from backend
       throw new ApiError(
         result.data.error?.message || "Unknown backend error",
-        500,
+        result.response?.status ?? 500,
         result.data.error?.code || "INTERNAL_ERROR",
         false,
         false,
@@ -310,7 +362,25 @@ async function executeRequest<T>(
 
     // Re-throw ApiErrors (already recorded)
     if (error instanceof ApiError) {
+      maybeDispatchAuthBoundary(error.status, path);
       throw error;
+    }
+
+    if (error instanceof Error) {
+      const match = error.message.match(/^HTTP\s+(\d{3})\s*:/i);
+      if (match) {
+        const status = Number(match[1]);
+        const apiError = new ApiError(
+          error.message,
+          status,
+          status === 401 ? "UNAUTHENTICATED" : status === 403 ? "FORBIDDEN" : "HTTP_ERROR",
+          false,
+          false,
+          false
+        );
+        maybeDispatchAuthBoundary(status, path);
+        throw apiError;
+      }
     }
 
     // Handle unknown errors
@@ -430,9 +500,6 @@ export const apiClient = {
 };
 
 export default apiClient;
-
-
-
 
 
 

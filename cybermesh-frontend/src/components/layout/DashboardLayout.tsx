@@ -15,6 +15,8 @@ import { useConnectionStatus } from "@/hooks/common/use-connection-status";
 import { isDemoMode } from "@/config/demo-mode";
 import { ROUTES } from "@/config/routes";
 import { cn } from "@/lib/utils";
+import AccessSwitcher from "@/components/auth/AccessSwitcher";
+import DelegationBanner from "@/components/auth/DelegationBanner";
 
 const DashboardContent = () => {
   const isFetching = useIsFetching();
@@ -105,6 +107,8 @@ const DashboardContent = () => {
               isFetching={!demoMode && isFetching > 0}
             />
 
+            <AccessSwitcher />
+
             {/* Mobile Settings shortcut - visible on mobile only */}
             <Link
               to={isSettingsPage ? ROUTES.DASHBOARD : ROUTES.SETTINGS}
@@ -125,6 +129,8 @@ const DashboardContent = () => {
             </div>
           </div>
         </header>
+
+        <DelegationBanner />
 
         {/* Offline banner */}
         <OfflineBanner />
