@@ -74,6 +74,10 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 
 	// Frontend runtime config.
 	mux.HandleFunc(basePath+"/frontend-config", s.handleFrontendConfig)
+	mux.HandleFunc(basePath+"/auth/me", s.handleAuthMe)
+	mux.HandleFunc(basePath+"/auth/access/select", s.handleAuthAccessSelect)
+	mux.HandleFunc(basePath+"/auth/delegations", s.handleAuthDelegations)
+	mux.HandleFunc(basePath+"/auth/delegations/", s.handleAuthDelegationMutation)
 
 	// Control-plane APIs (Wave 1 read visibility).
 	mux.HandleFunc(basePath+"/control/outbox/backlog", s.handleControlOutboxBacklog)
@@ -92,7 +96,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 
 	s.logger.Info("routes registered",
 		utils.ZapString("base_path", basePath),
-		utils.ZapInt("endpoint_count", 30))
+		utils.ZapInt("endpoint_count", 32))
 }
 
 // middlewareChain applies middleware in order
@@ -195,6 +199,7 @@ func (s *Server) isPublicEndpoint(path string) bool {
 	publicEndpoints := []string{
 		s.config.BasePath + "/health",
 		s.config.BasePath + "/ready",
+		s.config.BasePath + "/frontend-config",
 	}
 
 	for _, endpoint := range publicEndpoints {
@@ -213,6 +218,21 @@ func (s *Server) getRequiredRole(method, path string) string {
 	// Admin has access to everything
 	if strings.HasPrefix(path, basePath+"/blocks") {
 		return "block_reader"
+	}
+	if path == basePath+"/auth/me" {
+		return ""
+	}
+	if path == basePath+"/auth/access/select" {
+		return ""
+	}
+	if path == basePath+"/auth/delegations" {
+		return ""
+	}
+	if strings.HasPrefix(path, basePath+"/auth/delegations/") {
+		if method == http.MethodPost && (strings.HasSuffix(path, ":approve") || strings.HasSuffix(path, ":revoke")) {
+			return "control_lease_admin"
+		}
+		return ""
 	}
 	if strings.HasPrefix(path, basePath+"/state") {
 		return "state_reader"

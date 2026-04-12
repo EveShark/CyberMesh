@@ -139,10 +139,7 @@ func (s *Server) queryAuditRows(r *http.Request, limit int) ([]auditEntryDTO, st
 
 	args := []interface{}{}
 	where := []string{"1=1"}
-	if tenantScope != "" {
-		where = append(where, fmt.Sprintf("(caj.tenant_scope = $%d OR caj.tenant_scope IS NULL)", len(args)+1))
-		args = append(args, tenantScope)
-	}
+	where, args = appendAccessBoundAuditFilter(where, args, tenantScope)
 	if policyID := strings.TrimSpace(r.URL.Query().Get("policy_id")); policyID != "" {
 		where = append(where, fmt.Sprintf("COALESCE(caj.policy_id, co_created.policy_id, co.policy_id) = $%d", len(args)+1))
 		args = append(args, policyID)

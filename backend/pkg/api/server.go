@@ -20,6 +20,7 @@ import (
 	"backend/pkg/ingest/kafka"
 	"backend/pkg/mempool"
 	"backend/pkg/p2p"
+	backendsecurity "backend/pkg/security"
 	"backend/pkg/state"
 	"backend/pkg/storage/cockroach"
 	"backend/pkg/utils"
@@ -231,9 +232,12 @@ type Server struct {
 	sem           chan struct{}
 	routeLimiters map[rateLimitKey]*routeLimiter
 
-	aiClient    *http.Client
-	aiBaseURL   string
-	aiAuthToken string
+	aiClient     *http.Client
+	aiBaseURL    string
+	aiAuthToken  string
+	bearerAuth   bearerTokenValidator
+	authorizer   backendsecurity.Authorizer
+	tupleManager *openFGATupleManager
 
 	// State
 	running          atomic.Bool
@@ -274,6 +278,8 @@ type Server struct {
 	controlMutationLastActionByTarget   map[string]time.Time
 	controlGateStateMu                  sync.Mutex
 	controlGateLastSampleAt             time.Time
+	tupleSyncInFlight                   sync.Map
+	tupleSyncLastQueued                 sync.Map
 	controlGateLastPublishedRows        int64
 	controlGateLastAckedRows            int64
 	controlGateLastOldestPendingAgeMs   int64
@@ -449,6 +455,14 @@ func NewServer(deps Dependencies) (*Server, error) {
 	if deps.Config.MaxConcurrentReqs > 0 {
 		s.sem = make(chan struct{}, deps.Config.MaxConcurrentReqs)
 	}
+
+	if validator, err := newUserAuthnZitadel(deps.Config); err != nil {
+		return nil, fmt.Errorf("failed to initialize ZITADEL JWT validator: %w", err)
+	} else {
+		s.bearerAuth = validator
+	}
+	s.authorizer = newAuthzOpenFGA(deps.Config, deps.Logger)
+	s.tupleManager = newOpenFGATupleManager(deps.Config, deps.Logger)
 
 	if len(deps.NodeAliases) > 0 {
 		s.nodeAliases = make(map[string]string, len(deps.NodeAliases))
@@ -699,6 +713,10 @@ func (s *Server) Start(ctx context.Context) error {
 		s.wg.Add(1)
 		go s.runCacheWarmer()
 	}
+	if s.tupleManager != nil && s.config.OpenFGATupleReconcileEnabled {
+		s.wg.Add(1)
+		go s.runOpenFGATupleReconciler()
+	}
 
 	s.logger.Info("API server started",
 		utils.ZapString("addr", s.config.ListenAddr),
@@ -746,6 +764,11 @@ func (s *Server) Stop() error {
 		if s.redisClient != nil {
 			if err := s.redisClient.Close(); err != nil {
 				s.logger.Warn("Redis client close error", utils.ZapError(err))
+			}
+		}
+		if closer, ok := s.bearerAuth.(interface{ Close() error }); ok {
+			if err := closer.Close(); err != nil {
+				s.logger.Warn("bearer auth validator close error", utils.ZapError(err))
 			}
 		}
 

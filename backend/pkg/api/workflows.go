@@ -102,11 +102,7 @@ func (s *Server) handleWorkflowsList(w http.ResponseWriter, r *http.Request) {
 
 	args := []interface{}{}
 	where := []string{"workflow_id IS NOT NULL", "workflow_id <> ''"}
-	if tenantScope != "" {
-		tenantArg := len(args) + 1
-		where = append(where, fmt.Sprintf("(EXISTS (SELECT 1 FROM policy_acks pa WHERE pa.policy_id = control_policy_outbox.policy_id AND pa.tenant = $%d) OR %s = $%d)", tenantArg, outboxPayloadStringExpr("{tenant}", "{metadata,tenant}", "{trace,tenant}", "{target,tenant}", "{target,tenant_id}"), tenantArg))
-		args = append(args, tenantScope)
-	}
+	where, args = appendAccessBoundOutboxFilter(where, args, tenantScope)
 	if status := strings.TrimSpace(r.URL.Query().Get("status")); status != "" {
 		if !isValidOutboxStatus(status) {
 			writeErrorResponse(w, r, "INVALID_STATUS", "status must be one of pending,publishing,published,retry,terminal_failed,acked", http.StatusBadRequest)
@@ -123,6 +119,11 @@ func (s *Server) handleWorkflowsList(w http.ResponseWriter, r *http.Request) {
 		}
 		where = append(where, fmt.Sprintf("(created_at, workflow_id) < ($%d, $%d)", len(args)+1, len(args)+2))
 		args = append(args, cursorAt, cursorWorkflowID)
+	}
+	ackScopeArg := len(args) + 1
+	ackScopeClause := accessBoundAckWhereClause(ackScopeArg, tenantScope)
+	if tenantScope != "" {
+		args = append(args, tenantScope)
 	}
 	args = append(args, limit+1)
 
@@ -158,14 +159,14 @@ func (s *Server) handleWorkflowsList(w http.ResponseWriter, r *http.Request) {
 					workflow_id, %s, controller_instance, result, acked_at,
 					ROW_NUMBER() OVER (PARTITION BY workflow_id ORDER BY acked_at DESC NULLS LAST, observed_at DESC, controller_instance ASC) AS rn
 				FROM policy_acks
-				WHERE workflow_id IN (SELECT workflow_id FROM latest_outbox)
+				WHERE workflow_id IN (SELECT workflow_id FROM latest_outbox)%s
 			) ranked
 			WHERE rn = 1
 		),
 		ack_counts AS (
 			SELECT workflow_id, COUNT(*) AS ack_count
 			FROM policy_ack_events
-			WHERE workflow_id IN (SELECT workflow_id FROM latest_outbox)
+			WHERE workflow_id IN (SELECT workflow_id FROM latest_outbox)%s
 			GROUP BY workflow_id
 		)
 		SELECT
@@ -182,7 +183,7 @@ func (s *Server) handleWorkflowsList(w http.ResponseWriter, r *http.Request) {
 		LEFT JOIN ack_counts ac ON ac.workflow_id = lo.workflow_id
 		ORDER BY lo.created_at DESC, lo.workflow_id DESC
 		LIMIT $%d
-	`, controlOutboxRequestIDSelectExpr(schema), controlOutboxCommandIDSelectExpr(schema), strings.Join(where, " AND "), controlAckEventIDSelectExpr(schema), len(args))
+	`, controlOutboxRequestIDSelectExpr(schema), controlOutboxCommandIDSelectExpr(schema), strings.Join(where, " AND "), controlAckEventIDSelectExpr(schema), ackScopeClause, ackScopeClause, len(args))
 
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -333,7 +334,7 @@ func (s *Server) handleWorkflowRollback(w http.ResponseWriter, r *http.Request) 
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), s.controlMutationTimeout())
 	defer cancel()
-	actor := s.resolveMutationActor(r)
+	actor := s.resolveMutationActor(r, tenantScope)
 	requestID := getRequestID(r.Context())
 	commandID := generateCommandID()
 	if gateErr := s.enforceMutationThrottle(actor, "rollback|"+workflowID); gateErr != nil {
@@ -475,11 +476,8 @@ func (s *Server) loadWorkflowPolicySummaries(ctx context.Context, db *sql.DB, wo
 	}
 	args := []interface{}{workflowID}
 	where := []string{"workflow_id = $1"}
-	if tenantScope != "" {
-		tenantArg := len(args) + 1
-		where = append(where, fmt.Sprintf("(EXISTS (SELECT 1 FROM policy_acks pa WHERE pa.policy_id = control_policy_outbox.policy_id AND pa.tenant = $%d) OR %s = $%d)", tenantArg, outboxPayloadStringExpr("{tenant}", "{metadata,tenant}", "{trace,tenant}", "{target,tenant}", "{target,tenant_id}"), tenantArg))
-		args = append(args, tenantScope)
-	}
+	where, args = appendAccessBoundOutboxFilter(where, args, tenantScope)
+	ackScopeClause := accessBoundAckWhereClause(2, tenantScope)
 	query := fmt.Sprintf(`
 		WITH latest_outbox AS (
 			SELECT * FROM (
@@ -515,7 +513,7 @@ func (s *Server) loadWorkflowPolicySummaries(ctx context.Context, db *sql.DB, wo
 		ack_counts AS (
 			SELECT policy_id, COUNT(*) AS ack_count
 			FROM policy_ack_events
-			WHERE policy_id IN (SELECT policy_id FROM latest_outbox)
+			WHERE policy_id IN (SELECT policy_id FROM latest_outbox)%s
 			GROUP BY policy_id
 		)
 		SELECT
@@ -532,7 +530,7 @@ func (s *Server) loadWorkflowPolicySummaries(ctx context.Context, db *sql.DB, wo
 		LEFT JOIN latest_ack la ON la.policy_id = lo.policy_id
 		LEFT JOIN ack_counts ac ON ac.policy_id = lo.policy_id
 		ORDER BY lo.created_at DESC, lo.policy_id DESC
-	`, controlOutboxRequestIDSelectExpr(schema), controlOutboxCommandIDSelectExpr(schema), controlOutboxWorkflowIDSelectExpr(schema), controlOutboxAnomalyIDSelectExpr(schema), controlOutboxFlowIDSelectExpr(), controlOutboxSourceIDSelectExpr(), controlOutboxSourceTypeSelectExpr(), controlOutboxSensorIDSelectExpr(), controlOutboxValidatorIDSelectExpr(), controlOutboxScopeIdentifierSelectExpr(), controlOutboxSentinelSelectExpr(schema), strings.Join(where, " AND "), controlAckEventIDSelectExpr(schema), controlAckTraceSelectExpr(schema), controlAckSourceEventSelectExpr(schema), controlAckSentinelEventSelectExpr(schema), ackTenantWhereClause(tenantScope))
+	`, controlOutboxRequestIDSelectExpr(schema), controlOutboxCommandIDSelectExpr(schema), controlOutboxWorkflowIDSelectExpr(schema), controlOutboxAnomalyIDSelectExpr(schema), controlOutboxFlowIDSelectExpr(), controlOutboxSourceIDSelectExpr(), controlOutboxSourceTypeSelectExpr(), controlOutboxSensorIDSelectExpr(), controlOutboxValidatorIDSelectExpr(), controlOutboxScopeIdentifierSelectExpr(), controlOutboxSentinelSelectExpr(schema), strings.Join(where, " AND "), controlAckEventIDSelectExpr(schema), controlAckTraceSelectExpr(schema), controlAckSourceEventSelectExpr(schema), controlAckSentinelEventSelectExpr(schema), ackScopeClause, ackScopeClause)
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -558,6 +556,7 @@ func (s *Server) loadWorkflowPolicySummaries(ctx context.Context, db *sql.DB, wo
 
 func (s *Server) loadWorkflowRecentEvents(ctx context.Context, db *sql.DB, workflowID, tenantScope string) ([]policyAckPayload, []controlOutboxRowDTO, error) {
 	schema, _ := loadControlSchemaSupport(ctx, db)
+	outboxWhere, outboxArgs := appendAccessBoundOutboxClause("workflow_id = $1", []interface{}{workflowID}, tenantScope)
 	outboxRows, err := db.QueryContext(ctx, fmt.Sprintf(`
 		SELECT
 			id::STRING, block_height, block_ts, tx_index, policy_id,
@@ -566,10 +565,10 @@ func (s *Server) loadWorkflowRecentEvents(ctx context.Context, db *sql.DB, workf
 			kafka_partition, kafka_offset, published_at, ack_result, ack_reason, ack_controller, acked_at,
 			created_at, updated_at, rule_hash
 		FROM control_policy_outbox
-		WHERE workflow_id = $1
+		WHERE %s
 		ORDER BY created_at DESC, id DESC
 		LIMIT 50
-	`, controlOutboxRequestIDSelectExpr(schema), controlOutboxCommandIDSelectExpr(schema), controlOutboxWorkflowIDSelectExpr(schema), controlOutboxAnomalyIDSelectExpr(schema), controlOutboxFlowIDSelectExpr(), controlOutboxSourceIDSelectExpr(), controlOutboxSourceTypeSelectExpr(), controlOutboxSensorIDSelectExpr(), controlOutboxValidatorIDSelectExpr(), controlOutboxScopeIdentifierSelectExpr()), workflowID)
+	`, controlOutboxRequestIDSelectExpr(schema), controlOutboxCommandIDSelectExpr(schema), controlOutboxWorkflowIDSelectExpr(schema), controlOutboxAnomalyIDSelectExpr(schema), controlOutboxFlowIDSelectExpr(), controlOutboxSourceIDSelectExpr(), controlOutboxSourceTypeSelectExpr(), controlOutboxSensorIDSelectExpr(), controlOutboxValidatorIDSelectExpr(), controlOutboxScopeIdentifierSelectExpr(), outboxWhere), outboxArgs...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -586,9 +585,7 @@ func (s *Server) loadWorkflowRecentEvents(ctx context.Context, db *sql.DB, workf
 		); scanErr != nil {
 			return nil, nil, scanErr
 		}
-		if tenantScope == "" || tenantScopeMatchesOutboxRow(row, tenantScope) {
-			outbox = append(outbox, outboxRowToDTO(row))
-		}
+		outbox = append(outbox, outboxRowToDTO(row))
 	}
 	if err := outboxRows.Err(); err != nil {
 		return nil, nil, err
@@ -596,10 +593,7 @@ func (s *Server) loadWorkflowRecentEvents(ctx context.Context, db *sql.DB, workf
 
 	ackWhere := "workflow_id = $1"
 	ackArgs := []interface{}{workflowID}
-	if tenantScope != "" {
-		ackWhere += fmt.Sprintf(" AND tenant = $%d", len(ackArgs)+1)
-		ackArgs = append(ackArgs, tenantScope)
-	}
+	ackWhere, ackArgs = appendAccessBoundAckFilter(ackWhere, ackArgs, tenantScope)
 	ackRows, err := db.QueryContext(ctx, fmt.Sprintf(`
 		SELECT
 			policy_id, %s, %s, %s, %s, controller_instance,
@@ -635,6 +629,7 @@ func (s *Server) loadWorkflowRecentEvents(ctx context.Context, db *sql.DB, workf
 }
 
 func (s *Server) loadWorkflowLatestOutboxRows(ctx context.Context, tx *sql.Tx, workflowID, tenantScope string) ([]controlOutboxRow, error) {
+	outboxWhere, outboxArgs := appendAccessBoundOutboxClause("workflow_id = $1", []interface{}{workflowID}, tenantScope)
 	rows, err := tx.QueryContext(ctx, `
 		SELECT
 			id::STRING, block_height, block_ts, tx_index, policy_id,
@@ -643,10 +638,10 @@ func (s *Server) loadWorkflowLatestOutboxRows(ctx context.Context, tx *sql.Tx, w
 			kafka_partition, kafka_offset, published_at, ack_result, ack_reason, ack_controller, acked_at,
 			created_at, updated_at, rule_hash
 		FROM control_policy_outbox
-		WHERE workflow_id = $1
+		WHERE `+outboxWhere+`
 		ORDER BY created_at DESC, id DESC
 		FOR UPDATE
-	`, workflowID)
+	`, outboxArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -667,10 +662,8 @@ func (s *Server) loadWorkflowLatestOutboxRows(ctx context.Context, tx *sql.Tx, w
 		if _, seen := seenPolicies[row.PolicyID]; seen {
 			continue
 		}
-		if tenantScope == "" || tenantScopeMatchesOutboxRow(row, tenantScope) {
-			seenPolicies[row.PolicyID] = struct{}{}
-			items = append(items, row)
-		}
+		seenPolicies[row.PolicyID] = struct{}{}
+		items = append(items, row)
 	}
 	return items, rows.Err()
 }

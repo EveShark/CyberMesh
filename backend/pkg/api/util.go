@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 // parseUint64 parses a string to uint64 with validation
@@ -242,20 +244,28 @@ func extractCN(certSubject string) string {
 
 // Helper for validating request ID format
 func isValidRequestID(id string) bool {
-	if id == "" {
-		return false
-	}
+	_, ok := normalizeRequestID(id)
+	return ok
+}
 
-	// Allow alphanumeric, hyphens, underscores
-	for _, c := range id {
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-			(c >= '0' && c <= '9') || c == '-' || c == '_') {
-			return false
-		}
-	}
+func normalizeRequestID(id string) (string, bool) {
+	return normalizeUUIDID(id)
+}
 
-	const maxIDLength = 128
-	return len(id) <= maxIDLength
+func normalizeWorkflowID(id string) (string, bool) {
+	return normalizeUUIDID(id)
+}
+
+func normalizeUUIDID(id string) (string, bool) {
+	trimmed := strings.TrimSpace(id)
+	if trimmed == "" {
+		return "", false
+	}
+	parsed, err := uuid.Parse(trimmed)
+	if err != nil {
+		return "", false
+	}
+	return parsed.String(), true
 }
 
 // clamp clamps a value between min and max

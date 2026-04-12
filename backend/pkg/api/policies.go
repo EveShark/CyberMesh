@@ -196,11 +196,7 @@ func (s *Server) handlePoliciesList(w http.ResponseWriter, r *http.Request) {
 
 	args := []interface{}{}
 	where := []string{"1=1"}
-	if tenantScope != "" {
-		tenantArg := len(args) + 1
-		where = append(where, fmt.Sprintf("(EXISTS (SELECT 1 FROM policy_acks pa WHERE pa.policy_id = control_policy_outbox.policy_id AND pa.tenant = $%d) OR %s = $%d)", tenantArg, outboxPayloadStringExpr("{tenant}", "{metadata,tenant}", "{trace,tenant}", "{target,tenant}", "{target,tenant_id}"), tenantArg))
-		args = append(args, tenantScope)
-	}
+	where, args = appendAccessBoundOutboxFilter(where, args, tenantScope)
 	if status := strings.TrimSpace(r.URL.Query().Get("status")); status != "" {
 		if !isValidOutboxStatus(status) {
 			writeErrorResponse(w, r, "INVALID_STATUS", "status must be one of pending,publishing,published,retry,terminal_failed,acked", http.StatusBadRequest)
@@ -224,6 +220,11 @@ func (s *Server) handlePoliciesList(w http.ResponseWriter, r *http.Request) {
 		}
 		where = append(where, fmt.Sprintf("(created_at, policy_id) < ($%d, $%d)", len(args)+1, len(args)+2))
 		args = append(args, cursorAt, cursorPolicyID)
+	}
+	ackScopeArg := len(args) + 1
+	ackScopeClause := accessBoundAckWhereClause(ackScopeArg, tenantScope)
+	if tenantScope != "" {
+		args = append(args, tenantScope)
 	}
 	args = append(args, limit+1)
 
@@ -262,7 +263,7 @@ func (s *Server) handlePoliciesList(w http.ResponseWriter, r *http.Request) {
 		ack_counts AS (
 			SELECT policy_id, COUNT(*) AS ack_count
 			FROM policy_ack_events
-			WHERE policy_id IN (SELECT policy_id FROM latest_outbox)
+			WHERE policy_id IN (SELECT policy_id FROM latest_outbox)%s
 			GROUP BY policy_id
 		)
 		SELECT
@@ -280,7 +281,7 @@ func (s *Server) handlePoliciesList(w http.ResponseWriter, r *http.Request) {
 		LEFT JOIN ack_counts ac ON ac.policy_id = lo.policy_id
 		ORDER BY lo.created_at DESC, lo.policy_id DESC
 		LIMIT $%d
-	`, controlOutboxRequestIDSelectExpr(schema), controlOutboxCommandIDSelectExpr(schema), controlOutboxWorkflowIDSelectExpr(schema), controlOutboxAnomalyIDSelectExpr(schema), controlOutboxFlowIDSelectExpr(), controlOutboxSourceIDSelectExpr(), controlOutboxSourceTypeSelectExpr(), controlOutboxSensorIDSelectExpr(), controlOutboxValidatorIDSelectExpr(), controlOutboxScopeIdentifierSelectExpr(), controlOutboxSentinelSelectExpr(schema), strings.Join(where, " AND "), controlAckEventIDSelectExpr(schema), controlAckTraceSelectExpr(schema), controlAckSourceEventSelectExpr(schema), controlAckSentinelEventSelectExpr(schema), ackTenantWhereClause(tenantScope), len(args))
+	`, controlOutboxRequestIDSelectExpr(schema), controlOutboxCommandIDSelectExpr(schema), controlOutboxWorkflowIDSelectExpr(schema), controlOutboxAnomalyIDSelectExpr(schema), controlOutboxFlowIDSelectExpr(), controlOutboxSourceIDSelectExpr(), controlOutboxSourceTypeSelectExpr(), controlOutboxSensorIDSelectExpr(), controlOutboxValidatorIDSelectExpr(), controlOutboxScopeIdentifierSelectExpr(), controlOutboxSentinelSelectExpr(schema), strings.Join(where, " AND "), controlAckEventIDSelectExpr(schema), controlAckTraceSelectExpr(schema), controlAckSourceEventSelectExpr(schema), controlAckSentinelEventSelectExpr(schema), ackScopeClause, ackScopeClause, len(args))
 
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -422,7 +423,7 @@ func (s *Server) handlePolicyRevoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if tenantScope != "" {
-		visible, visErr := s.policyVisibleToTenant(ctx, db, row, tenantScope)
+		visible, visErr := s.outboxVisibleToAccess(ctx, db, row, tenantScope)
 		if visErr != nil {
 			writeErrorResponse(w, r, "TENANT_SCOPE_QUERY_FAILED", "failed to verify tenant scope", http.StatusInternalServerError)
 			return
@@ -495,7 +496,7 @@ func (s *Server) handlePolicyDecision(w http.ResponseWriter, r *http.Request, ac
 	ctx, cancel := context.WithTimeout(r.Context(), s.controlMutationTimeout())
 	defer cancel()
 
-	actor := s.resolveMutationActor(r)
+	actor := s.resolveMutationActor(r, tenantScope)
 	requestID := getRequestID(r.Context())
 	commandID := generateCommandID()
 	workflowID := resolveWorkflowID(r, req.WorkflowID)
@@ -571,7 +572,7 @@ func (s *Server) executePolicyDecision(ctx context.Context, db *sql.DB, policyID
 		return decisionResult{}, &apiError{Code: "POLICY_LOOKUP_FAILED", Message: "failed to resolve policy mutation target", HTTPStatus: http.StatusInternalServerError}
 	}
 	if tenantScope != "" {
-		visible, visErr := s.policyVisibleToTenant(ctx, tx, row, tenantScope)
+		visible, visErr := s.outboxVisibleToAccess(ctx, tx, row, tenantScope)
 		if visErr != nil {
 			return decisionResult{}, &apiError{Code: "TENANT_SCOPE_QUERY_FAILED", Message: "failed to verify tenant scope", HTTPStatus: http.StatusInternalServerError}
 		}
@@ -785,10 +786,7 @@ func (s *Server) handlePolicyAcks(w http.ResponseWriter, r *http.Request) {
 func (s *Server) loadPolicyTraceAcks(ctx context.Context, db *sql.DB, schema controlSchemaSupport, policyID, tenantScope string) ([]policyAckRow, []policyAckPayload, error) {
 	ackWhere := "policy_id = $1"
 	ackArgs := []interface{}{policyID}
-	if tenantScope != "" {
-		ackWhere += fmt.Sprintf(" AND tenant = $%d", len(ackArgs)+1)
-		ackArgs = append(ackArgs, tenantScope)
-	}
+	ackWhere, ackArgs = appendAccessBoundAckFilter(ackWhere, ackArgs, tenantScope)
 	for _, tableName := range []string{"policy_ack_events", "policy_acks"} {
 		rows, err := db.QueryContext(ctx, fmt.Sprintf(`
 			SELECT
@@ -851,11 +849,7 @@ func (s *Server) loadPolicyTraceDetail(parent context.Context, policyID, tenantS
 
 	outboxWhere := "policy_id = $1"
 	outboxArgs := []interface{}{policyID}
-	if tenantScope != "" {
-		tenantArg := len(outboxArgs) + 1
-		outboxWhere += fmt.Sprintf(" AND (EXISTS (SELECT 1 FROM policy_acks pa WHERE pa.policy_id = control_policy_outbox.policy_id AND pa.tenant = $%d) OR %s = $%d)", tenantArg, outboxPayloadStringExpr("{tenant}", "{metadata,tenant}", "{trace,tenant}", "{target,tenant}", "{target,tenant_id}"), tenantArg)
-		outboxArgs = append(outboxArgs, tenantScope)
-	}
+	outboxWhere, outboxArgs = appendAccessBoundOutboxClause(outboxWhere, outboxArgs, tenantScope)
 
 	outboxRows, err := db.QueryContext(ctx, fmt.Sprintf(`
 		SELECT
@@ -1136,13 +1130,6 @@ func decodePolicyCursor(cursor string) (time.Time, string, error) {
 	return decodeOutboxCursor(cursor)
 }
 
-func ackTenantWhereClause(tenantScope string) string {
-	if tenantScope == "" {
-		return ""
-	}
-	return " AND tenant = $1"
-}
-
 func (s *Server) loadLatestPolicyOutboxRow(ctx context.Context, query rowQueryer, policyID string) (controlOutboxRow, error) {
 	var row controlOutboxRow
 	err := query.QueryRowContext(ctx, `
@@ -1164,26 +1151,6 @@ func (s *Server) loadLatestPolicyOutboxRow(ctx context.Context, query rowQueryer
 		&row.AckedAt, &row.CreatedAt, &row.UpdatedAt, &row.RuleHash,
 	)
 	return row, err
-}
-
-func (s *Server) policyVisibleToTenant(ctx context.Context, query rowQueryer, row controlOutboxRow, tenantScope string) (bool, error) {
-	if strings.TrimSpace(tenantScope) == "" {
-		return true, nil
-	}
-	var visible bool
-	err := query.QueryRowContext(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM policy_acks pa
-			WHERE pa.policy_id = $1 AND pa.tenant = $2
-		)
-	`, row.PolicyID, tenantScope).Scan(&visible)
-	if err != nil {
-		return false, err
-	}
-	if visible {
-		return true, nil
-	}
-	return tenantScopeMatchesOutboxRow(row, tenantScope), nil
 }
 
 func extractPolicyPayloadAction(raw []byte) string {

@@ -36,8 +36,27 @@ type APIConfig struct {
 	IPAllowlist  []string            // Allowed client IPs/CIDRs
 	AllowedRoles map[string][]string // Role -> allowed endpoints mapping
 	// Auth gating (feature-flagged)
-	RequireAuth  bool     // If true, require auth even outside production (e.g., staging)
-	BearerTokens []string // Optional static bearer tokens accepted for auth
+	RequireAuth                   bool     // If true, require auth even outside production (e.g., staging)
+	BearerTokens                  []string // Optional static bearer tokens accepted for auth
+	ZitadelIssuer                 string
+	ZitadelClientID               string
+	ZitadelAudience               string
+	ZitadelJWKSRefreshInterval    time.Duration
+	ZitadelJWKSTimeout            time.Duration
+	OpenFGAAPIURL                 string
+	OpenFGAStoreID                string
+	OpenFGAModelID                string
+	OpenFGAToken                  string
+	OpenFGAShadow                 bool
+	OpenFGAEnforce                bool
+	OpenFGAEnforceTypes           []string
+	OpenFGATimeout                time.Duration
+	OpenFGAShadowMaxInflight      int
+	OpenFGATupleReconcileEnabled  bool
+	OpenFGATupleReconcileInterval time.Duration
+	OpenFGATupleBatchSize         int
+	BreakGlassEnabled             bool
+	BreakGlassMaxDuration         time.Duration
 
 	// Rate limiting
 	RateLimitEnabled   bool
@@ -151,6 +170,15 @@ func DefaultAPIConfig() *APIConfig {
 		Environment:                     "production",
 		AllowDegradedBootstrap:          false,
 		AIServiceTimeout:                2 * time.Second,
+		ZitadelJWKSRefreshInterval:      1 * time.Hour,
+		ZitadelJWKSTimeout:              5 * time.Second,
+		OpenFGATimeout:                  750 * time.Millisecond,
+		OpenFGAShadowMaxInflight:        64,
+		OpenFGAEnforceTypes:             []string{"policy", "workflow", "audit_scope"},
+		OpenFGATupleReconcileInterval:   60 * time.Second,
+		OpenFGATupleBatchSize:           200,
+		BreakGlassEnabled:               false,
+		BreakGlassMaxDuration:           1 * time.Hour,
 		AllowedRoles:                    defaultRoleMapping(),
 		ControlMutationsEnabled:         false,
 		ControlMutationsSafeMode:        false,
@@ -227,6 +255,55 @@ func LoadAPIConfig(cm *utils.ConfigManager) (*APIConfig, error) {
 	cfg.RequireAuth = cm.GetBool("API_REQUIRE_AUTH", false)
 	if tokens := cm.GetString("API_BEARER_TOKENS", ""); tokens != "" {
 		cfg.BearerTokens = parseCommaSeparated(tokens)
+	}
+	cfg.ZitadelIssuer = strings.TrimSpace(cm.GetString("ZITADEL_ISSUER", ""))
+	cfg.ZitadelClientID = strings.TrimSpace(cm.GetString("ZITADEL_CLIENT_ID", ""))
+	cfg.ZitadelAudience = strings.TrimSpace(cm.GetString("ZITADEL_AUDIENCE", ""))
+	if cfg.ZitadelAudience == "" {
+		cfg.ZitadelAudience = cfg.ZitadelClientID
+	}
+	if interval := cm.GetDuration("ZITADEL_JWKS_REFRESH_INTERVAL", 0); interval > 0 {
+		cfg.ZitadelJWKSRefreshInterval = interval
+	}
+	if timeout := cm.GetDuration("ZITADEL_JWKS_TIMEOUT", 0); timeout > 0 {
+		cfg.ZitadelJWKSTimeout = timeout
+	}
+	cfg.OpenFGAAPIURL = strings.TrimSpace(cm.GetString("FGA_API_URL", ""))
+	cfg.OpenFGAStoreID = strings.TrimSpace(cm.GetString("FGA_STORE_ID", ""))
+	cfg.OpenFGAModelID = strings.TrimSpace(cm.GetString("FGA_MODEL_ID", ""))
+	cfg.OpenFGAToken = strings.TrimSpace(cm.GetString("FGA_API_TOKEN", ""))
+	cfg.OpenFGAShadow = cm.GetBool("FGA_SHADOW_ENABLED", cfg.OpenFGAAPIURL != "" && cfg.OpenFGAStoreID != "" && cfg.OpenFGAModelID != "")
+	cfg.OpenFGAEnforce = cm.GetBool("FGA_ENFORCE_ENABLED", false)
+	if types := strings.TrimSpace(cm.GetString("FGA_ENFORCE_RESOURCE_TYPES", "")); types != "" {
+		parsed, err := normalizeAndValidateOpenFGAEnforceTypes(parseCommaSeparated(types))
+		if err != nil {
+			return nil, err
+		}
+		cfg.OpenFGAEnforceTypes = parsed
+	}
+	if timeout := cm.GetDuration("FGA_TIMEOUT", 0); timeout > 0 {
+		cfg.OpenFGATimeout = timeout
+	}
+	if maxInflight := cm.GetInt("FGA_SHADOW_MAX_INFLIGHT", 0); maxInflight != 0 {
+		if maxInflight <= 0 {
+			return nil, fmt.Errorf("FGA_SHADOW_MAX_INFLIGHT must be greater than zero")
+		}
+		cfg.OpenFGAShadowMaxInflight = maxInflight
+	}
+	cfg.OpenFGATupleReconcileEnabled = cm.GetBool("FGA_TUPLE_RECONCILE_ENABLED", cfg.OpenFGAAPIURL != "" && cfg.OpenFGAStoreID != "" && cfg.OpenFGAModelID != "")
+	if interval := cm.GetDuration("FGA_TUPLE_RECONCILE_INTERVAL", 0); interval > 0 {
+		cfg.OpenFGATupleReconcileInterval = interval
+	}
+	if size := cm.GetInt("FGA_TUPLE_BATCH_SIZE", 0); size > 0 {
+		cfg.OpenFGATupleBatchSize = size
+	}
+	cfg.BreakGlassEnabled = cm.GetBool("BREAK_GLASS_ENABLED", cfg.BreakGlassEnabled)
+	if rawDuration := strings.TrimSpace(cm.GetString("BREAK_GLASS_MAX_DURATION", "")); rawDuration != "" {
+		duration := cm.GetDuration("BREAK_GLASS_MAX_DURATION", 0)
+		if duration <= 0 {
+			return nil, fmt.Errorf("BREAK_GLASS_MAX_DURATION must be a positive duration")
+		}
+		cfg.BreakGlassMaxDuration = duration
 	}
 
 	// Rate limiting
@@ -673,6 +750,37 @@ func parseCommaSeparated(s string) []string {
 		}
 	}
 	return result
+}
+
+func normalizeAndValidateOpenFGAEnforceTypes(values []string) ([]string, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+
+	allowed := map[string]struct{}{
+		"policy":          {},
+		"workflow":        {},
+		"audit_scope":     {},
+		"platform_config": {},
+	}
+
+	normalized := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		key := strings.ToLower(strings.TrimSpace(value))
+		if key == "" {
+			continue
+		}
+		if _, ok := allowed[key]; !ok {
+			return nil, fmt.Errorf("invalid FGA_ENFORCE_RESOURCE_TYPES value %q", value)
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		normalized = append(normalized, key)
+	}
+	return normalized, nil
 }
 
 // splitAndTrim splits string and trims whitespace

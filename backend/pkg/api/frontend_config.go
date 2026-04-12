@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+	"strings"
 )
 
 // FrontendConfig represents configuration exposed to frontend
@@ -12,6 +13,9 @@ type FrontendConfig struct {
 	SupabaseProjectID string `json:"supabaseProjectId"`
 	SupabaseKey       string `json:"supabaseKey"`
 	DemoMode          string `json:"demoMode"`
+	ZitadelIssuer     string `json:"zitadelIssuer"`
+	ZitadelClientID   string `json:"zitadelClientId"`
+	ZitadelEnabled    bool   `json:"zitadelEnabled"`
 }
 
 // handleFrontendConfig returns runtime configuration for frontend
@@ -35,6 +39,9 @@ func (s *Server) handleFrontendConfig(w http.ResponseWriter, r *http.Request) {
 		SupabaseProjectID: getEnvOrDefault("VITE_SUPABASE_PROJECT_ID", "wcgddjipyslnjstabqaq"),
 		SupabaseKey:       getEnvOrDefault("VITE_SUPABASE_PUBLISHABLE_KEY", ""),
 		DemoMode:          getEnvOrDefault("VITE_DEMO_MODE", "false"),
+		ZitadelIssuer:     strings.TrimSpace(s.config.ZitadelIssuer),
+		ZitadelClientID:   strings.TrimSpace(s.config.ZitadelClientID),
+		ZitadelEnabled:    strings.TrimSpace(s.config.ZitadelIssuer) != "" && strings.TrimSpace(s.config.ZitadelClientID) != "",
 	}
 
 	// Set CORS headers for frontend access

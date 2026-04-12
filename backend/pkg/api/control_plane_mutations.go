@@ -129,7 +129,7 @@ func (s *Server) handleControlOutboxMutation(w http.ResponseWriter, r *http.Requ
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.controlMutationTimeout())
 	defer cancel()
-	actor := s.resolveMutationActor(r)
+	actor := s.resolveMutationActor(r, tenantScope)
 	requestID := getRequestID(r.Context())
 	commandID := generateCommandID()
 	workflowID := resolveWorkflowID(r, req.WorkflowID)
@@ -419,7 +419,7 @@ func (s *Server) handleControlLeaseForceTakeover(w http.ResponseWriter, r *http.
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), s.controlMutationTimeout())
 	defer cancel()
-	actor := s.resolveMutationActor(r)
+	actor := s.resolveMutationActor(r, tenantScope)
 	requestID := getRequestID(r.Context())
 	commandID := generateCommandID()
 	workflowID := resolveWorkflowID(r, "")
@@ -602,19 +602,16 @@ func (s *Server) requireControlMutationAllowed(r *http.Request) *controlMutation
 	return nil
 }
 
-func (s *Server) resolveMutationActor(r *http.Request) string {
-	role, _ := r.Context().Value(ctxKeyClientRole).(string)
-	if role == "" {
-		role = "unknown"
+func (s *Server) resolveMutationActor(r *http.Request, tenantScope string) string {
+	principalID := strings.TrimSpace(s.resolveLegacyPrincipalID(r))
+	if principalID == "" {
+		principalID = "legacy:unauthenticated"
 	}
-	tenant := strings.TrimSpace(r.Header.Get("X-Tenant-Id"))
-	if tenant == "" {
-		tenant = strings.TrimSpace(r.Header.Get("X-Tenant"))
+	tenantScope = strings.TrimSpace(tenantScope)
+	if tenantScope != "" {
+		return principalID + ":" + tenantScope
 	}
-	if tenant != "" {
-		return role + ":" + tenant
-	}
-	return role
+	return principalID
 }
 
 func parseOutboxMutationRef(rowRef string) (string, string, bool) {
@@ -664,11 +661,14 @@ func parseControlMutationRequest(r *http.Request) (controlMutationRequest, error
 
 func resolveWorkflowID(r *http.Request, bodyWorkflowID string) string {
 	if r != nil {
-		if headerWorkflowID := strings.TrimSpace(r.Header.Get("X-Workflow-Id")); headerWorkflowID != "" {
+		if headerWorkflowID, ok := normalizeWorkflowID(r.Header.Get("X-Workflow-Id")); ok {
 			return headerWorkflowID
 		}
 	}
-	return strings.TrimSpace(bodyWorkflowID)
+	if workflowID, ok := normalizeWorkflowID(bodyWorkflowID); ok {
+		return workflowID
+	}
+	return generateWorkflowID()
 }
 
 func (s *Server) loadOutboxRowForUpdate(ctx context.Context, tx *sql.Tx, rowID string) (controlOutboxRow, error) {
@@ -1259,6 +1259,14 @@ func isUniqueConstraintErr(err error) bool {
 }
 
 func generateCommandID() string {
+	id, err := uuid.NewV7()
+	if err != nil {
+		return uuid.NewString()
+	}
+	return id.String()
+}
+
+func generateWorkflowID() string {
 	id, err := uuid.NewV7()
 	if err != nil {
 		return uuid.NewString()

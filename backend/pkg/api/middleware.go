@@ -2,8 +2,7 @@ package api
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -13,27 +12,37 @@ import (
 	"time"
 
 	"backend/pkg/utils"
+	"github.com/google/uuid"
 )
 
 // Middleware context keys
 type contextKey string
 
 const (
-	ctxKeyRequestID  contextKey = "request_id"
-	ctxKeyClientIP   contextKey = "client_ip"
-	ctxKeyClientCert contextKey = "client_cert"
-	ctxKeyClientRole contextKey = "client_role"
-	ctxKeyStartTime  contextKey = "start_time"
+	ctxKeyRequestID          contextKey = "request_id"
+	ctxKeyClientIP           contextKey = "client_ip"
+	ctxKeyClientCert         contextKey = "client_cert"
+	ctxKeyClientRole         contextKey = "client_role"
+	ctxKeyStartTime          contextKey = "start_time"
+	ctxKeyPrincipalID        contextKey = "principal_id"
+	ctxKeyPrincipalType      contextKey = "principal_type"
+	ctxKeyAuthSubject        contextKey = "auth_subject"
+	ctxKeyAuthUsername       contextKey = "auth_username"
+	ctxKeyAuthEmail          contextKey = "auth_email"
+	ctxKeyAuthSource         contextKey = "auth_source"
+	ctxKeyTrustedMemberships contextKey = "trusted_memberships"
+	ctxKeyTrustedDelegation  contextKey = "trusted_delegation"
 )
+
+var errBearerValidatorUnavailable = errors.New("bearer_validator_unavailable")
 
 // middlewareRequestID adds a unique request ID to each request
 func (s *Server) middlewareRequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Check if client provided request ID
-		requestID := r.Header.Get(HeaderRequestID)
-
-		// Generate if not provided or invalid
-		if requestID == "" || !isValidRequestID(requestID) {
+		requestID := ""
+		if normalized, ok := normalizeRequestID(r.Header.Get(HeaderRequestID)); ok {
+			requestID = normalized
+		} else {
 			requestID = generateRequestID()
 		}
 
@@ -339,14 +348,14 @@ func getClientIdentifier(r *http.Request) string {
 	return fmt.Sprintf("ip:%s", getClientIP(r))
 }
 
-// generateRequestID generates a random request ID
+// generateRequestID generates a UUIDv7 request ID with UUIDv4 fallback.
 func generateRequestID() string {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		// Fallback to timestamp-based ID
-		return fmt.Sprintf("%d", time.Now().UnixNano())
+	id, err := uuid.NewV7()
+	if err != nil {
+		// Fallback to UUIDv4 if v7 generation fails.
+		return uuid.NewString()
 	}
-	return hex.EncodeToString(b)
+	return id.String()
 }
 
 // middlewareGlobalAuth enforces authentication for all non-public endpoints
@@ -362,6 +371,7 @@ func (s *Server) middlewareGlobalAuth(next http.Handler) http.Handler {
 		// SECURITY: Authentication required for this endpoint
 		authenticated := false
 		clientRole := "anonymous"
+		authSource := ""
 
 		// Determine if auth is required based on environment and feature flag
 		requireAuth := s.config.Environment == "production" || s.config.RequireAuth
@@ -372,6 +382,7 @@ func (s *Server) middlewareGlobalAuth(next http.Handler) http.Handler {
 			// Extract role from certificate CN or SAN
 			clientRole = extractRoleFromCert(cert.Subject.CommonName)
 			authenticated = true
+			authSource = "mtls"
 
 			s.logger.InfoContext(r.Context(), "client authenticated via mTLS",
 				utils.ZapString("role", clientRole),
@@ -383,14 +394,36 @@ func (s *Server) middlewareGlobalAuth(next http.Handler) http.Handler {
 			authHeader := r.Header.Get("Authorization")
 			if strings.HasPrefix(authHeader, "Bearer ") {
 				token := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
-				if token != "" && s.validateBearerToken(token) {
+				if token == "" {
+					s.recordBearerValidationFailure(r, errors.New("bearer token format invalid"))
+					writeErrorFromUtils(w, r, NewUnauthorizedError("invalid bearer token"))
+					return
+				}
+				if s.validateBearerToken(token) {
 					authenticated = true
 					clientRole = "api_client"
-				} else if !requireAuth && s.config.Environment != "production" {
-					// Dev convenience when auth not required: accept any token
-					authenticated = true
-					clientRole = "developer"
-					s.logger.WarnContext(r.Context(), "dev mode token accepted (API_REQUIRE_AUTH=false)")
+					authSource = "static_bearer"
+				} else if s.bearerAuth != nil {
+					if identity, err := s.bearerAuth.ValidateToken(r.Context(), token); err == nil {
+						authenticated = true
+						clientRole = "authenticated_user"
+						authSource = "jwt"
+						ctx := context.WithValue(r.Context(), ctxKeyPrincipalID, identity.PrincipalID)
+						ctx = context.WithValue(ctx, ctxKeyPrincipalType, string(identity.PrincipalType))
+						ctx = context.WithValue(ctx, ctxKeyAuthSubject, identity.Subject)
+						ctx = context.WithValue(ctx, ctxKeyAuthUsername, identity.Username)
+						ctx = context.WithValue(ctx, ctxKeyAuthEmail, identity.Email)
+						ctx = context.WithValue(ctx, ctxKeyAuthSource, authSource)
+						r = r.WithContext(ctx)
+					} else {
+						s.recordBearerValidationFailure(r, err)
+						writeErrorFromUtils(w, r, NewUnauthorizedError("invalid bearer token"))
+						return
+					}
+				} else {
+					s.recordBearerValidationFailure(r, errBearerValidatorUnavailable)
+					writeErrorFromUtils(w, r, NewUnauthorizedError("invalid bearer token"))
+					return
 				}
 			}
 		}
@@ -398,14 +431,10 @@ func (s *Server) middlewareGlobalAuth(next http.Handler) http.Handler {
 		// Method 3: API Key Authentication (fallback)
 		if !authenticated {
 			apiKey := r.Header.Get("X-API-Key")
-			if apiKey != "" {
-				// TODO: Implement API key validation
-				// For now, accept any key in development mode
-				if s.config.Environment != "production" {
-					authenticated = true
-					clientRole = "api_client"
-					s.logger.WarnContext(r.Context(), "API key auth not fully implemented, accepting key in dev mode")
-				}
+			if strings.TrimSpace(apiKey) != "" && s.validateAPIKey(apiKey) {
+				authenticated = true
+				clientRole = "api_client"
+				authSource = "api_key"
 			}
 		}
 
@@ -423,6 +452,7 @@ func (s *Server) middlewareGlobalAuth(next http.Handler) http.Handler {
 				utils.ZapString("path", r.URL.Path))
 			authenticated = true
 			clientRole = "developer"
+			authSource = "developer_fallback"
 		}
 
 		// Check role-based access control
@@ -430,6 +460,9 @@ func (s *Server) middlewareGlobalAuth(next http.Handler) http.Handler {
 		if s.config.Environment != "production" {
 			// Development mode: Allow all roles
 			ctx := context.WithValue(r.Context(), ctxKeyClientRole, clientRole)
+			if authSource != "" {
+				ctx = context.WithValue(ctx, ctxKeyAuthSource, authSource)
+			}
 			next.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
@@ -448,12 +481,73 @@ func (s *Server) middlewareGlobalAuth(next http.Handler) http.Handler {
 
 		// Add role to context
 		ctx := context.WithValue(r.Context(), ctxKeyClientRole, clientRole)
+		if authSource != "" {
+			ctx = context.WithValue(ctx, ctxKeyAuthSource, authSource)
+		}
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
+func (s *Server) recordBearerValidationFailure(r *http.Request, err error) {
+	if err == nil {
+		return
+	}
+	requestID := getRequestID(r.Context())
+	reason := classifyBearerValidationFailure(err)
+	if s.logger != nil {
+		s.logger.WarnContext(r.Context(), "bearer token validation failed",
+			utils.ZapString("request_id", requestID),
+			utils.ZapString("path", r.URL.Path),
+			utils.ZapString("client_ip", getClientIP(r)),
+			utils.ZapString("reason", reason))
+	}
+	if s.audit != nil {
+		_ = s.audit.Log("api.auth.bearer_invalid", utils.AuditSecurity, map[string]interface{}{
+			"request_id": requestID,
+			"path":       r.URL.Path,
+			"client_ip":  getClientIP(r),
+			"reason":     reason,
+		})
+	}
+}
+
+func classifyBearerValidationFailure(err error) string {
+	if err == nil {
+		return "validation_failed"
+	}
+	if errors.Is(err, errBearerValidatorUnavailable) {
+		return "validator_unavailable"
+	}
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	switch {
+	case strings.Contains(msg, "expired"):
+		return "expired"
+	case strings.Contains(msg, "issuer"):
+		return "issuer_mismatch"
+	case strings.Contains(msg, "audience"):
+		return "audience_mismatch"
+	case strings.Contains(msg, "signature"):
+		return "invalid_signature"
+	case strings.Contains(msg, "subject"):
+		return "invalid_subject"
+	case strings.Contains(msg, "format"), strings.Contains(msg, "malformed"), strings.Contains(msg, "parse"):
+		return "invalid_format"
+	default:
+		return "validation_failed"
+	}
+}
+
 // validateBearerToken checks provided token against configured static tokens (constant-time)
 func (s *Server) validateBearerToken(token string) bool {
+	return s.validateStaticToken(token)
+}
+
+// validateAPIKey checks provided API key against configured static tokens (constant-time).
+func (s *Server) validateAPIKey(apiKey string) bool {
+	return s.validateStaticToken(apiKey)
+}
+
+func (s *Server) validateStaticToken(token string) bool {
 	if len(s.config.BearerTokens) == 0 || token == "" {
 		return false
 	}

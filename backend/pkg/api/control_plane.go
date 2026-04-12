@@ -523,10 +523,7 @@ func (s *Server) handleControlOutboxList(w http.ResponseWriter, r *http.Request)
 		writeErrorResponse(w, r, scopeErr.Code, scopeErr.Message, scopeErr.HTTPStatus)
 		return
 	}
-	if tenantScope != "" {
-		where = append(where, fmt.Sprintf("EXISTS (SELECT 1 FROM policy_acks pa WHERE pa.policy_id = control_policy_outbox.policy_id AND pa.tenant = $%d)", len(args)+1))
-		args = append(args, tenantScope)
-	}
+	where, args = appendAccessBoundOutboxFilter(where, args, tenantScope)
 
 	if status := strings.TrimSpace(r.URL.Query().Get("status")); status != "" {
 		if !isValidOutboxStatus(status) {
@@ -757,19 +754,13 @@ func (s *Server) handleControlOutboxGet(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if tenantScope != "" {
-		var visible int
-		visErr := db.QueryRowContext(ctx, `
-			SELECT 1
-			FROM policy_acks
-			WHERE policy_id = $1 AND tenant = $2
-			LIMIT 1
-		`, row.PolicyID, tenantScope).Scan(&visible)
-		if visErr == sql.ErrNoRows {
-			writeErrorResponse(w, r, "OUTBOX_ROW_NOT_FOUND", "outbox row not found", http.StatusNotFound)
-			return
-		}
+		visible, visErr := s.outboxVisibleToAccess(ctx, db, row, tenantScope)
 		if visErr != nil {
 			writeErrorResponse(w, r, "OUTBOX_SCOPE_QUERY_FAILED", "failed to evaluate outbox row scope", http.StatusInternalServerError)
+			return
+		}
+		if !visible {
+			writeErrorResponse(w, r, "OUTBOX_ROW_NOT_FOUND", "outbox row not found", http.StatusNotFound)
 			return
 		}
 	}
@@ -831,10 +822,7 @@ func (s *Server) handleControlTraceList(w http.ResponseWriter, r *http.Request) 
 	where := []string{"1=1"}
 	args := make([]interface{}, 0, 16)
 	payloadFilters := outboxOperationalFilters{}
-	if tenantScope != "" {
-		where = append(where, fmt.Sprintf("EXISTS (SELECT 1 FROM policy_acks pa WHERE pa.policy_id = control_policy_outbox.policy_id AND pa.tenant = $%d)", len(args)+1))
-		args = append(args, tenantScope)
-	}
+	where, args = appendAccessBoundOutboxFilter(where, args, tenantScope)
 	if policyID != "" {
 		where = append(where, fmt.Sprintf("policy_id = $%d", len(args)+1))
 		args = append(args, policyID)
@@ -1055,10 +1043,7 @@ func (s *Server) handleControlTraceByPolicy(w http.ResponseWriter, r *http.Reque
 
 	outboxWhere := "policy_id = $1"
 	outboxArgs := []interface{}{policyID}
-	if tenantScope != "" {
-		outboxWhere = outboxWhere + fmt.Sprintf(" AND EXISTS (SELECT 1 FROM policy_acks pa WHERE pa.policy_id = control_policy_outbox.policy_id AND pa.tenant = $%d)", len(outboxArgs)+1)
-		outboxArgs = append(outboxArgs, tenantScope)
-	}
+	outboxWhere, outboxArgs = appendAccessBoundOutboxClause(outboxWhere, outboxArgs, tenantScope)
 	outboxRows, err := db.QueryContext(ctx, fmt.Sprintf(`
 		SELECT
 			id::STRING, block_height, block_ts, tx_index, policy_id,
@@ -1106,10 +1091,7 @@ func (s *Server) handleControlTraceByPolicy(w http.ResponseWriter, r *http.Reque
 
 	ackWhere := "policy_id = $1"
 	ackArgs := []interface{}{policyID}
-	if tenantScope != "" {
-		ackWhere = ackWhere + fmt.Sprintf(" AND tenant = $%d", len(ackArgs)+1)
-		ackArgs = append(ackArgs, tenantScope)
-	}
+	ackWhere, ackArgs = appendAccessBoundAckFilter(ackWhere, ackArgs, tenantScope)
 	ackRows, err := db.QueryContext(ctx, fmt.Sprintf(`
 		SELECT
 			policy_id, %s, %s, %s, %s, controller_instance,
@@ -1972,10 +1954,6 @@ func (s *Server) handleControlAcksList(w http.ResponseWriter, r *http.Request) {
 		where = append(where, fmt.Sprintf("pa.controller_instance = $%d", len(args)+1))
 		args = append(args, instance)
 	}
-	if tenant := strings.TrimSpace(r.URL.Query().Get("tenant")); tenant != "" && tenantScope == "" {
-		where = append(where, fmt.Sprintf("pa.tenant = $%d", len(args)+1))
-		args = append(args, tenant)
-	}
 	if region := strings.TrimSpace(r.URL.Query().Get("region")); region != "" {
 		where = append(where, fmt.Sprintf("pa.region = $%d", len(args)+1))
 		args = append(args, region)
@@ -2696,30 +2674,9 @@ func maxInt64(a, b int64) int64 {
 }
 
 func (s *Server) resolveTenantScope(r *http.Request) (string, *tenantScopeError) {
-	headerTenant := strings.TrimSpace(r.Header.Get("X-Tenant-ID"))
-	queryTenant := strings.TrimSpace(r.URL.Query().Get("tenant"))
-	if headerTenant != "" && queryTenant != "" && !strings.EqualFold(headerTenant, queryTenant) {
-		return "", &tenantScopeError{
-			Code:       "TENANT_SCOPE_CONFLICT",
-			Message:    "tenant in header and query must match",
-			HTTPStatus: http.StatusForbidden,
-		}
+	envelope, err := s.resolveNormalizedSecurityEnvelope(r)
+	if err != nil {
+		return "", err
 	}
-
-	scope := headerTenant
-	if scope == "" {
-		scope = queryTenant
-	}
-	requireScope := false
-	if s != nil && s.config != nil {
-		requireScope = strings.EqualFold(strings.TrimSpace(s.config.Environment), "production") || s.config.RequireAuth
-	}
-	if requireScope && scope == "" {
-		return "", &tenantScopeError{
-			Code:       "TENANT_SCOPE_REQUIRED",
-			Message:    "tenant scope is required",
-			HTTPStatus: http.StatusBadRequest,
-		}
-	}
-	return scope, nil
+	return strings.TrimSpace(envelope.Access.ActiveAccessID), nil
 }
