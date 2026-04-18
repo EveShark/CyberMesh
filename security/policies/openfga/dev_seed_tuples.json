@@ -1,0 +1,17 @@
+[
+  {
+    "user": "user:local-admin",
+    "relation": "admin",
+    "object": "access:access-local"
+  },
+  {
+    "user": "policy:policy-local",
+    "relation": "access",
+    "object": "access:access-local"
+  },
+  {
+    "user": "workflow:workflow-local",
+    "relation": "access",
+    "object": "access:access-local"
+  }
+]

@@ -1,0 +1,174 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cybermesh.local/security/audit/schema/audit_event.schema.json",
+  "title": "CyberMesh Audit Event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "audit_event_id",
+    "decision_id",
+    "request_id",
+    "timestamp",
+    "schema_version",
+    "decision",
+    "reason_code",
+    "action",
+    "actor",
+    "target"
+  ],
+  "properties": {
+    "audit_event_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 36,
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "decision_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 36,
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "request_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 36,
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "trace_id": {
+      "type": "string",
+      "maxLength": 255
+    },
+    "source_event_id": {
+      "type": "string",
+      "maxLength": 255
+    },
+    "sentinel_event_id": {
+      "type": "string",
+      "maxLength": 255
+    },
+    "policy_id": {
+      "type": "string",
+      "maxLength": 128
+    },
+    "scope_identifier": {
+      "type": "string",
+      "maxLength": 255
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "schema_version": {
+      "type": "string",
+      "const": "security.audit_event.v1"
+    },
+    "decision": {
+      "type": "string",
+      "enum": ["allow", "deny", "error"]
+    },
+    "reason_code": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "reason_detail": {
+      "type": "string",
+      "maxLength": 1024
+    },
+    "policy_source": {
+      "type": "string",
+      "maxLength": 128
+    },
+    "policy_store": {
+      "type": "string",
+      "maxLength": 128
+    },
+    "policy_model": {
+      "type": "string",
+      "maxLength": 128
+    },
+    "action": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "request_path": {
+      "type": "string",
+      "maxLength": 512
+    },
+    "http_method": {
+      "type": "string",
+      "maxLength": 16
+    },
+    "outcome": {
+      "type": "string",
+      "maxLength": 64
+    },
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["principal_id", "principal_type"],
+      "properties": {
+        "principal_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "principal_type": {
+          "type": "string",
+          "enum": ["user", "service"]
+        },
+        "workload_id": {
+          "type": "string",
+          "maxLength": 255
+        },
+        "session_id": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "delegation_id": {
+          "type": "string",
+          "maxLength": 36,
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["resource_type", "resource_id", "is_global_resource"],
+      "properties": {
+        "access_id": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "resource_type": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "resource_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "is_global_resource": {
+          "type": "boolean"
+        },
+        "selector_access_id": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "authorized_access_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        }
+      }
+    }
+  }
+}

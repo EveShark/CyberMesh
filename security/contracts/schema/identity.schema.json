@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cybermesh.local/security/contracts/schema/identity.schema.json",
+  "title": "CyberMesh Identity Claims",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "principal_id",
+    "principal_type",
+    "issuer",
+    "audience",
+    "subject",
+    "allowed_access_ids",
+    "internal_admin",
+    "support_delegated"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "security.identity.v1"
+    },
+    "principal_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+    "principal_type": { "type": "string", "enum": ["user", "service"] },
+    "access_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "issuer": { "type": "string", "minLength": 1, "maxLength": 255 },
+    "audience": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 255 } },
+    "subject": { "type": "string", "minLength": 1, "maxLength": 255 },
+    "roles": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 64 } },
+    "groups": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 128 } },
+    "allowed_access_ids": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 128 } },
+    "internal_admin": { "type": "boolean" },
+    "support_delegated": { "type": "boolean" },
+    "delegation_id": {
+      "type": "string",
+      "maxLength": 36,
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "session_id": { "type": "string", "maxLength": 128 },
+    "token_id": { "type": "string", "maxLength": 128 },
+    "authentication_ref": { "type": "string", "maxLength": 255 }
+  }
+}

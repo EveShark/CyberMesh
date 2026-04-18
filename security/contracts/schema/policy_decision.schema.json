@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cybermesh.local/security/contracts/schema/policy_decision.schema.json",
+  "title": "CyberMesh Policy Decision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "decision_id",
+    "effect",
+    "source",
+    "principal_id",
+    "principal_type",
+    "action",
+    "resource",
+    "reason_code",
+    "request_id"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "security.policy_decision.v1"
+    },
+    "decision_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 36,
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "effect": { "type": "string", "enum": ["allow", "deny", "error"] },
+    "source": { "type": "string", "enum": ["openfga", "static", "delegation"] },
+    "policy_store": { "type": "string", "maxLength": 128 },
+    "policy_model": { "type": "string", "maxLength": 128 },
+    "principal_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+    "principal_type": { "type": "string", "enum": ["user", "service"] },
+    "action": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "resource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "is_global_resource"],
+      "properties": {
+        "type": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "id": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "is_global_resource": { "type": "boolean" }
+      }
+    },
+    "access_id": { "type": "string", "maxLength": 128 },
+    "reason_code": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "reason_detail": { "type": "string", "maxLength": 1024 },
+    "request_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 36,
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "trace_id": { "type": "string", "maxLength": 255 },
+    "obligations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type"],
+        "properties": {
+          "type": { "type": "string", "enum": ["mask_fields", "limit_access_scope", "require_step_up", "read_only"] },
+          "value": { "type": "string", "maxLength": 255 },
+          "values": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 255 } },
+          "message": { "type": "string", "maxLength": 512 }
+        }
+      }
+    },
+    "expires_at": { "type": "string", "format": "date-time" },
+    "cached": { "type": "boolean" }
+  }
+}

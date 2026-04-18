@@ -1,0 +1,60 @@
+model
+  schema 1.1
+
+type user
+
+type service
+
+type access
+  relations
+    define platform_admin: [user]
+    define support_delegate: [user]
+    define admin: [user]
+    define analyst: [user]
+    define viewer: [user]
+    define responder: [user]
+    define member: admin or analyst or viewer or responder
+    define can_view: member or support_delegate or platform_admin
+    define can_admin: admin or platform_admin
+    define can_respond: responder or admin or platform_admin
+    define can_support: support_delegate or platform_admin
+
+type policy
+  relations
+    define access: [access]
+    define can_read: viewer from access or analyst from access or admin from access or support_delegate from access or platform_admin from access
+    define can_write: admin from access or platform_admin from access
+    define can_approve: admin from access or platform_admin from access
+    define can_delete: admin from access or platform_admin from access
+
+type workflow
+  relations
+    define access: [access]
+    define can_read: viewer from access or analyst from access or admin from access or support_delegate from access or platform_admin from access
+    define can_write: analyst from access or admin from access or platform_admin from access
+    define can_approve: admin from access or platform_admin from access
+    define can_apply: responder from access or admin from access or platform_admin from access
+
+type evidence
+  relations
+    define access: [access]
+    define can_read: viewer from access or analyst from access or admin from access or support_delegate from access or platform_admin from access
+    define can_write: analyst from access or admin from access or platform_admin from access
+
+type anomaly
+  relations
+    define access: [access]
+    define can_read: viewer from access or analyst from access or admin from access or support_delegate from access or platform_admin from access
+    define can_write: analyst from access or admin from access or platform_admin from access
+
+type audit_scope
+  relations
+    define access: [access]
+    define can_read: admin from access or support_delegate from access or platform_admin from access
+    define can_export: admin from access or platform_admin from access
+
+type platform
+  relations
+    define admin: [user, service]
+    define can_read_global_audit: admin
+    define can_manage_global_config: admin

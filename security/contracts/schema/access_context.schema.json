@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cybermesh.local/security/contracts/schema/access_context.schema.json",
+  "title": "CyberMesh Access Context",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "principal_id",
+    "principal_type",
+    "allowed_access_ids",
+    "access_source",
+    "access_resolution_reason",
+    "is_internal_admin",
+    "is_support_delegated",
+    "is_global_resource_request"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "security.access_context.v1"
+    },
+    "principal_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+    "principal_type": { "type": "string", "enum": ["user", "service"] },
+    "access_id": { "type": "string", "maxLength": 128 },
+    "allowed_access_ids": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 128 } },
+    "active_access_id": { "type": "string", "maxLength": 128 },
+    "access_source": { "type": "string", "enum": ["claim", "selector", "delegation", "system"] },
+    "access_resolution_reason": {
+      "type": "string",
+      "enum": ["claim_single_access", "selector", "delegation", "system_global"]
+    },
+    "is_internal_admin": { "type": "boolean" },
+    "is_support_delegated": { "type": "boolean" },
+    "delegation": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["delegation_id", "approver_id", "reason", "start_time", "expiry_time", "access_ids", "break_glass"],
+      "properties": {
+        "delegation_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 36,
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "approver_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "start_time": { "type": "string", "format": "date-time" },
+        "expiry_time": { "type": "string", "format": "date-time" },
+        "access_ids": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 128 } },
+        "break_glass": { "type": "boolean" }
+      }
+    },
+    "is_global_resource_request": { "type": "boolean" }
+  }
+}

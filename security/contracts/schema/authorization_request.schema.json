@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cybermesh.local/security/contracts/schema/authorization_request.schema.json",
+  "title": "CyberMesh Authorization Request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "principal_id", "principal_type", "access", "action", "resource", "context"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "security.authorization_request.v1"
+    },
+    "principal_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+    "principal_type": { "type": "string", "enum": ["user", "service"] },
+    "access": { "$ref": "access_context.schema.json" },
+    "action": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "resource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "is_global_resource"],
+      "properties": {
+        "type": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "id": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "is_global_resource": { "type": "boolean" }
+      }
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request_id"],
+      "properties": {
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 36,
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "trace_id": { "type": "string", "maxLength": 255 },
+        "source_event_id": { "type": "string", "maxLength": 255 },
+        "sentinel_event_id": { "type": "string", "maxLength": 255 },
+        "command_id": {
+          "type": "string",
+          "maxLength": 36,
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "workflow_id": {
+          "type": "string",
+          "maxLength": 36,
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "policy_id": { "type": "string", "maxLength": 128 },
+        "policy_version": { "type": "string", "maxLength": 128 },
+        "resource_version": { "type": "string", "maxLength": 128 },
+        "scope_identifier": { "type": "string", "maxLength": 255 },
+        "request_path": { "type": "string", "maxLength": 512 },
+        "http_method": { "type": "string", "maxLength": 16 },
+        "client_ip": { "type": "string", "maxLength": 64 },
+        "workload_id": { "type": "string", "maxLength": 255 },
+        "support_reason": { "type": "string", "maxLength": 512 },
+        "break_glass": { "type": "boolean" },
+        "selector_access_id": { "type": "string", "maxLength": 128 }
+      }
+    }
+  }
+}
