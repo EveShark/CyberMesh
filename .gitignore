@@ -286,6 +286,7 @@ frontend/tests/
 # Test files in source code
 *_test.go
 **/*_test.go
+!backend/pkg/config/config_api_test.go
 
 # Documentation directories (keep locally, not in git)
 backend/docs/
@@ -298,6 +299,31 @@ frontend/docs/
 # Temporary gitignore files
 .gitignore.old
 .gitignore.proposed
+
+# Local credentials and machine-specific config
+/.certbot-cloudflare.ini
+/.kubeconfig
+/.kubeconfig.kind
+/artifact-registry-key.json
+/tmp.jwt
+
+# Local tool state and caches
+/.azure_cli/
+/.docker/
+/.gocache/
+/.gocache-backend/
+/.gocache-enf/
+/.gocache-enforcement/
+/.gomodcache/
+/.gopath/
+/.gotelemetry/
+/.gotmp/
+/.tools/
+/.agent/
+/.factory/
+
+# Local quarantine workspace
+/tmp/repo_quarantine_*/
 
 # Demo directories and backup files
 frontend/src/app/demo/
