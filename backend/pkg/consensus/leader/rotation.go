@@ -239,8 +239,28 @@ func (r *Rotation) handleNoEligible(ctx context.Context, allValidators []Validat
 		}
 	}
 
+	// Liveness fallback: if activity tracking temporarily marks every validator inactive,
+	// select from joined validators to let consensus recover.
 	if len(activeValidators) == 0 {
-		return nil, fmt.Errorf("no active validators available")
+		joinedValidators := make([]ValidatorInfo, 0, len(allValidators))
+		for _, v := range allValidators {
+			if v.JoinedView <= view {
+				joinedValidators = append(joinedValidators, v)
+			}
+		}
+		if len(joinedValidators) == 0 {
+			return nil, fmt.Errorf("no active validators available")
+		}
+		sortValidatorsDeterministic(joinedValidators)
+		index := r.selectIndex(view, len(joinedValidators))
+		leader := &joinedValidators[index]
+
+		r.audit.Warn("fallback_leader_selected", map[string]interface{}{
+			"view":      view,
+			"leader_id": fmt.Sprintf("%x", leader.ID[:]),
+			"reason":    "no_active_validators",
+		})
+		return leader, nil
 	}
 
 	sortValidatorsDeterministic(activeValidators)

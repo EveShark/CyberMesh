@@ -29,7 +29,7 @@ type LegacyIdentityInput struct {
 	AuthenticationRef string
 }
 
-// NormalizeLegacyIdentity builds the Phase 0 identity contract from the
+// NormalizeLegacyIdentity builds the shared identity contract from the
 // strongest currently available caller identity material.
 func NormalizeLegacyIdentity(in LegacyIdentityInput) (contracts.IdentityClaims, error) {
 	principalID := strings.TrimSpace(in.PrincipalID)

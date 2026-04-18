@@ -411,6 +411,8 @@ func (e *ConsensusEngine) initializeComponents() error {
 		MaxReadyToVoteSize:        e.configMgr.GetInt("CONSENSUS_MAX_READY_TO_VOTE_SIZE", 4<<10),
 		ClockSkewTolerance:        e.configMgr.GetDuration("CONSENSUS_CLOCK_SKEW_TOLERANCE", 10*time.Second),
 		GenesisClockSkewTolerance: e.configMgr.GetDuration("CONSENSUS_GENESIS_CLOCK_SKEW_TOLERANCE", 24*time.Hour),
+		MaxMessageAge:             e.configMgr.GetDuration("CONSENSUS_MAX_MESSAGE_AGE", 30*time.Second),
+		GenesisMaxMessageAge:      e.configMgr.GetDuration("CONSENSUS_GENESIS_MAX_MESSAGE_AGE", 24*time.Hour),
 		VerifyCacheSize:           e.configMgr.GetInt("CONSENSUS_VERIFY_CACHE_SIZE", 10000),
 		VerifyCacheTTL:            e.configMgr.GetDuration("CONSENSUS_VERIFY_CACHE_TTL", 5*time.Minute),
 		RejectFutureMessages:      e.configMgr.GetBool("CONSENSUS_REJECT_FUTURE_MESSAGES", true),

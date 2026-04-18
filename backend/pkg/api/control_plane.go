@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -259,18 +260,22 @@ type tenantScopeError struct {
 }
 
 type controlSchemaSupport struct {
-	OutboxRequestID       bool
-	OutboxCommandID       bool
-	OutboxWorkflowID      bool
-	OutboxSentinelEventID bool
-	AnomaliesTable        bool
-	AckEventID            bool
-	AckRequestID          bool
-	AckCommandID          bool
-	AckWorkflowID         bool
-	AckTraceID            bool
-	AckSourceEventID      bool
-	AckSentinelEventID    bool
+	OutboxRequestID           bool
+	OutboxCommandID           bool
+	OutboxWorkflowID          bool
+	OutboxSentinelEventID     bool
+	StatePoliciesTable        bool
+	StatePoliciesPolicyID     bool
+	StatePoliciesPolicyIDText bool
+	StatePoliciesTenant       bool
+	AnomaliesTable            bool
+	AckEventID                bool
+	AckRequestID              bool
+	AckCommandID              bool
+	AckWorkflowID             bool
+	AckTraceID                bool
+	AckSourceEventID          bool
+	AckSentinelEventID        bool
 }
 
 func (e *tenantScopeError) Error() string {
@@ -282,18 +287,22 @@ func (e *tenantScopeError) Error() string {
 
 func loadControlSchemaSupport(ctx context.Context, db *sql.DB) (controlSchemaSupport, error) {
 	return controlSchemaSupport{
-		OutboxRequestID:       controlTableHasColumn(ctx, db, "control_policy_outbox", "request_id"),
-		OutboxCommandID:       controlTableHasColumn(ctx, db, "control_policy_outbox", "command_id"),
-		OutboxWorkflowID:      controlTableHasColumn(ctx, db, "control_policy_outbox", "workflow_id"),
-		OutboxSentinelEventID: controlTableHasColumn(ctx, db, "control_policy_outbox", "sentinel_event_id"),
-		AnomaliesTable:        controlTableExists(ctx, db, "anomalies"),
-		AckEventID:            controlTableHasColumn(ctx, db, "policy_acks", "ack_event_id") && controlTableHasColumn(ctx, db, "policy_ack_events", "ack_event_id"),
-		AckRequestID:          controlTableHasColumn(ctx, db, "policy_acks", "request_id") && controlTableHasColumn(ctx, db, "policy_ack_events", "request_id"),
-		AckCommandID:          controlTableHasColumn(ctx, db, "policy_acks", "command_id") && controlTableHasColumn(ctx, db, "policy_ack_events", "command_id"),
-		AckWorkflowID:         controlTableHasColumn(ctx, db, "policy_acks", "workflow_id") && controlTableHasColumn(ctx, db, "policy_ack_events", "workflow_id"),
-		AckTraceID:            controlTableHasColumn(ctx, db, "policy_acks", "trace_id") && controlTableHasColumn(ctx, db, "policy_ack_events", "trace_id"),
-		AckSourceEventID:      controlTableHasColumn(ctx, db, "policy_acks", "source_event_id") && controlTableHasColumn(ctx, db, "policy_ack_events", "source_event_id"),
-		AckSentinelEventID:    controlTableHasColumn(ctx, db, "policy_acks", "sentinel_event_id") && controlTableHasColumn(ctx, db, "policy_ack_events", "sentinel_event_id"),
+		OutboxRequestID:           controlTableHasColumn(ctx, db, "control_policy_outbox", "request_id"),
+		OutboxCommandID:           controlTableHasColumn(ctx, db, "control_policy_outbox", "command_id"),
+		OutboxWorkflowID:          controlTableHasColumn(ctx, db, "control_policy_outbox", "workflow_id"),
+		OutboxSentinelEventID:     controlTableHasColumn(ctx, db, "control_policy_outbox", "sentinel_event_id"),
+		StatePoliciesTable:        controlTableExists(ctx, db, "state_policies"),
+		StatePoliciesPolicyID:     controlTableHasColumn(ctx, db, "state_policies", "policy_id"),
+		StatePoliciesPolicyIDText: controlTableHasColumn(ctx, db, "state_policies", "policy_id_text"),
+		StatePoliciesTenant:       controlTableHasColumn(ctx, db, "state_policies", "tenant"),
+		AnomaliesTable:            controlTableExists(ctx, db, "anomalies"),
+		AckEventID:                controlTableHasColumn(ctx, db, "policy_acks", "ack_event_id") && controlTableHasColumn(ctx, db, "policy_ack_events", "ack_event_id"),
+		AckRequestID:              controlTableHasColumn(ctx, db, "policy_acks", "request_id") && controlTableHasColumn(ctx, db, "policy_ack_events", "request_id"),
+		AckCommandID:              controlTableHasColumn(ctx, db, "policy_acks", "command_id") && controlTableHasColumn(ctx, db, "policy_ack_events", "command_id"),
+		AckWorkflowID:             controlTableHasColumn(ctx, db, "policy_acks", "workflow_id") && controlTableHasColumn(ctx, db, "policy_ack_events", "workflow_id"),
+		AckTraceID:                controlTableHasColumn(ctx, db, "policy_acks", "trace_id") && controlTableHasColumn(ctx, db, "policy_ack_events", "trace_id"),
+		AckSourceEventID:          controlTableHasColumn(ctx, db, "policy_acks", "source_event_id") && controlTableHasColumn(ctx, db, "policy_ack_events", "source_event_id"),
+		AckSentinelEventID:        controlTableHasColumn(ctx, db, "policy_acks", "sentinel_event_id") && controlTableHasColumn(ctx, db, "policy_ack_events", "sentinel_event_id"),
 	}, nil
 }
 
@@ -320,35 +329,8 @@ func controlOutboxWorkflowIDSelectExpr(schema controlSchemaSupport) string {
 
 func controlOutboxAnomalyIDSelectExpr(schema controlSchemaSupport) string {
 	payloadAnomalyExpr := outboxPayloadStringExpr("{anomaly_id}", "{metadata,anomaly_id}", "{params,anomaly_id}", "{params,metadata,anomaly_id}")
-	if !schema.AnomaliesTable {
-		return payloadAnomalyExpr + " AS anomaly_id"
-	}
-	sourceEventExpr := fmt.Sprintf(
-		"COALESCE(NULLIF(source_event_id, ''), NULLIF(%s, ''))",
-		outboxPayloadStringExpr("{source_event_id}", "{metadata,source_event_id}", "{trace,source_event_id}", "{telemetry_event_id}", "{metadata,telemetry_event_id}"),
-	)
-	sentinelEventExpr := fmt.Sprintf(
-		"COALESCE(NULLIF(sentinel_event_id, ''), NULLIF(%s, ''))",
-		outboxPayloadStringExpr("{sentinel_event_id}", "{metadata,sentinel_event_id}", "{trace,sentinel_event_id}"),
-	)
-	return fmt.Sprintf(`COALESCE(
-		NULLIF(%s, ''),
-		(
-			SELECT a.anomaly_id
-			FROM anomalies a
-			WHERE a.source_event_id = %s
-			ORDER BY a.detected_at DESC, a.created_at DESC
-			LIMIT 1
-		),
-		(
-			SELECT a.anomaly_id
-			FROM anomalies a
-			WHERE a.sentinel_event_id = %s
-			ORDER BY a.detected_at DESC, a.created_at DESC
-			LIMIT 1
-		),
-		''
-	) AS anomaly_id`, payloadAnomalyExpr, sourceEventExpr, sentinelEventExpr)
+	_ = schema
+	return payloadAnomalyExpr + " AS anomaly_id"
 }
 
 func controlOutboxFlowIDSelectExpr() string {
@@ -430,6 +412,28 @@ func controlTableExists(ctx context.Context, db *sql.DB, tableName string) bool 
 	return err == nil && exists
 }
 
+func tenantHasPolicyProjection(ctx context.Context, db *sql.DB, schema controlSchemaSupport, tenantScope string) (bool, error) {
+	if db == nil || strings.TrimSpace(tenantScope) == "" {
+		return true, nil
+	}
+	if !schema.StatePoliciesTable || !schema.StatePoliciesTenant {
+		return true, nil
+	}
+	var found bool
+	err := db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM state_policies
+			WHERE tenant = $1
+			LIMIT 1
+		)
+	`, strings.TrimSpace(tenantScope)).Scan(&found)
+	if err != nil {
+		return false, err
+	}
+	return found, nil
+}
+
 func controlOutboxSentinelSelectExpr(schema controlSchemaSupport) string {
 	if schema.OutboxSentinelEventID {
 		return "sentinel_event_id"
@@ -504,26 +508,44 @@ func (s *Server) handleControlOutboxList(w http.ResponseWriter, r *http.Request)
 		writeErrorResponse(w, r, "INVALID_LIMIT", err.Error(), http.StatusBadRequest)
 		return
 	}
+	if !controlOutboxHasNarrowingFilter(r.URL.Query()) {
+		writeErrorResponse(w, r, "OUTBOX_FILTER_REQUIRED", "at least one narrowing filter is required", http.StatusBadRequest)
+		return
+	}
 
 	db, err := s.getDB()
 	if err != nil {
 		writeErrorResponse(w, r, "STORAGE_UNAVAILABLE", err.Error(), http.StatusInternalServerError)
 		return
 	}
-	schemaCtx, schemaCancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
+	schemaCtx, schemaCancel := context.WithTimeout(r.Context(), s.controlReadTimeout())
 	schema, _ := loadControlSchemaSupport(schemaCtx, db)
 	schemaCancel()
-
-	where := make([]string, 0, 8)
-	args := make([]interface{}, 0, 16)
-	payloadFilters := outboxOperationalFilters{}
-	where = append(where, "1=1")
 	tenantScope, scopeErr := s.resolveTenantScope(r)
 	if scopeErr != nil {
 		writeErrorResponse(w, r, scopeErr.Code, scopeErr.Message, scopeErr.HTTPStatus)
 		return
 	}
-	where, args = appendAccessBoundOutboxFilter(where, args, tenantScope)
+	projectionCtx, projectionCancel := context.WithTimeout(r.Context(), s.controlReadTimeout())
+	hasProjection, projErr := tenantHasPolicyProjection(projectionCtx, db, schema, tenantScope)
+	projectionCancel()
+	if projErr != nil {
+		writeErrorResponse(w, r, "OUTBOX_QUERY_FAILED", "failed to query outbox rows", http.StatusInternalServerError)
+		return
+	}
+	if !hasProjection {
+		writeJSONResponse(w, r, NewSuccessResponse(controlOutboxListResponse{
+			Rows:       []controlOutboxRowDTO{},
+			Pagination: controlListMeta{Limit: limit},
+		}), http.StatusOK)
+		return
+	}
+
+	where := make([]string, 0, 8)
+	args := make([]interface{}, 0, 16)
+	payloadFilters := outboxOperationalFilters{}
+	where = append(where, "1=1")
+	where, args = appendAccessBoundOutboxFilterWithProjection(where, args, tenantScope, schema)
 
 	if status := strings.TrimSpace(r.URL.Query().Get("status")); status != "" {
 		if !isValidOutboxStatus(status) {
@@ -645,11 +667,18 @@ func (s *Server) handleControlOutboxList(w http.ResponseWriter, r *http.Request)
 		LIMIT $%d`, controlOutboxRequestIDSelectExpr(schema), controlOutboxCommandIDSelectExpr(schema), controlOutboxWorkflowIDSelectExpr(schema), controlOutboxAnomalyIDSelectExpr(schema), controlOutboxFlowIDSelectExpr(), controlOutboxSourceIDSelectExpr(), controlOutboxSourceTypeSelectExpr(), controlOutboxSensorIDSelectExpr(), controlOutboxValidatorIDSelectExpr(), controlOutboxScopeIdentifierSelectExpr(), controlOutboxSentinelSelectExpr(schema), strings.Join(where, " AND "), len(args)+1)
 	args = append(args, fetchLimit)
 
-	ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), s.controlReadTimeout())
 	defer cancel()
 
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
+		if isTransientControlStorageError(err) {
+			writeJSONResponse(w, r, NewSuccessResponse(controlOutboxListResponse{
+				Rows:       []controlOutboxRowDTO{},
+				Pagination: controlListMeta{Limit: limit},
+			}), http.StatusOK)
+			return
+		}
 		writeErrorResponse(w, r, "OUTBOX_QUERY_FAILED", "failed to query outbox rows", http.StatusInternalServerError)
 		return
 	}
@@ -677,6 +706,13 @@ func (s *Server) handleControlOutboxList(w http.ResponseWriter, r *http.Request)
 		items = append(items, dto)
 	}
 	if err := rows.Err(); err != nil {
+		if isTransientControlStorageError(err) {
+			writeJSONResponse(w, r, NewSuccessResponse(controlOutboxListResponse{
+				Rows:       []controlOutboxRowDTO{},
+				Pagination: controlListMeta{Limit: limit},
+			}), http.StatusOK)
+			return
+		}
 		writeErrorResponse(w, r, "OUTBOX_ITERATION_FAILED", "failed to iterate outbox rows", http.StatusInternalServerError)
 		return
 	}
@@ -722,7 +758,7 @@ func (s *Server) handleControlOutboxGet(w http.ResponseWriter, r *http.Request) 
 		writeErrorResponse(w, r, "STORAGE_UNAVAILABLE", err.Error(), http.StatusInternalServerError)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), s.controlReadTimeout())
 	defer cancel()
 	schema, _ := loadControlSchemaSupport(ctx, db)
 
@@ -815,14 +851,14 @@ func (s *Server) handleControlTraceList(w http.ResponseWriter, r *http.Request) 
 		writeErrorResponse(w, r, scopeErr.Code, scopeErr.Message, scopeErr.HTTPStatus)
 		return
 	}
-	schemaCtx, schemaCancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
+	schemaCtx, schemaCancel := context.WithTimeout(r.Context(), s.controlReadTimeout())
 	schema, _ := loadControlSchemaSupport(schemaCtx, db)
 	schemaCancel()
 
 	where := []string{"1=1"}
 	args := make([]interface{}, 0, 16)
 	payloadFilters := outboxOperationalFilters{}
-	where, args = appendAccessBoundOutboxFilter(where, args, tenantScope)
+	where, args = appendAccessBoundOutboxFilterWithProjection(where, args, tenantScope, schema)
 	if policyID != "" {
 		where = append(where, fmt.Sprintf("policy_id = $%d", len(args)+1))
 		args = append(args, policyID)
@@ -940,6 +976,13 @@ func (s *Server) handleControlTraceList(w http.ResponseWriter, r *http.Request) 
 	defer cancel()
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
+		if isTransientControlStorageError(err) {
+			writeJSONResponse(w, r, NewSuccessResponse(controlOutboxListResponse{
+				Rows:       []controlOutboxRowDTO{},
+				Pagination: controlListMeta{Limit: limit},
+			}), http.StatusOK)
+			return
+		}
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "trace_query_failed")
 		s.noteControlTimeout(err, false)
@@ -1878,7 +1921,7 @@ func (s *Server) handleControlAcksList(w http.ResponseWriter, r *http.Request) {
 		writeErrorResponse(w, r, "STORAGE_UNAVAILABLE", err.Error(), http.StatusInternalServerError)
 		return
 	}
-	schemaCtx, schemaCancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
+	schemaCtx, schemaCancel := context.WithTimeout(r.Context(), s.controlReadTimeout())
 	schema, _ := loadControlSchemaSupport(schemaCtx, db)
 	schemaCancel()
 
@@ -2002,27 +2045,32 @@ func (s *Server) handleControlAcksList(w http.ResponseWriter, r *http.Request) {
 			hist.first_event_acked_at,
 			hist.latest_event_acked_at
 		FROM policy_acks pa
-		LEFT JOIN (
+		LEFT JOIN LATERAL (
 			SELECT
-				policy_id,
-				controller_instance,
 				count(*) AS ack_history_count,
 				min(acked_at) AS first_event_acked_at,
 				max(acked_at) AS latest_event_acked_at
-			FROM policy_ack_events
-			GROUP BY policy_id, controller_instance
+			FROM policy_ack_events pae
+			WHERE pae.policy_id = pa.policy_id
+			  AND pae.controller_instance = pa.controller_instance
 		) hist
-		  ON hist.policy_id = pa.policy_id
-		 AND hist.controller_instance = pa.controller_instance
+		  ON true
 		WHERE %s
 		ORDER BY COALESCE(pa.acked_at, pa.observed_at) DESC, pa.policy_id DESC, pa.controller_instance DESC
 		LIMIT $%d`, controlAckEventIDSelectExpr(schema), controlAckRequestIDSelectExpr(schema), controlAckCommandIDSelectExpr(schema), controlAckWorkflowIDSelectExpr(schema), controlAckTraceSelectExpr(schema), controlAckSourceEventSelectExpr(schema), controlAckSentinelEventSelectExpr(schema), strings.Join(where, " AND "), len(args)+1)
 	args = append(args, fetchLimit)
 
-	ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), s.controlReadTimeout())
 	defer cancel()
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
+		if isTransientControlStorageError(err) {
+			writeJSONResponse(w, r, NewSuccessResponse(controlAcksListResponse{
+				Rows:       []policyAckPayload{},
+				Pagination: controlListMeta{Limit: limit},
+			}), http.StatusOK)
+			return
+		}
 		writeErrorResponse(w, r, "ACKS_QUERY_FAILED", "failed to query control acks", http.StatusInternalServerError)
 		return
 	}
@@ -2136,6 +2184,56 @@ func parseControlLimit(raw string) (int, error) {
 		return controlListMaxLimit, nil
 	}
 	return limit, nil
+}
+
+func isTransientControlStorageError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "i/o timeout"):
+		return true
+	case strings.Contains(msg, "context deadline exceeded"):
+		return true
+	case strings.Contains(msg, "hostname resolving error"):
+		return true
+	case strings.Contains(msg, "failed to connect"):
+		return true
+	default:
+		return false
+	}
+}
+
+func controlOutboxHasNarrowingFilter(values url.Values) bool {
+	if values == nil {
+		return false
+	}
+	for _, key := range []string{
+		"status",
+		"policy_id",
+		"request_id",
+		"command_id",
+		"workflow_id",
+		"trace_id",
+		"sentinel_event_id",
+		"anomaly_id",
+		"flow_id",
+		"source_id",
+		"source_type",
+		"sensor_id",
+		"validator_id",
+		"scope_identifier",
+		"block_height",
+		"from",
+		"to",
+		"cursor",
+	} {
+		if strings.TrimSpace(values.Get(key)) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func parseControlTimeFilter(raw string) (time.Time, error) {

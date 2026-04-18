@@ -35,8 +35,8 @@ type LegacyRequestContextInput struct {
 	TenantID        string
 }
 
-// NormalizeLegacyRequestContext returns the Phase 0 authorization context plus
-// a single normalized selector access ID derived from the current prod fields.
+// NormalizeLegacyRequestContext returns the shared authorization context plus
+// a single normalized selector access ID derived from the current request fields.
 func NormalizeLegacyRequestContext(in LegacyRequestContextInput) (contracts.AuthorizationContext, error) {
 	requestID, ok := normalizeOrGenerateUUID(in.RequestID)
 	if !ok {

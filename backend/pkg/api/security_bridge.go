@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"time"
 
 	backendsecurity "backend/pkg/security"
 	"backend/pkg/security/contracts"
@@ -76,9 +77,7 @@ func (s *Server) resolveNormalizedSecurityEnvelope(r *http.Request) (normalizedS
 			Effect:     contracts.DecisionEffectDeny,
 			ReasonCode: "authz.denied_required_role",
 		}.Authorize(r.Context(), authReq)
-		if emitErr := (backendsecurity.AuditEmitter{Logger: s.audit}).BuildAndEmit(identity, contracts.AccessContext{}, decision, authReq, "denied"); emitErr != nil && s.logger != nil {
-			s.logger.WarnContext(r.Context(), "failed to emit normalized security audit")
-		}
+		s.emitNormalizedSecurityAuditAsync(identity, contracts.AccessContext{}, decision, authReq, "denied")
 		return normalizedSecurityEnvelope{}, roleErr
 	}
 	trustedMemberships, membershipErr := s.resolveTrustedMembershipSnapshot(r, principalID)
@@ -139,15 +138,11 @@ func (s *Server) resolveNormalizedSecurityEnvelope(r *http.Request) (normalizedS
 
 	decision, authErr := s.authorizeNormalizedRequest(r, clientRole, scope, authReq)
 	if authErr != nil {
-		if emitErr := (backendsecurity.AuditEmitter{Logger: s.audit}).BuildAndEmit(identity, access, decision, authReq, "denied"); emitErr != nil && s.logger != nil {
-			s.logger.WarnContext(r.Context(), "failed to emit normalized security audit")
-		}
+		s.emitNormalizedSecurityAuditAsync(identity, access, decision, authReq, "denied")
 		return normalizedSecurityEnvelope{}, authErr
 	}
 
-	if emitErr := (backendsecurity.AuditEmitter{Logger: s.audit}).BuildAndEmit(identity, access, decision, authReq, "authorized"); emitErr != nil && s.logger != nil {
-		s.logger.WarnContext(r.Context(), "failed to emit normalized security audit")
-	}
+	s.emitNormalizedSecurityAuditAsync(identity, access, decision, authReq, "authorized")
 
 	return normalizedSecurityEnvelope{
 		Identity: identity,
@@ -224,7 +219,17 @@ func (s *Server) resolveAccessContext(r *http.Request, identity contracts.Identi
 }
 
 func (s *Server) authorizeNormalizedRequest(r *http.Request, _ string, _ backendsecurity.ScopeDescriptor, req contracts.AuthorizationRequest) (contracts.PolicyDecision, *tenantScopeError) {
-	decision, err := s.currentAuthorizer().Authorize(r.Context(), req)
+	ctx := r.Context()
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		timeout := 2 * time.Second
+		if s != nil && s.config != nil && s.config.RequestTimeout > 0 && s.config.RequestTimeout < timeout {
+			timeout = s.config.RequestTimeout
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	decision, err := s.currentAuthorizer().Authorize(ctx, req)
 	if err != nil {
 		return contracts.PolicyDecision{}, &tenantScopeError{
 			Code:       "AUTHZ_DECISION_FAILED",
@@ -242,6 +247,19 @@ func (s *Server) authorizeNormalizedRequest(r *http.Request, _ string, _ backend
 	return decision, nil
 }
 
+func (s *Server) emitNormalizedSecurityAuditAsync(identity contracts.IdentityClaims, access contracts.AccessContext, decision contracts.PolicyDecision, req contracts.AuthorizationRequest, outcome string) {
+	if s == nil || s.audit == nil {
+		return
+	}
+	go func() {
+		emitCtx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		if emitErr := (backendsecurity.AuditEmitter{Logger: s.audit}).BuildAndEmit(identity, access, decision, req, outcome); emitErr != nil && s.logger != nil {
+			s.logger.WarnContext(emitCtx, "failed to emit normalized security audit")
+		}
+	}()
+}
+
 func (s *Server) currentAuthorizer() backendsecurity.Authorizer {
 	if s.authorizer != nil {
 		return s.authorizer
@@ -254,6 +272,16 @@ func (s *Server) currentAuthorizer() backendsecurity.Authorizer {
 func (s *Server) validateBridgeRole(clientRole string, scope backendsecurity.ScopeDescriptor) *tenantScopeError {
 	if !s.requireAccessScope() || scope.RequiredRole == "" {
 		return nil
+	}
+	// JWT callers enter the bridge as authenticated_user and rely on the
+	// authorizer for the final decision on policy/workflow/audit read paths.
+	// Allow those requests to reach the authorizer instead of failing at the
+	// coarse legacy role gate.
+	if strings.EqualFold(strings.TrimSpace(clientRole), "authenticated_user") {
+		switch strings.TrimSpace(scope.RequiredRole) {
+		case "policy_reader", "audit_reader":
+			return nil
+		}
 	}
 	if s.hasRole(clientRole, scope.RequiredRole) {
 		return nil

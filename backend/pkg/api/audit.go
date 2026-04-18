@@ -134,7 +134,7 @@ func (s *Server) queryAuditRows(r *http.Request, limit int) ([]auditEntryDTO, st
 	if err != nil {
 		return nil, "", &auditQueryError{Code: "STORAGE_UNAVAILABLE", Message: "storage unavailable", HTTPStatus: http.StatusServiceUnavailable}
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), s.controlReadTimeout())
 	defer cancel()
 
 	args := []interface{}{}
@@ -201,12 +201,19 @@ func (s *Server) queryAuditRows(r *http.Request, limit int) ([]auditEntryDTO, st
 			caj.created_at
 		FROM control_actions_journal caj
 		LEFT JOIN control_policy_outbox co ON co.id = caj.outbox_id
-		LEFT JOIN control_policy_outbox co_created ON co_created.id = TRY_CAST(caj.lease_key AS UUID)
+		LEFT JOIN control_policy_outbox co_created ON co_created.id = CASE
+			WHEN caj.lease_key ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+				THEN caj.lease_key::UUID
+			ELSE NULL
+		END
 		WHERE %s
 		ORDER BY caj.created_at DESC, caj.action_id DESC
 		LIMIT $%d
 	`, strings.Join(where, " AND "), len(args)), args...)
 	if err != nil {
+		if isTransientControlStorageError(err) {
+			return []auditEntryDTO{}, "", nil
+		}
 		return nil, "", &auditQueryError{Code: "AUDIT_QUERY_FAILED", Message: "failed to query audit entries", HTTPStatus: http.StatusInternalServerError}
 	}
 	defer rows.Close()
@@ -225,6 +232,9 @@ func (s *Server) queryAuditRows(r *http.Request, limit int) ([]auditEntryDTO, st
 		items = append(items, auditJournalRowToDTO(row))
 	}
 	if err := rows.Err(); err != nil {
+		if isTransientControlStorageError(err) {
+			return []auditEntryDTO{}, "", nil
+		}
 		return nil, "", &auditQueryError{Code: "AUDIT_ITERATION_FAILED", Message: "failed to iterate audit entries", HTTPStatus: http.StatusInternalServerError}
 	}
 	return items, "", nil

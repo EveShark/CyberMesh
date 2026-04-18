@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"errors"
+	"io"
 	"net"
 	"strings"
 
@@ -61,6 +62,9 @@ func IsRetryable(err error) bool {
 	if errors.Is(err, driver.ErrBadConn) {
 		return true
 	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
 
 	var netErr net.Error
 	if errors.As(err, &netErr) {
@@ -78,7 +82,10 @@ func IsRetryable(err error) bool {
 		strings.Contains(msg, "retry_serializable") ||
 		strings.Contains(msg, "transactionretrywithprotorefresherror") ||
 		strings.Contains(msg, "driver: bad connection") ||
-		strings.Contains(msg, "bad connection") {
+		strings.Contains(msg, "bad connection") ||
+		strings.Contains(msg, "unexpected eof") ||
+		strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "connection refused") {
 		return true
 	}
 

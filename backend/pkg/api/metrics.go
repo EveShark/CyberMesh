@@ -1325,6 +1325,16 @@ func (s *Server) writePrometheusMetrics(w io.Writer) {
 	} else {
 		fmt.Fprintf(w, "control_mutation_kill_switch_enabled 0\n")
 	}
+	livelockActive, _, noCommitSeconds := s.consensusLivelockSnapshot(nowTime)
+	fmt.Fprintf(w, "# HELP consensus_livelock_suspected Consensus livelock detector state (1=suspected active).\n")
+	fmt.Fprintf(w, "# TYPE consensus_livelock_suspected gauge\n")
+	fmt.Fprintf(w, "consensus_livelock_suspected %.0f\n", boolToFloat(livelockActive))
+	fmt.Fprintf(w, "# HELP consensus_livelock_detected_total Total consensus livelock detections.\n")
+	fmt.Fprintf(w, "# TYPE consensus_livelock_detected_total counter\n")
+	fmt.Fprintf(w, "consensus_livelock_detected_total %d\n", s.consensusLivelockDetectedTotal.Load())
+	fmt.Fprintf(w, "# HELP consensus_no_commit_seconds Seconds since livelock detector entered no-commit suspicion window.\n")
+	fmt.Fprintf(w, "# TYPE consensus_no_commit_seconds gauge\n")
+	fmt.Fprintf(w, "consensus_no_commit_seconds %.3f\n", noCommitSeconds)
 
 	// Consensus wiring/validation metrics
 	if s.engine != nil {

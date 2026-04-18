@@ -165,6 +165,8 @@ type EncoderConfig struct {
 	MaxReadyToVoteSize        int
 	ClockSkewTolerance        time.Duration
 	GenesisClockSkewTolerance time.Duration
+	MaxMessageAge             time.Duration
+	GenesisMaxMessageAge      time.Duration
 	VerifyCacheSize           int
 	VerifyCacheTTL            time.Duration
 	RejectFutureMessages      bool
@@ -187,6 +189,8 @@ func DefaultEncoderConfig() *EncoderConfig {
 		MaxReadyToVoteSize:        4 << 10,   // 4 KB
 		ClockSkewTolerance:        5 * time.Second,
 		GenesisClockSkewTolerance: 24 * time.Hour,
+		MaxMessageAge:             30 * time.Second,
+		GenesisMaxMessageAge:      24 * time.Hour,
 		VerifyCacheSize:           10000,
 		VerifyCacheTTL:            5 * time.Minute,
 		RejectFutureMessages:      true,
@@ -202,6 +206,12 @@ func NewEncoder(crypto types.CryptoService, config *EncoderConfig) (*Encoder, er
 
 	if config.GenesisClockSkewTolerance <= 0 {
 		config.GenesisClockSkewTolerance = config.ClockSkewTolerance
+	}
+	if config.MaxMessageAge <= 0 {
+		config.MaxMessageAge = config.ClockSkewTolerance
+	}
+	if config.GenesisMaxMessageAge <= 0 {
+		config.GenesisMaxMessageAge = config.GenesisClockSkewTolerance
 	}
 
 	// Strict CBOR encoding mode
@@ -549,6 +559,7 @@ func (e *Encoder) extractSignature(msg types.Message) ([]byte, ValidatorID, erro
 func (e *Encoder) checkTimestamp(msg types.Message) error {
 	var timestamp time.Time
 	tolerance := e.config.ClockSkewTolerance
+	maxAge := e.config.MaxMessageAge
 	switch m := msg.(type) {
 	case *Proposal:
 		timestamp = m.Timestamp
@@ -569,10 +580,16 @@ func (e *Encoder) checkTimestamp(msg types.Message) error {
 		if e.config.GenesisClockSkewTolerance > 0 {
 			tolerance = e.config.GenesisClockSkewTolerance
 		}
+		if e.config.GenesisMaxMessageAge > 0 {
+			maxAge = e.config.GenesisMaxMessageAge
+		}
 	case *GenesisCertificate:
 		timestamp = m.Timestamp
 		if e.config.GenesisClockSkewTolerance > 0 {
 			tolerance = e.config.GenesisClockSkewTolerance
+		}
+		if e.config.GenesisMaxMessageAge > 0 {
+			maxAge = e.config.GenesisMaxMessageAge
 		}
 	case *ProposalIntent:
 		timestamp = m.Timestamp
@@ -583,10 +600,13 @@ func (e *Encoder) checkTimestamp(msg types.Message) error {
 	}
 
 	now := time.Now()
+	if maxAge <= 0 {
+		maxAge = tolerance
+	}
 
-	if now.Sub(timestamp) > tolerance {
-		return fmt.Errorf("message timestamp too old: %v (now: %v, skew: %v)",
-			timestamp, now, tolerance)
+	if now.Sub(timestamp) > maxAge {
+		return fmt.Errorf("message timestamp too old: %v (now: %v, max_age: %v)",
+			timestamp, now, maxAge)
 	}
 
 	if e.config.RejectFutureMessages && timestamp.Sub(now) > tolerance {

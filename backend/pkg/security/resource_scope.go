@@ -24,7 +24,7 @@ type ScopeDescriptor struct {
 }
 
 // ClassifyHTTPResource derives resource scope from the current backend route patterns.
-// Unknown routes are rejected so Batch 2 does not silently classify new paths.
+// Unknown routes are rejected so new paths are not silently classified.
 func ClassifyHTTPResource(basePath, method, path string) (ScopeDescriptor, error) {
 	normalizedBase := strings.TrimSuffix(strings.TrimSpace(basePath), "/")
 	normalizedPath := strings.TrimSpace(path)

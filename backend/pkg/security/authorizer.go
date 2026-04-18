@@ -11,7 +11,7 @@ import (
 	"backend/pkg/security/contracts"
 )
 
-// Authorizer is the Batch 2 authorization boundary for backend handlers.
+// Authorizer is the authorization boundary for backend handlers.
 type Authorizer interface {
 	Authorize(context.Context, contracts.AuthorizationRequest) (contracts.PolicyDecision, error)
 }
@@ -51,8 +51,8 @@ func (a StaticAuthorizer) Authorize(_ context.Context, req contracts.Authorizati
 	return newDecision(req, effect, contracts.DecisionSourceStatic, reason, ""), nil
 }
 
-// Phase1Authorizer is the low-latency local authorization boundary used before
-// a remote policy engine is wired in.
+// Phase1Authorizer is the low-latency local authorization boundary used when
+// request handling stays on the in-process policy path.
 type Phase1Authorizer struct {
 	RequireResolvedAccess bool
 }

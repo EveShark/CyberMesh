@@ -67,6 +67,8 @@ type Config struct {
 	// P2P consensus networking (optional)
 	EnableP2P bool
 	P2PRouter *p2p.Router
+	// If true, the proposer loop is not started. Useful for guarded startup safe-mode.
+	ProposerDisabled bool
 }
 
 type Service struct {
@@ -145,6 +147,16 @@ type Service struct {
 
 	// P2P router (optional)
 	router *p2p.Router
+	// Startup livelock guard state.
+	startupGuardEnabled         bool
+	startupGuardMode            string
+	startupGuardStateKey        string
+	startupGuardMaxAge          time.Duration
+	startupGuardRecheckInterval time.Duration
+	startupGuardDB              *sql.DB
+	startupGuardPrimaryBypass   bool
+	startupGuardWasActive       atomic.Bool
+	proposerLoopStarted         atomic.Bool
 
 	mu                   sync.Mutex
 	lastParent           [32]byte
@@ -264,6 +276,70 @@ func parseOutboxOwnerIndex(nodeID string) int {
 		return 0
 	}
 	return id - 1
+}
+
+func isStartupGuardPrimaryNode(nodeID, consensusNodes string) bool {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return false
+	}
+	if id, err := strconv.Atoi(nodeID); err == nil && id == 1 {
+		return true
+	}
+	nodes := strings.Split(consensusNodes, ",")
+	for _, candidate := range nodes {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		return strings.EqualFold(candidate, nodeID)
+	}
+	return false
+}
+
+func shouldBypassStartupGuardSafeMode(cm *utils.ConfigManager) bool {
+	if cm == nil || !cm.GetBool("CONSENSUS_STARTUP_GUARD_PRIMARY_BYPASS", true) {
+		return false
+	}
+	nodeID := strings.TrimSpace(cm.GetString("NODE_ID", ""))
+	if explicitPrimary := strings.TrimSpace(cm.GetString("CONSENSUS_STARTUP_GUARD_PRIMARY_NODE_ID", "")); explicitPrimary != "" {
+		return strings.EqualFold(nodeID, explicitPrimary)
+	}
+	return isStartupGuardPrimaryNode(
+		nodeID,
+		cm.GetString("CONSENSUS_NODES", ""),
+	)
+}
+
+func loadStartupLivelockGuardState(ctx context.Context, db *sql.DB, stateKey string, maxAge time.Duration) (bool, string, error) {
+	if db == nil || strings.TrimSpace(stateKey) == "" {
+		return false, "", nil
+	}
+	var enabled bool
+	var reason sql.NullString
+	var updatedAt time.Time
+	err := db.QueryRowContext(ctx, `
+		SELECT enabled, reason_text, updated_at
+		FROM control_runtime_state
+		WHERE state_key = $1
+	`, strings.TrimSpace(stateKey)).Scan(&enabled, &reason, &updatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, "", nil
+		}
+		msg := strings.ToLower(err.Error())
+		if strings.Contains(msg, "control_runtime_state") && strings.Contains(msg, "does not exist") {
+			return false, "", nil
+		}
+		return false, "", err
+	}
+	if !enabled {
+		return false, "", nil
+	}
+	if maxAge > 0 && time.Since(updatedAt) > maxAge {
+		return false, "", nil
+	}
+	return true, strings.TrimSpace(reason.String), nil
 }
 
 func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, builder *block.Builder, store state.StateStore, log *utils.Logger) (*Service, error) {
@@ -632,6 +708,62 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 		if dbHandle != nil {
 			if err := policystate.Prime(context.Background(), dbHandle); err != nil {
 				log.Warn("policy state projection prime failed", utils.ZapError(err))
+			}
+			if cfg.ConfigManager != nil && cfg.ConfigManager.GetBool("CONSENSUS_STARTUP_GUARD_ENABLED", false) {
+				mode := strings.ToLower(strings.TrimSpace(cfg.ConfigManager.GetString("CONSENSUS_STARTUP_GUARD_MODE", "safe")))
+				if mode == "" {
+					mode = "safe"
+				}
+				stateKey := strings.TrimSpace(cfg.ConfigManager.GetString("CONSENSUS_STARTUP_GUARD_STATE_KEY", "consensus_livelock_guard"))
+				maxAge := cfg.ConfigManager.GetDuration("CONSENSUS_STARTUP_GUARD_MAX_AGE", 30*time.Minute)
+				if maxAge <= 0 {
+					maxAge = 30 * time.Minute
+				}
+				recheck := cfg.ConfigManager.GetDuration("CONSENSUS_STARTUP_GUARD_RECHECK_INTERVAL", 10*time.Second)
+				if recheck <= 0 {
+					recheck = 10 * time.Second
+				}
+				s.startupGuardEnabled = true
+				s.startupGuardMode = mode
+				s.startupGuardStateKey = stateKey
+				s.startupGuardMaxAge = maxAge
+				s.startupGuardRecheckInterval = recheck
+				s.startupGuardDB = dbHandle
+				s.startupGuardPrimaryBypass = shouldBypassStartupGuardSafeMode(cfg.ConfigManager)
+				guardCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				guardActive, reason, guardErr := loadStartupLivelockGuardState(guardCtx, dbHandle, stateKey, maxAge)
+				cancel()
+				if guardErr != nil {
+					log.Warn("startup livelock guard check failed", utils.ZapError(guardErr))
+				} else if guardActive {
+					if reason == "" {
+						reason = "persisted livelock guard is active"
+					}
+					s.startupGuardWasActive.Store(true)
+					switch mode {
+					case "fail":
+						return nil, fmt.Errorf("startup guard blocked node start: %s", reason)
+					case "safe":
+						if s.startupGuardPrimaryBypass {
+							log.Warn("startup guard active but primary-node bypass kept proposer enabled",
+								utils.ZapString("state_key", stateKey),
+								utils.ZapString("reason", reason))
+						} else {
+							s.cfg.ProposerDisabled = true
+							log.Warn("startup guard activated safe-mode proposer disable",
+								utils.ZapString("state_key", stateKey),
+								utils.ZapString("reason", reason))
+						}
+					default:
+						log.Warn("startup guard mode is invalid; defaulting to safe proposer disable",
+							utils.ZapString("mode", mode),
+							utils.ZapString("state_key", stateKey),
+							utils.ZapString("reason", reason))
+						if !s.startupGuardPrimaryBypass {
+							s.cfg.ProposerDisabled = true
+						}
+					}
+				}
 			}
 		}
 	}
@@ -1052,59 +1184,89 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 			}
 			schemaCtx, cancel := context.WithTimeout(context.Background(), schemaCheckTimeout)
 			defer cancel()
+			ackSchemaReady := true
 			if err := store.EnsureSchema(schemaCtx); err != nil {
-				if kafkaProducer != nil {
-					kafkaProducer.Close()
+				ackSchemaReady = false
+				if log != nil {
+					log.Warn("policy ACK schema check failed; skipping ACK consumer initialization for this startup",
+						utils.ZapError(err))
 				}
-				if s.kafkaConsumer != nil {
-					_ = s.kafkaConsumer.Stop()
+				if cfg.AuditLogger != nil {
+					_ = cfg.AuditLogger.Log("policy_ack_consumer_init_skipped", utils.AuditWarn, map[string]interface{}{
+						"reason": "schema_check_failed",
+						"error":  err.Error(),
+					})
 				}
-				return nil, fmt.Errorf("policy ack schema check failed: %w", err)
 			}
 
-			var trust *policyack.TrustedKeys
-			if ackCfg.TrustedKeysDir != "" {
-				t, terr := policyack.LoadTrustedKeys(ackCfg.TrustedKeysDir)
-				if terr != nil {
+			if ackSchemaReady {
+				var trust *policyack.TrustedKeys
+				if ackCfg.TrustedKeysDir != "" {
+					t, terr := policyack.LoadTrustedKeys(ackCfg.TrustedKeysDir)
+					if terr != nil {
+						if kafkaProducer != nil {
+							kafkaProducer.Close()
+						}
+						if s.kafkaConsumer != nil {
+							_ = s.kafkaConsumer.Stop()
+						}
+						return nil, fmt.Errorf("policy ack trust store load failed: %w", terr)
+					}
+					trust = t
+				}
+
+				// Reuse the backend's sarama configuration builder (TLS/SASL enforced).
+				saramaCfg, err := kafka.BuildSaramaConfig(context.Background(), cfg.ConfigManager, log, cfg.AuditLogger)
+				if err != nil {
 					if kafkaProducer != nil {
 						kafkaProducer.Close()
 					}
 					if s.kafkaConsumer != nil {
 						_ = s.kafkaConsumer.Stop()
 					}
-					return nil, fmt.Errorf("policy ack trust store load failed: %w", terr)
+					return nil, fmt.Errorf("policy ack consumer: build kafka config failed: %w", err)
 				}
-				trust = t
-			}
 
-			// Reuse the backend's sarama configuration builder (TLS/SASL enforced).
-			saramaCfg, err := kafka.BuildSaramaConfig(context.Background(), cfg.ConfigManager, log, cfg.AuditLogger)
-			if err != nil {
-				if kafkaProducer != nil {
-					kafkaProducer.Close()
-				}
-				if s.kafkaConsumer != nil {
-					_ = s.kafkaConsumer.Stop()
-				}
-				return nil, fmt.Errorf("policy ack consumer: build kafka config failed: %w", err)
-			}
-
-			cg, err := sarama.NewConsumerGroup(ackCfg.Brokers, ackCfg.GroupID, saramaCfg)
-			if err != nil {
-				if kafkaProducer != nil {
-					kafkaProducer.Close()
-				}
-				if s.kafkaConsumer != nil {
-					_ = s.kafkaConsumer.Stop()
-				}
-				return nil, fmt.Errorf("policy ack consumer: create consumer group failed: %w", err)
-			}
-
-			// DLQ producer is optional.
-			var dlq sarama.SyncProducer
-			if ackCfg.DLQ != "" {
-				dlq, err = sarama.NewSyncProducer(ackCfg.Brokers, saramaCfg)
+				cg, err := sarama.NewConsumerGroup(ackCfg.Brokers, ackCfg.GroupID, saramaCfg)
 				if err != nil {
+					if kafkaProducer != nil {
+						kafkaProducer.Close()
+					}
+					if s.kafkaConsumer != nil {
+						_ = s.kafkaConsumer.Stop()
+					}
+					return nil, fmt.Errorf("policy ack consumer: create consumer group failed: %w", err)
+				}
+
+				// DLQ producer is optional.
+				var dlq sarama.SyncProducer
+				if ackCfg.DLQ != "" {
+					dlq, err = sarama.NewSyncProducer(ackCfg.Brokers, saramaCfg)
+					if err != nil {
+						_ = cg.Close()
+						if kafkaProducer != nil {
+							kafkaProducer.Close()
+						}
+						if s.kafkaConsumer != nil {
+							_ = s.kafkaConsumer.Stop()
+						}
+						return nil, fmt.Errorf("policy ack consumer: create dlq producer failed: %w", err)
+					}
+				}
+
+				ac, err := policyack.New(context.Background(), cg, policyack.Options{
+					Config:         ackCfg,
+					Store:          store,
+					Trust:          trust,
+					Logger:         log,
+					Audit:          cfg.AuditLogger,
+					DLQ:            dlq,
+					TraceCollector: s.policyTraceCollector,
+				})
+				if err != nil {
+					if dlq != nil {
+						_ = dlq.Close()
+					}
 					_ = cg.Close()
 					if kafkaProducer != nil {
 						kafkaProducer.Close()
@@ -1112,39 +1274,16 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 					if s.kafkaConsumer != nil {
 						_ = s.kafkaConsumer.Stop()
 					}
-					return nil, fmt.Errorf("policy ack consumer: create dlq producer failed: %w", err)
+					return nil, fmt.Errorf("policy ack consumer init failed: %w", err)
 				}
-			}
-
-			ac, err := policyack.New(context.Background(), cg, policyack.Options{
-				Config:         ackCfg,
-				Store:          store,
-				Trust:          trust,
-				Logger:         log,
-				Audit:          cfg.AuditLogger,
-				DLQ:            dlq,
-				TraceCollector: s.policyTraceCollector,
-			})
-			if err != nil {
-				if dlq != nil {
-					_ = dlq.Close()
+				s.policyAckCons = ac
+				if log != nil {
+					log.Info("Policy ACK consumer configured",
+						utils.ZapString("topic", ackCfg.Topic),
+						utils.ZapString("group_id", ackCfg.GroupID),
+						utils.ZapBool("signature_required", ackCfg.SigningRequired),
+						utils.ZapBool("dlq_enabled", ackCfg.DLQ != ""))
 				}
-				_ = cg.Close()
-				if kafkaProducer != nil {
-					kafkaProducer.Close()
-				}
-				if s.kafkaConsumer != nil {
-					_ = s.kafkaConsumer.Stop()
-				}
-				return nil, fmt.Errorf("policy ack consumer init failed: %w", err)
-			}
-			s.policyAckCons = ac
-			if log != nil {
-				log.Info("Policy ACK consumer configured",
-					utils.ZapString("topic", ackCfg.Topic),
-					utils.ZapString("group_id", ackCfg.GroupID),
-					utils.ZapBool("signature_required", ackCfg.SigningRequired),
-					utils.ZapBool("dlq_enabled", ackCfg.DLQ != ""))
 			}
 		}
 	}
@@ -1370,11 +1509,75 @@ func (s *Service) Start(ctx context.Context) error {
 		utils.ZapDuration("grace_period", s.genesisGracePeriod))
 
 	// Proposer loop
-	go s.runProposer(ctx)
+	if s.cfg.ProposerDisabled {
+		if s.log != nil {
+			s.log.WarnContext(ctx, "proposer loop disabled by startup guard")
+		}
+	} else {
+		s.startProposerLoopOnce(ctx, "initial_start")
+	}
+	if s.startupGuardEnabled && strings.EqualFold(strings.TrimSpace(s.startupGuardMode), "safe") && s.startupGuardDB != nil {
+		go s.runStartupGuardMonitor(ctx)
+	}
 	go s.runPersistenceBackfill(ctx)
 	go s.runReplayFilterRefresh(ctx)
 
 	return nil
+}
+
+func (s *Service) startProposerLoopOnce(ctx context.Context, reason string) {
+	if s == nil {
+		return
+	}
+	if !s.proposerLoopStarted.CompareAndSwap(false, true) {
+		return
+	}
+	if s.log != nil {
+		s.log.InfoContext(ctx, "starting proposer loop",
+			utils.ZapString("reason", strings.TrimSpace(reason)))
+	}
+	go s.runProposer(ctx)
+}
+
+func (s *Service) runStartupGuardMonitor(ctx context.Context) {
+	if s == nil || s.startupGuardDB == nil || s.startupGuardRecheckInterval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(s.startupGuardRecheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+			checkCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			active, reason, err := loadStartupLivelockGuardState(checkCtx, s.startupGuardDB, s.startupGuardStateKey, s.startupGuardMaxAge)
+			cancel()
+			if err != nil {
+				if s.log != nil {
+					s.log.Warn("startup guard monitor check failed", utils.ZapError(err))
+				}
+				continue
+			}
+			s.startupGuardWasActive.Store(active)
+			if active {
+				continue
+			}
+			if s.cfg.ProposerDisabled {
+				s.cfg.ProposerDisabled = false
+			}
+			if !s.proposerLoopStarted.Load() {
+				if s.log != nil {
+					s.log.Info("startup guard cleared; re-enabling proposer loop",
+						utils.ZapString("state_key", s.startupGuardStateKey),
+						utils.ZapString("reason", strings.TrimSpace(reason)))
+				}
+				s.startProposerLoopOnce(ctx, "startup_guard_cleared")
+			}
+		}
+	}
 }
 
 func (s *Service) Stop() {

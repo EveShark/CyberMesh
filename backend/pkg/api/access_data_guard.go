@@ -25,6 +25,24 @@ func appendAccessBoundOutboxFilter(where []string, args []interface{}, tenantSco
 	return where, args
 }
 
+func appendAccessBoundOutboxFilterWithProjection(where []string, args []interface{}, tenantScope string, schema controlSchemaSupport) ([]string, []interface{}) {
+	if strings.TrimSpace(tenantScope) == "" {
+		return where, args
+	}
+	if schema.StatePoliciesTable && schema.StatePoliciesTenant && schema.StatePoliciesPolicyIDText {
+		tenantArg := len(args) + 1
+		where = append(where, fmt.Sprintf(`control_policy_outbox.policy_id IN (
+			SELECT sp.policy_id_text
+			FROM state_policies sp
+			WHERE sp.policy_id_text IS NOT NULL
+			  AND sp.tenant = $%d
+		)`, tenantArg))
+		args = append(args, tenantScope)
+		return where, args
+	}
+	return appendAccessBoundOutboxFilter(where, args, tenantScope)
+}
+
 func appendAccessBoundOutboxClause(base string, args []interface{}, tenantScope string) (string, []interface{}) {
 	parts := []string{base}
 	parts, args = appendAccessBoundOutboxFilter(parts, args, tenantScope)

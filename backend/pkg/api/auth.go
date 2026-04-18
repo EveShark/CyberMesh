@@ -68,7 +68,7 @@ func (s *Server) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 		writeErrorResponse(w, r, "AUTHZ_CONTEXT_FAILED", "failed to load active delegation context", http.StatusInternalServerError)
 		return
 	}
-	clientRole, _ := r.Context().Value(ctxKeyClientRole).(string)
+	canManageDelegations := s.canManageDelegationsForPrincipal(r, principalID)
 
 	resp := authMeResponse{
 		Authenticated:     authSource != "" && !strings.EqualFold(authSource, "developer_fallback"),
@@ -87,7 +87,7 @@ func (s *Server) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 			HasActiveAccess:         activeAccessID != "",
 			IsGlobalOnly:            len(allowedAccessIDs) == 0,
 			AllowedAccessCount:      len(allowedAccessIDs),
-			CanManageDelegations:    strings.EqualFold(strings.TrimSpace(clientRole), "control_lease_admin"),
+			CanManageDelegations:    canManageDelegations,
 			BreakGlassEnabled:       s.config != nil && s.config.BreakGlassEnabled,
 		},
 	}

@@ -187,16 +187,141 @@ func (s *Server) handlePoliciesList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), s.controlReadTimeout())
 	defer cancel()
 
-	schemaCtx, schemaCancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
+	schemaCtx, schemaCancel := context.WithTimeout(r.Context(), s.controlReadTimeout())
 	schema, _ := loadControlSchemaSupport(schemaCtx, db)
 	schemaCancel()
+	if hasProjection, projErr := tenantHasPolicyProjection(ctx, db, schema, tenantScope); projErr != nil {
+		if s.logger != nil {
+			s.logger.WarnContext(ctx, "state_policies projection probe failed; falling back to legacy policy query",
+				utils.ZapString("tenant_scope", tenantScope),
+				utils.ZapString("error", projErr.Error()))
+		}
+		if isTransientPolicyStorageError(projErr) {
+			writeJSONResponse(w, r, NewSuccessResponse(policyListResponse{
+				Rows:       []policySummaryDTO{},
+				Pagination: controlListMeta{Limit: limit},
+			}), http.StatusOK)
+			return
+		}
+		goto legacyPoliciesQuery
+	} else if !hasProjection {
+		writeJSONResponse(w, r, NewSuccessResponse(policyListResponse{
+			Rows:       []policySummaryDTO{},
+			Pagination: controlListMeta{Limit: limit},
+		}), http.StatusOK)
+		return
+	}
+	if tenantScope != "" {
+		args := []interface{}{tenantScope}
+		where := []string{
+			"tenant = $1",
+			"policy_id_text IS NOT NULL",
+		}
+		if cursor := strings.TrimSpace(r.URL.Query().Get("cursor")); cursor != "" {
+			cursorAt, cursorPolicyID, parseErr := decodePolicyCursor(cursor)
+			if parseErr != nil {
+				writeErrorResponse(w, r, "INVALID_CURSOR", parseErr.Error(), http.StatusBadRequest)
+				return
+			}
+			where = append(where, fmt.Sprintf("(COALESCE(updated_at, created_at), policy_id_text) < ($%d, $%d)", len(args)+1, len(args)+2))
+			args = append(args, cursorAt, cursorPolicyID)
+		}
+		args = append(args, limit+1)
+		rows, qErr := db.QueryContext(ctx, fmt.Sprintf(`
+			SELECT
+				policy_id_text,
+				workflow_id,
+				current_status,
+				trace_id,
+				anomaly_id,
+				source_event_id,
+				sentinel_event_id,
+				COALESCE(updated_at, created_at) AS sort_ts
+			FROM state_policies
+			WHERE %s
+			ORDER BY sort_ts DESC, policy_id_text DESC
+			LIMIT $%d
+		`, strings.Join(where, " AND "), len(args)), args...)
+		if qErr != nil {
+			if s.logger != nil {
+				s.logger.WarnContext(ctx, "state_policies projection query failed; falling back to legacy policy query",
+					utils.ZapString("tenant_scope", tenantScope),
+					utils.ZapString("error", qErr.Error()))
+			}
+			if isTransientPolicyStorageError(qErr) {
+				writeJSONResponse(w, r, NewSuccessResponse(policyListResponse{
+					Rows:       []policySummaryDTO{},
+					Pagination: controlListMeta{Limit: limit},
+				}), http.StatusOK)
+				return
+			}
+			goto legacyPoliciesQuery
+		}
+		defer rows.Close()
+		items := make([]policySummaryDTO, 0, limit+1)
+		for rows.Next() {
+			var (
+				policyID        string
+				workflowID      sql.NullString
+				status          sql.NullString
+				traceID         sql.NullString
+				anomalyID       sql.NullString
+				sourceEventID   sql.NullString
+				sentinelEventID sql.NullString
+				sortTS          time.Time
+			)
+			if scanErr := rows.Scan(&policyID, &workflowID, &status, &traceID, &anomalyID, &sourceEventID, &sentinelEventID, &sortTS); scanErr != nil {
+				writeErrorResponse(w, r, "POLICIES_SCAN_FAILED", "failed to read policy row", http.StatusInternalServerError)
+				return
+			}
+			dto := policySummaryDTO{
+				PolicyID:        strings.TrimSpace(policyID),
+				LatestStatus:    strings.TrimSpace(status.String),
+				LatestCreatedAt: sortTS.UTC().Unix(),
+			}
+			if workflowID.Valid {
+				dto.WorkflowID = strings.TrimSpace(workflowID.String)
+			}
+			if traceID.Valid {
+				dto.TraceID = strings.TrimSpace(traceID.String)
+			}
+			if anomalyID.Valid {
+				dto.AnomalyID = strings.TrimSpace(anomalyID.String)
+			}
+			if sourceEventID.Valid {
+				dto.SourceEventID = strings.TrimSpace(sourceEventID.String)
+			}
+			if sentinelEventID.Valid {
+				dto.SentinelEventID = strings.TrimSpace(sentinelEventID.String)
+			}
+			items = append(items, dto)
+		}
+		if err := rows.Err(); err != nil {
+			writeErrorResponse(w, r, "POLICIES_ITERATION_FAILED", "failed to iterate policy rows", http.StatusInternalServerError)
+			return
+		}
+		nextCursor := ""
+		if len(items) > limit {
+			last := items[limit-1]
+			nextCursor = encodePolicyCursor(time.Unix(last.LatestCreatedAt, 0).UTC(), last.PolicyID)
+			items = items[:limit]
+		}
+		writeJSONResponse(w, r, NewSuccessResponse(policyListResponse{
+			Rows:       items,
+			Pagination: controlListMeta{Limit: limit, NextCursor: nextCursor},
+		}), http.StatusOK)
+		return
+	}
+legacyPoliciesQuery:
+	legacyCtx, legacyCancel := context.WithTimeout(r.Context(), s.controlReadTimeout())
+	defer legacyCancel()
 
 	args := []interface{}{}
 	where := []string{"1=1"}
-	where, args = appendAccessBoundOutboxFilter(where, args, tenantScope)
+	where, args = appendAccessBoundOutboxFilterWithProjection(where, args, tenantScope, schema)
 	if status := strings.TrimSpace(r.URL.Query().Get("status")); status != "" {
 		if !isValidOutboxStatus(status) {
 			writeErrorResponse(w, r, "INVALID_STATUS", "status must be one of pending,publishing,published,retry,terminal_failed,acked", http.StatusBadRequest)
@@ -283,8 +408,15 @@ func (s *Server) handlePoliciesList(w http.ResponseWriter, r *http.Request) {
 		LIMIT $%d
 	`, controlOutboxRequestIDSelectExpr(schema), controlOutboxCommandIDSelectExpr(schema), controlOutboxWorkflowIDSelectExpr(schema), controlOutboxAnomalyIDSelectExpr(schema), controlOutboxFlowIDSelectExpr(), controlOutboxSourceIDSelectExpr(), controlOutboxSourceTypeSelectExpr(), controlOutboxSensorIDSelectExpr(), controlOutboxValidatorIDSelectExpr(), controlOutboxScopeIdentifierSelectExpr(), controlOutboxSentinelSelectExpr(schema), strings.Join(where, " AND "), controlAckEventIDSelectExpr(schema), controlAckTraceSelectExpr(schema), controlAckSourceEventSelectExpr(schema), controlAckSentinelEventSelectExpr(schema), ackScopeClause, ackScopeClause, len(args))
 
-	rows, err := db.QueryContext(ctx, query, args...)
+	rows, err := db.QueryContext(legacyCtx, query, args...)
 	if err != nil {
+		if isTransientPolicyStorageError(err) {
+			writeJSONResponse(w, r, NewSuccessResponse(policyListResponse{
+				Rows:       []policySummaryDTO{},
+				Pagination: controlListMeta{Limit: limit},
+			}), http.StatusOK)
+			return
+		}
 		writeErrorResponse(w, r, "POLICIES_QUERY_FAILED", "failed to query policies", http.StatusInternalServerError)
 		return
 	}
@@ -318,7 +450,14 @@ func (s *Server) handlePoliciesList(w http.ResponseWriter, r *http.Request) {
 		nextCursor = encodePolicyCursor(time.Unix(last.LatestCreatedAt, 0).UTC(), last.PolicyID)
 		items = items[:limit]
 	}
-	if err := overlayStateOnPolicySummaries(ctx, db, items); err != nil {
+	if err := overlayStateOnPolicySummaries(legacyCtx, db, items); err != nil {
+		if isTransientPolicyStorageError(err) {
+			writeJSONResponse(w, r, NewSuccessResponse(policyListResponse{
+				Rows:       []policySummaryDTO{},
+				Pagination: controlListMeta{Limit: limit, NextCursor: nextCursor},
+			}), http.StatusOK)
+			return
+		}
 		writeErrorResponse(w, r, "POLICY_STATE_READ_FAILED", "failed to read policy state projection", http.StatusInternalServerError)
 		return
 	}
@@ -327,6 +466,20 @@ func (s *Server) handlePoliciesList(w http.ResponseWriter, r *http.Request) {
 		Rows:       items,
 		Pagination: controlListMeta{Limit: limit, NextCursor: nextCursor},
 	}), http.StatusOK)
+}
+
+func isTransientPolicyStorageError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	if msg == "" {
+		return false
+	}
+	return strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "context deadline exceeded") ||
+		strings.Contains(msg, "hostname resolving error") ||
+		strings.Contains(msg, "failed to connect")
 }
 
 // handlePoliciesGet handles:
@@ -703,10 +856,10 @@ func (s *Server) handlePolicyAcks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), s.controlReadTimeout())
 	defer cancel()
 
-	schemaCtx, schemaCancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
+	schemaCtx, schemaCancel := context.WithTimeout(r.Context(), s.controlReadTimeout())
 	schema, _ := loadControlSchemaSupport(schemaCtx, db)
 	schemaCancel()
 
@@ -723,23 +876,29 @@ func (s *Server) handlePolicyAcks(w http.ResponseWriter, r *http.Request) {
 			hist.first_event_acked_at,
 			hist.latest_event_acked_at
 		FROM policy_acks pa
-		LEFT JOIN (
+		LEFT JOIN LATERAL (
 			SELECT
-				policy_id,
-				controller_instance,
 				count(*) AS ack_history_count,
 				min(acked_at) AS first_event_acked_at,
 				max(acked_at) AS latest_event_acked_at
-			FROM policy_ack_events
-			GROUP BY policy_id, controller_instance
+			FROM policy_ack_events pae
+			WHERE pae.policy_id = pa.policy_id
+			  AND pae.controller_instance = pa.controller_instance
 		) hist
-		  ON hist.policy_id = pa.policy_id
-		 AND hist.controller_instance = pa.controller_instance
+		  ON true
 		WHERE pa.policy_id = $1
 		ORDER BY pa.acked_at DESC NULLS LAST, pa.observed_at DESC
 		LIMIT 100
 	`, policyID)
 	if err != nil {
+		if isTransientControlStorageError(err) || isTransientPolicyStorageError(err) {
+			writeJSONResponse(w, r, NewSuccessResponse(policyAckResponse{
+				PolicyID: policyID,
+				Count:    0,
+				Acks:     []policyAckPayload{},
+			}), http.StatusOK)
+			return
+		}
 		s.recordAPIRequest(http.StatusInternalServerError)
 		if s.logger != nil {
 			s.logger.WarnContext(ctx, "policy acks query failed", utils.ZapString("policy_id", policyID), utils.ZapError(err))
@@ -770,6 +929,14 @@ func (s *Server) handlePolicyAcks(w http.ResponseWriter, r *http.Request) {
 		acks = append(acks, policyAckToPayload(row))
 	}
 	if err := rows.Err(); err != nil {
+		if isTransientControlStorageError(err) || isTransientPolicyStorageError(err) {
+			writeJSONResponse(w, r, NewSuccessResponse(policyAckResponse{
+				PolicyID: policyID,
+				Count:    0,
+				Acks:     []policyAckPayload{},
+			}), http.StatusOK)
+			return
+		}
 		writeErrorResponse(w, r, "ACKS_ITERATION_FAILED", "failed to iterate policy acks", http.StatusInternalServerError)
 		return
 	}

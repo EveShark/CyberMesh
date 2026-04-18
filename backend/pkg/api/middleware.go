@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"backend/pkg/security/contracts"
 	"backend/pkg/utils"
 	"github.com/google/uuid"
 )
@@ -401,12 +403,17 @@ func (s *Server) middlewareGlobalAuth(next http.Handler) http.Handler {
 				}
 				if s.validateBearerToken(token) {
 					authenticated = true
-					clientRole = "api_client"
+					principalID, parsedRole := staticBearerIdentity(token)
+					clientRole = parsedRole
 					authSource = "static_bearer"
+					ctx := context.WithValue(r.Context(), ctxKeyPrincipalID, principalID)
+					ctx = context.WithValue(ctx, ctxKeyPrincipalType, string(contracts.PrincipalTypeUser))
+					ctx = context.WithValue(ctx, ctxKeyAuthSource, authSource)
+					r = r.WithContext(ctx)
 				} else if s.bearerAuth != nil {
 					if identity, err := s.bearerAuth.ValidateToken(r.Context(), token); err == nil {
 						authenticated = true
-						clientRole = "authenticated_user"
+						clientRole = deriveJWTClientRole(identity)
 						authSource = "jwt"
 						ctx := context.WithValue(r.Context(), ctxKeyPrincipalID, identity.PrincipalID)
 						ctx = context.WithValue(ctx, ctxKeyPrincipalType, string(identity.PrincipalType))
@@ -455,21 +462,22 @@ func (s *Server) middlewareGlobalAuth(next http.Handler) http.Handler {
 			authSource = "developer_fallback"
 		}
 
-		// Check role-based access control
-		// In development mode, skip RBAC checks (allow all authenticated requests)
-		if s.config.Environment != "production" {
-			// Development mode: Allow all roles
-			ctx := context.WithValue(r.Context(), ctxKeyClientRole, clientRole)
-			if authSource != "" {
-				ctx = context.WithValue(ctx, ctxKeyAuthSource, authSource)
-			}
-			next.ServeHTTP(w, r.WithContext(ctx))
-			return
-		}
-
-		// Production mode: Enforce RBAC
+		// Enforce RBAC whenever it is enabled. Environment-specific bypasses make
+		// live JWT auth behave differently from the configured permission model.
 		requiredRole := s.getRequiredRole(r.Method, r.URL.Path)
-		if requiredRole != "" && !s.hasRole(clientRole, requiredRole) {
+		if s.config.RBACEnabled && requiredRole != "" && !s.hasRole(clientRole, requiredRole) {
+			// JWT callers are normalized as authenticated_user and must reach the
+			// security bridge for policy/audit reads where access membership and
+			// authorizer checks make the final decision.
+			if strings.EqualFold(strings.TrimSpace(clientRole), "authenticated_user") &&
+				(requiredRole == "policy_reader" || requiredRole == "audit_reader") {
+				ctx := context.WithValue(r.Context(), ctxKeyClientRole, clientRole)
+				if authSource != "" {
+					ctx = context.WithValue(ctx, ctxKeyAuthSource, authSource)
+				}
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
+			}
 			s.logger.WarnContext(r.Context(), "access denied - insufficient role",
 				utils.ZapString("path", r.URL.Path),
 				utils.ZapString("client_role", clientRole),
@@ -494,12 +502,18 @@ func (s *Server) recordBearerValidationFailure(r *http.Request, err error) {
 	}
 	requestID := getRequestID(r.Context())
 	reason := classifyBearerValidationFailure(err)
+	detail := strings.TrimSpace(err.Error())
+	if detail == "" {
+		detail = "validation_failed"
+	}
+	detail = sanitizeBearerValidationDetail(detail)
 	if s.logger != nil {
 		s.logger.WarnContext(r.Context(), "bearer token validation failed",
 			utils.ZapString("request_id", requestID),
 			utils.ZapString("path", r.URL.Path),
 			utils.ZapString("client_ip", getClientIP(r)),
-			utils.ZapString("reason", reason))
+			utils.ZapString("reason", reason),
+			utils.ZapString("detail", detail))
 	}
 	if s.audit != nil {
 		_ = s.audit.Log("api.auth.bearer_invalid", utils.AuditSecurity, map[string]interface{}{
@@ -507,6 +521,7 @@ func (s *Server) recordBearerValidationFailure(r *http.Request, err error) {
 			"path":       r.URL.Path,
 			"client_ip":  getClientIP(r),
 			"reason":     reason,
+			"detail":     detail,
 		})
 	}
 }
@@ -535,6 +550,109 @@ func classifyBearerValidationFailure(err error) string {
 	default:
 		return "validation_failed"
 	}
+}
+
+func sanitizeBearerValidationDetail(detail string) string {
+	detail = strings.TrimSpace(detail)
+	if detail == "" {
+		return "validation_failed"
+	}
+	lower := strings.ToLower(detail)
+	// Guard against accidentally logging raw credential/token fragments from validator errors.
+	if strings.Contains(lower, "token ") ||
+		strings.Contains(lower, "bearer ") ||
+		strings.Contains(lower, "authorization:") ||
+		containsTokenLikeFragment(detail) {
+		return "[REDACTED]"
+	}
+	const maxDetailLen = 240
+	if len(detail) > maxDetailLen {
+		return detail[:maxDetailLen]
+	}
+	return detail
+}
+
+func containsTokenLikeFragment(detail string) bool {
+	fields := strings.FieldsFunc(detail, func(r rune) bool {
+		switch r {
+		case ' ', '\t', '\n', '\r', ',', ';', ':', '=', '"', '\'', '(', ')', '[', ']', '{', '}':
+			return true
+		default:
+			return false
+		}
+	})
+	for _, field := range fields {
+		f := strings.TrimSpace(field)
+		if len(f) < 24 {
+			continue
+		}
+		// JWT-like fragments.
+		if strings.Count(f, ".") >= 2 {
+			return true
+		}
+		if isBase64URLLike(f) {
+			return true
+		}
+	}
+	return false
+}
+
+func isBase64URLLike(value string) bool {
+	if len(value) < 32 {
+		return false
+	}
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') ||
+			(r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') ||
+			r == '-' || r == '_' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func deriveJWTClientRole(identity *validatedBearerIdentity) string {
+	if identity == nil {
+		return "authenticated_user"
+	}
+	clientID := strings.ToLower(strings.TrimSpace(identity.ClientID))
+	if clientID == "" {
+		return "authenticated_user"
+	}
+	patterns := []struct {
+		substr string
+		role   string
+	}{
+		{".platform.admin.", "admin"},
+		{".control.admin.", "control_lease_admin"},
+		{".block.reader.", "block_reader"},
+		{".state.reader.", "state_reader"},
+		{".validator.reader.", "validator_reader"},
+		{".stats.reader.", "stats_reader"},
+		{".metrics.reader.", "metrics_reader"},
+		{".policy.reader.", "policy_reader"},
+		{".audit.reader.", "audit_reader"},
+		{".network.reader.", "network_reader"},
+		{".consensus.reader.", "consensus_reader"},
+		{".ai.reader.", "ai_reader"},
+		{".anomaly.reader.", "anomaly_reader"},
+		{".outbox.reader.", "control_outbox_reader"},
+		{".trace.reader.", "control_trace_reader"},
+		{".lease.reader.", "control_lease_reader"},
+		{".ack.reader.", "control_ack_reader"},
+		{".outbox.operator.", "control_outbox_operator"},
+		{".api.client.", "api_client"},
+		{".developer.", "developer"},
+		{".support.access.approver.", "control_lease_admin"},
+	}
+	for _, pattern := range patterns {
+		if strings.Contains(clientID, pattern.substr) {
+			return pattern.role
+		}
+	}
+	return "authenticated_user"
 }
 
 // validateBearerToken checks provided token against configured static tokens (constant-time)
@@ -587,6 +705,43 @@ func subtleConstantTimeCompare(a, b string) bool {
 		v |= a[i] ^ b[i]
 	}
 	return v == 0
+}
+
+func staticBearerIdentity(token string) (string, string) {
+	token = strings.TrimSpace(token)
+	role := "api_client"
+	principalID := ""
+
+	segments := strings.Split(token, ";")
+	for _, segment := range segments {
+		segment = strings.TrimSpace(segment)
+		if segment == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(segment, "=")
+		if !ok {
+			continue
+		}
+		key = strings.ToLower(strings.TrimSpace(key))
+		value = strings.TrimSpace(value)
+		switch key {
+		case "id", "principal_id", "principal":
+			principalID = value
+		case "role":
+			if value != "" {
+				role = value
+			}
+		}
+	}
+
+	if strings.TrimSpace(principalID) == "" {
+		sum := sha256.Sum256([]byte(token))
+		principalID = "user:static-" + fmt.Sprintf("%x", sum[:8])
+	} else if !strings.Contains(principalID, ":") {
+		principalID = "user:" + principalID
+	}
+
+	return principalID, role
 }
 
 // extractRoleFromCert extracts role from certificate CN

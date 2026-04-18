@@ -335,6 +335,14 @@ func (s *Server) runConsensusCheck(ctx context.Context) (ReadinessCheckResult, i
 		"consensus_peers_seen":       activation.PeersSeen,
 		"consensus_seen_quorum":      activation.SeenQuorum,
 	}
+	if active, reason, noCommitSeconds := s.consensusLivelockSnapshot(time.Now()); active {
+		details["livelock_detected"] = true
+		details["livelock_reason"] = reason
+		details["livelock_no_commit_seconds"] = noCommitSeconds
+		res := buildCheckResult(start, "not ready", errors.New("consensus livelock detected"))
+		res.Message = "consensus livelock detected"
+		return res, details, "inactive"
+	}
 
 	var message string
 	var phase string

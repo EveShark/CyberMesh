@@ -85,90 +85,60 @@ func (s *Store) EnsureSchema(ctx context.Context) error {
 		return fmt.Errorf("policy outbox: required table control_dispatcher_leases missing")
 	}
 
-	var traceCols int
-	if err := s.db.QueryRowContext(ctx, `
-		SELECT count(*)
-		FROM information_schema.columns
-		WHERE table_schema = 'public'
-		  AND table_name = 'control_policy_outbox'
-		  AND column_name IN ('trace_id', 'ai_event_ts_ms')
-	`).Scan(&traceCols); err != nil {
-		return fmt.Errorf("policy outbox: trace column check failed: %w", err)
-	}
-	if traceCols < 2 {
+	if err := probeOutboxColumns(ctx, s.db, "trace_id", "ai_event_ts_ms"); err != nil {
 		return fmt.Errorf("policy outbox: required trace columns missing; ensure migration 008 applied")
 	}
-	var sourceCols int
-	if err := s.db.QueryRowContext(ctx, `
-		SELECT count(*)
-		FROM information_schema.columns
-		WHERE table_schema = 'public'
-		  AND table_name = 'control_policy_outbox'
-		  AND column_name IN ('source_event_id', 'source_event_ts_ms')
-	`).Scan(&sourceCols); err != nil {
-		return fmt.Errorf("policy outbox: source trace column check failed: %w", err)
-	}
-	s.hasSourceColumns = sourceCols >= 2
-	var requestCols int
-	if err := s.db.QueryRowContext(ctx, `
-		SELECT count(*)
-		FROM information_schema.columns
-		WHERE table_schema = 'public'
-		  AND table_name = 'control_policy_outbox'
-		  AND column_name = 'request_id'
-	`).Scan(&requestCols); err != nil {
-		return fmt.Errorf("policy outbox: request_id column check failed: %w", err)
-	}
-	s.hasRequestColumn = requestCols >= 1
-	var commandCols int
-	if err := s.db.QueryRowContext(ctx, `
-		SELECT count(*)
-		FROM information_schema.columns
-		WHERE table_schema = 'public'
-		  AND table_name = 'control_policy_outbox'
-		  AND column_name = 'command_id'
-	`).Scan(&commandCols); err != nil {
-		return fmt.Errorf("policy outbox: command_id column check failed: %w", err)
-	}
-	s.hasCommandColumn = commandCols >= 1
-	var workflowCols int
-	if err := s.db.QueryRowContext(ctx, `
-		SELECT count(*)
-		FROM information_schema.columns
-		WHERE table_schema = 'public'
-		  AND table_name = 'control_policy_outbox'
-		  AND column_name = 'workflow_id'
-	`).Scan(&workflowCols); err != nil {
-		return fmt.Errorf("policy outbox: workflow_id column check failed: %w", err)
-	}
-	s.hasWorkflowColumn = workflowCols >= 1
-	var sentinelCols int
-	if err := s.db.QueryRowContext(ctx, `
-		SELECT count(*)
-		FROM information_schema.columns
-		WHERE table_schema = 'public'
-		  AND table_name = 'control_policy_outbox'
-		  AND column_name = 'sentinel_event_id'
-	`).Scan(&sentinelCols); err != nil {
-		return fmt.Errorf("policy outbox: sentinel event column check failed: %w", err)
-	}
-	s.hasSentinelColumn = sentinelCols >= 1
-	var dispatchShardCols int
-	if err := s.db.QueryRowContext(ctx, `
-		SELECT count(*)
-		FROM information_schema.columns
-		WHERE table_schema = 'public'
-		  AND table_name = 'control_policy_outbox'
-		  AND column_name = 'dispatch_shard'
-	`).Scan(&dispatchShardCols); err != nil {
-		return fmt.Errorf("policy outbox: dispatch shard column check failed: %w", err)
-	}
-	s.hasDispatchShard = dispatchShardCols >= 1
+	s.hasSourceColumns = probeOutboxColumns(ctx, s.db, "source_event_id", "source_event_ts_ms") == nil
+	s.hasRequestColumn = probeOutboxColumns(ctx, s.db, "request_id") == nil
+	s.hasCommandColumn = probeOutboxColumns(ctx, s.db, "command_id") == nil
+	s.hasWorkflowColumn = probeOutboxColumns(ctx, s.db, "workflow_id") == nil
+	s.hasSentinelColumn = probeOutboxColumns(ctx, s.db, "sentinel_event_id") == nil
+	s.hasDispatchShard = probeOutboxColumns(ctx, s.db, "dispatch_shard") == nil
 	if !s.hasDispatchShard {
 		return fmt.Errorf("policy outbox: required dispatch_shard column missing; ensure migration 028 applied")
 	}
 
 	return nil
+}
+
+func probeOutboxColumns(ctx context.Context, db *sql.DB, columns ...string) error {
+	if db == nil || len(columns) == 0 {
+		return fmt.Errorf("invalid outbox column probe")
+	}
+	parts := make([]string, 0, len(columns))
+	for _, column := range columns {
+		column = strings.TrimSpace(column)
+		if column == "" {
+			return fmt.Errorf("invalid outbox column probe")
+		}
+		parts = append(parts, `"`+strings.ReplaceAll(column, `"`, `""`)+`"`)
+	}
+	query := fmt.Sprintf("SELECT %s FROM control_policy_outbox LIMIT 0", strings.Join(parts, ", "))
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		if isUndefinedColumnErr(err) {
+			return fmt.Errorf("missing required column")
+		}
+		return err
+	}
+	_ = rows.Close()
+	return nil
+}
+
+func isUndefinedColumnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "42703"
+	}
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		return string(pqErr.Code) == "42703"
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "undefined column")
 }
 
 func (s *Store) TryAcquireLease(ctx context.Context, leaseKey, holderID string, ttl time.Duration) (bool, int64, error) {

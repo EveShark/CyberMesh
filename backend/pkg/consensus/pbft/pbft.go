@@ -202,6 +202,11 @@ func (hs *HotStuff) onProposalLocked(ctx context.Context, proposal *messages.Pro
 
 	// Validate proposal structure
 	if err := hs.validator.ValidateProposal(ctx, proposal); err != nil {
+		hs.logger.WarnContext(ctx, "proposal validation failed",
+			"view", proposal.View,
+			"height", proposal.Height,
+			"proposer", fmt.Sprintf("%x", proposal.ProposerID[:8]),
+			"error", err)
 		if hs.audit != nil {
 			hs.audit.Warn("invalid_proposal", map[string]interface{}{
 				"view":     proposal.View,
@@ -233,6 +238,10 @@ func (hs *HotStuff) onProposalLocked(ctx context.Context, proposal *messages.Pro
 	// Validate justifyQC
 	if proposal.JustifyQC != nil {
 		if err := hs.validator.ValidateQC(ctx, proposal.JustifyQC); err != nil {
+			hs.logger.WarnContext(ctx, "proposal justifyQC validation failed",
+				"view", proposal.View,
+				"height", proposal.Height,
+				"error", err)
 			return nil, fmt.Errorf("invalid justifyQC: %w", err)
 		}
 
@@ -261,6 +270,11 @@ func (hs *HotStuff) onProposalLocked(ctx context.Context, proposal *messages.Pro
 
 	// Store proposal
 	if err := hs.storage.StoreProposal(proposal); err != nil {
+		hs.logger.ErrorContext(ctx, "failed to store proposal",
+			"view", proposal.View,
+			"height", proposal.Height,
+			"block_hash", fmt.Sprintf("%x", proposal.BlockHash[:8]),
+			"error", err)
 		return nil, fmt.Errorf("failed to store proposal: %w", err)
 	}
 
@@ -514,6 +528,8 @@ func (hs *HotStuff) detectVoteEquivocation(ctx context.Context, newVote *message
 
 	for _, existingVote := range existingVotes {
 		if existingVote.VoterID == newVote.VoterID &&
+			existingVote.Height == newVote.Height &&
+			existingVote.Round == newVote.Round &&
 			existingVote.BlockHash != newVote.BlockHash {
 			// Equivocation detected!
 			hs.logger.WarnContext(ctx, "equivocation detected",
@@ -1149,6 +1165,9 @@ func (hs *HotStuff) bestValidatedFallbackQC(ctx context.Context, exclude types.Q
 	candidates := []types.QC{locked, prepare}
 	if hs.storage != nil {
 		candidates = append(candidates, hs.storage.GetLastCommittedQC())
+		for _, persisted := range hs.storage.GetQCsSnapshot() {
+			candidates = append(candidates, persisted)
+		}
 	}
 
 	var best types.QC
@@ -1182,7 +1201,13 @@ func (hs *HotStuff) rebuildQCFromVotes(ctx context.Context, qc types.QC) (types.
 	discardedVotes := 0
 	discardedByReason := make(map[string]int)
 	discardedSamples := make([]string, 0, 3)
-	for _, vote := range hs.storage.GetVotesByView(qc.GetView()) {
+	for _, vote := range hs.storage.GetVotesForQCRepair(
+		ctx,
+		qc.GetView(),
+		qc.GetHeight(),
+		qc.GetBlockHash(),
+		hs.quorum.GetQuorumThreshold(),
+	) {
 		if vote == nil {
 			continue
 		}

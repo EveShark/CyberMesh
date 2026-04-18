@@ -37,7 +37,12 @@ func (r *Router) DebugConsume(topic string, sub *pubsub.Subscription) {
 							r.log.Error("handler panic", utils.ZapString("topic", topic), utils.ZapAny("panic", rec))
 						}
 					}()
-					_ = h(r.ctx, from, msg.Data)
+					if err := h(r.ctx, from, msg.Data); err != nil {
+						r.log.Warn("handler returned error",
+							utils.ZapString("topic", topic),
+							utils.ZapString("from", from.String()),
+							utils.ZapError(err))
+					}
 				}(h)
 			case <-r.ctx.Done():
 				return

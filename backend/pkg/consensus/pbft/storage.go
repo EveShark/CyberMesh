@@ -466,7 +466,6 @@ func (s *Storage) Stop() error {
 // StoreProposal stores a proposal in the replay window
 func (s *Storage) StoreProposal(p *messages.Proposal) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	// Check if within replay window
 	if !s.isWithinWindow(p.Height) {
@@ -505,6 +504,7 @@ func (s *Storage) StoreProposal(p *messages.Proposal) error {
 			)
 		}
 		if !s.isWithinWindow(p.Height) {
+			s.mu.Unlock()
 			return fmt.Errorf("proposal height %d outside replay window [%d, %d]",
 				p.Height, s.lastCommitted+1, s.lastCommitted+uint64(s.config.ReplayWindowSize))
 		}
@@ -512,19 +512,29 @@ func (s *Storage) StoreProposal(p *messages.Proposal) error {
 
 	// Check capacity
 	if len(s.proposals) >= s.config.MaxProposals {
+		s.mu.Unlock()
 		return fmt.Errorf("proposal storage full: %d", len(s.proposals))
 	}
 
 	// Store in memory
 	s.proposals[p.BlockHash] = p
+	backend := s.backend
+	enablePersistence := s.config.EnablePersistence
+	s.mu.Unlock()
 
 	// Persist if enabled
-	if s.config.EnablePersistence && s.backend != nil {
+	if enablePersistence && backend != nil {
 		data, err := s.encodeProposal(p)
 		if err != nil {
+			s.mu.Lock()
+			delete(s.proposals, p.BlockHash)
+			s.mu.Unlock()
 			return fmt.Errorf("encode proposal: %w", err)
 		}
-		if err := s.backend.SaveProposal(s.backgroundCtx, p.BlockHash[:], p.Height, p.View, p.ProposerID[:], data); err != nil {
+		if err := backend.SaveProposal(s.backgroundCtx, p.BlockHash[:], p.Height, p.View, p.ProposerID[:], data); err != nil {
+			s.mu.Lock()
+			delete(s.proposals, p.BlockHash)
+			s.mu.Unlock()
 			return fmt.Errorf("persist proposal: %w", err)
 		}
 		if s.audit != nil {
@@ -714,6 +724,112 @@ func (s *Storage) GetVotesByView(view uint64) []*messages.Vote {
 	return s.votes[view]
 }
 
+// GetVotesForQCRepair returns votes that match the target QC tuple.
+// It first checks in-memory replay-window votes; if below neededCount,
+// it backfills from durable storage using height-based scans.
+func (s *Storage) GetVotesForQCRepair(
+	ctx context.Context,
+	view uint64,
+	height uint64,
+	blockHash BlockHash,
+	neededCount int,
+) []*messages.Vote {
+	s.mu.RLock()
+	cached := append([]*messages.Vote(nil), s.votes[view]...)
+	backend := s.backend
+	decMode := s.decMode
+	logger := s.logger
+	s.mu.RUnlock()
+
+	matches := make([]*messages.Vote, 0, len(cached))
+	for _, vote := range cached {
+		if vote == nil {
+			continue
+		}
+		if vote.View == view && vote.Height == height && vote.BlockHash == blockHash {
+			matches = append(matches, vote)
+		}
+	}
+	if neededCount > 0 && len(matches) >= neededCount {
+		return matches
+	}
+	if backend == nil || decMode == nil {
+		return matches
+	}
+
+	limits := []int{2048, 8192, 32768, 131072}
+	seen := make(map[[32]byte]struct{}, len(matches))
+	for _, vote := range matches {
+		if vote == nil {
+			continue
+		}
+		vh := vote.Hash()
+		seen[vh] = struct{}{}
+	}
+
+	for _, limit := range limits {
+		records, err := backend.ListVotes(ctx, height, limit)
+		if err != nil {
+			if logger != nil {
+				logger.WarnContext(ctx, "qc repair vote backfill failed",
+					"view", view,
+					"height", height,
+					"limit", limit,
+					"error", err)
+			}
+			break
+		}
+		if len(records) == 0 {
+			break
+		}
+
+		added := 0
+		for _, rec := range records {
+			if rec.View != view || rec.Height != height {
+				continue
+			}
+			if len(rec.BlockHash) != 32 {
+				continue
+			}
+			var recHash BlockHash
+			copy(recHash[:], rec.BlockHash)
+			if recHash != blockHash {
+				continue
+			}
+
+			var vote messages.Vote
+			if err := decMode.Unmarshal(rec.Data, &vote); err != nil {
+				continue
+			}
+			vh := vote.Hash()
+			if _, exists := seen[vh]; exists {
+				continue
+			}
+			seen[vh] = struct{}{}
+			voteCopy := vote
+			matches = append(matches, &voteCopy)
+			added++
+		}
+
+		if logger != nil && added > 0 {
+			logger.InfoContext(ctx, "qc repair vote backfill matched persisted votes",
+				"view", view,
+				"height", height,
+				"limit", limit,
+				"added", added,
+				"total_matches", len(matches))
+		}
+		if neededCount > 0 && len(matches) >= neededCount {
+			break
+		}
+		if len(records) < limit {
+			break
+		}
+	}
+
+	return matches
+}
+
 // StoreQC stores a quorum certificate
 func (s *Storage) StoreQC(qc QC) error {
 	s.mu.Lock()
@@ -760,6 +876,20 @@ func (s *Storage) GetQC(hash BlockHash) QC {
 	defer s.mu.RUnlock()
 
 	return s.qcs[hash]
+}
+
+// GetQCsSnapshot returns a copy of currently loaded QCs.
+func (s *Storage) GetQCsSnapshot() []QC {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make([]QC, 0, len(s.qcs))
+	for _, qc := range s.qcs {
+		if qc != nil {
+			out = append(out, qc)
+		}
+	}
+	return out
 }
 
 // StoreEvidence stores Byzantine evidence
@@ -817,6 +947,24 @@ func (s *Storage) CommitBlock(hash BlockHash, height uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Fail closed on conflicting commits at the same height.
+	// Idempotent re-commit of the same hash is allowed.
+	if existing, ok := s.committedBlocks[height]; ok {
+		if existing != hash {
+			err := fmt.Errorf("conflicting committed block at height %d", height)
+			if s.audit != nil {
+				_ = s.audit.Security("block_commit_conflict_detected", map[string]interface{}{
+					"height":        height,
+					"existing_hash": fmt.Sprintf("%x", existing[:]),
+					"incoming_hash": fmt.Sprintf("%x", hash[:]),
+				})
+			}
+			return err
+		}
+		// Idempotent commit for already persisted block.
+		return nil
+	}
+
 	// Update last committed
 	if height > s.lastCommitted {
 		s.lastCommitted = height
@@ -825,10 +973,12 @@ func (s *Storage) CommitBlock(hash BlockHash, height uint64) error {
 	// Store committed block
 	s.committedBlocks[height] = hash
 
-	s.audit.Info("block_committed_storage", map[string]interface{}{
-		"height": height,
-		"hash":   fmt.Sprintf("%x", hash[:]),
-	})
+	if s.audit != nil {
+		_ = s.audit.Info("block_committed_storage", map[string]interface{}{
+			"height": height,
+			"hash":   fmt.Sprintf("%x", hash[:]),
+		})
+	}
 
 	// Auto-prune if enabled
 	if s.config.AutoPrune {

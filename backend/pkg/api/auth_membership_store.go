@@ -16,6 +16,7 @@ const activeAccessCookieName = "cybermesh_access_id"
 type trustedMembershipSnapshot struct {
 	PrimaryAccessID  string
 	AllowedAccessIDs []string
+	AccessRoles      map[string]string
 }
 
 func (s *Server) loadTrustedMembershipSnapshot(ctx context.Context, principalID string) (trustedMembershipSnapshot, error) {
@@ -41,7 +42,7 @@ func (s *Server) loadTrustedMembershipSnapshotWithMode(ctx context.Context, prin
 	}
 
 	const query = `
-		SELECT access_id, is_primary
+		SELECT access_id, is_primary, role
 		FROM auth_access_memberships
 		WHERE principal_id = $1
 		  AND status = 'active'
@@ -58,7 +59,8 @@ func (s *Server) loadTrustedMembershipSnapshotWithMode(ctx context.Context, prin
 	for rows.Next() {
 		var accessID string
 		var isPrimary bool
-		if scanErr := rows.Scan(&accessID, &isPrimary); scanErr != nil {
+		var role string
+		if scanErr := rows.Scan(&accessID, &isPrimary, &role); scanErr != nil {
 			return trustedMembershipSnapshot{}, scanErr
 		}
 		accessID = strings.TrimSpace(accessID)
@@ -68,6 +70,12 @@ func (s *Server) loadTrustedMembershipSnapshotWithMode(ctx context.Context, prin
 		snapshot.AllowedAccessIDs = append(snapshot.AllowedAccessIDs, accessID)
 		if isPrimary && snapshot.PrimaryAccessID == "" {
 			snapshot.PrimaryAccessID = accessID
+		}
+		if normalizedRole := normalizeAccessRole(role); normalizedRole != "" {
+			if snapshot.AccessRoles == nil {
+				snapshot.AccessRoles = make(map[string]string)
+			}
+			snapshot.AccessRoles[strings.ToLower(accessID)] = normalizedRole
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -79,6 +87,13 @@ func (s *Server) loadTrustedMembershipSnapshotWithMode(ctx context.Context, prin
 	}
 	s.queuePrincipalTupleSync(principalID)
 	return snapshot, nil
+}
+
+func (s trustedMembershipSnapshot) roleForAccess(accessID string) string {
+	if len(s.AccessRoles) == 0 {
+		return ""
+	}
+	return normalizeAccessRole(s.AccessRoles[strings.ToLower(strings.TrimSpace(accessID))])
 }
 
 func (s *Server) resolveTrustedMembershipSnapshot(r *http.Request, principalID string) (trustedMembershipSnapshot, error) {
@@ -188,6 +203,15 @@ func normalizeAllowedAccessIDs(values []string) []string {
 		lastNormalized = normalized
 	}
 	return deduped
+}
+
+func normalizeAccessRole(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "platform_admin", "support_delegate", "admin", "analyst", "viewer", "responder":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return ""
+	}
 }
 
 func accessListContains(values []string, want string) bool {

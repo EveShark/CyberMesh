@@ -286,6 +286,20 @@ type Server struct {
 	controlGateContinuousPassSince      time.Time
 	controlGateLastIntegrityTotal       uint64
 	controlGateLastTxMismatchTotal      uint64
+
+	consensusLivelockMu              sync.Mutex
+	consensusLivelockLastSampleAt    time.Time
+	consensusLivelockLastCommitted   uint64
+	consensusLivelockLastViewChanges uint64
+	consensusLivelockSuspectSince    time.Time
+	consensusLivelockActive          atomic.Bool
+	consensusLivelockDetectedTotal   atomic.Uint64
+	consensusLivelockLastReason      atomic.Value
+	consensusLivelockNoCommitMs      atomic.Uint64
+	consensusLivelockPersistMu       sync.Mutex
+	consensusLivelockLastPersistAt   time.Time
+	consensusLivelockLastPersistSet  atomic.Bool
+	consensusLivelockLastPersistFlag atomic.Bool
 }
 
 type rateLimitKey struct {
@@ -396,12 +410,6 @@ func NewServer(deps Dependencies) (*Server, error) {
 		return nil, fmt.Errorf("config validation failed: %w", err)
 	}
 
-	// Ensure RBAC is only enabled when mTLS client authentication is configured
-	if deps.Config.RBACEnabled && deps.Config.TLSClientCAFile == "" {
-		deps.Logger.Warn("RBAC requires mutual TLS client CA; disabling RBAC until certificates are provisioned")
-		deps.Config.RBACEnabled = false
-	}
-
 	s := &Server{
 		config:           deps.Config,
 		logger:           deps.Logger,
@@ -436,6 +444,7 @@ func NewServer(deps Dependencies) (*Server, error) {
 		})
 	}
 	s.controlMutationLastActionByTarget = make(map[string]time.Time)
+	s.consensusLivelockLastReason.Store("")
 
 	s.loopStatus.Store("unknown")
 	s.loopIssues.Store("")
@@ -716,6 +725,10 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.tupleManager != nil && s.config.OpenFGATupleReconcileEnabled {
 		s.wg.Add(1)
 		go s.runOpenFGATupleReconciler()
+	}
+	if s.config.ConsensusLivelockDetectorEnabled {
+		s.wg.Add(1)
+		go s.runConsensusLivelockMonitor()
 	}
 
 	s.logger.Info("API server started",

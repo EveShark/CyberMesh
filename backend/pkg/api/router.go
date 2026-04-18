@@ -89,6 +89,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc(basePath+"/control/leases:force-takeover", s.handleControlLeases)
 	mux.HandleFunc(basePath+"/control/safe-mode:toggle", s.handleControlSafeModeToggle)
 	mux.HandleFunc(basePath+"/control/kill-switch:toggle", s.handleControlKillSwitchToggle)
+	mux.HandleFunc(basePath+"/control/runtime:repair", s.handleControlRuntimeRepair)
 	mux.HandleFunc(basePath+"/control/acks", s.handleControlAcksList)
 
 	// P2P info (for peer discovery) - DISABLED: handler method missing
@@ -96,7 +97,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 
 	s.logger.Info("routes registered",
 		utils.ZapString("base_path", basePath),
-		utils.ZapInt("endpoint_count", 32))
+		utils.ZapInt("endpoint_count", 33))
 }
 
 // middlewareChain applies middleware in order
@@ -300,6 +301,9 @@ func (s *Server) getRequiredRole(method, path string) string {
 	if strings.HasPrefix(path, basePath+"/control/safe-mode") {
 		return "control_lease_admin"
 	}
+	if strings.HasPrefix(path, basePath+"/control/runtime:repair") {
+		return "control_lease_admin"
+	}
 	if strings.HasPrefix(path, basePath+"/control/kill-switch") {
 		return "control_lease_admin"
 	}
@@ -328,14 +332,60 @@ func (s *Server) hasRole(clientRole, requiredRole string) bool {
 		return true
 	}
 
-	// Check role mapping from config
-	if allowedEndpoints, exists := s.config.AllowedRoles[clientRole]; exists {
-		for _, endpoint := range allowedEndpoints {
-			if strings.HasPrefix(requiredRole, endpoint) {
-				return true
-			}
-		}
+	if s == nil || s.config == nil {
+		return false
 	}
 
+	// If both roles exist in the configured endpoint map, grant access when the
+	// client role covers every endpoint exposed by the required role.
+	clientEndpoints, clientExists := s.config.AllowedRoles[clientRole]
+	if !clientExists {
+		return false
+	}
+
+	// Backward-compatible mode: explicit role aliases in AllowedRoles.
+	if stringSetContainsFold(clientEndpoints, requiredRole) {
+		return true
+	}
+
+	// Endpoint-coverage mode: if both roles are defined as endpoint sets, the
+	// client role can satisfy the required role when it covers all endpoints.
+	requiredEndpoints, requiredExists := s.config.AllowedRoles[requiredRole]
+	if !requiredExists {
+		return false
+	}
+	return endpointSetContainsAll(clientEndpoints, requiredEndpoints)
+}
+
+func endpointSetContainsAll(have, want []string) bool {
+	if len(want) == 0 {
+		return true
+	}
+	normalized := make(map[string]struct{}, len(have))
+	for _, value := range have {
+		key := strings.TrimSpace(value)
+		if key == "" {
+			continue
+		}
+		normalized[key] = struct{}{}
+	}
+	for _, value := range want {
+		key := strings.TrimSpace(value)
+		if key == "" {
+			continue
+		}
+		if _, ok := normalized[key]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func stringSetContainsFold(values []string, want string) bool {
+	for _, value := range values {
+		if strings.EqualFold(strings.TrimSpace(value), strings.TrimSpace(want)) {
+			return true
+		}
+	}
 	return false
 }

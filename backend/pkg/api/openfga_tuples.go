@@ -625,7 +625,15 @@ func (m *openFGATupleManager) writeBatch(ctx context.Context, writes, deletes []
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("openfga write returned %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+		msg := strings.TrimSpace(string(data))
+		normalized := strings.ToLower(msg)
+		// OpenFGA write is not idempotent for duplicate writes/missing deletes.
+		// Treat these known cases as converged so reconcile can continue.
+		if strings.Contains(normalized, "tuple to be written already existed") ||
+			strings.Contains(normalized, "tuple to be deleted did not exist") {
+			return nil
+		}
+		return fmt.Errorf("openfga write returned %d: %s", resp.StatusCode, msg)
 	}
 	return nil
 }

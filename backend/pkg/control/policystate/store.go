@@ -177,9 +177,11 @@ func loadSchemaSupport(ctx context.Context, db *sql.DB, query queryExecer) (sche
 	if source == nil {
 		return schemaSupport{}, nil
 	}
+	schemaProbeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
 	schema := schemaSupport{}
 	var reg sql.NullString
-	if err := source.QueryRowContext(ctx, `SELECT to_regclass('state_policies')::STRING`).Scan(&reg); err != nil {
+	if err := source.QueryRowContext(schemaProbeCtx, `SELECT to_regclass('state_policies')::STRING`).Scan(&reg); err != nil {
 		return schema, err
 	}
 	if !reg.Valid || strings.TrimSpace(reg.String) == "" {
@@ -190,7 +192,7 @@ func loadSchemaSupport(ctx context.Context, db *sql.DB, query queryExecer) (sche
 	}
 	const requiredColumns = 11
 	var count int
-	if err := source.QueryRowContext(ctx, `
+	if err := source.QueryRowContext(schemaProbeCtx, `
 		SELECT count(*)
 		FROM information_schema.columns
 		WHERE table_schema = 'public'

@@ -126,6 +126,13 @@ func (s *Server) controlTraceTimeout() time.Duration {
 	return 15 * time.Second
 }
 
+func (s *Server) controlReadTimeout() time.Duration {
+	if s != nil && s.config != nil && s.config.ControlReadTimeout > 0 {
+		return s.config.ControlReadTimeout
+	}
+	return 5 * time.Second
+}
+
 func (s *Server) noteControlTimeout(err error, mutation bool) {
 	if err == nil {
 		return

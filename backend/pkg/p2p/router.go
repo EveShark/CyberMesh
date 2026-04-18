@@ -354,9 +354,11 @@ func NewRouter(parent context.Context, nodeCfg *config.NodeConfig, secCfg *confi
 	}()
 
 	// ---- GossipSub v1.1 with scoring ----
+	maxMessageSize := configMgr.GetIntRange("P2P_MAX_MESSAGE_SIZE", 1024*1024, 1024, 10*1024*1024)
 	psOpts := []pubsub.Option{
 		pubsub.WithMessageSigning(true),
 		pubsub.WithStrictSignatureVerification(true),
+		pubsub.WithMaxMessageSize(maxMessageSize),
 	}
 
 	// Configure GossipSub parameters for small validator networks
@@ -406,6 +408,7 @@ func NewRouter(parent context.Context, nodeCfg *config.NodeConfig, secCfg *confi
 		cancel()
 		return nil, fmt.Errorf("gossipsub: %w", err)
 	}
+	log.Info("gossipsub max message size configured", utils.ZapInt("bytes", maxMessageSize))
 
 	r := &Router{
 		ctx:                  ctx,

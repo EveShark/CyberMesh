@@ -41,6 +41,7 @@ type APIConfig struct {
 	ZitadelIssuer                 string
 	ZitadelClientID               string
 	ZitadelAudience               string
+	ZitadelJWKSJSON               string
 	ZitadelJWKSRefreshInterval    time.Duration
 	ZitadelJWKSTimeout            time.Duration
 	OpenFGAAPIURL                 string
@@ -105,17 +106,27 @@ type APIConfig struct {
 	NodeAliasList []string
 
 	// Control-plane mutation safety flags
-	ControlMutationsEnabled         bool
-	ControlMutationsSafeMode        bool
-	ControlMutationRequireConsensus bool
-	ControlMutationRequireTenant    bool
-	ControlMutationTimeout          time.Duration
-	ControlTraceTimeout             time.Duration
-	ControlAPIBreakerEnabled        bool
-	ControlAPIBreakerErrorThreshold int
-	ControlAPIBreakerCooldown       time.Duration
-	ControlMutationCooldown         time.Duration
-	ControlMutationMaxPerMinute     int
+	ControlMutationsEnabled          bool
+	ControlMutationsSafeMode         bool
+	ControlMutationRequireConsensus  bool
+	ControlMutationRequireTenant     bool
+	ControlMutationTimeout           time.Duration
+	ControlTraceTimeout              time.Duration
+	ControlReadTimeout               time.Duration
+	ControlAPIBreakerEnabled         bool
+	ControlAPIBreakerErrorThreshold  int
+	ControlAPIBreakerCooldown        time.Duration
+	ControlMutationCooldown          time.Duration
+	ControlMutationMaxPerMinute      int
+	ConsensusLivelockDetectorEnabled bool
+	ConsensusLivelockMonitorInterval time.Duration
+	ConsensusLivelockNoCommitWindow  time.Duration
+	ConsensusLivelockMinViewChanges  uint64
+	ConsensusLivelockMinMempoolTxs   int
+	ConsensusLivelockMinOldestTxAge  time.Duration
+	ConsensusLivelockPersistState    bool
+	ConsensusLivelockPersistInterval time.Duration
+	ConsensusLivelockStateKey        string
 }
 
 // RateLimitOverride configures per-route rate limiting policies.
@@ -160,37 +171,47 @@ func DefaultAPIConfig() *APIConfig {
 			"control_commit_",
 			"control_",
 		},
-		MetricsCompress:                 true,
-		MaxRequestSize:                  1024 * 1024, // 1MB
-		MaxHeaderSize:                   1024 * 1024, // 1MB
-		MaxConcurrentReqs:               100,
-		RequestTimeout:                  30 * time.Second,
-		DashboardBlockLimit:             50,
-		DashboardCacheTTL:               3 * time.Second,
-		Environment:                     "production",
-		AllowDegradedBootstrap:          false,
-		AIServiceTimeout:                2 * time.Second,
-		ZitadelJWKSRefreshInterval:      1 * time.Hour,
-		ZitadelJWKSTimeout:              5 * time.Second,
-		OpenFGATimeout:                  750 * time.Millisecond,
-		OpenFGAShadowMaxInflight:        64,
-		OpenFGAEnforceTypes:             []string{"policy", "workflow", "audit_scope"},
-		OpenFGATupleReconcileInterval:   60 * time.Second,
-		OpenFGATupleBatchSize:           200,
-		BreakGlassEnabled:               false,
-		BreakGlassMaxDuration:           1 * time.Hour,
-		AllowedRoles:                    defaultRoleMapping(),
-		ControlMutationsEnabled:         false,
-		ControlMutationsSafeMode:        false,
-		ControlMutationRequireConsensus: true,
-		ControlMutationRequireTenant:    true,
-		ControlMutationTimeout:          10 * time.Second,
-		ControlTraceTimeout:             15 * time.Second,
-		ControlAPIBreakerEnabled:        true,
-		ControlAPIBreakerErrorThreshold: 5,
-		ControlAPIBreakerCooldown:       15 * time.Second,
-		ControlMutationCooldown:         1 * time.Second,
-		ControlMutationMaxPerMinute:     120,
+		MetricsCompress:                  true,
+		MaxRequestSize:                   1024 * 1024, // 1MB
+		MaxHeaderSize:                    1024 * 1024, // 1MB
+		MaxConcurrentReqs:                100,
+		RequestTimeout:                   30 * time.Second,
+		DashboardBlockLimit:              50,
+		DashboardCacheTTL:                3 * time.Second,
+		Environment:                      "production",
+		AllowDegradedBootstrap:           false,
+		AIServiceTimeout:                 2 * time.Second,
+		ZitadelJWKSRefreshInterval:       1 * time.Hour,
+		ZitadelJWKSTimeout:               5 * time.Second,
+		OpenFGATimeout:                   750 * time.Millisecond,
+		OpenFGAShadowMaxInflight:         64,
+		OpenFGAEnforceTypes:              []string{"policy", "workflow", "audit_scope"},
+		OpenFGATupleReconcileInterval:    60 * time.Second,
+		OpenFGATupleBatchSize:            200,
+		BreakGlassEnabled:                false,
+		BreakGlassMaxDuration:            1 * time.Hour,
+		AllowedRoles:                     defaultRoleMapping(),
+		ControlMutationsEnabled:          false,
+		ControlMutationsSafeMode:         false,
+		ControlMutationRequireConsensus:  true,
+		ControlMutationRequireTenant:     true,
+		ControlMutationTimeout:           10 * time.Second,
+		ControlTraceTimeout:              15 * time.Second,
+		ControlReadTimeout:               5 * time.Second,
+		ControlAPIBreakerEnabled:         true,
+		ControlAPIBreakerErrorThreshold:  5,
+		ControlAPIBreakerCooldown:        15 * time.Second,
+		ControlMutationCooldown:          1 * time.Second,
+		ControlMutationMaxPerMinute:      120,
+		ConsensusLivelockDetectorEnabled: false,
+		ConsensusLivelockMonitorInterval: 1 * time.Second,
+		ConsensusLivelockNoCommitWindow:  90 * time.Second,
+		ConsensusLivelockMinViewChanges:  8,
+		ConsensusLivelockMinMempoolTxs:   64,
+		ConsensusLivelockMinOldestTxAge:  15 * time.Second,
+		ConsensusLivelockPersistState:    true,
+		ConsensusLivelockPersistInterval: 10 * time.Second,
+		ConsensusLivelockStateKey:        "consensus_livelock_guard",
 	}
 }
 
@@ -259,6 +280,7 @@ func LoadAPIConfig(cm *utils.ConfigManager) (*APIConfig, error) {
 	cfg.ZitadelIssuer = strings.TrimSpace(cm.GetString("ZITADEL_ISSUER", ""))
 	cfg.ZitadelClientID = strings.TrimSpace(cm.GetString("ZITADEL_CLIENT_ID", ""))
 	cfg.ZitadelAudience = strings.TrimSpace(cm.GetString("ZITADEL_AUDIENCE", ""))
+	cfg.ZitadelJWKSJSON = strings.TrimSpace(cm.GetString("ZITADEL_JWKS_JSON", ""))
 	if cfg.ZitadelAudience == "" {
 		cfg.ZitadelAudience = cfg.ZitadelClientID
 	}
@@ -383,11 +405,6 @@ func LoadAPIConfig(cm *utils.ConfigManager) (*APIConfig, error) {
 		cfg.RedisTLSEnabled = cm.GetBool("REDIS_TLS_ENABLED", false)
 	}
 
-	// Validate configuration
-	if err := cfg.Validate(); err != nil {
-		return nil, fmt.Errorf("API config validation failed: %w", err)
-	}
-
 	if aliasMapEnv := cm.GetString("NETWORK_NODE_ALIASES", ""); aliasMapEnv != "" {
 		cfg.NodeAliasMap = parseAliasMap(aliasMapEnv)
 	}
@@ -407,6 +424,9 @@ func LoadAPIConfig(cm *utils.ConfigManager) (*APIConfig, error) {
 	if timeout := cm.GetDuration("CONTROL_API_TIMEOUT_TRACE", 0); timeout > 0 {
 		cfg.ControlTraceTimeout = timeout
 	}
+	if timeout := cm.GetDuration("CONTROL_API_TIMEOUT_READ", 0); timeout > 0 {
+		cfg.ControlReadTimeout = timeout
+	}
 	cfg.ControlAPIBreakerEnabled = cm.GetBool("CONTROL_API_BREAKER_ENABLED", true)
 	if threshold := cm.GetInt("CONTROL_API_BREAKER_ERROR_THRESHOLD", 0); threshold > 0 {
 		cfg.ControlAPIBreakerErrorThreshold = threshold
@@ -419,6 +439,33 @@ func LoadAPIConfig(cm *utils.ConfigManager) (*APIConfig, error) {
 	}
 	if rpm := cm.GetInt("CONTROL_MUTATION_MAX_ACTIONS_PER_MINUTE", 0); rpm > 0 {
 		cfg.ControlMutationMaxPerMinute = rpm
+	}
+	cfg.ConsensusLivelockDetectorEnabled = cm.GetBool("CONSENSUS_LIVELOCK_DETECTOR_ENABLED", cfg.ConsensusLivelockDetectorEnabled)
+	if interval := cm.GetDuration("CONSENSUS_LIVELOCK_MONITOR_INTERVAL", 0); interval > 0 {
+		cfg.ConsensusLivelockMonitorInterval = interval
+	}
+	if window := cm.GetDuration("CONSENSUS_LIVELOCK_NO_COMMIT_WINDOW", 0); window > 0 {
+		cfg.ConsensusLivelockNoCommitWindow = window
+	}
+	if minViewChanges := cm.GetInt("CONSENSUS_LIVELOCK_MIN_VIEW_CHANGES", 0); minViewChanges > 0 {
+		cfg.ConsensusLivelockMinViewChanges = uint64(minViewChanges)
+	}
+	if minTxs := cm.GetInt("CONSENSUS_LIVELOCK_MIN_MEMPOOL_TXS", 0); minTxs > 0 {
+		cfg.ConsensusLivelockMinMempoolTxs = minTxs
+	}
+	if minAge := cm.GetDuration("CONSENSUS_LIVELOCK_MIN_OLDEST_TX_AGE", 0); minAge > 0 {
+		cfg.ConsensusLivelockMinOldestTxAge = minAge
+	}
+	cfg.ConsensusLivelockPersistState = cm.GetBool("CONSENSUS_LIVELOCK_PERSIST_STATE", cfg.ConsensusLivelockPersistState)
+	if interval := cm.GetDuration("CONSENSUS_LIVELOCK_PERSIST_INTERVAL", 0); interval > 0 {
+		cfg.ConsensusLivelockPersistInterval = interval
+	}
+	if stateKey := strings.TrimSpace(cm.GetString("CONSENSUS_LIVELOCK_STATE_KEY", "")); stateKey != "" {
+		cfg.ConsensusLivelockStateKey = stateKey
+	}
+	// Validate configuration after all env-driven overrides are applied.
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("API config validation failed: %w", err)
 	}
 
 	return cfg, nil
@@ -513,15 +560,9 @@ func (c *APIConfig) Validate() error {
 		}
 	}
 
-	// mTLS validation (client CA required for RBAC)
-	if c.RBACEnabled && c.TLSEnabled {
-		if c.TLSClientCAFile == "" {
-			return &SecurityError{
-				Field:  "TLSClientCAFile",
-				Reason: "Client CA file required for RBAC (mTLS)",
-			}
-		}
-
+	// mTLS validation applies only when a client CA is configured. JWT-backed
+	// RBAC is valid without mTLS.
+	if c.RBACEnabled && c.TLSEnabled && strings.TrimSpace(c.TLSClientCAFile) != "" {
 		if _, err := os.Stat(c.TLSClientCAFile); os.IsNotExist(err) {
 			return &SecurityError{
 				Field:  "TLSClientCAFile",
@@ -566,6 +607,27 @@ func (c *APIConfig) Validate() error {
 	}
 	if c.DashboardCacheTTL < 0 {
 		return fmt.Errorf("dashboard cache TTL cannot be negative")
+	}
+	if c.ConsensusLivelockNoCommitWindow <= 0 {
+		return fmt.Errorf("consensus livelock no-commit window must be positive")
+	}
+	if c.ConsensusLivelockMonitorInterval <= 0 {
+		return fmt.Errorf("consensus livelock monitor interval must be positive")
+	}
+	if c.ConsensusLivelockMinViewChanges == 0 {
+		return fmt.Errorf("consensus livelock min view changes must be positive")
+	}
+	if c.ConsensusLivelockMinMempoolTxs <= 0 {
+		return fmt.Errorf("consensus livelock min mempool txs must be positive")
+	}
+	if c.ConsensusLivelockMinOldestTxAge <= 0 {
+		return fmt.Errorf("consensus livelock min oldest tx age must be positive")
+	}
+	if c.ConsensusLivelockPersistInterval <= 0 {
+		return fmt.Errorf("consensus livelock persist interval must be positive")
+	}
+	if strings.TrimSpace(c.ConsensusLivelockStateKey) == "" {
+		return fmt.Errorf("consensus livelock state key must be configured")
 	}
 	for key, override := range c.RouteRateLimits {
 		if strings.TrimSpace(key) == "" {
@@ -632,7 +694,7 @@ func (c *APIConfig) IsProduction() bool {
 
 // RequiresMTLS returns true if mTLS is required
 func (c *APIConfig) RequiresMTLS() bool {
-	return c.TLSEnabled && c.TLSClientCAFile != "" && c.RBACEnabled
+	return c.TLSEnabled && strings.TrimSpace(c.TLSClientCAFile) != "" && c.RBACEnabled
 }
 
 // defaultRoleMapping returns default RBAC role mappings
@@ -684,6 +746,11 @@ func defaultRoleMapping() map[string][]string {
 			"/ready",
 			"/policies",
 		},
+		"audit_reader": {
+			"/health",
+			"/ready",
+			"/audit",
+		},
 		"network_reader": {
 			"/health",
 			"/ready",
@@ -733,6 +800,9 @@ func defaultRoleMapping() map[string][]string {
 			"/health",
 			"/ready",
 			"/control/leases",
+			"/control/safe-mode",
+			"/control/runtime:repair",
+			"/control/kill-switch",
 		},
 	}
 }

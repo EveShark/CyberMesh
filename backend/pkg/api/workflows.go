@@ -93,16 +93,26 @@ func (s *Server) handleWorkflowsList(w http.ResponseWriter, r *http.Request) {
 		writeErrorResponse(w, r, "STORAGE_UNAVAILABLE", "storage unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), s.controlReadTimeout())
 	defer cancel()
 	schema, _ := loadControlSchemaSupport(ctx, db)
 	if !requireControlSchemaColumn(w, r, schema.OutboxWorkflowID, "workflow_id", "024") {
 		return
 	}
+	if hasProjection, projErr := tenantHasPolicyProjection(ctx, db, schema, tenantScope); projErr != nil {
+		writeErrorResponse(w, r, "WORKFLOWS_QUERY_FAILED", "failed to query workflows", http.StatusInternalServerError)
+		return
+	} else if !hasProjection {
+		writeJSONResponse(w, r, NewSuccessResponse(workflowListResponse{
+			Rows:       []workflowSummaryDTO{},
+			Pagination: controlListMeta{Limit: limit},
+		}), http.StatusOK)
+		return
+	}
 
 	args := []interface{}{}
 	where := []string{"workflow_id IS NOT NULL", "workflow_id <> ''"}
-	where, args = appendAccessBoundOutboxFilter(where, args, tenantScope)
+	where, args = appendAccessBoundOutboxFilterWithProjection(where, args, tenantScope, schema)
 	if status := strings.TrimSpace(r.URL.Query().Get("status")); status != "" {
 		if !isValidOutboxStatus(status) {
 			writeErrorResponse(w, r, "INVALID_STATUS", "status must be one of pending,publishing,published,retry,terminal_failed,acked", http.StatusBadRequest)
@@ -476,7 +486,7 @@ func (s *Server) loadWorkflowPolicySummaries(ctx context.Context, db *sql.DB, wo
 	}
 	args := []interface{}{workflowID}
 	where := []string{"workflow_id = $1"}
-	where, args = appendAccessBoundOutboxFilter(where, args, tenantScope)
+	where, args = appendAccessBoundOutboxFilterWithProjection(where, args, tenantScope, schema)
 	ackScopeClause := accessBoundAckWhereClause(2, tenantScope)
 	query := fmt.Sprintf(`
 		WITH latest_outbox AS (

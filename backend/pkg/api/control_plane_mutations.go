@@ -568,6 +568,17 @@ type controlMutationGateError struct {
 }
 
 func (s *Server) requireControlMutationAllowed(r *http.Request) *controlMutationGateError {
+	return s.requireControlMutationAllowedWithOptions(r, false)
+}
+
+// Runtime repair is the bounded recovery path for unhealthy consensus, so it
+// bypasses only the consensus health gate while preserving all other mutation
+// safety checks.
+func (s *Server) requireControlRuntimeRepairAllowed(r *http.Request) *controlMutationGateError {
+	return s.requireControlMutationAllowedWithOptions(r, true)
+}
+
+func (s *Server) requireControlMutationAllowedWithOptions(r *http.Request, bypassConsensusGate bool) *controlMutationGateError {
 	if !s.config.ControlMutationsEnabled {
 		return &controlMutationGateError{Code: "CONTROL_MUTATIONS_DISABLED", Message: "control mutations are disabled", HTTPStatus: http.StatusForbidden}
 	}
@@ -587,7 +598,7 @@ func (s *Server) requireControlMutationAllowed(r *http.Request) *controlMutation
 		s.controlMutationBlockedKillSwitch.Add(1)
 		return &controlMutationGateError{Code: "CONTROL_KILL_SWITCH_ENABLED", Message: "control mutations are disabled by kill-switch", HTTPStatus: http.StatusServiceUnavailable}
 	}
-	if s.config.ControlMutationRequireConsensus {
+	if s.config.ControlMutationRequireConsensus && !bypassConsensusGate {
 		if s.engine == nil {
 			s.controlMutationBlockedConsensus.Add(1)
 			return &controlMutationGateError{Code: "CONSENSUS_NOT_AVAILABLE", Message: "consensus engine not available", HTTPStatus: http.StatusServiceUnavailable}

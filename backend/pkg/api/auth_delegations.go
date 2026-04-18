@@ -21,6 +21,7 @@ var (
 	errDelegationSelfApproval          = errors.New("delegation self approval forbidden")
 	errDelegationPendingRequired       = errors.New("delegation pending status required")
 	errDelegationActiveOrPendingOnly   = errors.New("delegation active or pending status required")
+	errDelegationActiveAlreadyExists   = errors.New("active support delegation already exists for principal")
 	errDelegationBreakGlassDisabled    = errors.New("break-glass is disabled")
 	errDelegationBreakGlassApprovalRef = errors.New("break-glass approval reference is required")
 	errDelegationScopeAllForbidden     = errors.New("delegation scope-all forbidden")
@@ -112,9 +113,10 @@ func (s *Server) handleAuthDelegationList(w http.ResponseWriter, r *http.Request
 		writeErrorResponse(w, r, "AUTHN_CONTEXT_INVALID", "principal context is required", http.StatusUnauthorized)
 		return
 	}
+	canManage := s.canManageDelegationsForPrincipal(r, principalID)
 	listAll := strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("scope")), "all")
 	limit := parseDelegationListLimit(r)
-	grants, err := s.listSupportDelegations(r.Context(), principalID, principalType, listAll, currentClientRole(r), limit)
+	grants, err := s.listSupportDelegations(r.Context(), principalID, principalType, listAll, canManage, limit)
 	if err != nil {
 		if errors.Is(err, errDelegationScopeAllForbidden) {
 			writeErrorResponse(w, r, "DELEGATION_SCOPE_FORBIDDEN", "delegation scope requires control_lease_admin", http.StatusForbidden)
@@ -210,6 +212,11 @@ func (s *Server) handleAuthDelegationApprove(w http.ResponseWriter, r *http.Requ
 		writeErrorResponse(w, r, "AUTHN_CONTEXT_INVALID", "principal context is required", http.StatusUnauthorized)
 		return
 	}
+	canManage := s.canManageDelegationsForPrincipal(r, approverID)
+	if !canManage {
+		writeErrorResponse(w, r, "DELEGATION_SCOPE_FORBIDDEN", "delegation approve requires control_lease_admin", http.StatusForbidden)
+		return
+	}
 	req, err := decodeDelegationApproveRequest(r)
 	if err != nil {
 		writeErrorResponse(w, r, "INVALID_REQUEST", "invalid delegation approval body", http.StatusBadRequest)
@@ -227,6 +234,11 @@ func (s *Server) handleAuthDelegationRevoke(w http.ResponseWriter, r *http.Reque
 	actorID, _, ok := resolveAuthenticatedPrincipal(r, s)
 	if !ok {
 		writeErrorResponse(w, r, "AUTHN_CONTEXT_INVALID", "principal context is required", http.StatusUnauthorized)
+		return
+	}
+	canManage := s.canManageDelegationsForPrincipal(r, actorID)
+	if !canManage {
+		writeErrorResponse(w, r, "DELEGATION_SCOPE_FORBIDDEN", "delegation revoke requires control_lease_admin", http.StatusForbidden)
 		return
 	}
 	req, err := decodeDelegationRevokeRequest(r)
@@ -368,6 +380,8 @@ func writeDelegationMutationError(w http.ResponseWriter, r *http.Request, err er
 		writeErrorResponse(w, r, "DELEGATION_SELF_APPROVAL_FORBIDDEN", "requester cannot approve their own delegation", http.StatusForbidden)
 	case errors.Is(err, errDelegationPendingRequired):
 		writeErrorResponse(w, r, "DELEGATION_STATUS_CONFLICT", err.Error(), http.StatusConflict)
+	case errors.Is(err, errDelegationActiveAlreadyExists):
+		writeErrorResponse(w, r, "DELEGATION_STATUS_CONFLICT", err.Error(), http.StatusConflict)
 	case errors.Is(err, errDelegationActiveOrPendingOnly):
 		writeErrorResponse(w, r, "DELEGATION_STATUS_CONFLICT", err.Error(), http.StatusConflict)
 	default:
@@ -440,8 +454,30 @@ func currentClientRole(r *http.Request) string {
 	return strings.TrimSpace(role)
 }
 
-func (s *Server) listSupportDelegations(ctx context.Context, principalID string, principalType contracts.PrincipalType, listAll bool, clientRole string, limit int) ([]delegationResponse, error) {
-	if listAll && !strings.EqualFold(strings.TrimSpace(clientRole), "control_lease_admin") {
+func (s *Server) canManageDelegationsForPrincipal(r *http.Request, principalID string) bool {
+	role := currentClientRole(r)
+	if strings.EqualFold(role, "control_lease_admin") {
+		return true
+	}
+	if s != nil && s.hasRole(role, "control_lease_admin") {
+		return true
+	}
+	authSource, _ := r.Context().Value(ctxKeyAuthSource).(string)
+	snapshot, err := s.resolveMembershipSnapshotForAuth(r, principalID, authSource)
+	if err != nil {
+		return false
+	}
+	for _, role := range snapshot.AccessRoles {
+		switch normalizeAccessRole(role) {
+		case "admin", "platform_admin", "support_delegate":
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) listSupportDelegations(ctx context.Context, principalID string, principalType contracts.PrincipalType, listAll bool, canManage bool, limit int) ([]delegationResponse, error) {
+	if listAll && !canManage {
 		return nil, errDelegationScopeAllForbidden
 	}
 	db, err := s.getDB()
@@ -520,6 +556,25 @@ func (s *Server) approveSupportDelegation(ctx context.Context, delegationID, app
 	}
 	if item.Status != "pending" {
 		return delegationResponse{}, fmt.Errorf("%w: support delegation must be pending before approval", errDelegationPendingRequired)
+	}
+	const activeOverlapQuery = `
+		SELECT EXISTS (
+			SELECT 1
+			FROM support_delegations
+			WHERE principal_id = $1
+			  AND principal_type = $2
+			  AND status = 'active'
+			  AND starts_at <= now()
+			  AND expires_at > now()
+			  AND delegation_id <> $3
+		)
+	`
+	var activeOverlap bool
+	if err := tx.QueryRowContext(ctx, activeOverlapQuery, item.PrincipalID, string(item.PrincipalType), delegationID).Scan(&activeOverlap); err != nil {
+		return delegationResponse{}, err
+	}
+	if activeOverlap {
+		return delegationResponse{}, fmt.Errorf("%w", errDelegationActiveAlreadyExists)
 	}
 	if item.BreakGlass {
 		if !s.config.BreakGlassEnabled {

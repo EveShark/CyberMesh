@@ -256,3 +256,100 @@ func TestLoadAPIConfigRejectsNonPositiveBreakGlassMaxDuration(t *testing.T) {
 		t.Fatal("expected non-positive break-glass duration error")
 	}
 }
+
+func TestDefaultRoleMappingIncludesAuditReader(t *testing.T) {
+	t.Parallel()
+
+	roles := defaultRoleMapping()
+	endpoints, ok := roles["audit_reader"]
+	if !ok {
+		t.Fatal("expected audit_reader to be present in default role mapping")
+	}
+	want := map[string]struct{}{
+		"/health": {},
+		"/ready":  {},
+		"/audit":  {},
+	}
+	for _, endpoint := range endpoints {
+		delete(want, endpoint)
+	}
+	if len(want) != 0 {
+		t.Fatalf("audit_reader endpoints missing: %#v", want)
+	}
+}
+
+func TestDefaultRoleMappingIncludesControlLeaseAdminPlatformConfigRoutes(t *testing.T) {
+	t.Parallel()
+
+	roles := defaultRoleMapping()
+	endpoints, ok := roles["control_lease_admin"]
+	if !ok {
+		t.Fatal("expected control_lease_admin to be present in default role mapping")
+	}
+	want := map[string]struct{}{
+		"/health":                {},
+		"/ready":                 {},
+		"/control/leases":        {},
+		"/control/safe-mode":     {},
+		"/control/runtime:repair": {},
+		"/control/kill-switch":   {},
+	}
+	for _, endpoint := range endpoints {
+		delete(want, endpoint)
+	}
+	if len(want) != 0 {
+		t.Fatalf("control_lease_admin endpoints missing: %#v", want)
+	}
+}
+
+func TestLoadAPIConfigParsesLivelockMonitorInterval(t *testing.T) {
+	t.Parallel()
+
+	cm, err := utils.NewConfigManager(&utils.ConfigManagerConfig{
+		Source: staticConfigSource{
+			"ENVIRONMENT":                         "development",
+			"API_TLS_ENABLED":                     "false",
+			"CONSENSUS_LIVELOCK_MONITOR_INTERVAL": "2s",
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewConfigManager: %v", err)
+	}
+
+	cfg, err := LoadAPIConfig(cm)
+	if err != nil {
+		t.Fatalf("LoadAPIConfig: %v", err)
+	}
+	if cfg.ConsensusLivelockMonitorInterval != 2*time.Second {
+		t.Fatalf("monitor_interval=%s", cfg.ConsensusLivelockMonitorInterval)
+	}
+}
+
+func TestLoadAPIConfigAllowsJWTBackedRBACWithoutMTLS(t *testing.T) {
+	t.Parallel()
+
+	cm, err := utils.NewConfigManager(&utils.ConfigManagerConfig{
+		Source: staticConfigSource{
+			"ENVIRONMENT":         "production",
+			"API_TLS_ENABLED":     "true",
+			"API_TLS_CERT_FILE":   "B:/CyberMesh/certs/server.crt",
+			"API_TLS_KEY_FILE":    "B:/CyberMesh/certs/server.key",
+			"API_TLS_MIN_VERSION": "1.3",
+			"API_RBAC_ENABLED":    "true",
+			"API_REQUIRE_AUTH":    "true",
+			"ZITADEL_ISSUER":      "https://cybermesh-laifid.us1.zitadel.cloud",
+			"ZITADEL_AUDIENCE":    "367547039522873108",
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewConfigManager: %v", err)
+	}
+
+	cfg, err := LoadAPIConfig(cm)
+	if err != nil {
+		t.Fatalf("LoadAPIConfig: %v", err)
+	}
+	if cfg.RequiresMTLS() {
+		t.Fatal("expected JWT-backed RBAC to avoid mTLS requirement when client CA is unset")
+	}
+}

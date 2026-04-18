@@ -484,8 +484,10 @@ func (a *adapter) detectTableExists(ctx context.Context, tableName string) bool 
 	if a == nil || a.db == nil || strings.TrimSpace(tableName) == "" {
 		return false
 	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
 	var exists bool
-	err := a.db.QueryRowContext(ctx, `
+	err := a.db.QueryRowContext(lookupCtx, `
 		SELECT EXISTS (
 			SELECT 1
 			FROM information_schema.tables

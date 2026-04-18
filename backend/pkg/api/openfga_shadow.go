@@ -316,8 +316,7 @@ func buildOpenFGACheck(req contracts.AuthorizationRequest, ctx context.Context) 
 		return nil, "authz.shadow_model_gap", "unsupported principal format for OpenFGA shadow"
 	}
 
-	clientRole, _ := ctx.Value(ctxKeyClientRole).(string)
-	roleRelation, ok := mapClientRoleToOpenFGARelation(clientRole)
+	roleRelation, ok := resolveOpenFGARelation(req, ctx)
 	if !ok {
 		return nil, "authz.shadow_model_gap", "client role is not mapped to the OpenFGA model"
 	}
@@ -336,6 +335,27 @@ func buildOpenFGACheck(req contracts.AuthorizationRequest, ctx context.Context) 
 		},
 		ContextualTuples: openFGAContextualTuples{TupleKeys: contextualTuples},
 	}, "", ""
+}
+
+func resolveOpenFGARelation(req contracts.AuthorizationRequest, ctx context.Context) (string, bool) {
+	clientRole, _ := ctx.Value(ctxKeyClientRole).(string)
+	if req.Resource.Type == "audit_scope" {
+		if strings.EqualFold(strings.TrimSpace(clientRole), "audit_reader") {
+			return "admin", true
+		}
+		if relation, ok := mapClientRoleToOpenFGARelation(clientRole); ok && relation == "admin" {
+			return relation, true
+		}
+	}
+	if req.Access.IsSupportDelegated {
+		return "support_delegate", true
+	}
+	if membership, ok := ctx.Value(ctxKeyTrustedMemberships).(trustedMembershipSnapshot); ok {
+		if relation, ok := mapPersistedAccessRoleToOpenFGARelation(membership.roleForAccess(req.Access.ActiveAccessID)); ok {
+			return relation, true
+		}
+	}
+	return mapClientRoleToOpenFGARelation(clientRole)
 }
 
 func mapRequestToOpenFGA(req contracts.AuthorizationRequest, principal, roleRelation string) (string, string, []openFGATupleKey, bool) {
@@ -457,12 +477,21 @@ func mapClientRoleToOpenFGARelation(role string) (string, bool) {
 	switch strings.TrimSpace(role) {
 	case "admin":
 		return "platform_admin", true
+	case "control_lease_admin":
+		return "platform_admin", true
 	case "control_outbox_operator":
 		return "admin", true
-	case "policy_reader", "control_ack_reader", "control_outbox_reader", "control_trace_reader", "authenticated_user", "api_client", "developer":
+	case "block_reader", "state_reader", "validator_reader", "stats_reader", "metrics_reader", "policy_reader", "audit_reader", "network_reader", "consensus_reader", "ai_reader", "anomaly_reader", "control_ack_reader", "control_outbox_reader", "control_trace_reader", "control_lease_reader", "authenticated_user", "api_client", "developer":
 		return "viewer", true
-	case "audit_reader":
-		return "admin", true
+	default:
+		return "", false
+	}
+}
+
+func mapPersistedAccessRoleToOpenFGARelation(role string) (string, bool) {
+	switch normalizeAccessRole(role) {
+	case "platform_admin", "support_delegate", "admin", "analyst", "viewer", "responder":
+		return normalizeAccessRole(role), true
 	default:
 		return "", false
 	}
