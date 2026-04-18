@@ -74,10 +74,10 @@ class PolicyAckEvent:
             ) from exc
 
         result = msg.result.strip().lower()
-        if result not in {"applied", "failed"}:
+        if result not in {"applied", "failed", "rejected"}:
             raise PolicyAckContractError(
                 "invalid_policy_ack_invalid_result",
-                f"PolicyAckEvent result must be 'applied' or 'failed', got {msg.result}",
+                f"PolicyAckEvent result must be 'applied', 'failed', or 'rejected', got {msg.result}",
             )
 
         applied_at = int(msg.applied_at)

@@ -452,6 +452,16 @@ class SentinelKafkaAdapter:
                         and self._app_events_pack.enabled
                         and self._app_events_policy_bypass_clean_enabled
                     ):
+                        if self._tracker:
+                            anomaly_id = self._deterministic_uuid4_from_seed(event_id)
+                            self._tracker.record_detected(
+                                anomaly_id=anomaly_id,
+                                anomaly_type=self._map_anomaly_type(analysis, envelope=envelope),
+                                confidence=self._safe_float(analysis.get("confidence"), default=0.5),
+                                severity=self._map_severity(analysis),
+                                raw_score=self._safe_float(analysis.get("final_score"), default=None),
+                                timestamp=float(time.time()),
+                            )
                         bypassed = self._maybe_publish_policy(
                             event_id=event_id,
                             anomaly_id=self._deterministic_uuid4_from_seed(event_id),

@@ -23,7 +23,6 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Dict, Any, Callable, List, Tuple
-from uuid import uuid4
 import ipaddress
 
 from ..config import Settings
@@ -33,6 +32,7 @@ from ..utils import Signer, NonceManager, CircuitBreaker
 from ..utils.errors import ServiceError
 from ..kafka import AIProducer, AIConsumer
 from ..contracts import AnomalyMessage, EvidenceMessage, PolicyMessage
+from ..utils.id_gen import generate_uuid7
 from .crypto_setup import (
     initialize_signer,
     initialize_nonce_manager,
@@ -795,7 +795,7 @@ class ServiceManager:
         if not requester:
             raise ValueError("requester required")
 
-        req_id = str(request_id or uuid4()).strip()
+        req_id = str(request_id or generate_uuid7()).strip()
         validate_uuid(req_id, "request_id")
 
         duration_val = int(duration_ms if duration_ms is not None else os.getenv("AI_PCAP_DEFAULT_DURATION_MS", "5000"))

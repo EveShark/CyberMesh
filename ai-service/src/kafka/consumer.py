@@ -528,7 +528,7 @@ class AIConsumer:
             return "invalid_policy_ack_missing_policy_id"
         if "invalid policy_id" in text:
             return "invalid_policy_ack_invalid_policy_id"
-        if "result must be 'applied' or 'failed'" in text:
+        if "result must be 'applied', 'failed', or 'rejected'" in text:
             return "invalid_policy_ack_invalid_result"
         return "invalid_policy_ack"
 
