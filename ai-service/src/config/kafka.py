@@ -15,6 +15,7 @@ class KafkaTopicsConfig:
     control_policy: str
     control_policy_ack: str
     control_evidence: str
+    control_trace_events: str
     pcap_request: str
     dlq: str
     
@@ -30,6 +31,7 @@ class KafkaTopicsConfig:
             self.control_policy,
             self.control_policy_ack,
             self.control_evidence,
+            self.control_trace_events,
             self.pcap_request,
             self.dlq
         ]
@@ -291,6 +293,7 @@ def load_kafka_config(environment: str) -> tuple[KafkaTopicsConfig, KafkaProduce
         control_policy=_get_env("TOPIC_CONTROL_POLICY", "control.policy.v2"),
         control_policy_ack=_get_env("TOPIC_CONTROL_POLICY_ACK", "control.enforcement_ack.v1"),
         control_evidence=_get_env("TOPIC_CONTROL_EVIDENCE", "control.evidence.v1"),
+        control_trace_events=_get_env("TOPIC_CONTROL_TRACE_EVENTS", "control.trace.events.v1"),
         pcap_request=_get_env("TOPIC_PCAP_REQUEST", "pcap.request.v1"),
         dlq=_get_env("TOPIC_DLQ", "ai.dlq.v1")
     )

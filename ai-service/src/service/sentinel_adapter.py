@@ -28,7 +28,7 @@ from .policy_emitter import PolicyContext, build_policy_candidate
 from .policy_aggregation import PolicyAggregationManager
 from .fast_mitigation import decide_fast_mitigation
 from .app_events_policy_pack import AppEventsPolicyPack, AppEventsPolicyDecision
-from .publisher import MessagePublisher
+from .publisher import MessagePublisher, _emit_control_trace_event
 from ..utils.errors import StorageError, ValidationError
 from ..utils.metrics import get_metrics_collector
 from ..observability import start_span
@@ -787,6 +787,7 @@ class SentinelKafkaAdapter:
             "t_sentinel_analysis_done_ms": _normalize_event_ts_ms(labels.get("t_sentinel_analysis_done_ms")),
             "t_sentinel_emit_ms": _normalize_event_ts_ms(labels.get("t_sentinel_emit_ms"))
             or _normalize_event_ts_ms(envelope.get("timestamp")),
+            "t_sentinel_publish_ack_ms": _normalize_event_ts_ms(labels.get("t_sentinel_publish_ack_ms")),
             "t_ai_sentinel_consume_ms": ai_consume_ts_ms,
             "profile_mode": labels.get("profile_mode"),
             "scenario": labels.get("scenario"),
@@ -976,10 +977,17 @@ class SentinelKafkaAdapter:
         policy_id = str(candidate.policy_id)
         policy_payload = dict(candidate.payload)
         policy_payload["policy_id"] = policy_id
+        ai_decision_done_ms = int(time.time() * 1000)
+        trace_section = policy_payload.setdefault("trace", {})
+        if isinstance(trace_section, dict):
+            stages = trace_section.setdefault("stages", {})
+            if isinstance(stages, dict):
+                stages["t_ai_decision_done"] = ai_decision_done_ms
+        metadata_obj = policy_payload.get("metadata") if isinstance(policy_payload.get("metadata"), dict) else {}
         if _env_bool("POLICY_STAGE_MARKERS_ENABLED", False):
             trace_id = (
-                (policy_payload.get("trace") or {}).get("id")
-                or (policy_payload.get("metadata") or {}).get("trace_id")
+                (trace_section if isinstance(trace_section, dict) else {}).get("id")
+                or metadata_obj.get("trace_id")
                 or policy_payload.get("trace_id")
                 or policy_payload.get("qc_reference")
                 or ""
@@ -991,9 +999,47 @@ class SentinelKafkaAdapter:
                         "stage": "t_ai_decision_done",
                         "policy_id": policy_id,
                         "trace_id": str(trace_id),
-                        "t_ms": int(time.time() * 1000),
+                        "t_ms": ai_decision_done_ms,
                     },
                 )
+        else:
+            trace_id = (
+                (trace_section if isinstance(trace_section, dict) else {}).get("id")
+                or metadata_obj.get("trace_id")
+                or policy_payload.get("trace_id")
+                or policy_payload.get("qc_reference")
+                or ""
+            )
+        self._emit_policy_trace_stage_events(
+            policy_id=policy_id,
+            trace_id=str(trace_id or ""),
+            trace_section=trace_section if isinstance(trace_section, dict) else {},
+            metadata_obj=metadata_obj if isinstance(metadata_obj, dict) else {},
+        )
+        if trace_id:
+            _emit_control_trace_event(
+                self._publisher.producer,
+                {
+                    "policy_id": policy_id,
+                    "trace_id": str(trace_id),
+                    "stage": "t_ai_decision_done",
+                    "stage_source": "ai-service",
+                    "timestamp_ms": ai_decision_done_ms,
+                    "request_id": str(metadata_obj.get("request_id") or ""),
+                    "command_id": str(metadata_obj.get("command_id") or ""),
+                    "workflow_id": str(metadata_obj.get("workflow_id") or ""),
+                    "source_event_id": str(metadata_obj.get("source_event_id") or ""),
+                    "sentinel_event_id": str(metadata_obj.get("sentinel_event_id") or ""),
+                    "scope_identifier": str(metadata_obj.get("scope_identifier") or ""),
+                    "tenant": str(metadata_obj.get("tenant_id") or ""),
+                    "region": str(metadata_obj.get("region") or ""),
+                    "details": {
+                        "modality": str(modality_token),
+                        "aggregation_mode": str(aggregation_mode),
+                    },
+                },
+                self._logger,
+            )
 
         self._metric_inc("policy_candidates")
         task = {
@@ -1024,6 +1070,19 @@ class SentinelKafkaAdapter:
     def _publish_policy_task(self, task: Dict[str, Any]) -> None:
         publish_start = time.monotonic()
         modality_token = _metrics_modality_token(task.get("modality"))
+        policy_payload = task.get("policy_payload")
+        if not isinstance(policy_payload, dict):
+            policy_payload = {}
+            task["policy_payload"] = policy_payload
+        metadata_obj = policy_payload.get("metadata") if isinstance(policy_payload.get("metadata"), dict) else {}
+        trace_section = policy_payload.get("trace") if isinstance(policy_payload.get("trace"), dict) else {}
+        trace_id = str(
+            trace_section.get("id")
+            or metadata_obj.get("trace_id")
+            or policy_payload.get("trace_id")
+            or policy_payload.get("qc_reference")
+            or ""
+        ).strip()
         with start_span(
             "ai.policy.publish",
             tracer_name="ai-service/sentinel",
@@ -1063,11 +1122,29 @@ class SentinelKafkaAdapter:
                                 "error": str(exc),
                             },
                         )
+                self._record_policy_producer_stage(
+                    policy_id=str(task["policy_id"]),
+                    trace_id=trace_id,
+                    policy_payload=policy_payload,
+                    metadata_obj=metadata_obj if isinstance(metadata_obj, dict) else {},
+                    stage="t_ai_producer_send_start",
+                    timestamp_ms=int(time.time() * 1000),
+                    modality_token=modality_token,
+                )
                 self._publisher.publish_policy_violation(
                     policy_id=task["policy_id"],
                     rule_type=task["rule_type"],
                     enforcement_action=task["enforcement_action"],
                     payload=task["policy_payload"],
+                )
+                self._record_policy_producer_stage(
+                    policy_id=str(task["policy_id"]),
+                    trace_id=trace_id,
+                    policy_payload=policy_payload,
+                    metadata_obj=metadata_obj if isinstance(metadata_obj, dict) else {},
+                    stage="t_ai_producer_ack",
+                    timestamp_ms=int(time.time() * 1000),
+                    modality_token=modality_token,
                 )
                 self._metric_inc("policy_published")
                 if self._tracker:
@@ -1119,6 +1196,52 @@ class SentinelKafkaAdapter:
             except Exception:
                 self._logger.debug("Failed to record sentinel policy publish metric", exc_info=True)
 
+    def _record_policy_producer_stage(
+        self,
+        *,
+        policy_id: str,
+        trace_id: str,
+        policy_payload: Dict[str, Any],
+        metadata_obj: Dict[str, Any],
+        stage: str,
+        timestamp_ms: int,
+        modality_token: str,
+    ) -> None:
+        trace_id = str(trace_id or "").strip()
+        if not policy_id or not trace_id or timestamp_ms <= 0:
+            return
+        trace_section = policy_payload.setdefault("trace", {})
+        if isinstance(trace_section, dict):
+            stages = trace_section.setdefault("stages", {})
+            if isinstance(stages, dict):
+                stages[stage] = timestamp_ms
+        producer = getattr(self._publisher, "producer", None)
+        if producer is None or not isinstance(trace_section, dict):
+            return
+        _emit_control_trace_event(
+            producer,
+            {
+                "policy_id": policy_id,
+                "trace_id": trace_id,
+                "stage": stage,
+                "stage_source": "ai-service",
+                "timestamp_ms": timestamp_ms,
+                "request_id": str(metadata_obj.get("request_id") or trace_section.get("request_id") or ""),
+                "command_id": str(metadata_obj.get("command_id") or trace_section.get("command_id") or ""),
+                "workflow_id": str(metadata_obj.get("workflow_id") or trace_section.get("workflow_id") or ""),
+                "source_event_id": str(metadata_obj.get("source_event_id") or trace_section.get("source_event_id") or ""),
+                "sentinel_event_id": str(metadata_obj.get("sentinel_event_id") or trace_section.get("sentinel_event_id") or ""),
+                "scope_identifier": str(metadata_obj.get("scope_identifier") or trace_section.get("scope_identifier") or ""),
+                "tenant": str(metadata_obj.get("tenant_id") or metadata_obj.get("tenant") or ""),
+                "region": str(metadata_obj.get("region") or ""),
+                "details": {
+                    "modality": str(modality_token),
+                    "emitted_from": "sentinel_policy_publish_boundary",
+                },
+            },
+            self._logger,
+        )
+
     def _evaluate_app_events_policy_pack(
         self,
         *,
@@ -1156,6 +1279,61 @@ class SentinelKafkaAdapter:
         else:
             self._metric_inc("app_events_no_match")
         return decision
+
+    def _emit_policy_trace_stage_events(
+        self,
+        *,
+        policy_id: str,
+        trace_id: str,
+        trace_section: Dict[str, Any],
+        metadata_obj: Dict[str, Any],
+    ) -> None:
+        trace_id = str(trace_id or "").strip()
+        if not policy_id or not trace_id or not isinstance(trace_section, dict):
+            return
+        stages = trace_section.get("stages")
+        if not isinstance(stages, dict):
+            return
+        source_event_id = str(
+            metadata_obj.get("source_event_id") or trace_section.get("source_event_id") or ""
+        ).strip()
+        sentinel_event_id = str(
+            metadata_obj.get("sentinel_event_id") or trace_section.get("sentinel_event_id") or ""
+        ).strip()
+        base_event = {
+            "policy_id": policy_id,
+            "trace_id": trace_id,
+            "request_id": str(metadata_obj.get("request_id") or trace_section.get("request_id") or ""),
+            "command_id": str(metadata_obj.get("command_id") or trace_section.get("command_id") or ""),
+            "workflow_id": str(metadata_obj.get("workflow_id") or trace_section.get("workflow_id") or ""),
+            "source_event_id": source_event_id,
+            "sentinel_event_id": sentinel_event_id,
+            "scope_identifier": str(metadata_obj.get("scope_identifier") or trace_section.get("scope_identifier") or ""),
+            "tenant": str(metadata_obj.get("tenant_id") or metadata_obj.get("tenant") or ""),
+            "region": str(metadata_obj.get("region") or ""),
+        }
+        source_by_stage = {
+            "t_telemetry_ingest": "telemetry",
+            "t_sentinel_consume": "sentinel",
+            "t_sentinel_analysis_done": "sentinel",
+            "t_sentinel_emit": "sentinel",
+            "t_sentinel_publish_ack": "sentinel",
+            "t_ai_sentinel_consume": "ai-service",
+        }
+        for stage, stage_source in source_by_stage.items():
+            timestamp_ms = _normalize_event_ts_ms(stages.get(stage))
+            if timestamp_ms <= 0:
+                continue
+            event = dict(base_event)
+            event.update(
+                {
+                    "stage": stage,
+                    "stage_source": stage_source,
+                    "timestamp_ms": timestamp_ms,
+                    "details": {"emitted_from": "policy_payload_trace_stages"},
+                }
+            )
+            _emit_control_trace_event(self._publisher.producer, event, self._logger)
 
     @staticmethod
     def _merge_runtime_policy_metadata(*, candidate_payload: Dict[str, Any], metadata: Dict[str, Any]) -> None:

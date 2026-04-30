@@ -509,9 +509,21 @@ def _extract_trace_stages(
             "t_sentinel_emit_ms",
             "sentinel_emit_ts_ms",
         ),
+        "t_sentinel_publish_ack": (
+            "t_sentinel_publish_ack_ms",
+            "sentinel_publish_ack_ts_ms",
+        ),
         "t_ai_sentinel_consume": (
             "t_ai_sentinel_consume_ms",
             "ai_sentinel_consume_ts_ms",
+        ),
+        "t_ai_producer_send_start": (
+            "t_ai_producer_send_start_ms",
+            "ai_producer_send_start_ts_ms",
+        ),
+        "t_ai_producer_ack": (
+            "t_ai_producer_ack_ms",
+            "ai_producer_ack_ts_ms",
         ),
     }
     for stage, keys in mapping.items():

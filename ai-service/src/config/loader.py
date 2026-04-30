@@ -148,6 +148,7 @@ def _load_kafka_topics() -> KafkaTopicsConfig:
         control_policy=_get_env("TOPIC_CONTROL_POLICY", "control.policy.v2"),
         control_policy_ack=_get_env("TOPIC_CONTROL_POLICY_ACK", "control.enforcement_ack.v1"),
         control_evidence=_get_env("TOPIC_CONTROL_EVIDENCE", "control.evidence.v1"),
+        control_trace_events=_get_env("TOPIC_CONTROL_TRACE_EVENTS", "control.trace.events.v1"),
         pcap_request=_get_env("TOPIC_PCAP_REQUEST", "pcap.request.v1"),
         dlq=_get_env("TOPIC_DLQ", "ai.dlq.v1"),
     )

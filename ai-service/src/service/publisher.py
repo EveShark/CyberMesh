@@ -381,6 +381,38 @@ def _validate_allowlist_entries(
 from ..logging import get_logger
 
 
+def _trace_payload_string(container: Dict[str, Any], key: str) -> str:
+    if not isinstance(container, dict):
+        return ""
+    value = container.get(key)
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _emit_control_trace_event(producer: AIProducer, event: Dict[str, Any], logger) -> None:
+    try:
+        accepted = producer.send_trace_event(
+            event,
+            key=str(event.get("trace_id") or event.get("policy_id") or ""),
+        )
+        if accepted is False:
+            logger.warning(
+                "Control trace event publish was not accepted",
+                extra={
+                    "stage": event.get("stage"),
+                    "policy_id": event.get("policy_id"),
+                    "trace_id": event.get("trace_id"),
+                },
+            )
+    except Exception as exc:  # pragma: no cover
+        logger.warning(
+            "Failed to publish control trace event",
+            extra={"stage": event.get("stage"), "error": str(exc)},
+            exc_info=True,
+        )
+
+
 class MessagePublisher:
     """
     High-level message publisher with signing, validation, and delivery tracking.
@@ -719,6 +751,22 @@ class MessagePublisher:
             raise KafkaError("Circuit breaker is open, rejecting message")
         
         normalized_payload = _prepare_policy_payload(policy_id, rule_type, enforcement_action, payload)
+        metadata = normalized_payload.get("metadata") if isinstance(normalized_payload.get("metadata"), dict) else {}
+        trace_section = normalized_payload.get("trace") if isinstance(normalized_payload.get("trace"), dict) else {}
+        trace_id = (
+            trace_section.get("id")
+            or metadata.get("trace_id")
+            or normalized_payload.get("trace_id")
+            or normalized_payload.get("qc_reference")
+            or ""
+        )
+        ai_producer_send_start_ms = int(time.time() * 1000)
+        if self._policy_stage_markers_enabled() and trace_id:
+            trace_section = normalized_payload.setdefault("trace", {})
+            if isinstance(trace_section, dict):
+                stages = trace_section.setdefault("stages", {})
+                if isinstance(stages, dict):
+                    stages["t_ai_producer_send_start"] = ai_producer_send_start_ms
         payload_json = json.dumps(normalized_payload, sort_keys=True, separators=(",", ":"))
 
         ts_value = timestamp if timestamp is not None else int(time.time())
@@ -752,13 +800,6 @@ class MessagePublisher:
         
         # Send via producer (it handles serialization)
         try:
-            trace_id = (
-                (normalized_payload.get("trace") or {}).get("id")
-                or (normalized_payload.get("metadata") or {}).get("trace_id")
-                or normalized_payload.get("trace_id")
-                or normalized_payload.get("qc_reference")
-                or ""
-            )
             if self._policy_stage_markers_enabled() and trace_id:
                 self.logger.info(
                     "policy stage marker",
@@ -766,8 +807,32 @@ class MessagePublisher:
                         "stage": "t_ai_producer_send_start",
                         "policy_id": policy_id,
                         "trace_id": str(trace_id),
-                        "t_ms": int(time.time() * 1000),
+                        "t_ms": ai_producer_send_start_ms,
                     },
+                )
+            if trace_id:
+                _emit_control_trace_event(
+                    self.producer,
+                    {
+                        "policy_id": policy_id,
+                        "trace_id": str(trace_id),
+                        "stage": "t_ai_producer_send_start",
+                        "stage_source": "ai-service",
+                        "timestamp_ms": ai_producer_send_start_ms,
+                        "request_id": _trace_payload_string(metadata, "request_id") or _trace_payload_string(trace_section, "request_id"),
+                        "command_id": _trace_payload_string(metadata, "command_id") or _trace_payload_string(trace_section, "command_id"),
+                        "workflow_id": _trace_payload_string(metadata, "workflow_id") or _trace_payload_string(trace_section, "workflow_id"),
+                        "source_event_id": _trace_payload_string(metadata, "source_event_id") or _trace_payload_string(trace_section, "source_event_id"),
+                        "sentinel_event_id": _trace_payload_string(metadata, "sentinel_event_id") or _trace_payload_string(trace_section, "sentinel_event_id"),
+                        "scope_identifier": _trace_payload_string(metadata, "scope_identifier"),
+                        "tenant": _trace_payload_string(metadata, "tenant"),
+                        "region": _trace_payload_string(metadata, "region"),
+                        "details": {
+                            "rule_type": str(rule_type),
+                            "action": str(enforcement_action),
+                        },
+                    },
+                    self.logger,
                 )
             success = self.producer.send_policy(policy_msg)
             
@@ -795,6 +860,30 @@ class MessagePublisher:
                         "trace_id": str(trace_id),
                         "t_ms": int(time.time() * 1000),
                     },
+                )
+            if success and trace_id:
+                _emit_control_trace_event(
+                    self.producer,
+                    {
+                        "policy_id": policy_id,
+                        "trace_id": str(trace_id),
+                        "stage": "t_ai_producer_ack",
+                        "stage_source": "ai-service",
+                        "timestamp_ms": int(time.time() * 1000),
+                        "request_id": _trace_payload_string(metadata, "request_id") or _trace_payload_string(trace_section, "request_id"),
+                        "command_id": _trace_payload_string(metadata, "command_id") or _trace_payload_string(trace_section, "command_id"),
+                        "workflow_id": _trace_payload_string(metadata, "workflow_id") or _trace_payload_string(trace_section, "workflow_id"),
+                        "source_event_id": _trace_payload_string(metadata, "source_event_id") or _trace_payload_string(trace_section, "source_event_id"),
+                        "sentinel_event_id": _trace_payload_string(metadata, "sentinel_event_id") or _trace_payload_string(trace_section, "sentinel_event_id"),
+                        "scope_identifier": _trace_payload_string(metadata, "scope_identifier"),
+                        "tenant": _trace_payload_string(metadata, "tenant"),
+                        "region": _trace_payload_string(metadata, "region"),
+                        "details": {
+                            "rule_type": str(rule_type),
+                            "action": str(enforcement_action),
+                        },
+                    },
+                    self.logger,
                 )
             
             return message_id

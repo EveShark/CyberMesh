@@ -11,6 +11,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -664,6 +665,11 @@ class PolicyMessage:
         self._validate_core_inputs(policy_id, action, timestamp, payload_bytes)
 
         parsed_payload = self._try_parse_json(payload_bytes)
+        parsed_payload, payload_bytes = self._stamp_producer_send_start(
+            policy_id=policy_id,
+            parsed_payload=parsed_payload,
+            payload_bytes=payload_bytes,
+        )
         params_bytes = self._extract_params_bytes(parsed_payload, payload_bytes)
         rule_value = self._determine_rule(rule, action, parsed_payload)
 
@@ -710,6 +716,64 @@ class PolicyMessage:
             return json.loads(payload_bytes.decode("utf-8"))
         except Exception:
             return None
+
+    @staticmethod
+    def _stage_markers_enabled() -> bool:
+        return os.getenv("POLICY_STAGE_MARKERS_ENABLED", "false").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+
+    @classmethod
+    def _stamp_producer_send_start(
+        cls,
+        *,
+        policy_id: str,
+        parsed_payload: Optional[Any],
+        payload_bytes: bytes,
+    ) -> tuple[Optional[Any], bytes]:
+        if not cls._stage_markers_enabled() or not isinstance(parsed_payload, dict):
+            return parsed_payload, payload_bytes
+        stamp_target = parsed_payload
+        nested_params = parsed_payload.get("params")
+        if isinstance(nested_params, dict):
+            stamp_target = nested_params
+
+        trace_obj = stamp_target.get("trace")
+        metadata = stamp_target.get("metadata")
+        if not isinstance(trace_obj, dict):
+            trace_obj = {}
+            stamp_target["trace"] = trace_obj
+        if not isinstance(metadata, dict):
+            metadata = {}
+        trace_id = str(
+            trace_obj.get("id")
+            or trace_obj.get("trace_id")
+            or metadata.get("trace_id")
+            or stamp_target.get("trace_id")
+            or stamp_target.get("qc_reference")
+            or parsed_payload.get("trace_id")
+            or parsed_payload.get("qc_reference")
+            or ""
+        ).strip()
+        if not trace_id:
+            return parsed_payload, payload_bytes
+
+        stages = trace_obj.get("stages")
+        if not isinstance(stages, dict):
+            stages = {}
+            trace_obj["stages"] = stages
+        if not stages.get("t_ai_producer_send_start"):
+            stages["t_ai_producer_send_start"] = int(time.time() * 1000)
+        trace_obj.setdefault("id", trace_id)
+        stamp_target["policy_id"] = policy_id
+        return parsed_payload, json.dumps(
+            parsed_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
 
     def _extract_params_bytes(self, parsed_payload: Optional[Any], payload_bytes: bytes) -> bytes:
         if isinstance(parsed_payload, dict) and "params" in parsed_payload:

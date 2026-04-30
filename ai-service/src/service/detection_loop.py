@@ -14,6 +14,7 @@ from typing import Optional, Dict, Any, Callable, List, TYPE_CHECKING
 from .policy_emitter import PolicyContext, build_policy_candidate
 from .fast_mitigation import decide_fast_mitigation
 from .policy_aggregation import PolicyAggregationManager
+from .publisher import _emit_control_trace_event
 from ..utils.metrics import get_metrics_collector
 
 if TYPE_CHECKING:  # pragma: no cover - avoid runtime dependency cycle
@@ -964,14 +965,21 @@ class DetectionLoop:
         )
 
         self._increment_metric("policy_candidates")
+        ai_decision_done_ms = int(time.time() * 1000)
+        trace_section = candidate.payload.setdefault("trace", {})
+        if isinstance(trace_section, dict):
+            stages = trace_section.setdefault("stages", {})
+            if isinstance(stages, dict):
+                stages["t_ai_decision_done"] = ai_decision_done_ms
+        metadata_obj = candidate.payload.get("metadata") if isinstance(candidate.payload.get("metadata"), dict) else {}
+        trace_id = (
+            (trace_section if isinstance(trace_section, dict) else {}).get("id")
+            or metadata_obj.get("trace_id")
+            or candidate.payload.get("trace_id")
+            or candidate.payload.get("qc_reference")
+            or ""
+        )
         if _policy_stage_markers_enabled():
-            trace_id = (
-                (candidate.payload.get("trace") or {}).get("id")
-                or (candidate.payload.get("metadata") or {}).get("trace_id")
-                or candidate.payload.get("trace_id")
-                or candidate.payload.get("qc_reference")
-                or ""
-            )
             if trace_id:
                 self.logger.info(
                     "policy stage marker",
@@ -979,12 +987,72 @@ class DetectionLoop:
                         "stage": "t_ai_decision_done",
                         "policy_id": candidate.policy_id,
                         "trace_id": str(trace_id),
-                        "t_ms": int(time.time() * 1000),
+                        "t_ms": ai_decision_done_ms,
                     },
                 )
+        if trace_id:
+            _emit_control_trace_event(
+                self.publisher.producer,
+                {
+                    "policy_id": str(candidate.policy_id),
+                    "trace_id": str(trace_id),
+                    "stage": "t_ai_decision_done",
+                    "stage_source": "ai-service",
+                    "timestamp_ms": ai_decision_done_ms,
+                    "request_id": str(metadata_obj.get("request_id") or ""),
+                    "command_id": str(metadata_obj.get("command_id") or ""),
+                    "workflow_id": str(metadata_obj.get("workflow_id") or ""),
+                    "source_event_id": str(metadata_obj.get("source_event_id") or ""),
+                    "sentinel_event_id": str(metadata_obj.get("sentinel_event_id") or ""),
+                    "scope_identifier": str(metadata_obj.get("scope_identifier") or ""),
+                    "tenant": str(metadata_obj.get("tenant_id") or ""),
+                    "region": str(metadata_obj.get("region") or ""),
+                    "details": {
+                        "modality": "detection_loop",
+                        "aggregation_mode": str(aggregation_mode),
+                    },
+                },
+                self.logger,
+            )
 
         publish_start = time.monotonic()
         try:
+            def record_producer_stage(stage: str, timestamp_ms: int) -> None:
+                if not trace_id or timestamp_ms <= 0:
+                    return
+                trace_payload = candidate.payload.setdefault("trace", {})
+                if isinstance(trace_payload, dict):
+                    trace_stages = trace_payload.setdefault("stages", {})
+                    if isinstance(trace_stages, dict):
+                        trace_stages[stage] = timestamp_ms
+                producer = getattr(self.publisher, "producer", None)
+                if producer is None:
+                    return
+                _emit_control_trace_event(
+                    producer,
+                    {
+                        "policy_id": str(candidate.policy_id),
+                        "trace_id": str(trace_id),
+                        "stage": stage,
+                        "stage_source": "ai-service",
+                        "timestamp_ms": timestamp_ms,
+                        "request_id": str(metadata_obj.get("request_id") or ""),
+                        "command_id": str(metadata_obj.get("command_id") or ""),
+                        "workflow_id": str(metadata_obj.get("workflow_id") or ""),
+                        "source_event_id": str(metadata_obj.get("source_event_id") or ""),
+                        "sentinel_event_id": str(metadata_obj.get("sentinel_event_id") or ""),
+                        "scope_identifier": str(metadata_obj.get("scope_identifier") or ""),
+                        "tenant": str(metadata_obj.get("tenant_id") or ""),
+                        "region": str(metadata_obj.get("region") or ""),
+                        "details": {
+                            "modality": "detection_loop",
+                            "aggregation_mode": str(aggregation_mode),
+                            "emitted_from": "detection_policy_publish_boundary",
+                        },
+                    },
+                    self.logger,
+                )
+
             publish_fast = getattr(self.publisher, "publish_fast_mitigation_async", None)
             if not callable(publish_fast):
                 publish_fast = getattr(self.publisher, "publish_fast_mitigation", None)
@@ -1012,12 +1080,14 @@ class DetectionLoop:
                             "reason": fast_mitigation.reason,
                         },
                     )
+            record_producer_stage("t_ai_producer_send_start", int(time.time() * 1000))
             self.publisher.publish_policy_violation(
                 policy_id=candidate.policy_id,
                 rule_type=candidate.rule_type,
                 enforcement_action=candidate.action,
                 payload=candidate.payload,
             )
+            record_producer_stage("t_ai_producer_ack", int(time.time() * 1000))
         except Exception as exc:  # pragma: no cover - defensive
             self._increment_metric("policy_failed")
             try:

@@ -14,6 +14,7 @@ import time
 import hashlib
 import threading
 import os
+import json
 from typing import Optional
 from ..contracts import AnomalyMessage, EvidenceMessage, FastMitigationMessage, PolicyMessage
 from ..utils.errors import KafkaError
@@ -176,6 +177,20 @@ class AIProducer:
             payload,
             key=key,
             force_flush=True,
+        )
+
+    def send_trace_event(self, payload: dict, *, key: Optional[str] = None) -> bool:
+        """Send canonical control trace event to control.trace.events.v1."""
+        data = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return self._send_bytes(
+            self.topics.control_trace_events,
+            data,
+            key=key,
+            force_flush=False,
+            max_attempts=2,
+            retry_enabled=True,
+            send_to_dlq=False,
+            raise_on_failure=False,
         )
 
     def _send_bytes(
