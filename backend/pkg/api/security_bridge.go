@@ -36,7 +36,7 @@ func (s *Server) resolveNormalizedSecurityEnvelope(r *http.Request) (normalizedS
 		RequestID:       requestID,
 		RequestPath:     r.URL.Path,
 		HTTPMethod:      r.Method,
-		ClientIP:        getClientIP(r),
+		ClientIP:        s.getClientIP(r),
 		SessionAccessID: readActiveAccessCookie(r),
 		HeaderAccessID:  r.Header.Get("X-Tenant-ID"),
 		QueryAccessID:   r.URL.Query().Get("tenant"),

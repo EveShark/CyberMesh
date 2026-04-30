@@ -22,6 +22,7 @@ import (
 	"backend/pkg/control/lifecycleaudit"
 	"backend/pkg/control/policyoutbox"
 	"backend/pkg/control/policystate"
+	"backend/pkg/control/policytrace"
 	"backend/pkg/state"
 	"backend/pkg/utils"
 	"github.com/google/uuid"
@@ -135,30 +136,32 @@ func isUniqueViolation(err error, constraint string) bool {
 
 // adapter implements the Adapter interface
 type adapter struct {
-	db                  *sql.DB
-	logger              *utils.Logger
-	auditLogger         *utils.AuditLogger
-	txIsolation         sql.IsolationLevel
-	txIsolationLabel    string
-	outboxNotifyMu      sync.RWMutex
-	outboxDurableNotify func(context.Context, uint64, int)
-	policyRefreshSem    chan struct{}
-	policyRefreshAsync  bool
-	policyRefreshMaxIDs int
-	policyRefreshTTL    time.Duration
+	db                         *sql.DB
+	logger                     *utils.Logger
+	auditLogger                *utils.AuditLogger
+	txIsolation                sql.IsolationLevel
+	txIsolationLabel           string
+	outboxNotifyMu             sync.RWMutex
+	outboxDurableNotify        func(context.Context, uint64, int)
+	policyRefreshSem           chan struct{}
+	policyRefreshAsync         bool
+	policyRefreshMaxIDs        int
+	policyRefreshTTL           time.Duration
 	policyRefreshFailureStreak atomic.Uint32
 	policyRefreshCooldownUntil atomic.Int64
-	metrics             *dbMetrics
-	anomalyStoreEnabled bool
-	txMismatchSeenMu    sync.Mutex
-	txMismatchSeen      map[[32]byte]time.Time
-	txMismatchSeenTTL   time.Duration
-	txMismatchSeenMax   int
-	perf                adapterPerformanceConfig
-	txBatchCanary       *batchCanaryState
-	outboxBatchCanary   *batchCanaryState
-	batchTuner          *batchTunerState
-	sqlTpl              sqlTemplateCache
+	metrics                    *dbMetrics
+	anomalyStoreEnabled        bool
+	txMismatchSeenMu           sync.Mutex
+	txMismatchSeen             map[[32]byte]time.Time
+	txMismatchSeenTTL          time.Duration
+	txMismatchSeenMax          int
+	perf                       adapterPerformanceConfig
+	txBatchCanary              *batchCanaryState
+	outboxBatchCanary          *batchCanaryState
+	batchTuner                 *batchTunerState
+	traceEvents                *policytrace.Store
+	traceCollector             *policytrace.Collector
+	sqlTpl                     sqlTemplateCache
 
 	// Prepared statements for queries
 	stmtGetBlock    *sql.Stmt
@@ -224,6 +227,13 @@ type outboxPrepared struct {
 	sourceEventID   string
 	sourceEventTsMs int64
 	sentinelEventID string
+	upstreamStages  []parsedPolicyTraceStage
+}
+
+type parsedPolicyTraceStage struct {
+	stage       string
+	timestampMs int64
+	source      string
 }
 
 type batchTunerState struct {
@@ -3410,6 +3420,93 @@ func parsePolicyTrace(raw []byte) (string, int64, string, int64, string) {
 	return traceID, aiEventTsMs, sourceEventID, sourceEventTsMs, sentinelEventID
 }
 
+func parsePolicyTraceStages(raw []byte) []parsedPolicyTraceStage {
+	var payload map[string]interface{}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil
+	}
+	stageMap := make(map[string]parsedPolicyTraceStage)
+	collectPayloadTraceStages(payload, stageMap)
+	if params, ok := payload["params"].(map[string]interface{}); ok {
+		collectPayloadTraceStages(params, stageMap)
+	}
+	if len(stageMap) == 0 {
+		return nil
+	}
+	out := make([]parsedPolicyTraceStage, 0, len(stageMap))
+	for _, stage := range stageMap {
+		out = append(out, stage)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].timestampMs == out[j].timestampMs {
+			return out[i].stage < out[j].stage
+		}
+		return out[i].timestampMs < out[j].timestampMs
+	})
+	return out
+}
+
+func collectPayloadTraceStages(payload map[string]interface{}, stages map[string]parsedPolicyTraceStage) {
+	if payload == nil {
+		return
+	}
+	if metadata, ok := payload["metadata"].(map[string]interface{}); ok {
+		appendParsedStage(stages, policytrace.StageAIDecisionDone, metadata["ai_event_ts_ms"], policytrace.StageSourceAI)
+		appendParsedStage(stages, policytrace.StageTelemetryIngest, metadata["telemetry_ingest_ts_ms"], policytrace.StageSourceSentinel)
+		appendParsedStage(stages, policytrace.StageTelemetryIngest, metadata["source_event_ts_ms"], policytrace.StageSourceSentinel)
+		appendParsedStage(stages, policytrace.StageSentinelConsume, metadata["t_sentinel_consume_ms"], policytrace.StageSourceSentinel)
+		appendParsedStage(stages, policytrace.StageSentinelAnalysisDone, metadata["t_sentinel_analysis_done_ms"], policytrace.StageSourceSentinel)
+		appendParsedStage(stages, policytrace.StageSentinelEmit, metadata["t_sentinel_emit_ms"], policytrace.StageSourceSentinel)
+		appendParsedStage(stages, policytrace.StageSentinelPublishAck, metadata["t_sentinel_publish_ack_ms"], policytrace.StageSourceSentinel)
+		appendParsedStage(stages, policytrace.StageAISentinelConsume, metadata["t_ai_sentinel_consume_ms"], policytrace.StageSourceAI)
+	}
+	if trace, ok := payload["trace"].(map[string]interface{}); ok {
+		appendParsedStage(stages, policytrace.StageAIDecisionDone, trace["ai_event_ts_ms"], policytrace.StageSourceAI)
+		appendParsedStage(stages, policytrace.StageTelemetryIngest, trace["telemetry_ingest_ts_ms"], policytrace.StageSourceSentinel)
+		appendParsedStage(stages, policytrace.StageTelemetryIngest, trace["source_event_ts_ms"], policytrace.StageSourceSentinel)
+		if rawStages, ok := trace["stages"].(map[string]interface{}); ok {
+			for stageName, value := range rawStages {
+				appendParsedStage(stages, stageName, value, inferPolicyTraceStageSource(stageName))
+			}
+		}
+	}
+}
+
+func appendParsedStage(stages map[string]parsedPolicyTraceStage, stage string, value interface{}, source string) {
+	stage = strings.TrimSpace(stage)
+	if stage == "" || stages == nil {
+		return
+	}
+	normalized := extractInt64(map[string]interface{}{"v": value}, "v")
+	if normalized <= 0 {
+		return
+	}
+	if unixMs, _, valid := utils.NormalizeUnixMillis(normalized); valid {
+		normalized = unixMs
+	} else {
+		return
+	}
+	existing, ok := stages[stage]
+	if !ok || normalized < existing.timestampMs {
+		stages[stage] = parsedPolicyTraceStage{
+			stage:       stage,
+			timestampMs: normalized,
+			source:      strings.TrimSpace(source),
+		}
+	}
+}
+
+func inferPolicyTraceStageSource(stage string) string {
+	switch strings.TrimSpace(stage) {
+	case policytrace.StageTelemetryIngest, policytrace.StageSentinelConsume, policytrace.StageSentinelAnalysisDone, policytrace.StageSentinelEmit, policytrace.StageSentinelPublishAck:
+		return policytrace.StageSourceSentinel
+	case policytrace.StageAISentinelConsume, policytrace.StageAIDecisionDone, policytrace.StageAIProducerSendStart, policytrace.StageAIProducerAck:
+		return policytrace.StageSourceAI
+	default:
+		return policytrace.StageSourceBackend
+	}
+}
+
 func parsePolicyRequestID(raw []byte) string {
 	var payload map[string]interface{}
 	if err := json.Unmarshal(raw, &payload); err != nil {
@@ -3870,6 +3967,7 @@ func (a *adapter) upsertPolicyOutbox(ctx context.Context, tx *sql.Tx, blockHeigh
 	requestID := parsePolicyRequestID(payload)
 	commandID := parsePolicyCommandID(payload)
 	workflowID := parsePolicyWorkflowID(payload)
+	upstreamStages := parsePolicyTraceStages(payload)
 	if aiEventTsMs <= 0 && txTS > 0 {
 		aiEventTsMs = txTS * 1000
 	}
@@ -3897,31 +3995,24 @@ func (a *adapter) upsertPolicyOutbox(ctx context.Context, tx *sql.Tx, blockHeigh
 		return err
 	}
 	if createdOutboxID != "" {
-		a.logPolicyStage(policyID, traceID, "t_outbox_row_created", time.Now().UnixMilli(), blockHeight, txIndex, persistAttempt)
-		if shouldSkipLifecycleAuditForDeadline(ctx, 1) {
-			if a.metrics != nil {
-				a.metrics.observePersistDiagnosticSignal("lifecycle_audit_deferred")
-			}
-			if a.logger != nil {
-				deadline, _ := ctx.Deadline()
-				a.logger.WarnContext(ctx, "skipping lifecycle audit for created outbox row to preserve durable commit budget",
-					utils.ZapString("policy_id", policyID),
-					utils.ZapString("trace_id", traceID),
-					utils.ZapDuration("estimated_budget", estimateLifecycleAuditBudget(1)),
-					utils.ZapDuration("remaining", time.Until(deadline)))
-			}
-			if a.auditLogger != nil {
-				_ = a.auditLogger.Warn("lifecycle_audit_skipped_due_to_deadline_budget", map[string]interface{}{
-					"height":          blockHeight,
-					"tx_index":        txIndex,
-					"event_count":     1,
-					"estimated_ms":    estimateLifecycleAuditBudget(1).Milliseconds(),
-					"commit_reserve":  lifecycleAuditCommitReserve.Milliseconds(),
-					"persist_attempt": persistAttempt,
-				})
-			}
-			return nil
-		}
+		createdAtMs := time.Now().UnixMilli()
+		a.appendPolicyTraceEventsTx(ctx, tx, buildPayloadTraceEvents(policyTraceEventInput{
+			policyID:         policyID,
+			traceID:          traceID,
+			requestID:        requestID,
+			commandID:        commandID,
+			workflowID:       workflowID,
+			sourceEventID:    sourceEventID,
+			sentinelEventID:  sentinelEventID,
+			outboxID:         createdOutboxID,
+			ruleHash:         ruleHash[:],
+			blockHeight:      blockHeight,
+			txIndex:          txIndex,
+			stages:           upstreamStages,
+			durableStage:     policytrace.StageOutboxRowCreated,
+			durableTimestamp: createdAtMs,
+		}))
+		a.logPolicyStage(policyID, traceID, "t_outbox_row_created", createdAtMs, blockHeight, txIndex, persistAttempt)
 		if _, auditErr := lifecycleaudit.InsertOutboxEvent(ctx, tx, lifecycleaudit.OutboxEvent{
 			ActionType:  lifecycleaudit.ActionPolicyCreated,
 			OutboxID:    createdOutboxID,
@@ -3932,15 +4023,7 @@ func (a *adapter) upsertPolicyOutbox(ctx context.Context, tx *sql.Tx, blockHeigh
 			ReasonText:  "durable outbox row created",
 			AfterStatus: "pending",
 		}); auditErr != nil {
-			if !lifecycleaudit.IsBestEffortErr(auditErr) {
-				return fmt.Errorf("insert lifecycle audit for created outbox row: %w", auditErr)
-			}
-			if a.logger != nil {
-				a.logger.WarnContext(ctx, "policy lifecycle audit degraded to best-effort for created outbox row",
-					utils.ZapError(auditErr),
-					utils.ZapString("policy_id", policyID),
-					utils.ZapString("trace_id", traceID))
-			}
+			return fmt.Errorf("insert lifecycle audit for created outbox row: %w", auditErr)
 		}
 		return nil
 	}
@@ -3989,7 +4072,23 @@ func (a *adapter) upsertPolicyOutbox(ctx context.Context, tx *sql.Tx, blockHeigh
 					if refreshed {
 						return nil
 					}
-					a.logPolicyStage(policyID, traceID, "t_outbox_row_reused", time.Now().UnixMilli(), blockHeight, txIndex, persistAttempt)
+					reusedAtMs := time.Now().UnixMilli()
+					a.appendPolicyTraceEventsTx(ctx, tx, buildPayloadTraceEvents(policyTraceEventInput{
+						policyID:         policyID,
+						traceID:          traceID,
+						requestID:        requestID,
+						commandID:        commandID,
+						workflowID:       workflowID,
+						sourceEventID:    sourceEventID,
+						sentinelEventID:  sentinelEventID,
+						ruleHash:         ruleHash[:],
+						blockHeight:      blockHeight,
+						txIndex:          txIndex,
+						stages:           upstreamStages,
+						durableStage:     policytrace.StageOutboxRowReused,
+						durableTimestamp: reusedAtMs,
+					}))
+					a.logPolicyStage(policyID, traceID, "t_outbox_row_reused", reusedAtMs, blockHeight, txIndex, persistAttempt)
 					return nil
 				}
 			}
@@ -4051,6 +4150,7 @@ func (a *adapter) upsertPolicyOutboxBatch(ctx context.Context, tx *sql.Tx, rows 
 		requestID := parsePolicyRequestID(row.payload)
 		commandID := parsePolicyCommandID(row.payload)
 		workflowID := parsePolicyWorkflowID(row.payload)
+		upstreamStages := parsePolicyTraceStages(row.payload)
 		if aiEventTsMs <= 0 && row.txTS > 0 {
 			aiEventTsMs = row.txTS * 1000
 		}
@@ -4074,6 +4174,7 @@ func (a *adapter) upsertPolicyOutboxBatch(ctx context.Context, tx *sql.Tx, rows 
 			sourceEventID:   sourceEventID,
 			sourceEventTsMs: sourceEventTsMs,
 			sentinelEventID: sentinelEventID,
+			upstreamStages:  upstreamStages,
 		})
 	}
 
@@ -4183,6 +4284,22 @@ func (a *adapter) upsertPolicyOutboxBatch(ctx context.Context, tx *sql.Tx, rows 
 		nowMs := time.Now().UnixMilli()
 		for _, row := range filteredChunk {
 			if outboxID, ok := insertedByTxIndex[row.txIndex]; ok {
+				a.appendPolicyTraceEventsTx(ctx, tx, buildPayloadTraceEvents(policyTraceEventInput{
+					policyID:         row.policyID,
+					traceID:          row.traceID,
+					requestID:        row.requestID,
+					commandID:        row.commandID,
+					workflowID:       row.workflowID,
+					sourceEventID:    row.sourceEventID,
+					sentinelEventID:  row.sentinelEventID,
+					outboxID:         outboxID,
+					ruleHash:         row.ruleHash[:],
+					blockHeight:      row.blockHeight,
+					txIndex:          row.txIndex,
+					stages:           row.upstreamStages,
+					durableStage:     policytrace.StageOutboxRowCreated,
+					durableTimestamp: nowMs,
+				}))
 				a.logPolicyStage(row.policyID, row.traceID, "t_outbox_row_created", nowMs, row.blockHeight, row.txIndex, persistAttempt)
 				lifecycleEvents = append(lifecycleEvents, lifecycleaudit.OutboxEvent{
 					ActionType:  lifecycleaudit.ActionPolicyCreated,
@@ -4199,35 +4316,8 @@ func (a *adapter) upsertPolicyOutboxBatch(ctx context.Context, tx *sql.Tx, rows 
 			conflicts = append(conflicts, row)
 		}
 		if len(lifecycleEvents) > 0 {
-			if shouldSkipLifecycleAuditForDeadline(ctx, len(lifecycleEvents)) {
-				if a.metrics != nil {
-					a.metrics.observePersistDiagnosticSignal("lifecycle_audit_deferred")
-				}
-				if a.logger != nil {
-					deadline, _ := ctx.Deadline()
-					a.logger.WarnContext(ctx, "skipping lifecycle audit for created outbox batch to preserve durable commit budget",
-						utils.ZapInt("batch_size", len(lifecycleEvents)),
-						utils.ZapDuration("estimated_budget", estimateLifecycleAuditBudget(len(lifecycleEvents))),
-						utils.ZapDuration("remaining", time.Until(deadline)))
-				}
-				if a.auditLogger != nil {
-					_ = a.auditLogger.Warn("lifecycle_audit_skipped_due_to_deadline_budget", map[string]interface{}{
-						"height":          chunk[0].blockHeight,
-						"event_count":     len(lifecycleEvents),
-						"estimated_ms":    estimateLifecycleAuditBudget(len(lifecycleEvents)).Milliseconds(),
-						"commit_reserve":  lifecycleAuditCommitReserve.Milliseconds(),
-						"persist_attempt": persistAttempt,
-					})
-				}
-			} else if err := lifecycleaudit.InsertOutboxEvents(ctx, tx, lifecycleEvents); err != nil {
-				if !lifecycleaudit.IsBestEffortErr(err) {
-					return fmt.Errorf("insert lifecycle audit for created outbox rows: %w", err)
-				}
-				if a.logger != nil {
-					a.logger.WarnContext(ctx, "policy lifecycle audit degraded to best-effort for created outbox batch",
-						utils.ZapError(err),
-						utils.ZapInt("batch_size", len(lifecycleEvents)))
-				}
+			if err := lifecycleaudit.InsertOutboxEvents(ctx, tx, lifecycleEvents); err != nil {
+				return fmt.Errorf("insert lifecycle audit for created outbox rows: %w", err)
 			}
 		}
 		conflictsAll = append(conflictsAll, conflicts...)
@@ -4326,7 +4416,23 @@ func (a *adapter) upsertPolicyOutboxBatch(ctx context.Context, tx *sql.Tx, rows 
 						if refreshed {
 							continue
 						}
-						a.logPolicyStage(row.policyID, row.traceID, "t_outbox_row_reused", time.Now().UnixMilli(), row.blockHeight, row.txIndex, persistAttempt)
+						reusedAtMs := time.Now().UnixMilli()
+						a.appendPolicyTraceEventsTx(ctx, tx, buildPayloadTraceEvents(policyTraceEventInput{
+							policyID:         row.policyID,
+							traceID:          row.traceID,
+							requestID:        row.requestID,
+							commandID:        row.commandID,
+							workflowID:       row.workflowID,
+							sourceEventID:    row.sourceEventID,
+							sentinelEventID:  row.sentinelEventID,
+							ruleHash:         row.ruleHash[:],
+							blockHeight:      row.blockHeight,
+							txIndex:          row.txIndex,
+							stages:           row.upstreamStages,
+							durableStage:     policytrace.StageOutboxRowReused,
+							durableTimestamp: reusedAtMs,
+						}))
+						a.logPolicyStage(row.policyID, row.traceID, "t_outbox_row_reused", reusedAtMs, row.blockHeight, row.txIndex, persistAttempt)
 						continue
 					}
 				}
@@ -4507,8 +4613,128 @@ func (a *adapter) refreshActivePolicyOutboxRow(ctx context.Context, tx *sql.Tx, 
 	if a.metrics != nil {
 		a.metrics.observePersistDiagnosticSignal("outbox_semantic_refresh_applied")
 	}
-	a.logPolicyStage(incoming.policyID, incoming.traceID, "t_outbox_row_refreshed", time.Now().UnixMilli(), incoming.blockHeight, incoming.txIndex, persistAttempt)
+	refreshedAtMs := time.Now().UnixMilli()
+	a.appendPolicyTraceEventsTx(ctx, tx, buildPayloadTraceEvents(policyTraceEventInput{
+		policyID:         incoming.policyID,
+		traceID:          incoming.traceID,
+		requestID:        incoming.requestID,
+		commandID:        incoming.commandID,
+		workflowID:       incoming.workflowID,
+		sourceEventID:    incoming.sourceEventID,
+		sentinelEventID:  incoming.sentinelEventID,
+		ruleHash:         incoming.ruleHash[:],
+		blockHeight:      incoming.blockHeight,
+		txIndex:          incoming.txIndex,
+		stages:           incoming.upstreamStages,
+		durableStage:     policytrace.StageOutboxRowRefreshed,
+		durableTimestamp: refreshedAtMs,
+	}))
+	a.logPolicyStage(incoming.policyID, incoming.traceID, "t_outbox_row_refreshed", refreshedAtMs, incoming.blockHeight, incoming.txIndex, persistAttempt)
 	return true, nil
+}
+
+type policyTraceEventInput struct {
+	policyID         string
+	traceID          string
+	requestID        string
+	commandID        string
+	workflowID       string
+	sourceEventID    string
+	sentinelEventID  string
+	outboxID         string
+	ruleHash         []byte
+	blockHeight      uint64
+	txIndex          int
+	stages           []parsedPolicyTraceStage
+	durableStage     string
+	durableTimestamp int64
+}
+
+func buildPayloadTraceEvents(input policyTraceEventInput) []policytrace.TraceEvent {
+	events := make([]policytrace.TraceEvent, 0, len(input.stages)+1)
+	for _, stage := range input.stages {
+		if stage.timestampMs <= 0 || strings.TrimSpace(stage.stage) == "" {
+			continue
+		}
+		events = append(events, policytrace.TraceEvent{
+			PolicyID:        input.policyID,
+			TraceID:         input.traceID,
+			Stage:           stage.stage,
+			StageClass:      policytrace.ClassifyStage(stage.stage),
+			StageSource:     strings.TrimSpace(stage.source),
+			TimestampMs:     stage.timestampMs,
+			RequestID:       input.requestID,
+			CommandID:       input.commandID,
+			WorkflowID:      input.workflowID,
+			SourceEventID:   input.sourceEventID,
+			SentinelEventID: input.sentinelEventID,
+			RuleHash:        input.ruleHash,
+			Height:          input.blockHeight,
+			TxIndex:         input.txIndex,
+		})
+	}
+	if strings.TrimSpace(input.durableStage) != "" && input.durableTimestamp > 0 {
+		events = append(events, policytrace.TraceEvent{
+			PolicyID:        input.policyID,
+			TraceID:         input.traceID,
+			Stage:           input.durableStage,
+			StageClass:      policytrace.ClassifyStage(input.durableStage),
+			StageSource:     policytrace.StageSourceBackend,
+			TimestampMs:     input.durableTimestamp,
+			RequestID:       input.requestID,
+			CommandID:       input.commandID,
+			WorkflowID:      input.workflowID,
+			SourceEventID:   input.sourceEventID,
+			SentinelEventID: input.sentinelEventID,
+			OutboxID:        input.outboxID,
+			RuleHash:        input.ruleHash,
+			Height:          input.blockHeight,
+			TxIndex:         input.txIndex,
+		})
+	}
+	return events
+}
+
+func (a *adapter) appendPolicyTraceEventsTx(ctx context.Context, tx *sql.Tx, events []policytrace.TraceEvent) {
+	if a == nil || tx == nil || len(events) == 0 {
+		return
+	}
+	if a.traceEvents == nil {
+		a.emitPolicyTraceEventsFallback(events)
+		return
+	}
+	if err := a.traceEvents.AppendBatchWithExec(ctx, tx, events); err != nil {
+		if a.logger != nil {
+			a.logger.WarnContext(ctx, "policy trace event append failed",
+				utils.ZapError(err),
+				utils.ZapInt("event_count", len(events)))
+		}
+		a.emitPolicyTraceEventsFallback(events)
+	}
+}
+
+func (a *adapter) emitPolicyTraceEventsFallback(events []policytrace.TraceEvent) {
+	if a == nil || a.traceCollector == nil || len(events) == 0 {
+		return
+	}
+	for _, event := range events {
+		if strings.TrimSpace(event.PolicyID) == "" || strings.TrimSpace(event.Stage) == "" || event.TimestampMs <= 0 {
+			continue
+		}
+		a.traceCollector.Record(policytrace.Marker{
+			Stage:       event.Stage,
+			PolicyID:    event.PolicyID,
+			TraceID:     event.TraceID,
+			Reason:      event.Reason,
+			TimestampMs: event.TimestampMs,
+			Height:      event.Height,
+			View:        event.View,
+			QCTsMs:      event.QCTsMs,
+			OutboxID:    event.OutboxID,
+			Partition:   event.Partition,
+			Offset:      event.Offset,
+		})
+	}
 }
 
 func collectPolicyIDsFromMarkers(markers []policyStageMarker) []string {
@@ -5105,6 +5331,20 @@ func (a *adapter) Close() error {
 // This is used by the API layer for statistics calculations
 func (a *adapter) GetDB() *sql.DB {
 	return a.db
+}
+
+func (a *adapter) SetPolicyTraceStore(store *policytrace.Store) {
+	if a == nil {
+		return
+	}
+	a.traceEvents = store
+}
+
+func (a *adapter) SetPolicyTraceCollector(collector *policytrace.Collector) {
+	if a == nil {
+		return
+	}
+	a.traceCollector = collector
 }
 
 // Metrics returns a snapshot of CockroachDB latency metrics.

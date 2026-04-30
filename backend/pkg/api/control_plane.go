@@ -173,6 +173,37 @@ type runtimeTraceMarkerDTO struct {
 	Offset      int64  `json:"offset,omitempty"`
 }
 
+type controlTraceEventRow struct {
+	EventID         string
+	EventKey        string
+	PolicyID        string
+	TraceID         string
+	Stage           string
+	StageClass      string
+	StageSource     string
+	TimestampMs     int64
+	RequestID       sql.NullString
+	CommandID       sql.NullString
+	WorkflowID      sql.NullString
+	SourceEventID   sql.NullString
+	SentinelEventID sql.NullString
+	OutboxID        sql.NullString
+	AckEventID      sql.NullString
+	RuleHash        []byte
+	ScopeIdentifier sql.NullString
+	Tenant          sql.NullString
+	Region          sql.NullString
+	Reason          sql.NullString
+	Height          sql.NullInt64
+	TxIndex         sql.NullInt64
+	ViewNo          sql.NullInt64
+	QCTsMs          sql.NullInt64
+	KafkaPartition  sql.NullInt64
+	KafkaOffset     sql.NullInt64
+	DetailsJSON     []byte
+	CreatedAt       time.Time
+}
+
 type materializedTraceDTO struct {
 	TraceID             string                          `json:"trace_id,omitempty"`
 	SourceEventID       string                          `json:"source_event_id,omitempty"`
@@ -186,7 +217,11 @@ type materializedTraceDTO struct {
 	CurrentAction       *materializedTraceActionDTO     `json:"current_action,omitempty"`
 	LastCompletedAction *materializedTraceActionDTO     `json:"last_completed_action,omitempty"`
 	Stages              []materializedTraceStageDTO     `json:"stages,omitempty"`
+	RuntimeStages       []materializedTraceStageDTO     `json:"runtime_stages,omitempty"`
+	DurableStages       []materializedTraceStageDTO     `json:"durable_stages,omitempty"`
+	AnomalyStages       []materializedTraceStageDTO     `json:"anomaly_stages,omitempty"`
 	Latencies           []materializedTraceLatencyDTO   `json:"latencies,omitempty"`
+	Anomalies           []materializedTraceAnomalyDTO   `json:"anomalies,omitempty"`
 }
 
 type materializedOutboxAckDTO struct {
@@ -231,6 +266,23 @@ type materializedTraceStageDTO struct {
 type materializedTraceLatencyDTO struct {
 	Name       string `json:"name"`
 	DurationMs int64  `json:"duration_ms"`
+	Negative   bool   `json:"negative,omitempty"`
+	Reason     string `json:"reason,omitempty"`
+}
+
+type materializedTraceAnomalyDTO struct {
+	Code             string   `json:"code"`
+	Message          string   `json:"message"`
+	RelatedStages    []string `json:"related_stages,omitempty"`
+	SelectedOutboxID string   `json:"selected_outbox_id,omitempty"`
+	SiblingOutboxIDs []string `json:"sibling_outbox_ids,omitempty"`
+}
+
+type materializedTraceSelection struct {
+	Outbox    *controlOutboxRow
+	Ack       *policyAckRow
+	TraceID   string
+	Anomalies []materializedTraceAnomalyDTO
 }
 
 type outboxOperationalContext struct {
@@ -264,6 +316,7 @@ type controlSchemaSupport struct {
 	OutboxCommandID           bool
 	OutboxWorkflowID          bool
 	OutboxSentinelEventID     bool
+	TraceEventsTable          bool
 	StatePoliciesTable        bool
 	StatePoliciesPolicyID     bool
 	StatePoliciesPolicyIDText bool
@@ -291,6 +344,7 @@ func loadControlSchemaSupport(ctx context.Context, db *sql.DB) (controlSchemaSup
 		OutboxCommandID:           controlTableHasColumn(ctx, db, "control_policy_outbox", "command_id"),
 		OutboxWorkflowID:          controlTableHasColumn(ctx, db, "control_policy_outbox", "workflow_id"),
 		OutboxSentinelEventID:     controlTableHasColumn(ctx, db, "control_policy_outbox", "sentinel_event_id"),
+		TraceEventsTable:          controlTableExists(ctx, db, "control_policy_trace_events"),
 		StatePoliciesTable:        controlTableExists(ctx, db, "state_policies"),
 		StatePoliciesPolicyID:     controlTableHasColumn(ctx, db, "state_policies", "policy_id"),
 		StatePoliciesPolicyIDText: controlTableHasColumn(ctx, db, "state_policies", "policy_id_text"),
@@ -1189,7 +1243,16 @@ func (s *Server) handleControlTraceByPolicy(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	materialized := materializeControlTrace(outboxRowsRaw, ackRowsRaw, runtimeMarkers)
+	traceEvents, err := loadPolicyTraceEvents(ctx, db, schema, policyID, tenantScope, outboxRowsRaw, ackRowsRaw)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "trace_events_query_failed")
+		writeErrorResponse(w, r, "TRACE_EVENTS_QUERY_FAILED", "failed to load canonical trace events", http.StatusInternalServerError)
+		s.recordControlBreakerFailure(endpointName)
+		return
+	}
+
+	materialized := materializeControlTraceWithEvents(traceEvents, outboxRowsRaw, ackRowsRaw, runtimeMarkers)
 	traceID, sourceEventID, sentinelEventID := materializedTraceLineage(outboxRowsRaw, ackRowsRaw, materialized)
 
 	writeJSONResponse(w, r, NewSuccessResponse(controlTraceResponse{
@@ -1205,6 +1268,7 @@ func (s *Server) handleControlTraceByPolicy(w http.ResponseWriter, r *http.Reque
 	span.SetAttributes(
 		attribute.Int("trace.outbox_rows", len(outbox)),
 		attribute.Int("trace.ack_rows", len(acks)),
+		attribute.Int("trace.canonical_events", len(traceEvents)),
 		attribute.Int("trace.runtime_markers", len(runtimeMarkers)),
 	)
 	span.SetStatus(codes.Ok, "trace_by_policy_ok")
@@ -1262,16 +1326,622 @@ func filterScopedRuntimeMarkers(markers []policytrace.Marker, outbox []controlOu
 	return filtered
 }
 
+func appendDistinctStrings(dst []string, seen map[string]struct{}, values ...string) []string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		dst = append(dst, value)
+	}
+	return dst
+}
+
+func collectTraceEventLineage(policyID string, outbox []controlOutboxRow, acks []policyAckRow) (traceIDs []string, sourceEventIDs []string, sentinelEventIDs []string) {
+	traceSeen := make(map[string]struct{}, 8)
+	sourceSeen := make(map[string]struct{}, 8)
+	sentinelSeen := make(map[string]struct{}, 8)
+	for _, row := range outbox {
+		traceIDs = appendDistinctStrings(traceIDs, traceSeen, strings.TrimSpace(row.TraceID.String))
+		sourceEventIDs = appendDistinctStrings(sourceEventIDs, sourceSeen, strings.TrimSpace(row.SourceEventID.String))
+		sentinelEventIDs = appendDistinctStrings(sentinelEventIDs, sentinelSeen, strings.TrimSpace(row.SentinelEventID.String))
+	}
+	for _, row := range acks {
+		traceIDs = appendDistinctStrings(traceIDs, traceSeen, strings.TrimSpace(row.TraceID.String))
+		sourceEventIDs = appendDistinctStrings(sourceEventIDs, sourceSeen, strings.TrimSpace(row.SourceEventID.String))
+		sentinelEventIDs = appendDistinctStrings(sentinelEventIDs, sentinelSeen, strings.TrimSpace(row.SentinelEventID.String))
+	}
+	return traceIDs, sourceEventIDs, sentinelEventIDs
+}
+
+func loadPolicyTraceEvents(ctx context.Context, db *sql.DB, schema controlSchemaSupport, policyID, tenantScope string, outbox []controlOutboxRow, acks []policyAckRow) ([]controlTraceEventRow, error) {
+	if db == nil || !schema.TraceEventsTable {
+		return nil, nil
+	}
+
+	traceIDs, sourceEventIDs, sentinelEventIDs := collectTraceEventLineage(policyID, outbox, acks)
+	whereParts := make([]string, 0, 4)
+	args := make([]interface{}, 0, 16)
+	if strings.TrimSpace(policyID) != "" {
+		whereParts = append(whereParts, fmt.Sprintf("policy_id = $%d", len(args)+1))
+		args = append(args, strings.TrimSpace(policyID))
+	}
+	for _, traceID := range traceIDs {
+		whereParts = append(whereParts, fmt.Sprintf("trace_id = $%d", len(args)+1))
+		args = append(args, traceID)
+	}
+	for _, sourceEventID := range sourceEventIDs {
+		whereParts = append(whereParts, fmt.Sprintf("source_event_id = $%d", len(args)+1))
+		args = append(args, sourceEventID)
+	}
+	for _, sentinelEventID := range sentinelEventIDs {
+		whereParts = append(whereParts, fmt.Sprintf("sentinel_event_id = $%d", len(args)+1))
+		args = append(args, sentinelEventID)
+	}
+	if len(whereParts) == 0 {
+		return nil, nil
+	}
+
+	where := "(" + strings.Join(whereParts, " OR ") + ")"
+	if strings.TrimSpace(tenantScope) != "" {
+		where += fmt.Sprintf(" AND ((tenant = $%d) OR (scope_identifier = 'cluster') OR (scope_identifier IS NULL))", len(args)+1)
+		args = append(args, tenantScope)
+	}
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT
+			event_id, event_key, policy_id, trace_id, stage, stage_class, stage_source, timestamp_ms,
+			request_id, command_id, workflow_id, source_event_id, sentinel_event_id, outbox_id, ack_event_id, rule_hash,
+			scope_identifier, tenant, region, reason, height, tx_index, view_no, qc_ts_ms, kafka_partition, kafka_offset,
+			details_json, created_at
+		FROM control_policy_trace_events
+		WHERE `+where+`
+		ORDER BY timestamp_ms ASC, created_at ASC, event_id ASC
+		LIMIT 1000
+	`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	events := make([]controlTraceEventRow, 0, 64)
+	for rows.Next() {
+		var row controlTraceEventRow
+		if scanErr := rows.Scan(
+			&row.EventID, &row.EventKey, &row.PolicyID, &row.TraceID, &row.Stage, &row.StageClass, &row.StageSource, &row.TimestampMs,
+			&row.RequestID, &row.CommandID, &row.WorkflowID, &row.SourceEventID, &row.SentinelEventID, &row.OutboxID, &row.AckEventID, &row.RuleHash,
+			&row.ScopeIdentifier, &row.Tenant, &row.Region, &row.Reason, &row.Height, &row.TxIndex, &row.ViewNo, &row.QCTsMs, &row.KafkaPartition, &row.KafkaOffset,
+			&row.DetailsJSON, &row.CreatedAt,
+		); scanErr != nil {
+			return nil, scanErr
+		}
+		events = append(events, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
+func materializeControlTraceWithEvents(events []controlTraceEventRow, outbox []controlOutboxRow, acks []policyAckRow, runtime []runtimeTraceMarkerDTO) *materializedTraceDTO {
+	if len(events) == 0 {
+		return materializeControlTrace(outbox, acks, runtime)
+	}
+	return materializeControlTraceFromCanonicalEvents(events, outbox, acks, runtime)
+}
+
+func materializeControlTraceFromCanonicalEvents(events []controlTraceEventRow, outbox []controlOutboxRow, acks []policyAckRow, runtime []runtimeTraceMarkerDTO) *materializedTraceDTO {
+	if len(events) == 0 && len(outbox) == 0 && len(acks) == 0 && len(runtime) == 0 {
+		return nil
+	}
+
+	fallbackSelection := selectMaterializedTraceContext(outbox, acks, runtime)
+	traceID := selectCanonicalEventTraceID(events, fallbackSelection.TraceID)
+	if traceID == "" {
+		return materializeControlTrace(outbox, acks, runtime)
+	}
+
+	firstAck, latestAck := selectMaterializedAckBounds(acks, traceID)
+	primaryAck := latestAck
+	if primaryAck == nil {
+		primaryAck = fallbackSelection.Ack
+	}
+
+	anomalies := append([]materializedTraceAnomalyDTO(nil), fallbackSelection.Anomalies...)
+	sourceEventID := ""
+	sentinelEventID := ""
+	sourceEventTsMs := int64(0)
+	aiEventTsMs := int64(0)
+	primaryOutbox := fallbackSelection.Outbox
+	sourceEventIDs := make(map[string]struct{}, 4)
+	sentinelEventIDs := make(map[string]struct{}, 4)
+	addLineageID := func(dst map[string]struct{}, value string) {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			dst[value] = struct{}{}
+		}
+	}
+	if primaryOutbox != nil {
+		if primaryOutbox.SourceEventID.Valid {
+			sourceEventID = strings.TrimSpace(primaryOutbox.SourceEventID.String)
+			addLineageID(sourceEventIDs, sourceEventID)
+		}
+		if primaryOutbox.SourceEventTsMs.Valid {
+			sourceEventTsMs = primaryOutbox.SourceEventTsMs.Int64
+		}
+		if primaryOutbox.SentinelEventID.Valid {
+			sentinelEventID = strings.TrimSpace(primaryOutbox.SentinelEventID.String)
+			addLineageID(sentinelEventIDs, sentinelEventID)
+		}
+	}
+	for _, ack := range acks {
+		if strings.TrimSpace(ack.TraceID.String) != "" && strings.TrimSpace(ack.TraceID.String) != traceID {
+			continue
+		}
+		if ack.SourceEventID.Valid {
+			addLineageID(sourceEventIDs, ack.SourceEventID.String)
+		}
+		if ack.SentinelEventID.Valid {
+			addLineageID(sentinelEventIDs, ack.SentinelEventID.String)
+		}
+	}
+
+	selectedOutboxID := ""
+	if primaryOutbox != nil {
+		selectedOutboxID = strings.TrimSpace(primaryOutbox.ID)
+	}
+	selectedAckEventID := ""
+	if primaryAck != nil && primaryAck.AckEventID.Valid {
+		selectedAckEventID = strings.TrimSpace(primaryAck.AckEventID.String)
+	}
+	canonicalEvents := filterCanonicalTraceEvents(events, traceID, sourceEventIDs, sentinelEventIDs, selectedOutboxID, selectedAckEventID)
+	if len(canonicalEvents) == 0 {
+		return materializeControlTrace(outbox, acks, runtime)
+	}
+	stages := make([]materializedTraceStageDTO, 0, len(canonicalEvents)+1)
+
+	for _, event := range canonicalEvents {
+		if sourceEventID == "" && event.SourceEventID.Valid {
+			sourceEventID = strings.TrimSpace(event.SourceEventID.String)
+			addLineageID(sourceEventIDs, sourceEventID)
+		}
+		if sentinelEventID == "" && event.SentinelEventID.Valid {
+			sentinelEventID = strings.TrimSpace(event.SentinelEventID.String)
+			addLineageID(sentinelEventIDs, sentinelEventID)
+		}
+		if aiEventTsMs == 0 && strings.TrimSpace(event.Stage) == policytrace.StageAIDecisionDone {
+			aiEventTsMs = event.TimestampMs
+		}
+		if event.TimestampMs <= 0 || strings.TrimSpace(event.Stage) == "" {
+			continue
+		}
+		stageSource := materializedStageSourceFromEvent(event)
+		stages = append(stages, materializedTraceStageDTO{
+			Stage:       strings.TrimSpace(event.Stage),
+			Source:      stageSource,
+			TimestampMs: event.TimestampMs,
+		})
+		if strings.EqualFold(strings.TrimSpace(event.StageClass), string(policytrace.StageClassAnomaly)) {
+			message := "canonical trace anomaly event"
+			if event.Reason.Valid && strings.TrimSpace(event.Reason.String) != "" {
+				message = strings.TrimSpace(event.Reason.String)
+			}
+			anomalies = append(anomalies, materializedTraceAnomalyDTO{
+				Code:          strings.TrimSpace(event.Stage),
+				Message:       message,
+				RelatedStages: []string{strings.TrimSpace(event.Stage)},
+			})
+		}
+	}
+
+	if normalized, _, valid := utils.NormalizeTimestampMs(sourceEventTsMs, utils.TimestampNormalizeTraceCompatible); valid {
+		sourceEventTsMs = normalized
+	} else {
+		sourceEventTsMs = 0
+	}
+	if aiEventTsMs == 0 {
+		aiEventTsMs = stageTimestamp(stages, policytrace.StageAIDecisionDone)
+	}
+	if normalized, _, valid := utils.NormalizeTimestampMs(aiEventTsMs, utils.TimestampNormalizeTraceCompatible); valid {
+		aiEventTsMs = normalized
+	} else {
+		aiEventTsMs = 0
+	}
+	if sourceEventTsMs > 0 {
+		stages = append(stages, materializedTraceStageDTO{
+			Stage:       "t_source_event",
+			Source:      "durable",
+			TimestampMs: sourceEventTsMs,
+		})
+	}
+	if sentinelEventID == "" {
+		sentinelEventID = firstNonEmptyAckField(acks, func(row policyAckRow) sql.NullString { return row.SentinelEventID }, traceID)
+	}
+
+	sort.SliceStable(stages, func(i, j int) bool {
+		if stages[i].TimestampMs == stages[j].TimestampMs {
+			if stages[i].Source == stages[j].Source {
+				return stages[i].Stage < stages[j].Stage
+			}
+			return stages[i].Source < stages[j].Source
+		}
+		return stages[i].TimestampMs < stages[j].TimestampMs
+	})
+
+	outboxCreatedMs := stageTimestamp(stages, policytrace.StageOutboxRowCreated)
+	if outboxCreatedMs > 0 {
+		filteredStages := make([]materializedTraceStageDTO, 0, len(stages))
+		excludedStages := make([]string, 0, 8)
+		for _, stage := range stages {
+			if isPostOutboxReplayRuntimeStage(stage, outboxCreatedMs) {
+				excludedStages = append(excludedStages, stage.Stage)
+				continue
+			}
+			filteredStages = append(filteredStages, stage)
+		}
+		if len(excludedStages) > 0 {
+			stages = filteredStages
+			anomalies = append(anomalies, materializedTraceAnomalyDTO{
+				Code:          "post_outbox_runtime_stage",
+				Message:       "excluded runtime stages that occurred after outbox persistence for the selected trace",
+				RelatedStages: excludedStages,
+			})
+		}
+	}
+	publishedMs := stageTimestamp(stages, policytrace.StageControlPublishAck)
+	outboxAckMs := stageTimestamp(stages, "t_outbox_acked")
+	if outboxAckMs == 0 {
+		outboxAckMs = materializedOutboxAckTs(primaryOutbox)
+	}
+	firstPolicyAckMs := firstStageTimestamp(stages, policytrace.StageAckPersisted)
+	if firstPolicyAckMs == 0 {
+		firstPolicyAckMs = firstStageTimestamp(stages, policytrace.StageAck)
+	}
+	if firstPolicyAckMs == 0 {
+		firstPolicyAckMs = materializedAckTs(firstAck)
+	}
+	policyAckMs := lastStageTimestamp(stages, policytrace.StageAckPersisted)
+	if policyAckMs == 0 {
+		policyAckMs = lastStageTimestamp(stages, policytrace.StageAck)
+	}
+	if policyAckMs == 0 {
+		policyAckMs = materializedAckTs(primaryAck)
+	}
+
+	latencies := make([]materializedTraceLatencyDTO, 0, 24)
+	appendLatency := func(name string, start, end int64, startStage string, endStage string) {
+		if start <= 0 || end <= 0 {
+			return
+		}
+		if duration, ok, negative := utils.DurationMillis(start, end); ok {
+			latencies = append(latencies, materializedTraceLatencyDTO{Name: name, DurationMs: duration})
+		} else if negative {
+			latencies = append(latencies, materializedTraceLatencyDTO{
+				Name:       name,
+				DurationMs: end - start,
+				Negative:   true,
+				Reason:     "selected timestamps are causally inverted",
+			})
+			anomalies = append(anomalies, materializedTraceAnomalyDTO{
+				Code:          "negative_latency",
+				Message:       fmt.Sprintf("%s is negative because %s precedes %s for the selected canonical events", name, endStage, startStage),
+				RelatedStages: []string{startStage, endStage},
+			})
+		}
+	}
+
+	appendLatency("source_to_ai_decision", sourceEventTsMs, aiEventTsMs, "t_source_event", policytrace.StageAIDecisionDone)
+	appendLatency("ai_decision_to_outbox_persisted", aiEventTsMs, outboxCreatedMs, policytrace.StageAIDecisionDone, policytrace.StageOutboxRowCreated)
+	appendLatency("outbox_persisted_to_published", outboxCreatedMs, publishedMs, policytrace.StageOutboxRowCreated, policytrace.StageControlPublishAck)
+	appendLatency("published_to_outbox_ack", publishedMs, outboxAckMs, policytrace.StageControlPublishAck, "t_outbox_acked")
+	appendLatency("outbox_persisted_to_outbox_ack", outboxCreatedMs, outboxAckMs, policytrace.StageOutboxRowCreated, "t_outbox_acked")
+	appendLatency("published_to_first_policy_ack", publishedMs, firstPolicyAckMs, policytrace.StageControlPublishAck, "t_first_policy_ack")
+	appendLatency("source_to_first_policy_ack", sourceEventTsMs, firstPolicyAckMs, "t_source_event", "t_first_policy_ack")
+	appendLatency("ai_decision_to_first_policy_ack", aiEventTsMs, firstPolicyAckMs, policytrace.StageAIDecisionDone, "t_first_policy_ack")
+	appendLatency("published_to_policy_ack", publishedMs, policyAckMs, policytrace.StageControlPublishAck, "t_policy_ack")
+	appendLatency("source_to_policy_ack", sourceEventTsMs, policyAckMs, "t_source_event", "t_policy_ack")
+	appendLatency("ai_decision_to_policy_ack", aiEventTsMs, policyAckMs, policytrace.StageAIDecisionDone, "t_policy_ack")
+	appendLatency("published_to_ack", publishedMs, policyAckMs, policytrace.StageControlPublishAck, policytrace.StageAck)
+	appendLatency("source_to_ack", sourceEventTsMs, policyAckMs, "t_source_event", policytrace.StageAck)
+	appendLatency("ai_decision_to_ack", aiEventTsMs, policyAckMs, policytrace.StageAIDecisionDone, policytrace.StageAck)
+	appendLatency("telemetry_ingest_to_ai_decision", stageTimestamp(stages, policytrace.StageTelemetryIngest), aiEventTsMs, policytrace.StageTelemetryIngest, policytrace.StageAIDecisionDone)
+	appendLatency("telemetry_to_sentinel_emit", stageTimestamp(stages, policytrace.StageTelemetryIngest), stageTimestamp(stages, policytrace.StageSentinelEmit), policytrace.StageTelemetryIngest, policytrace.StageSentinelEmit)
+	appendLatency("sentinel_emit_to_ai_decision", stageTimestamp(stages, policytrace.StageSentinelEmit), aiEventTsMs, policytrace.StageSentinelEmit, policytrace.StageAIDecisionDone)
+	appendLatency("ai_decision_to_backend_consume", aiEventTsMs, stageTimestamp(stages, policytrace.StageBackendConsume), policytrace.StageAIDecisionDone, policytrace.StageBackendConsume)
+	appendLatency("backend_consume_to_commit", stageTimestamp(stages, policytrace.StageBackendConsume), stageTimestamp(stages, policytrace.StageCommit), policytrace.StageBackendConsume, policytrace.StageCommit)
+	appendLatency("commit_to_publish", stageTimestamp(stages, policytrace.StageCommit), publishedMs, policytrace.StageCommit, policytrace.StageControlPublishAck)
+	appendLatency("publish_to_enforcement_consume", publishedMs, stageTimestamp(stages, policytrace.StageEnforcementConsume), policytrace.StageControlPublishAck, policytrace.StageEnforcementConsume)
+	appendLatency("enforcement_consume_to_apply", stageTimestamp(stages, policytrace.StageEnforcementConsume), stageTimestamp(stages, policytrace.StageEnforcementApplyDone), policytrace.StageEnforcementConsume, policytrace.StageEnforcementApplyDone)
+	appendLatency("enforcement_apply_to_ack_publish_start", stageTimestamp(stages, policytrace.StageEnforcementApplyDone), stageTimestamp(stages, policytrace.StageAckPublishStart), policytrace.StageEnforcementApplyDone, policytrace.StageAckPublishStart)
+	appendLatency("ack_publish_start_to_done", stageTimestamp(stages, policytrace.StageAckPublishStart), stageTimestamp(stages, policytrace.StageAckPublishDone), policytrace.StageAckPublishStart, policytrace.StageAckPublishDone)
+	appendLatency("ack_publish_done_to_ack_persisted", stageTimestamp(stages, policytrace.StageAckPublishDone), policyAckMs, policytrace.StageAckPublishDone, policytrace.StageAckPersisted)
+	appendLatency("publish_to_ack", publishedMs, policyAckMs, policytrace.StageControlPublishAck, policytrace.StageAck)
+
+	if publishedMs == 0 && (outboxAckMs > 0 || firstPolicyAckMs > 0 || policyAckMs > 0) {
+		selectedOutboxID := ""
+		if primaryOutbox != nil {
+			selectedOutboxID = primaryOutbox.ID
+		}
+		anomalies = append(anomalies, materializedTraceAnomalyDTO{
+			Code:             "missing_publish_stage",
+			Message:          "canonical trace has ACK state but no publish stage",
+			RelatedStages:    []string{policytrace.StageControlPublishAck, "t_outbox_acked", "t_policy_ack"},
+			SelectedOutboxID: selectedOutboxID,
+		})
+	}
+	appendCanonicalTraceCompletenessAnomalies(&anomalies, stages)
+
+	actionHistory := materializedActionHistory(outbox, acks)
+	currentAction, lastCompletedAction := summarizeActionHistory(actionHistory)
+	runtimeStages, durableStages, anomalyStages := splitMaterializedStages(stages)
+	return &materializedTraceDTO{
+		TraceID:             traceID,
+		SourceEventID:       sourceEventID,
+		SentinelEventID:     sentinelEventID,
+		SourceEventTsMs:     sourceEventTsMs,
+		AIEventTsMs:         aiEventTsMs,
+		OutboxAck:           materializedOutboxAck(primaryOutbox),
+		FirstPolicyAck:      materializedAckSummary(firstAck),
+		LatestPolicyAck:     materializedAckSummary(primaryAck),
+		ActionHistory:       actionHistory,
+		CurrentAction:       currentAction,
+		LastCompletedAction: lastCompletedAction,
+		Stages:              stages,
+		RuntimeStages:       runtimeStages,
+		DurableStages:       durableStages,
+		AnomalyStages:       anomalyStages,
+		Latencies:           latencies,
+		Anomalies:           anomalies,
+	}
+}
+
+func isPostOutboxReplayRuntimeStage(stage materializedTraceStageDTO, outboxCreatedMs int64) bool {
+	if outboxCreatedMs <= 0 || stage.TimestampMs <= outboxCreatedMs {
+		return false
+	}
+	switch strings.TrimSpace(stage.Source) {
+	case "durable", "anomaly":
+		return false
+	}
+	switch strings.TrimSpace(stage.Stage) {
+	case policytrace.StageSentinelConsume,
+		policytrace.StageSentinelAnalysisDone,
+		policytrace.StageSentinelEmit,
+		policytrace.StageSentinelPublishAck,
+		policytrace.StageAISentinelConsume,
+		policytrace.StageAIDecisionDone,
+		policytrace.StageAIProducerSendStart,
+		policytrace.StageAIProducerAck,
+		policytrace.StagePolicyHandlerEnter,
+		policytrace.StageDecodeDone,
+		policytrace.StageBackendConsume,
+		policytrace.StageBackendVerifiedDone,
+		policytrace.StageMempoolEnqueued,
+		policytrace.StageNonceIdempotencyOK,
+		policytrace.StageLeaderSelected,
+		policytrace.StageProposeStart,
+		policytrace.StageProposalBroadcast,
+		policytrace.StageQCFormed,
+		policytrace.StageCommit,
+		policytrace.StageStateApplyDone:
+		return true
+	default:
+		return false
+	}
+}
+
+func appendCanonicalTraceCompletenessAnomalies(anomalies *[]materializedTraceAnomalyDTO, stages []materializedTraceStageDTO) {
+	if anomalies == nil || len(stages) == 0 {
+		return
+	}
+	required := []string{
+		policytrace.StageTelemetryIngest,
+		policytrace.StageSentinelConsume,
+		policytrace.StageSentinelAnalysisDone,
+		policytrace.StageSentinelEmit,
+		policytrace.StageAIDecisionDone,
+		policytrace.StageAIProducerSendStart,
+		policytrace.StageAIProducerAck,
+		policytrace.StageBackendConsume,
+		policytrace.StageOutboxRowCreated,
+		policytrace.StageControlPublishAck,
+		policytrace.StageEnforcementConsume,
+		policytrace.StageEnforcementApplyDone,
+		policytrace.StageAckPublishStart,
+		policytrace.StageAckPublishDone,
+	}
+	missing := make([]string, 0, len(required)+1)
+	for _, stage := range required {
+		if stageTimestamp(stages, stage) == 0 {
+			missing = append(missing, stage)
+		}
+	}
+	if stageTimestamp(stages, policytrace.StageAckPersisted) == 0 && stageTimestamp(stages, policytrace.StageAck) == 0 {
+		missing = append(missing, policytrace.StageAckPersisted)
+	}
+	if len(missing) == 0 {
+		return
+	}
+	*anomalies = append(*anomalies, materializedTraceAnomalyDTO{
+		Code:          "canonical_trace_incomplete",
+		Message:       "canonical trace is missing source-authored stages required for full layer-by-layer latency",
+		RelatedStages: missing,
+	})
+}
+
+func materializedStageSourceFromEvent(event controlTraceEventRow) string {
+	stageClass := strings.TrimSpace(event.StageClass)
+	switch stageClass {
+	case string(policytrace.StageClassDurable):
+		return "durable"
+	case string(policytrace.StageClassAnomaly):
+		return "anomaly"
+	default:
+		source := strings.TrimSpace(event.StageSource)
+		if source == "" {
+			return "runtime"
+		}
+		return source
+	}
+}
+
+func selectCanonicalEventTraceID(events []controlTraceEventRow, fallbackTraceID string) string {
+	fallbackTraceID = strings.TrimSpace(fallbackTraceID)
+	if fallbackTraceID != "" {
+		for _, event := range events {
+			if strings.TrimSpace(event.TraceID) == fallbackTraceID {
+				return fallbackTraceID
+			}
+		}
+	}
+	type traceScore struct {
+		traceID     string
+		latestTs    int64
+		eventCount  int
+		durableSeen bool
+	}
+	scores := make(map[string]traceScore, len(events))
+	for _, event := range events {
+		traceID := strings.TrimSpace(event.TraceID)
+		if traceID == "" {
+			continue
+		}
+		score := scores[traceID]
+		score.traceID = traceID
+		score.eventCount++
+		if event.TimestampMs > score.latestTs {
+			score.latestTs = event.TimestampMs
+		}
+		if strings.EqualFold(strings.TrimSpace(event.StageClass), string(policytrace.StageClassDurable)) {
+			score.durableSeen = true
+		}
+		scores[traceID] = score
+	}
+	best := traceScore{}
+	for _, score := range scores {
+		if best.traceID == "" ||
+			(score.durableSeen && !best.durableSeen) ||
+			(score.durableSeen == best.durableSeen && score.latestTs > best.latestTs) ||
+			(score.durableSeen == best.durableSeen && score.latestTs == best.latestTs && score.eventCount > best.eventCount) ||
+			(score.durableSeen == best.durableSeen && score.latestTs == best.latestTs && score.eventCount == best.eventCount && score.traceID < best.traceID) {
+			best = score
+		}
+	}
+	return best.traceID
+}
+
+func filterCanonicalTraceEvents(events []controlTraceEventRow, traceID string, sourceEventIDs map[string]struct{}, sentinelEventIDs map[string]struct{}, selectedOutboxID string, selectedAckEventID string) []controlTraceEventRow {
+	traceID = strings.TrimSpace(traceID)
+	if traceID == "" {
+		return nil
+	}
+	selectedOutboxID = strings.TrimSpace(selectedOutboxID)
+	selectedAckEventID = strings.TrimSpace(selectedAckEventID)
+	filtered := make([]controlTraceEventRow, 0, len(events))
+	for _, event := range events {
+		if strings.TrimSpace(event.TraceID) != traceID && !eventMatchesLineage(event, sourceEventIDs, sentinelEventIDs) {
+			continue
+		}
+		if !eventMatchesSelectedCausalChain(event, selectedOutboxID, selectedAckEventID) {
+			continue
+		}
+		filtered = append(filtered, event)
+	}
+	return filtered
+}
+
+func eventMatchesSelectedCausalChain(event controlTraceEventRow, selectedOutboxID string, selectedAckEventID string) bool {
+	stage := strings.TrimSpace(event.Stage)
+	if selectedOutboxID != "" && eventStageBelongsToOutbox(stage) && event.OutboxID.Valid && strings.TrimSpace(event.OutboxID.String) != selectedOutboxID {
+		return false
+	}
+	if selectedAckEventID != "" && eventStageBelongsToAck(stage) && event.AckEventID.Valid && strings.TrimSpace(event.AckEventID.String) != selectedAckEventID {
+		return false
+	}
+	return true
+}
+
+func eventStageBelongsToOutbox(stage string) bool {
+	switch strings.TrimSpace(stage) {
+	case policytrace.StageOutboxRowCreated,
+		policytrace.StageOutboxClaimed,
+		policytrace.StageControlPublishStart,
+		policytrace.StageControlPublishAck,
+		policytrace.StageOutboxMarkDone:
+		return true
+	default:
+		return false
+	}
+}
+
+func eventStageBelongsToAck(stage string) bool {
+	switch strings.TrimSpace(stage) {
+	case policytrace.StageEnforcementConsume,
+		policytrace.StageEnforcementApplyDone,
+		policytrace.StageEnforcementPersisted,
+		policytrace.StageAckPublishStart,
+		policytrace.StageAckPublishDone,
+		policytrace.StageAckReceived,
+		policytrace.StageAckPersisted,
+		policytrace.StageAck:
+		return true
+	default:
+		return false
+	}
+}
+
+func eventMatchesLineage(event controlTraceEventRow, sourceEventIDs map[string]struct{}, sentinelEventIDs map[string]struct{}) bool {
+	if event.SourceEventID.Valid {
+		if _, ok := sourceEventIDs[strings.TrimSpace(event.SourceEventID.String)]; ok {
+			return true
+		}
+	}
+	if event.SentinelEventID.Valid {
+		if _, ok := sentinelEventIDs[strings.TrimSpace(event.SentinelEventID.String)]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func splitMaterializedStages(stages []materializedTraceStageDTO) ([]materializedTraceStageDTO, []materializedTraceStageDTO, []materializedTraceStageDTO) {
+	if len(stages) == 0 {
+		return nil, nil, nil
+	}
+	runtimeStages := make([]materializedTraceStageDTO, 0, len(stages))
+	durableStages := make([]materializedTraceStageDTO, 0, len(stages))
+	anomalyStages := make([]materializedTraceStageDTO, 0, len(stages))
+	for _, stage := range stages {
+		switch strings.TrimSpace(stage.Source) {
+		case "durable":
+			durableStages = append(durableStages, stage)
+		case "anomaly":
+			anomalyStages = append(anomalyStages, stage)
+		default:
+			runtimeStages = append(runtimeStages, stage)
+		}
+	}
+	return runtimeStages, durableStages, anomalyStages
+}
+
 func materializeControlTrace(outbox []controlOutboxRow, acks []policyAckRow, runtime []runtimeTraceMarkerDTO) *materializedTraceDTO {
 	if len(outbox) == 0 && len(acks) == 0 && len(runtime) == 0 {
 		return nil
 	}
 
-	primaryOutbox, primaryAck, traceID := selectMaterializedTraceRows(outbox, acks, runtime)
+	selection := selectMaterializedTraceContext(outbox, acks, runtime)
+	primaryOutbox := selection.Outbox
+	primaryAck := selection.Ack
+	traceID := selection.TraceID
 	firstAck, latestAck := selectMaterializedAckBounds(acks, traceID)
 	if latestAck != nil {
 		primaryAck = latestAck
 	}
+	anomalies := append([]materializedTraceAnomalyDTO(nil), selection.Anomalies...)
 	sourceEventID := ""
 	sentinelEventID := ""
 	sourceEventTsMs := int64(0)
@@ -1376,35 +2046,60 @@ func materializeControlTrace(outbox []controlOutboxRow, acks []policyAckRow, run
 	firstPolicyAckMs := materializedAckTs(firstAck)
 	policyAckMs := materializedAckTs(primaryAck)
 	latencies := make([]materializedTraceLatencyDTO, 0, 12)
-	appendLatency := func(name string, start, end int64) {
-		if duration, ok, _ := utils.DurationMillis(start, end); ok {
+	appendLatency := func(name string, start, end int64, startStage string, endStage string) {
+		if start <= 0 || end <= 0 {
+			return
+		}
+		if duration, ok, negative := utils.DurationMillis(start, end); ok {
 			latencies = append(latencies, materializedTraceLatencyDTO{Name: name, DurationMs: duration})
+		} else if negative {
+			latencies = append(latencies, materializedTraceLatencyDTO{
+				Name:       name,
+				DurationMs: end - start,
+				Negative:   true,
+				Reason:     "selected timestamps are causally inverted",
+			})
+			anomalies = append(anomalies, materializedTraceAnomalyDTO{
+				Code:          "negative_latency",
+				Message:       fmt.Sprintf("%s is negative because %s precedes %s for the selected durable rows", name, endStage, startStage),
+				RelatedStages: []string{startStage, endStage},
+			})
 		}
 	}
-	appendLatency("source_to_ai_decision", sourceEventTsMs, aiEventTsMs)
-	appendLatency("ai_decision_to_outbox_created", aiEventTsMs, outboxCreatedMs)
-	appendLatency("outbox_created_to_published", outboxCreatedMs, publishedMs)
-	appendLatency("published_to_outbox_ack", publishedMs, outboxAckMs)
-	appendLatency("outbox_created_to_outbox_ack", outboxCreatedMs, outboxAckMs)
-	appendLatency("published_to_first_policy_ack", publishedMs, firstPolicyAckMs)
-	appendLatency("source_to_first_policy_ack", sourceEventTsMs, firstPolicyAckMs)
-	appendLatency("ai_decision_to_first_policy_ack", aiEventTsMs, firstPolicyAckMs)
-	appendLatency("published_to_policy_ack", publishedMs, policyAckMs)
-	appendLatency("source_to_policy_ack", sourceEventTsMs, policyAckMs)
-	appendLatency("ai_decision_to_policy_ack", aiEventTsMs, policyAckMs)
-	appendLatency("published_to_ack", publishedMs, policyAckMs)
-	appendLatency("source_to_ack", sourceEventTsMs, policyAckMs)
-	appendLatency("ai_decision_to_ack", aiEventTsMs, policyAckMs)
-	appendLatency("telemetry_ingest_to_ai_decision", upstreamStages["t_telemetry_ingest"], aiEventTsMs)
-	appendLatency("telemetry_to_sentinel_emit", upstreamStages["t_telemetry_ingest"], upstreamStages["t_sentinel_emit"])
-	appendLatency("sentinel_emit_to_ai_decision", upstreamStages["t_sentinel_emit"], aiEventTsMs)
-	appendLatency("ai_decision_to_backend_consume", aiEventTsMs, stageTimestamp(stages, "t_backend_consume"))
-	appendLatency("backend_consume_to_commit", stageTimestamp(stages, "t_backend_consume"), stageTimestamp(stages, "t_commit"))
-	appendLatency("commit_to_publish", stageTimestamp(stages, "t_commit"), publishedMs)
-	appendLatency("publish_to_ack", publishedMs, policyAckMs)
+	appendLatency("source_to_ai_decision", sourceEventTsMs, aiEventTsMs, "t_source_event", "t_ai_decision_done")
+	appendLatency("ai_decision_to_outbox_persisted", aiEventTsMs, outboxCreatedMs, "t_ai_decision_done", "t_outbox_row_created")
+	appendLatency("outbox_persisted_to_published", outboxCreatedMs, publishedMs, "t_outbox_row_created", "t_control_publish_ack")
+	appendLatency("published_to_outbox_ack", publishedMs, outboxAckMs, "t_control_publish_ack", "t_outbox_acked")
+	appendLatency("outbox_persisted_to_outbox_ack", outboxCreatedMs, outboxAckMs, "t_outbox_row_created", "t_outbox_acked")
+	appendLatency("published_to_first_policy_ack", publishedMs, firstPolicyAckMs, "t_control_publish_ack", "t_first_policy_ack")
+	appendLatency("source_to_first_policy_ack", sourceEventTsMs, firstPolicyAckMs, "t_source_event", "t_first_policy_ack")
+	appendLatency("ai_decision_to_first_policy_ack", aiEventTsMs, firstPolicyAckMs, "t_ai_decision_done", "t_first_policy_ack")
+	appendLatency("published_to_policy_ack", publishedMs, policyAckMs, "t_control_publish_ack", "t_policy_ack")
+	appendLatency("source_to_policy_ack", sourceEventTsMs, policyAckMs, "t_source_event", "t_policy_ack")
+	appendLatency("ai_decision_to_policy_ack", aiEventTsMs, policyAckMs, "t_ai_decision_done", "t_policy_ack")
+	appendLatency("published_to_ack", publishedMs, policyAckMs, "t_control_publish_ack", "t_ack")
+	appendLatency("source_to_ack", sourceEventTsMs, policyAckMs, "t_source_event", "t_ack")
+	appendLatency("ai_decision_to_ack", aiEventTsMs, policyAckMs, "t_ai_decision_done", "t_ack")
+	appendLatency("telemetry_ingest_to_ai_decision", upstreamStages["t_telemetry_ingest"], aiEventTsMs, "t_telemetry_ingest", "t_ai_decision_done")
+	appendLatency("telemetry_to_sentinel_emit", upstreamStages["t_telemetry_ingest"], upstreamStages["t_sentinel_emit"], "t_telemetry_ingest", "t_sentinel_emit")
+	appendLatency("sentinel_emit_to_ai_decision", upstreamStages["t_sentinel_emit"], aiEventTsMs, "t_sentinel_emit", "t_ai_decision_done")
+	appendLatency("ai_decision_to_backend_consume", aiEventTsMs, stageTimestamp(stages, "t_backend_consume"), "t_ai_decision_done", "t_backend_consume")
+	appendLatency("backend_consume_to_commit", stageTimestamp(stages, "t_backend_consume"), stageTimestamp(stages, "t_commit"), "t_backend_consume", "t_commit")
+	appendLatency("commit_to_publish", stageTimestamp(stages, "t_commit"), publishedMs, "t_commit", "t_control_publish_ack")
+	appendLatency("publish_to_ack", publishedMs, policyAckMs, "t_control_publish_ack", "t_ack")
+
+	if primaryOutbox != nil && !primaryOutbox.PublishedAt.Valid && (outboxAckMs > 0 || firstPolicyAckMs > 0 || policyAckMs > 0) {
+		anomalies = append(anomalies, materializedTraceAnomalyDTO{
+			Code:             "missing_publish_stage",
+			Message:          "selected durable outbox row has ACK state but no published_at timestamp",
+			RelatedStages:    []string{"t_control_publish_ack", "t_outbox_acked", "t_policy_ack"},
+			SelectedOutboxID: primaryOutbox.ID,
+		})
+	}
 
 	actionHistory := materializedActionHistory(outbox, acks)
 	currentAction, lastCompletedAction := summarizeActionHistory(actionHistory)
+	runtimeStages, durableStages, anomalyStages := splitMaterializedStages(stages)
 	return &materializedTraceDTO{
 		TraceID:             traceID,
 		SourceEventID:       sourceEventID,
@@ -1418,7 +2113,11 @@ func materializeControlTrace(outbox []controlOutboxRow, acks []policyAckRow, run
 		CurrentAction:       currentAction,
 		LastCompletedAction: lastCompletedAction,
 		Stages:              stages,
+		RuntimeStages:       runtimeStages,
+		DurableStages:       durableStages,
+		AnomalyStages:       anomalyStages,
 		Latencies:           latencies,
+		Anomalies:           anomalies,
 	}
 }
 
@@ -1688,7 +2387,30 @@ func stageTimestamp(stages []materializedTraceStageDTO, stage string) int64 {
 	return 0
 }
 
+func firstStageTimestamp(stages []materializedTraceStageDTO, stage string) int64 {
+	for _, item := range stages {
+		if item.Stage == stage && item.TimestampMs > 0 {
+			return item.TimestampMs
+		}
+	}
+	return 0
+}
+
+func lastStageTimestamp(stages []materializedTraceStageDTO, stage string) int64 {
+	for i := len(stages) - 1; i >= 0; i-- {
+		if stages[i].Stage == stage && stages[i].TimestampMs > 0 {
+			return stages[i].TimestampMs
+		}
+	}
+	return 0
+}
+
 func selectMaterializedTraceRows(outbox []controlOutboxRow, acks []policyAckRow, runtime []runtimeTraceMarkerDTO) (*controlOutboxRow, *policyAckRow, string) {
+	selection := selectMaterializedTraceContext(outbox, acks, runtime)
+	return selection.Outbox, selection.Ack, selection.TraceID
+}
+
+func selectMaterializedTraceContext(outbox []controlOutboxRow, acks []policyAckRow, runtime []runtimeTraceMarkerDTO) materializedTraceSelection {
 	traceID := ""
 	for _, row := range outbox {
 		if row.TraceID.Valid && strings.TrimSpace(row.TraceID.String) != "" {
@@ -1714,11 +2436,36 @@ func selectMaterializedTraceRows(outbox []controlOutboxRow, acks []policyAckRow,
 	}
 
 	var selectedOutbox *controlOutboxRow
+	anomalies := make([]materializedTraceAnomalyDTO, 0, 2)
 	if traceID != "" {
+		candidateIdx := make([]int, 0, len(outbox))
 		for i := range outbox {
 			if outbox[i].TraceID.Valid && strings.TrimSpace(outbox[i].TraceID.String) == traceID {
-				selectedOutbox = &outbox[i]
-				break
+				candidateIdx = append(candidateIdx, i)
+			}
+		}
+		if len(candidateIdx) > 0 {
+			selectedIdx := candidateIdx[0]
+			for _, idx := range candidateIdx[1:] {
+				if controlOutboxRowCanonicalLess(outbox[idx], outbox[selectedIdx]) {
+					selectedIdx = idx
+				}
+			}
+			selectedOutbox = &outbox[selectedIdx]
+			if len(candidateIdx) > 1 {
+				siblingIDs := make([]string, 0, len(candidateIdx)-1)
+				for _, idx := range candidateIdx {
+					if idx == selectedIdx {
+						continue
+					}
+					siblingIDs = append(siblingIDs, outbox[idx].ID)
+				}
+				anomalies = append(anomalies, materializedTraceAnomalyDTO{
+					Code:             "duplicate_outbox_rows",
+					Message:          fmt.Sprintf("multiple durable outbox rows share trace_id %q; canonical selection preferred the earliest publish-capable row", traceID),
+					SelectedOutboxID: outbox[selectedIdx].ID,
+					SiblingOutboxIDs: siblingIDs,
+				})
 			}
 		}
 	}
@@ -1739,7 +2486,68 @@ func selectMaterializedTraceRows(outbox []controlOutboxRow, acks []policyAckRow,
 		}
 	}
 
-	return selectedOutbox, selectedAck, traceID
+	return materializedTraceSelection{
+		Outbox:    selectedOutbox,
+		Ack:       selectedAck,
+		TraceID:   traceID,
+		Anomalies: anomalies,
+	}
+}
+
+func controlOutboxRowCanonicalLess(a, b controlOutboxRow) bool {
+	if rankA, rankB := controlOutboxCanonicalStatusRank(a), controlOutboxCanonicalStatusRank(b); rankA != rankB {
+		return rankA < rankB
+	}
+	if a.BlockHeight != b.BlockHeight {
+		if a.BlockHeight == 0 {
+			return false
+		}
+		if b.BlockHeight == 0 {
+			return true
+		}
+		return a.BlockHeight < b.BlockHeight
+	}
+	if a.TxIndex != b.TxIndex {
+		return a.TxIndex < b.TxIndex
+	}
+	if !a.CreatedAt.Equal(b.CreatedAt) {
+		if a.CreatedAt.IsZero() {
+			return false
+		}
+		if b.CreatedAt.IsZero() {
+			return true
+		}
+		return a.CreatedAt.Before(b.CreatedAt)
+	}
+	if !a.UpdatedAt.Equal(b.UpdatedAt) {
+		if a.UpdatedAt.IsZero() {
+			return false
+		}
+		if b.UpdatedAt.IsZero() {
+			return true
+		}
+		return a.UpdatedAt.Before(b.UpdatedAt)
+	}
+	return strings.TrimSpace(a.ID) < strings.TrimSpace(b.ID)
+}
+
+func controlOutboxCanonicalStatusRank(row controlOutboxRow) int {
+	switch {
+	case row.AckedAt.Valid || strings.EqualFold(strings.TrimSpace(row.Status), "acked"):
+		return 0
+	case row.PublishedAt.Valid || strings.EqualFold(strings.TrimSpace(row.Status), "published"):
+		return 1
+	case strings.EqualFold(strings.TrimSpace(row.Status), "publishing"):
+		return 2
+	case strings.EqualFold(strings.TrimSpace(row.Status), "retry"):
+		return 3
+	case strings.EqualFold(strings.TrimSpace(row.Status), "pending"):
+		return 4
+	case strings.EqualFold(strings.TrimSpace(row.Status), "terminal_failed"):
+		return 5
+	default:
+		return 6
+	}
 }
 
 func materializedAckTs(ack *policyAckRow) int64 {

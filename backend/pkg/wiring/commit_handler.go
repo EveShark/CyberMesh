@@ -66,6 +66,23 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 			utils.ZapInt("tx_count", ab.GetTransactionCount()))
 	}
 
+	qcTsMs := int64(0)
+	qcView := uint64(0)
+	var qcData []byte
+	if qc != nil {
+		qcTsMs = qc.GetTimestamp().UnixMilli()
+		qcView = qc.GetView()
+		var encodeErr error
+		qcData, encodeErr = encodeCommittedQC(qc)
+		if encodeErr != nil {
+			s.log.Warn("failed to encode committed QC metadata",
+				utils.ZapUint64("height", ab.GetHeight()),
+				utils.ZapError(encodeErr))
+		}
+	}
+	s.logPolicyStageForBlock("t_qc_formed", ab, qcView, ab.GetHeight(), qcTsMs)
+	s.logPolicyStageForBlock("t_commit", ab, qcView, ab.GetHeight(), qcTsMs)
+
 	// Execute deterministically against state store (use block timestamp, not wall clock)
 	blockTime := ab.GetTimestamp()
 	skew := s.cfg.TimestampSkew
@@ -145,22 +162,6 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 			utils.ZapString("state_root", fmt.Sprintf("%x", root[:8])),
 			utils.ZapUint64("version", version))
 	}
-	qcTsMs := int64(0)
-	qcView := uint64(0)
-	var qcData []byte
-	if qc != nil {
-		qcTsMs = qc.GetTimestamp().UnixMilli()
-		qcView = qc.GetView()
-		var encodeErr error
-		qcData, encodeErr = encodeCommittedQC(qc)
-		if encodeErr != nil {
-			s.log.Warn("failed to encode committed QC metadata",
-				utils.ZapUint64("height", ab.GetHeight()),
-				utils.ZapError(encodeErr))
-		}
-	}
-	s.logPolicyStageForBlock("t_qc_formed", ab, qcView, ab.GetHeight(), qcTsMs)
-	s.logPolicyStageForBlock("t_commit", ab, qcView, ab.GetHeight(), qcTsMs)
 
 	// Prune old state versions to prevent memory growth
 	if memStore, ok := s.store.(*state.MemStore); ok {

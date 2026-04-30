@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -145,13 +146,16 @@ func (s *Server) noteControlTimeout(err error, mutation bool) {
 	}
 }
 
-func (s *Server) enforceMutationThrottle(actor, targetKey string) *controlMutationGateError {
+func (s *Server) enforceMutationThrottle(principalKey, actor, targetKey string) *controlMutationGateError {
 	if s == nil || s.config == nil {
 		return nil
 	}
 	if s.controlMutationLimiter != nil {
-		allowed, _ := s.controlMutationLimiter.Allow(actor)
-		if !allowed {
+		for _, key := range mutationThrottleKeys(principalKey, actor) {
+			allowed, _ := s.controlMutationLimiter.Allow(key)
+			if allowed {
+				continue
+			}
 			s.controlMutationRateLimitedTotal.Add(1)
 			return &controlMutationGateError{
 				Code:       "CONTROL_MUTATION_RATE_LIMITED",
@@ -179,4 +183,17 @@ func (s *Server) enforceMutationThrottle(actor, targetKey string) *controlMutati
 	s.controlMutationLastActionByTarget[targetKey] = now
 	s.controlMutationLastActionMu.Unlock()
 	return nil
+}
+
+func mutationThrottleKeys(principalKey, actor string) []string {
+	keys := make([]string, 0, 2)
+	principalKey = strings.TrimSpace(principalKey)
+	actor = strings.TrimSpace(actor)
+	if principalKey != "" {
+		keys = append(keys, principalKey)
+	}
+	if actor != "" && actor != principalKey {
+		keys = append(keys, actor)
+	}
+	return keys
 }

@@ -129,12 +129,13 @@ func (s *Server) handleControlOutboxMutation(w http.ResponseWriter, r *http.Requ
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.controlMutationTimeout())
 	defer cancel()
+	principalKey := s.resolveMutationPrincipal(r)
 	actor := s.resolveMutationActor(r, tenantScope)
 	requestID := getRequestID(r.Context())
 	commandID := generateCommandID()
 	workflowID := resolveWorkflowID(r, req.WorkflowID)
 	// Rate limit remains per actor, while cooldown is keyed by mutation target.
-	if gateErr := s.enforceMutationThrottle(actor, action+"|"+rowID); gateErr != nil {
+	if gateErr := s.enforceMutationThrottle(principalKey, actor, action+"|"+rowID); gateErr != nil {
 		writeErrorResponse(w, r, gateErr.Code, gateErr.Message, gateErr.HTTPStatus)
 		return
 	}
@@ -419,6 +420,7 @@ func (s *Server) handleControlLeaseForceTakeover(w http.ResponseWriter, r *http.
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), s.controlMutationTimeout())
 	defer cancel()
+	principalKey := s.resolveMutationPrincipal(r)
 	actor := s.resolveMutationActor(r, tenantScope)
 	requestID := getRequestID(r.Context())
 	commandID := generateCommandID()
@@ -455,7 +457,7 @@ func (s *Server) handleControlLeaseForceTakeover(w http.ResponseWriter, r *http.
 	if leaseKey == "" {
 		leaseKey = "control.policy.dispatcher"
 	}
-	if gateErr := s.enforceMutationThrottle(actor, "force_takeover|"+leaseKey); gateErr != nil {
+	if gateErr := s.enforceMutationThrottle(principalKey, actor, "force_takeover|"+leaseKey); gateErr != nil {
 		writeErrorResponse(w, r, gateErr.Code, gateErr.Message, gateErr.HTTPStatus)
 		return
 	}
@@ -614,13 +616,21 @@ func (s *Server) requireControlMutationAllowedWithOptions(r *http.Request, bypas
 }
 
 func (s *Server) resolveMutationActor(r *http.Request, tenantScope string) string {
-	principalID := strings.TrimSpace(s.resolveLegacyPrincipalID(r))
+	principalID := strings.TrimSpace(s.resolveMutationPrincipal(r))
 	if principalID == "" {
 		principalID = "legacy:unauthenticated"
 	}
 	tenantScope = strings.TrimSpace(tenantScope)
 	if tenantScope != "" {
 		return principalID + ":" + tenantScope
+	}
+	return principalID
+}
+
+func (s *Server) resolveMutationPrincipal(r *http.Request) string {
+	principalID := strings.TrimSpace(s.resolveLegacyPrincipalID(r))
+	if principalID == "" {
+		return "legacy:unauthenticated"
 	}
 	return principalID
 }
@@ -782,6 +792,23 @@ func tenantScopeMatchesOutboxRow(row controlOutboxRow, tenantScope string) bool 
 	if target, ok := payload["target"].(map[string]interface{}); ok {
 		candidates = append(candidates, extractMapString(target, "tenant"))
 		candidates = append(candidates, extractMapString(target, "tenant_id"))
+	}
+	scopeCandidates := []string{
+		extractMapString(payload, "scope_identifier"),
+	}
+	if metadata, ok := payload["metadata"].(map[string]interface{}); ok {
+		scopeCandidates = append(scopeCandidates, extractMapString(metadata, "scope_identifier"))
+	}
+	if trace, ok := payload["trace"].(map[string]interface{}); ok {
+		scopeCandidates = append(scopeCandidates, extractMapString(trace, "scope_identifier"))
+	}
+	if target, ok := payload["target"].(map[string]interface{}); ok {
+		scopeCandidates = append(scopeCandidates, extractMapString(target, "scope"))
+	}
+	for _, scope := range scopeCandidates {
+		if strings.EqualFold(strings.TrimSpace(scope), "cluster") {
+			return true
+		}
 	}
 	for _, candidate := range candidates {
 		if strings.TrimSpace(candidate) == strings.TrimSpace(tenantScope) {

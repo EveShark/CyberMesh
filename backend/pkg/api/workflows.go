@@ -344,10 +344,11 @@ func (s *Server) handleWorkflowRollback(w http.ResponseWriter, r *http.Request) 
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), s.controlMutationTimeout())
 	defer cancel()
+	principalKey := s.resolveMutationPrincipal(r)
 	actor := s.resolveMutationActor(r, tenantScope)
 	requestID := getRequestID(r.Context())
 	commandID := generateCommandID()
-	if gateErr := s.enforceMutationThrottle(actor, "rollback|"+workflowID); gateErr != nil {
+	if gateErr := s.enforceMutationThrottle(principalKey, actor, "rollback|"+workflowID); gateErr != nil {
 		writeErrorResponse(w, r, gateErr.Code, gateErr.Message, gateErr.HTTPStatus)
 		return
 	}

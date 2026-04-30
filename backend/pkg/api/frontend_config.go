@@ -34,14 +34,30 @@ func (s *Server) handleFrontendConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	frontendZitadelIssuer := strings.TrimSpace(getEnvOrDefault("FRONTEND_ZITADEL_ISSUER", s.config.ZitadelIssuer))
+	frontendZitadelClientID := strings.TrimSpace(getEnvOrDefault("FRONTEND_ZITADEL_CLIENT_ID", s.config.ZitadelClientID))
+	frontendZitadelEnabled := frontendZitadelIssuer != "" && frontendZitadelClientID != ""
+	if override := strings.TrimSpace(os.Getenv("FRONTEND_ZITADEL_ENABLED")); override != "" {
+		switch strings.ToLower(override) {
+		case "true", "1", "yes", "on":
+			frontendZitadelEnabled = true
+		case "false", "0", "no", "off":
+			frontendZitadelEnabled = false
+		}
+	}
+	if !frontendZitadelEnabled {
+		frontendZitadelIssuer = ""
+		frontendZitadelClientID = ""
+	}
+
 	config := FrontendConfig{
 		SupabaseURL:       getEnvOrDefault("VITE_SUPABASE_URL", "https://wcgddjipyslnjstabqaq.supabase.co"),
 		SupabaseProjectID: getEnvOrDefault("VITE_SUPABASE_PROJECT_ID", "wcgddjipyslnjstabqaq"),
 		SupabaseKey:       getEnvOrDefault("VITE_SUPABASE_PUBLISHABLE_KEY", ""),
 		DemoMode:          getEnvOrDefault("VITE_DEMO_MODE", "false"),
-		ZitadelIssuer:     strings.TrimSpace(s.config.ZitadelIssuer),
-		ZitadelClientID:   strings.TrimSpace(s.config.ZitadelClientID),
-		ZitadelEnabled:    strings.TrimSpace(s.config.ZitadelIssuer) != "" && strings.TrimSpace(s.config.ZitadelClientID) != "",
+		ZitadelIssuer:     frontendZitadelIssuer,
+		ZitadelClientID:   frontendZitadelClientID,
+		ZitadelEnabled:    frontendZitadelEnabled,
 	}
 
 	// Set CORS headers for frontend access

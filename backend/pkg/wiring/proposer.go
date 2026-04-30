@@ -574,6 +574,7 @@ func (s *Service) logPolicyStageForBlock(stage string, blk *block.AppBlock, view
 	if stage == "t_qc_formed" && qcTsMs > 0 {
 		stageTsMs = qcTsMs
 	}
+	recorded := 0
 	for _, tx := range blk.Transactions() {
 		if tx == nil || tx.Type() != state.TxPolicy {
 			continue
@@ -582,18 +583,6 @@ func (s *Service) logPolicyStageForBlock(stage string, blk *block.AppBlock, view
 		if policyID == "" {
 			continue
 		}
-		zf := []zap.Field{
-			utils.ZapString("stage", stage),
-			utils.ZapString("policy_id", policyID),
-			utils.ZapString("trace_id", traceID),
-			utils.ZapInt64("t_ms", stageTsMs),
-			utils.ZapUint64("height", height),
-			utils.ZapUint64("view", view),
-		}
-		if qcTsMs > 0 {
-			zf = append(zf, utils.ZapInt64("qc_ts_ms", qcTsMs))
-		}
-		s.log.Info("policy stage marker", zf...)
 		if s.policyTraceCollector != nil {
 			s.policyTraceCollector.Record(policytrace.Marker{
 				Stage:       stage,
@@ -605,6 +594,20 @@ func (s *Service) logPolicyStageForBlock(stage string, blk *block.AppBlock, view
 				QCTsMs:      qcTsMs,
 			})
 		}
+		recorded++
+	}
+	if recorded > 0 {
+		fields := []zap.Field{
+			utils.ZapString("stage", stage),
+			utils.ZapInt("policy_markers", recorded),
+			utils.ZapInt64("t_ms", stageTsMs),
+			utils.ZapUint64("height", height),
+			utils.ZapUint64("view", view),
+		}
+		if qcTsMs > 0 {
+			fields = append(fields, utils.ZapInt64("qc_ts_ms", qcTsMs))
+		}
+		s.log.Debug("policy stage markers recorded", fields...)
 	}
 }
 

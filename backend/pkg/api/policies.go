@@ -649,11 +649,12 @@ func (s *Server) handlePolicyDecision(w http.ResponseWriter, r *http.Request, ac
 	ctx, cancel := context.WithTimeout(r.Context(), s.controlMutationTimeout())
 	defer cancel()
 
+	principalKey := s.resolveMutationPrincipal(r)
 	actor := s.resolveMutationActor(r, tenantScope)
 	requestID := getRequestID(r.Context())
 	commandID := generateCommandID()
 	workflowID := resolveWorkflowID(r, req.WorkflowID)
-	if gateErr := s.enforceMutationThrottle(actor, action+"|"+policyID); gateErr != nil {
+	if gateErr := s.enforceMutationThrottle(principalKey, actor, action+"|"+policyID); gateErr != nil {
 		writeErrorResponse(w, r, gateErr.Code, gateErr.Message, gateErr.HTTPStatus)
 		return
 	}
@@ -1069,7 +1070,12 @@ func (s *Server) loadPolicyTraceDetail(parent context.Context, policyID, tenantS
 		}
 	}
 
-	materialized := materializeControlTrace(outboxRowsRaw, ackRowsRaw, runtimeMarkers)
+	traceEvents, err := loadPolicyTraceEvents(ctx, db, schema, policyID, tenantScope, outboxRowsRaw, ackRowsRaw)
+	if err != nil {
+		return controlTraceResponse{}, err
+	}
+
+	materialized := materializeControlTraceWithEvents(traceEvents, outboxRowsRaw, ackRowsRaw, runtimeMarkers)
 	traceID, sourceEventID, sentinelEventID := materializedTraceLineage(outboxRowsRaw, ackRowsRaw, materialized)
 	return controlTraceResponse{
 		PolicyID:        policyID,

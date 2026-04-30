@@ -3,15 +3,18 @@ package policyack
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"backend/pkg/control/lifecycleaudit"
-	"backend/pkg/observability"
 	"backend/pkg/control/policystate"
+	"backend/pkg/control/policytrace"
+	"backend/pkg/observability"
 	"backend/pkg/utils"
 	pb "backend/proto"
 	"go.opentelemetry.io/otel/attribute"
@@ -20,12 +23,14 @@ import (
 )
 
 type Store struct {
-	db          *sql.DB
-	stats       ackStoreStats
-	schemaMu    sync.Mutex
-	schemaReady bool
-	eventsCols  ackOptionalColumns
-	acksCols    ackOptionalColumns
+	db             *sql.DB
+	traceEvents    *policytrace.Store
+	traceCollector *policytrace.Collector
+	stats          ackStoreStats
+	schemaMu       sync.Mutex
+	schemaReady    bool
+	eventsCols     ackOptionalColumns
+	acksCols       ackOptionalColumns
 }
 
 type ackOptionalColumns struct {
@@ -144,6 +149,20 @@ func NewStore(db *sql.DB) (*Store, error) {
 	}, nil
 }
 
+func (s *Store) SetPolicyTraceStore(store *policytrace.Store) {
+	if s == nil {
+		return
+	}
+	s.traceEvents = store
+}
+
+func (s *Store) SetPolicyTraceCollector(collector *policytrace.Collector) {
+	if s == nil {
+		return
+	}
+	s.traceCollector = collector
+}
+
 func (s *Store) Upsert(ctx context.Context, evt *pb.PolicyAckEvent, observedAt time.Time) error {
 	policyID := ""
 	result := ""
@@ -185,6 +204,15 @@ func (s *Store) Upsert(ctx context.Context, evt *pb.PolicyAckEvent, observedAt t
 	if observedAt.IsZero() {
 		observedAt = time.Now().UTC()
 	}
+	enforcementStages := map[string]int64{}
+	if appliedAt.Valid {
+		enforcementStages[policytrace.StageEnforcementApplyDone] = appliedAt.Time.UTC().UnixMilli()
+	}
+	if ackedAt.Valid {
+		enforcementStages[policytrace.StageAckPublishDone] = ackedAt.Time.UTC().UnixMilli()
+	}
+	s.AppendEnforcementTraceEvents(ctx, evt, enforcementStages)
+	s.appendAckTraceEvent(ctx, evt, policytrace.StageAckReceived, policytrace.StageClassDurable, observedAt.UTC().UnixMilli(), "ack message received by backend", nil)
 
 	if err := s.insertEvent(ctx, evt, appliedAt, ackedAt, observedAt.UTC()); err != nil {
 		span.RecordError(err)
@@ -199,6 +227,11 @@ func (s *Store) Upsert(ctx context.Context, evt *pb.PolicyAckEvent, observedAt t
 		span.SetStatus(codes.Error, "acks_upsert_failed")
 		return fmt.Errorf("policy ack store: upsert failed: %w", err)
 	}
+	ackPersistedAtMs := time.Now().UTC().UnixMilli()
+	if ackPersistedAtMs < observedAt.UTC().UnixMilli() {
+		ackPersistedAtMs = observedAt.UTC().UnixMilli()
+	}
+	s.appendAckTraceEvent(ctx, evt, policytrace.StageAckPersisted, policytrace.StageClassDurable, ackPersistedAtMs, "ack summary persisted", nil)
 	if !isTerminalAckResult(evt.Result) {
 		return nil
 	}
@@ -209,7 +242,20 @@ func (s *Store) Upsert(ctx context.Context, evt *pb.PolicyAckEvent, observedAt t
 	if corrErr != nil {
 		span.RecordError(corrErr)
 		if isOutboxMissingErr(corrErr) {
+			s.appendAckTraceEvent(ctx, evt, policytrace.StageAckUnresolved, policytrace.StageClassAnomaly, observedAt.UTC().UnixMilli(), "outbox row missing during ACK correlation", map[string]string{
+				"correlation_mode": string(correlationUnresolved),
+				"error":            corrErr.Error(),
+			})
 			span.SetStatus(codes.Ok, "outbox_missing")
+			return nil
+		}
+		if errors.Is(corrErr, errAckCorrelationAmbiguous) {
+			s.appendAckTraceEvent(ctx, evt, policytrace.StageAckAmbiguous, policytrace.StageClassAnomaly, observedAt.UTC().UnixMilli(), "multiple outbox rows matched ACK correlation selectors", map[string]string{
+				"correlation_mode": string(correlationAmbiguous),
+				"error":            corrErr.Error(),
+			})
+			s.stats.correlationNoMatch.Add(1)
+			span.SetStatus(codes.Ok, "correlate_outbox_ambiguous")
 			return nil
 		}
 		s.stats.correlationErrors.Add(1)
@@ -232,6 +278,11 @@ func (s *Store) Upsert(ctx context.Context, evt *pb.PolicyAckEvent, observedAt t
 		s.stats.correlationFallbackTrace.Add(1)
 	default:
 		s.stats.correlationNoMatch.Add(1)
+	}
+	if mode == correlationNone {
+		s.appendAckTraceEvent(ctx, evt, policytrace.StageAckUnresolved, policytrace.StageClassAnomaly, observedAt.UTC().UnixMilli(), "no strong outbox correlation match found for ACK", map[string]string{
+			"correlation_mode": string(correlationUnresolved),
+		})
 	}
 
 	// AI/source causal latencies are only considered strong when correlation included trace linkage.
@@ -337,6 +388,121 @@ func eventTime(unixMs, unixSec int64) (time.Time, bool) {
 	return time.Time{}, false
 }
 
+func (s *Store) appendPolicyTraceEvent(ctx context.Context, event policytrace.TraceEvent) {
+	if s == nil {
+		return
+	}
+	traceStore := s.traceEvents
+	if traceStore == nil && s.db != nil {
+		traceStore = policytrace.NewStore(s.db)
+	}
+	if traceStore == nil {
+		if strings.HasPrefix(event.Stage, "t_ack") {
+			fmt.Fprintf(os.Stderr, "policyack trace append fallback-no-store policy=%s trace=%s stage=%s\n", event.PolicyID, event.TraceID, event.Stage)
+		}
+		if s.traceCollector != nil {
+			s.traceCollector.Record(policytrace.Marker{
+				Stage:       event.Stage,
+				PolicyID:    event.PolicyID,
+				TraceID:     event.TraceID,
+				Reason:      event.Reason,
+				TimestampMs: event.TimestampMs,
+				Height:      event.Height,
+				View:        event.View,
+				QCTsMs:      event.QCTsMs,
+				OutboxID:    event.OutboxID,
+				Partition:   event.Partition,
+				Offset:      event.Offset,
+			})
+		}
+		return
+	}
+	if err := traceStore.Append(ctx, event); err != nil {
+		if strings.HasPrefix(event.Stage, "t_ack") {
+			fmt.Fprintf(os.Stderr, "policyack trace append failed policy=%s trace=%s stage=%s err=%v\n", event.PolicyID, event.TraceID, event.Stage, err)
+		}
+		if s.traceCollector != nil {
+			s.traceCollector.Record(policytrace.Marker{
+				Stage:       event.Stage,
+				PolicyID:    event.PolicyID,
+				TraceID:     event.TraceID,
+				Reason:      event.Reason,
+				TimestampMs: event.TimestampMs,
+				Height:      event.Height,
+				View:        event.View,
+				QCTsMs:      event.QCTsMs,
+				OutboxID:    event.OutboxID,
+				Partition:   event.Partition,
+				Offset:      event.Offset,
+			})
+		}
+		return
+	}
+	if strings.HasPrefix(event.Stage, "t_ack") {
+		fmt.Fprintf(os.Stderr, "policyack trace append ok policy=%s trace=%s stage=%s\n", event.PolicyID, event.TraceID, event.Stage)
+	}
+}
+
+func (s *Store) appendAckTraceEvent(ctx context.Context, evt *pb.PolicyAckEvent, stage string, stageClass policytrace.StageClass, timestampMs int64, reason string, details map[string]string) {
+	s.appendAckTraceEventWithSource(ctx, evt, stage, stageClass, policytrace.StageSourceBackend, timestampMs, reason, details)
+}
+
+func (s *Store) appendAckTraceEventWithSource(ctx context.Context, evt *pb.PolicyAckEvent, stage string, stageClass policytrace.StageClass, stageSource string, timestampMs int64, reason string, details map[string]string) {
+	if s == nil || evt == nil || strings.TrimSpace(evt.GetPolicyId()) == "" || timestampMs <= 0 {
+		return
+	}
+	if strings.TrimSpace(stageSource) == "" {
+		stageSource = policytrace.StageSourceBackend
+	}
+	traceID := strings.TrimSpace(evt.GetTraceId())
+	if traceID == "" {
+		traceID = strings.TrimSpace(evt.GetQcReference())
+	}
+	if traceID == "" {
+		traceID = "ack:" + strings.TrimSpace(evt.GetPolicyId())
+	}
+	event := policytrace.TraceEvent{
+		PolicyID:        strings.TrimSpace(evt.GetPolicyId()),
+		TraceID:         traceID,
+		Stage:           stage,
+		StageClass:      stageClass,
+		StageSource:     stageSource,
+		TimestampMs:     timestampMs,
+		RequestID:       strings.TrimSpace(evt.GetRequestId()),
+		CommandID:       strings.TrimSpace(evt.GetCommandId()),
+		WorkflowID:      strings.TrimSpace(evt.GetWorkflowId()),
+		SourceEventID:   strings.TrimSpace(evt.GetSourceEventId()),
+		SentinelEventID: strings.TrimSpace(evt.GetSentinelEventId()),
+		AckEventID:      strings.TrimSpace(evt.GetAckEventId()),
+		RuleHash:        append([]byte(nil), evt.GetRuleHash()...),
+		ScopeIdentifier: strings.TrimSpace(evt.GetScopeIdentifier()),
+		Tenant:          strings.TrimSpace(evt.GetTenant()),
+		Region:          strings.TrimSpace(evt.GetRegion()),
+		Reason:          strings.TrimSpace(reason),
+		Details:         details,
+	}
+	s.appendPolicyTraceEvent(ctx, event)
+}
+
+func (s *Store) AppendEnforcementTraceEvents(ctx context.Context, evt *pb.PolicyAckEvent, stageTimes map[string]int64) {
+	if s == nil || evt == nil || len(stageTimes) == 0 {
+		return
+	}
+	for _, stage := range []string{
+		policytrace.StageEnforcementConsume,
+		policytrace.StageEnforcementApplyDone,
+		policytrace.StageEnforcementPersisted,
+		policytrace.StageAckPublishStart,
+		policytrace.StageAckPublishDone,
+	} {
+		ts := stageTimes[stage]
+		if ts <= 0 {
+			continue
+		}
+		s.appendAckTraceEventWithSource(ctx, evt, stage, policytrace.StageClassRuntime, policytrace.StageSourceEnforcement, ts, "enforcement runtime stage from ACK producer", nil)
+	}
+}
+
 func (s *Store) insertEvent(ctx context.Context, evt *pb.PolicyAckEvent, appliedAt, ackedAt sql.NullTime, observedAt time.Time) error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("policy ack store: not initialized")
@@ -415,7 +581,11 @@ const (
 	correlationExact         correlationMode = "exact"
 	correlationFallbackHash  correlationMode = "fallback_hash"
 	correlationFallbackTrace correlationMode = "fallback_trace"
+	correlationUnresolved    correlationMode = "unresolved"
+	correlationAmbiguous     correlationMode = "ambiguous"
 )
+
+var errAckCorrelationAmbiguous = errors.New("policy ack store: ambiguous outbox correlation")
 
 const (
 	hashCorrelationMaxAge  = 5 * time.Minute
@@ -481,11 +651,28 @@ func (s *Store) correlateOutbox(ctx context.Context, evt *pb.PolicyAckEvent, ack
 }
 
 func (s *Store) correlateByCommandID(ctx context.Context, policyID, commandID, result, reason, controller string, ackedAt sql.NullTime, cutoff time.Time) (sql.NullInt64, sql.NullInt64, sql.NullTime, sql.NullTime, error) {
+	count, err := s.correlationCandidateCount(ctx, `
+		SELECT COUNT(*)
+		FROM control_policy_outbox
+		WHERE policy_id = $1
+		  AND command_id = $2
+		  AND status IN ('publishing', 'published', 'acked')
+		  AND created_at >= $3
+	`, policyID, commandID, cutoff)
+	if err != nil {
+		return sql.NullInt64{}, sql.NullInt64{}, sql.NullTime{}, sql.NullTime{}, err
+	}
+	if count == 0 {
+		return sql.NullInt64{}, sql.NullInt64{}, sql.NullTime{}, sql.NullTime{}, sql.ErrNoRows
+	}
+	if count > 1 {
+		return sql.NullInt64{}, sql.NullInt64{}, sql.NullTime{}, sql.NullTime{}, errAckCorrelationAmbiguous
+	}
 	var aiEventTsMs sql.NullInt64
 	var sourceEventTsMs sql.NullInt64
 	var publishedAt sql.NullTime
 	var ackedAtRow sql.NullTime
-	err := s.db.QueryRowContext(ctx, `
+	err = s.db.QueryRowContext(ctx, `
 		WITH chosen AS (
 			SELECT id, ai_event_ts_ms, source_event_ts_ms, published_at
 			FROM control_policy_outbox
@@ -493,7 +680,19 @@ func (s *Store) correlateByCommandID(ctx context.Context, policyID, commandID, r
 			  AND command_id = $2
 			  AND status IN ('publishing', 'published', 'acked')
 			  AND created_at >= $7
-			ORDER BY created_at DESC
+			ORDER BY
+			  CASE
+			    WHEN acked_at IS NOT NULL THEN 0
+			    WHEN published_at IS NOT NULL THEN 1
+			    WHEN status = 'published' THEN 2
+			    WHEN status = 'publishing' THEN 3
+			    ELSE 4
+			  END,
+			  CASE WHEN block_height > 0 THEN block_height ELSE 9223372036854775807 END ASC,
+			  CASE WHEN tx_index >= 0 THEN tx_index ELSE 2147483647 END ASC,
+			  created_at ASC,
+			  updated_at ASC,
+			  id ASC
 			LIMIT 1
 		)
 		UPDATE control_policy_outbox
@@ -501,7 +700,6 @@ func (s *Store) correlateByCommandID(ctx context.Context, policyID, commandID, r
 			ack_result=$3,
 			ack_reason=$4,
 			ack_controller=$5,
-			published_at=COALESCE(published_at, COALESCE($6, now())),
 			acked_at=COALESCE($6, now()),
 			updated_at=now()
 		WHERE id IN (SELECT id FROM chosen)
@@ -514,11 +712,29 @@ func (s *Store) correlateByCommandID(ctx context.Context, policyID, commandID, r
 }
 
 func (s *Store) correlateExact(ctx context.Context, policyID string, ruleHash []byte, traceID, result, reason, controller string, ackedAt sql.NullTime, cutoff time.Time) (sql.NullInt64, sql.NullInt64, sql.NullTime, sql.NullTime, error) {
+	count, err := s.correlationCandidateCount(ctx, `
+		SELECT COUNT(*)
+		FROM control_policy_outbox
+		WHERE policy_id = $1
+		  AND rule_hash = $2
+		  AND trace_id = $3
+		  AND status IN ('publishing', 'published', 'acked')
+		  AND created_at >= $4
+	`, policyID, ruleHash, traceID, cutoff)
+	if err != nil {
+		return sql.NullInt64{}, sql.NullInt64{}, sql.NullTime{}, sql.NullTime{}, err
+	}
+	if count == 0 {
+		return sql.NullInt64{}, sql.NullInt64{}, sql.NullTime{}, sql.NullTime{}, sql.ErrNoRows
+	}
+	if count > 1 {
+		return sql.NullInt64{}, sql.NullInt64{}, sql.NullTime{}, sql.NullTime{}, errAckCorrelationAmbiguous
+	}
 	var aiEventTsMs sql.NullInt64
 	var sourceEventTsMs sql.NullInt64
 	var publishedAt sql.NullTime
 	var ackedAtRow sql.NullTime
-	err := s.db.QueryRowContext(ctx, `
+	err = s.db.QueryRowContext(ctx, `
 		WITH chosen AS (
 			SELECT id, ai_event_ts_ms, source_event_ts_ms, published_at
 			FROM control_policy_outbox
@@ -527,7 +743,19 @@ func (s *Store) correlateExact(ctx context.Context, policyID string, ruleHash []
 			  AND trace_id = $3
 			  AND status IN ('publishing', 'published', 'acked')
 			  AND created_at >= $8
-			ORDER BY created_at DESC
+			ORDER BY
+			  CASE
+			    WHEN acked_at IS NOT NULL THEN 0
+			    WHEN published_at IS NOT NULL THEN 1
+			    WHEN status = 'published' THEN 2
+			    WHEN status = 'publishing' THEN 3
+			    ELSE 4
+			  END,
+			  CASE WHEN block_height > 0 THEN block_height ELSE 9223372036854775807 END ASC,
+			  CASE WHEN tx_index >= 0 THEN tx_index ELSE 2147483647 END ASC,
+			  created_at ASC,
+			  updated_at ASC,
+			  id ASC
 			LIMIT 1
 		)
 		UPDATE control_policy_outbox
@@ -535,7 +763,6 @@ func (s *Store) correlateExact(ctx context.Context, policyID string, ruleHash []
 			ack_result=$4,
 			ack_reason=$5,
 			ack_controller=$6,
-			published_at=COALESCE(published_at, COALESCE($7, now())),
 			acked_at=COALESCE($7, now()),
 			updated_at=now()
 		WHERE id IN (SELECT id FROM chosen)
@@ -548,11 +775,28 @@ func (s *Store) correlateExact(ctx context.Context, policyID string, ruleHash []
 }
 
 func (s *Store) correlateByRuleHash(ctx context.Context, policyID string, ruleHash []byte, result, reason, controller string, ackedAt sql.NullTime, cutoff time.Time) (sql.NullInt64, sql.NullInt64, sql.NullTime, sql.NullTime, error) {
+	count, err := s.correlationCandidateCount(ctx, `
+		SELECT COUNT(*)
+		FROM control_policy_outbox
+		WHERE policy_id = $1
+		  AND rule_hash = $2
+		  AND status IN ('publishing', 'published', 'acked')
+		  AND created_at >= $3
+	`, policyID, ruleHash, cutoff)
+	if err != nil {
+		return sql.NullInt64{}, sql.NullInt64{}, sql.NullTime{}, sql.NullTime{}, err
+	}
+	if count == 0 {
+		return sql.NullInt64{}, sql.NullInt64{}, sql.NullTime{}, sql.NullTime{}, sql.ErrNoRows
+	}
+	if count > 1 {
+		return sql.NullInt64{}, sql.NullInt64{}, sql.NullTime{}, sql.NullTime{}, errAckCorrelationAmbiguous
+	}
 	var aiEventTsMs sql.NullInt64
 	var sourceEventTsMs sql.NullInt64
 	var publishedAt sql.NullTime
 	var ackedAtRow sql.NullTime
-	err := s.db.QueryRowContext(ctx, `
+	err = s.db.QueryRowContext(ctx, `
 		WITH chosen AS (
 			SELECT id, ai_event_ts_ms, source_event_ts_ms, published_at
 			FROM control_policy_outbox
@@ -560,7 +804,19 @@ func (s *Store) correlateByRuleHash(ctx context.Context, policyID string, ruleHa
 			  AND rule_hash = $2
 			  AND status IN ('publishing', 'published', 'acked')
 			  AND created_at >= $7
-			ORDER BY created_at DESC
+			ORDER BY
+			  CASE
+			    WHEN acked_at IS NOT NULL THEN 0
+			    WHEN published_at IS NOT NULL THEN 1
+			    WHEN status = 'published' THEN 2
+			    WHEN status = 'publishing' THEN 3
+			    ELSE 4
+			  END,
+			  CASE WHEN block_height > 0 THEN block_height ELSE 9223372036854775807 END ASC,
+			  CASE WHEN tx_index >= 0 THEN tx_index ELSE 2147483647 END ASC,
+			  created_at ASC,
+			  updated_at ASC,
+			  id ASC
 			LIMIT 1
 		)
 		UPDATE control_policy_outbox
@@ -568,7 +824,6 @@ func (s *Store) correlateByRuleHash(ctx context.Context, policyID string, ruleHa
 			ack_result=$3,
 			ack_reason=$4,
 			ack_controller=$5,
-			published_at=COALESCE(published_at, COALESCE($6, now())),
 			acked_at=COALESCE($6, now()),
 			updated_at=now()
 		WHERE id IN (SELECT id FROM chosen)
@@ -581,11 +836,28 @@ func (s *Store) correlateByRuleHash(ctx context.Context, policyID string, ruleHa
 }
 
 func (s *Store) correlateByTraceID(ctx context.Context, policyID, traceID, result, reason, controller string, ackedAt sql.NullTime, cutoff time.Time) (sql.NullInt64, sql.NullInt64, sql.NullTime, sql.NullTime, error) {
+	count, err := s.correlationCandidateCount(ctx, `
+		SELECT COUNT(*)
+		FROM control_policy_outbox
+		WHERE policy_id = $1
+		  AND trace_id = $2
+		  AND status IN ('publishing', 'published', 'acked')
+		  AND created_at >= $3
+	`, policyID, traceID, cutoff)
+	if err != nil {
+		return sql.NullInt64{}, sql.NullInt64{}, sql.NullTime{}, sql.NullTime{}, err
+	}
+	if count == 0 {
+		return sql.NullInt64{}, sql.NullInt64{}, sql.NullTime{}, sql.NullTime{}, sql.ErrNoRows
+	}
+	if count > 1 {
+		return sql.NullInt64{}, sql.NullInt64{}, sql.NullTime{}, sql.NullTime{}, errAckCorrelationAmbiguous
+	}
 	var aiEventTsMs sql.NullInt64
 	var sourceEventTsMs sql.NullInt64
 	var publishedAt sql.NullTime
 	var ackedAtRow sql.NullTime
-	err := s.db.QueryRowContext(ctx, `
+	err = s.db.QueryRowContext(ctx, `
 		WITH chosen AS (
 			SELECT id, ai_event_ts_ms, source_event_ts_ms, published_at
 			FROM control_policy_outbox
@@ -593,7 +865,19 @@ func (s *Store) correlateByTraceID(ctx context.Context, policyID, traceID, resul
 			  AND trace_id = $2
 			  AND status IN ('publishing', 'published', 'acked')
 			  AND created_at >= $7
-			ORDER BY created_at DESC
+			ORDER BY
+			  CASE
+			    WHEN acked_at IS NOT NULL THEN 0
+			    WHEN published_at IS NOT NULL THEN 1
+			    WHEN status = 'published' THEN 2
+			    WHEN status = 'publishing' THEN 3
+			    ELSE 4
+			  END,
+			  CASE WHEN block_height > 0 THEN block_height ELSE 9223372036854775807 END ASC,
+			  CASE WHEN tx_index >= 0 THEN tx_index ELSE 2147483647 END ASC,
+			  created_at ASC,
+			  updated_at ASC,
+			  id ASC
 			LIMIT 1
 		)
 		UPDATE control_policy_outbox
@@ -601,7 +885,6 @@ func (s *Store) correlateByTraceID(ctx context.Context, policyID, traceID, resul
 			ack_result=$3,
 			ack_reason=$4,
 			ack_controller=$5,
-			published_at=COALESCE(published_at, COALESCE($6, now())),
 			acked_at=COALESCE($6, now()),
 			updated_at=now()
 		WHERE id IN (SELECT id FROM chosen)
@@ -611,6 +894,14 @@ func (s *Store) correlateByTraceID(ctx context.Context, policyID, traceID, resul
 		return s.correlateByTraceIDLegacy(ctx, policyID, traceID, result, reason, controller, ackedAt, cutoff)
 	}
 	return aiEventTsMs, sourceEventTsMs, publishedAt, ackedAtRow, err
+}
+
+func (s *Store) correlationCandidateCount(ctx context.Context, query string, args ...any) (int64, error) {
+	var count int64
+	if err := s.db.QueryRowContext(ctx, query, args...).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 func (s *Store) correlateExactLegacy(ctx context.Context, policyID string, ruleHash []byte, traceID, result, reason, controller string, ackedAt sql.NullTime, cutoff time.Time) (sql.NullInt64, sql.NullInt64, sql.NullTime, sql.NullTime, error) {
@@ -626,7 +917,19 @@ func (s *Store) correlateExactLegacy(ctx context.Context, policyID string, ruleH
 			  AND trace_id = $3
 			  AND status IN ('publishing', 'published', 'acked')
 			  AND created_at >= $8
-			ORDER BY created_at DESC
+			ORDER BY
+			  CASE
+			    WHEN acked_at IS NOT NULL THEN 0
+			    WHEN published_at IS NOT NULL THEN 1
+			    WHEN status = 'published' THEN 2
+			    WHEN status = 'publishing' THEN 3
+			    ELSE 4
+			  END,
+			  CASE WHEN block_height > 0 THEN block_height ELSE 9223372036854775807 END ASC,
+			  CASE WHEN tx_index >= 0 THEN tx_index ELSE 2147483647 END ASC,
+			  created_at ASC,
+			  updated_at ASC,
+			  id ASC
 			LIMIT 1
 		)
 		UPDATE control_policy_outbox
@@ -634,7 +937,6 @@ func (s *Store) correlateExactLegacy(ctx context.Context, policyID string, ruleH
 			ack_result=$4,
 			ack_reason=$5,
 			ack_controller=$6,
-			published_at=COALESCE(published_at, COALESCE($7, now())),
 			acked_at=COALESCE($7, now()),
 			updated_at=now()
 		WHERE id IN (SELECT id FROM chosen)
@@ -655,7 +957,19 @@ func (s *Store) correlateByCommandIDLegacy(ctx context.Context, policyID, comman
 			  AND command_id = $2
 			  AND status IN ('publishing', 'published', 'acked')
 			  AND created_at >= $7
-			ORDER BY created_at DESC
+			ORDER BY
+			  CASE
+			    WHEN acked_at IS NOT NULL THEN 0
+			    WHEN published_at IS NOT NULL THEN 1
+			    WHEN status = 'published' THEN 2
+			    WHEN status = 'publishing' THEN 3
+			    ELSE 4
+			  END,
+			  CASE WHEN block_height > 0 THEN block_height ELSE 9223372036854775807 END ASC,
+			  CASE WHEN tx_index >= 0 THEN tx_index ELSE 2147483647 END ASC,
+			  created_at ASC,
+			  updated_at ASC,
+			  id ASC
 			LIMIT 1
 		)
 		UPDATE control_policy_outbox
@@ -663,7 +977,6 @@ func (s *Store) correlateByCommandIDLegacy(ctx context.Context, policyID, comman
 			ack_result=$3,
 			ack_reason=$4,
 			ack_controller=$5,
-			published_at=COALESCE(published_at, COALESCE($6, now())),
 			acked_at=COALESCE($6, now()),
 			updated_at=now()
 		WHERE id IN (SELECT id FROM chosen)
@@ -684,7 +997,19 @@ func (s *Store) correlateByRuleHashLegacy(ctx context.Context, policyID string, 
 			  AND rule_hash = $2
 			  AND status IN ('publishing', 'published', 'acked')
 			  AND created_at >= $7
-			ORDER BY created_at DESC
+			ORDER BY
+			  CASE
+			    WHEN acked_at IS NOT NULL THEN 0
+			    WHEN published_at IS NOT NULL THEN 1
+			    WHEN status = 'published' THEN 2
+			    WHEN status = 'publishing' THEN 3
+			    ELSE 4
+			  END,
+			  CASE WHEN block_height > 0 THEN block_height ELSE 9223372036854775807 END ASC,
+			  CASE WHEN tx_index >= 0 THEN tx_index ELSE 2147483647 END ASC,
+			  created_at ASC,
+			  updated_at ASC,
+			  id ASC
 			LIMIT 1
 		)
 		UPDATE control_policy_outbox
@@ -692,7 +1017,6 @@ func (s *Store) correlateByRuleHashLegacy(ctx context.Context, policyID string, 
 			ack_result=$3,
 			ack_reason=$4,
 			ack_controller=$5,
-			published_at=COALESCE(published_at, COALESCE($6, now())),
 			acked_at=COALESCE($6, now()),
 			updated_at=now()
 		WHERE id IN (SELECT id FROM chosen)
@@ -713,7 +1037,19 @@ func (s *Store) correlateByTraceIDLegacy(ctx context.Context, policyID, traceID,
 			  AND trace_id = $2
 			  AND status IN ('publishing', 'published', 'acked')
 			  AND created_at >= $7
-			ORDER BY created_at DESC
+			ORDER BY
+			  CASE
+			    WHEN acked_at IS NOT NULL THEN 0
+			    WHEN published_at IS NOT NULL THEN 1
+			    WHEN status = 'published' THEN 2
+			    WHEN status = 'publishing' THEN 3
+			    ELSE 4
+			  END,
+			  CASE WHEN block_height > 0 THEN block_height ELSE 9223372036854775807 END ASC,
+			  CASE WHEN tx_index >= 0 THEN tx_index ELSE 2147483647 END ASC,
+			  created_at ASC,
+			  updated_at ASC,
+			  id ASC
 			LIMIT 1
 		)
 		UPDATE control_policy_outbox
@@ -721,7 +1057,6 @@ func (s *Store) correlateByTraceIDLegacy(ctx context.Context, policyID, traceID,
 			ack_result=$3,
 			ack_reason=$4,
 			ack_controller=$5,
-			published_at=COALESCE(published_at, COALESCE($6, now())),
 			acked_at=COALESCE($6, now()),
 			updated_at=now()
 		WHERE id IN (SELECT id FROM chosen)

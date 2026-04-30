@@ -139,6 +139,7 @@ type Service struct {
 	policyOutboxDispatcher                      *policyoutbox.Dispatcher
 	policyOutboxStore                           *policyoutbox.Store
 	policyAckCons                               *policyack.Consumer
+	policyTraceIngressCons                      *policytrace.KafkaIngressConsumer
 	policyTraceCollector                        *policytrace.Collector
 	controlDispatchSafeMode                     atomic.Bool
 
@@ -340,6 +341,24 @@ func loadStartupLivelockGuardState(ctx context.Context, db *sql.DB, stateKey str
 		return false, "", nil
 	}
 	return true, strings.TrimSpace(reason.String), nil
+}
+
+func policyTraceEventsTableExists(ctx context.Context, db *sql.DB) (bool, error) {
+	if db == nil {
+		return false, nil
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	var exists bool
+	err := db.QueryRowContext(checkCtx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.tables
+			WHERE table_schema = current_schema()
+			  AND table_name = 'control_policy_trace_events'
+		)
+	`).Scan(&exists)
+	return exists, err
 }
 
 func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, builder *block.Builder, store state.StateStore, log *utils.Logger) (*Service, error) {
@@ -703,8 +722,30 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 	s.persistFallbackSlots = make(chan struct{}, s.persistDirectFallbackMaxInFlight)
 
 	var dbHandle *sql.DB
+	var traceStore *policytrace.Store
 	if provider, ok := cfg.DBAdapter.(interface{ GetDB() *sql.DB }); ok {
 		dbHandle = provider.GetDB()
+		if dbHandle != nil {
+			traceStore = policytrace.NewStore(dbHandle)
+			if enabled, traceErr := policyTraceEventsTableExists(context.Background(), dbHandle); traceErr != nil {
+				if log != nil {
+					log.Warn("policy trace event table detection failed", utils.ZapError(traceErr))
+				}
+			} else if enabled {
+				s.policyTraceCollector.AddSink(traceStore)
+				if setter, ok := cfg.DBAdapter.(interface{ SetPolicyTraceStore(*policytrace.Store) }); ok {
+					setter.SetPolicyTraceStore(traceStore)
+				}
+				if setter, ok := cfg.DBAdapter.(interface{ SetPolicyTraceCollector(*policytrace.Collector) }); ok {
+					setter.SetPolicyTraceCollector(s.policyTraceCollector)
+				}
+				if log != nil {
+					log.Info("policy trace event dual-write enabled")
+				}
+			} else if log != nil {
+				log.Info("policy trace event table not present; dual-write disabled")
+			}
+		}
 		if dbHandle != nil {
 			if err := policystate.Prime(context.Background(), dbHandle); err != nil {
 				log.Warn("policy state projection prime failed", utils.ZapError(err))
@@ -994,7 +1035,7 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 							RetryJitterRatio:      cfg.ConfigManager.GetFloat64("CONTROL_POLICY_OUTBOX_RETRY_JITTER_RATIO", 0.2),
 							LogThrottle:           cfg.ConfigManager.GetDuration("CONTROL_POLICY_OUTBOX_LOG_THROTTLE", 5*time.Second),
 						}
-						dispatcher, err := policyoutbox.NewDispatcher(outboxCfg, outboxStore, pp, log, cfg.AuditLogger, holderID, s.policyTraceCollector)
+						dispatcher, err := policyoutbox.NewDispatcher(outboxCfg, outboxStore, pp, log, cfg.AuditLogger, holderID, s.policyTraceCollector, traceStore)
 						if err != nil {
 							kafkaProducer.Close()
 							return nil, fmt.Errorf("failed to initialize policy outbox dispatcher: %w", err)
@@ -1178,6 +1219,10 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 				}
 				return nil, fmt.Errorf("policy ack store init failed: %w", err)
 			}
+			store.SetPolicyTraceCollector(s.policyTraceCollector)
+			if enabled, traceErr := policyTraceEventsTableExists(context.Background(), dbHandle); traceErr == nil && enabled {
+				store.SetPolicyTraceStore(policytrace.NewStore(dbHandle))
+			}
 			schemaCheckTimeout := cfg.ConfigManager.GetDuration("CONTROL_POLICY_ACK_SCHEMA_CHECK_TIMEOUT", 10*time.Second)
 			if schemaCheckTimeout <= 0 {
 				schemaCheckTimeout = 10 * time.Second
@@ -1284,6 +1329,73 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 						utils.ZapBool("signature_required", ackCfg.SigningRequired),
 						utils.ZapBool("dlq_enabled", ackCfg.DLQ != ""))
 				}
+			}
+		}
+	}
+
+	// Initialize direct canonical trace-event ingress consumer (optional).
+	if cfg.EnableKafka && cfg.ConfigManager != nil && traceStore != nil {
+		traceIngressCfg, err := policytrace.LoadKafkaIngressConfig(cfg.ConfigManager)
+		if err != nil {
+			if kafkaProducer != nil {
+				kafkaProducer.Close()
+			}
+			if s.kafkaConsumer != nil {
+				_ = s.kafkaConsumer.Stop()
+			}
+			if s.policyAckCons != nil {
+				_ = s.policyAckCons.Stop()
+			}
+			return nil, fmt.Errorf("policy trace ingress config invalid: %w", err)
+		}
+		if traceIngressCfg.Enabled {
+			saramaCfg, err := kafka.BuildSaramaConfig(context.Background(), cfg.ConfigManager, log, cfg.AuditLogger)
+			if err != nil {
+				if kafkaProducer != nil {
+					kafkaProducer.Close()
+				}
+				if s.kafkaConsumer != nil {
+					_ = s.kafkaConsumer.Stop()
+				}
+				if s.policyAckCons != nil {
+					_ = s.policyAckCons.Stop()
+				}
+				return nil, fmt.Errorf("policy trace ingress: build kafka config failed: %w", err)
+			}
+
+			cg, err := sarama.NewConsumerGroup(traceIngressCfg.Brokers, traceIngressCfg.GroupID, saramaCfg)
+			if err != nil {
+				if kafkaProducer != nil {
+					kafkaProducer.Close()
+				}
+				if s.kafkaConsumer != nil {
+					_ = s.kafkaConsumer.Stop()
+				}
+				if s.policyAckCons != nil {
+					_ = s.policyAckCons.Stop()
+				}
+				return nil, fmt.Errorf("policy trace ingress: create consumer group failed: %w", err)
+			}
+
+			traceIngress, err := policytrace.NewKafkaIngressConsumer(context.Background(), traceIngressCfg, cg, traceStore, log)
+			if err != nil {
+				_ = cg.Close()
+				if kafkaProducer != nil {
+					kafkaProducer.Close()
+				}
+				if s.kafkaConsumer != nil {
+					_ = s.kafkaConsumer.Stop()
+				}
+				if s.policyAckCons != nil {
+					_ = s.policyAckCons.Stop()
+				}
+				return nil, fmt.Errorf("policy trace ingress init failed: %w", err)
+			}
+			s.policyTraceIngressCons = traceIngress
+			if log != nil {
+				log.Info("Policy trace ingress consumer configured",
+					utils.ZapString("topic", traceIngressCfg.Topic),
+					utils.ZapString("group_id", traceIngressCfg.GroupID))
 			}
 		}
 	}
@@ -1455,9 +1567,31 @@ func (s *Service) Start(ctx context.Context) error {
 		}
 	}
 
+	// Start policy trace ingress consumer if configured.
+	if s.policyTraceIngressCons != nil {
+		if err := s.policyTraceIngressCons.Start(); err != nil {
+			if s.policyAckCons != nil {
+				_ = s.policyAckCons.Stop()
+			}
+			if s.kafkaConsumer != nil {
+				_ = s.kafkaConsumer.Stop()
+			}
+			if s.persistWorker != nil {
+				_ = s.persistWorker.Stop()
+			}
+			return fmt.Errorf("failed to start policy trace ingress consumer: %w", err)
+		}
+		if s.log != nil {
+			s.log.InfoContext(ctx, "Policy trace ingress consumer started")
+		}
+	}
+
 	// Start policy outbox dispatcher if configured.
 	if s.policyOutboxDispatcher != nil {
 		if err := s.policyOutboxDispatcher.Start(ctx); err != nil {
+			if s.policyTraceIngressCons != nil {
+				_ = s.policyTraceIngressCons.Stop()
+			}
 			if s.policyAckCons != nil {
 				_ = s.policyAckCons.Stop()
 			}
@@ -1617,6 +1751,13 @@ func (s *Service) Stop() {
 			s.log.Warn("policy ack consumer stop error", utils.ZapError(err))
 		} else {
 			s.log.Info("policy ack consumer stopped")
+		}
+	}
+	if s.policyTraceIngressCons != nil {
+		if err := s.policyTraceIngressCons.Stop(); err != nil {
+			s.log.Warn("policy trace ingress consumer stop error", utils.ZapError(err))
+		} else {
+			s.log.Info("policy trace ingress consumer stopped")
 		}
 	}
 

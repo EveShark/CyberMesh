@@ -28,6 +28,19 @@ var (
 	ErrReplayRejected = errors.New("kafka: replay admission rejected")
 )
 
+type policyStageIdentity struct {
+	PolicyID        string
+	TraceID         string
+	RequestID       string
+	CommandID       string
+	WorkflowID      string
+	SourceEventID   string
+	SentinelEventID string
+	ScopeIdentifier string
+	Tenant          string
+	Region          string
+}
+
 // Consumer handles consuming messages from Kafka ai.* topics and submitting to mempool
 type Consumer struct {
 	consumerGroup sarama.ConsumerGroup
@@ -652,7 +665,7 @@ func (c *Consumer) processMessage(ctx context.Context, session sarama.ConsumerGr
 
 	if message.Topic == "ai.policy.v1" {
 		if ptx, ok := tx.(*state.PolicyTx); ok {
-			policyID, traceID := extractPolicyStageIdentity(ptx.Data)
+			policyID, traceID := extractPolicyStageIdentityLegacy(ptx.Data)
 			if policyID != "" {
 				c.recordPolicyStage("t_mempool_enqueued", policyID, traceID, now.UnixMilli())
 			}
@@ -722,7 +735,16 @@ func (c *Consumer) SetLifecycleAdmissionMode(mode string, rollbackEnabled bool) 
 }
 
 func (c *Consumer) recordPolicyStage(stage, policyID, traceID string, tsMs int64) {
-	if c == nil || stage == "" || policyID == "" || tsMs <= 0 {
+	c.recordPolicyStageWithLineage(stage, policyStageIdentity{PolicyID: policyID, TraceID: traceID}, tsMs)
+}
+
+func (c *Consumer) recordPolicyStageWithLineage(stage string, identity policyStageIdentity, tsMs int64) {
+	if c == nil || stage == "" || tsMs <= 0 {
+		return
+	}
+	policyID := strings.TrimSpace(identity.PolicyID)
+	traceID := strings.TrimSpace(identity.TraceID)
+	if policyID == "" {
 		return
 	}
 	if c.logger != nil {
@@ -737,10 +759,18 @@ func (c *Consumer) recordPolicyStage(stage, policyID, traceID string, tsMs int64
 	c.mu.RUnlock()
 	if trace != nil {
 		trace.Record(policytrace.Marker{
-			Stage:       stage,
-			PolicyID:    policyID,
-			TraceID:     traceID,
-			TimestampMs: tsMs,
+			Stage:           stage,
+			PolicyID:        policyID,
+			TraceID:         traceID,
+			RequestID:       strings.TrimSpace(identity.RequestID),
+			CommandID:       strings.TrimSpace(identity.CommandID),
+			WorkflowID:      strings.TrimSpace(identity.WorkflowID),
+			SourceEventID:   strings.TrimSpace(identity.SourceEventID),
+			SentinelEventID: strings.TrimSpace(identity.SentinelEventID),
+			ScopeIdentifier: strings.TrimSpace(identity.ScopeIdentifier),
+			Tenant:          strings.TrimSpace(identity.Tenant),
+			Region:          strings.TrimSpace(identity.Region),
+			TimestampMs:     tsMs,
 		})
 	}
 }
@@ -930,11 +960,12 @@ func (c *Consumer) processPolicyMessage(message *sarama.ConsumerMessage) (state.
 		}
 		return nil, mempool.AdmissionMeta{}, fmt.Errorf("decode failed: %w", err)
 	}
-	policyID, traceID := extractPolicyStageIdentity(msg.Params)
-	if policyID != "" {
-		c.recordPolicyStage("t_policy_handler_enter", policyID, traceID, consumeMs)
-		c.recordPolicyStage("t_decode_done", policyID, traceID, time.Now().UnixMilli())
-		c.recordPolicyStage("t_backend_consume", policyID, traceID, consumeMs)
+	identity := extractPolicyStageIdentity(msg.Params)
+	if identity.PolicyID != "" {
+		c.recordPolicyPayloadTraceStages(identity, msg.Params)
+		c.recordPolicyStageWithLineage("t_policy_handler_enter", identity, consumeMs)
+		c.recordPolicyStageWithLineage("t_decode_done", identity, time.Now().UnixMilli())
+		c.recordPolicyStageWithLineage("t_backend_consume", identity, consumeMs)
 	}
 
 	tx, err := VerifyPolicyMsg(msg, c.verifierCfg, c.logger)
@@ -953,8 +984,8 @@ func (c *Consumer) processPolicyMessage(message *sarama.ConsumerMessage) (state.
 		}
 		return nil, mempool.AdmissionMeta{}, fmt.Errorf("verification failed: %w", err)
 	}
-	if policyID != "" {
-		c.recordPolicyStage("t_backend_verified_done", policyID, traceID, time.Now().UnixMilli())
+	if identity.PolicyID != "" {
+		c.recordPolicyStageWithLineage("t_backend_verified_done", identity, time.Now().UnixMilli())
 	}
 
 	// Policy has high priority
@@ -967,45 +998,198 @@ func (c *Consumer) processPolicyMessage(message *sarama.ConsumerMessage) (state.
 	return tx, mempool.ComputeMeta(tx, meta), nil
 }
 
-func extractPolicyStageIdentity(payload []byte) (string, string) {
-	if len(payload) == 0 {
-		return "", ""
+func extractPolicyStageIdentityLegacy(payload []byte) (string, string) {
+	identity := extractPolicyStageIdentity(payload)
+	return identity.PolicyID, identity.TraceID
+}
+
+func (c *Consumer) recordPolicyPayloadTraceStages(identity policyStageIdentity, payload []byte) {
+	if c == nil || identity.PolicyID == "" || identity.TraceID == "" || len(payload) == 0 {
+		return
 	}
 	var root map[string]interface{}
 	if err := json.Unmarshal(payload, &root); err != nil {
-		return "", ""
+		return
 	}
-	policyID := strings.TrimSpace(asString(root["policy_id"]))
-	traceID := strings.TrimSpace(asString(root["trace_id"]))
-	if traceID == "" {
-		if metadata, ok := root["metadata"].(map[string]interface{}); ok {
-			traceID = strings.TrimSpace(asString(metadata["trace_id"]))
+	stages := extractPolicyPayloadStageMap(root)
+	if len(stages) == 0 {
+		return
+	}
+	for _, stage := range []string{
+		policytrace.StageTelemetryIngest,
+		policytrace.StageSentinelConsume,
+		policytrace.StageSentinelAnalysisDone,
+		policytrace.StageSentinelEmit,
+		policytrace.StageSentinelPublishAck,
+		policytrace.StageAISentinelConsume,
+		policytrace.StageAIDecisionDone,
+		policytrace.StageAIProducerSendStart,
+		policytrace.StageAIProducerAck,
+	} {
+		tsMs := normalizedPayloadStageMs(stages[stage])
+		if tsMs <= 0 {
+			continue
 		}
+		c.recordPolicyStageWithLineage(stage, identity, tsMs)
 	}
-	if traceID == "" {
-		if trace, ok := root["trace"].(map[string]interface{}); ok {
-			traceID = strings.TrimSpace(asString(trace["id"]))
+}
+
+func extractPolicyPayloadStageMap(root map[string]interface{}) map[string]interface{} {
+	if root == nil {
+		return nil
+	}
+	if traceObj, ok := root["trace"].(map[string]interface{}); ok {
+		if stages, ok := traceObj["stages"].(map[string]interface{}); ok {
+			return stages
 		}
 	}
 	if nested, ok := root["params"].(map[string]interface{}); ok {
-		if policyID == "" {
-			policyID = strings.TrimSpace(asString(nested["policy_id"]))
+		return extractPolicyPayloadStageMap(nested)
+	}
+	return nil
+}
+
+func normalizedPayloadStageMs(value interface{}) int64 {
+	switch typed := value.(type) {
+	case float64:
+		return normalizePolicyTraceTimestampMs(typed)
+	case float32:
+		return normalizePolicyTraceTimestampMs(float64(typed))
+	case int:
+		return normalizePolicyTraceTimestampMs(float64(typed))
+	case int64:
+		return normalizePolicyTraceTimestampMs(float64(typed))
+	case json.Number:
+		n, err := typed.Float64()
+		if err != nil {
+			return 0
 		}
-		if traceID == "" {
-			traceID = strings.TrimSpace(asString(nested["trace_id"]))
+		return normalizePolicyTraceTimestampMs(n)
+	case string:
+		var n float64
+		if _, err := fmt.Sscanf(strings.TrimSpace(typed), "%f", &n); err != nil {
+			return 0
 		}
-		if traceID == "" {
-			if metadata, ok := nested["metadata"].(map[string]interface{}); ok {
-				traceID = strings.TrimSpace(asString(metadata["trace_id"]))
-			}
-		}
-		if traceID == "" {
-			if trace, ok := nested["trace"].(map[string]interface{}); ok {
-				traceID = strings.TrimSpace(asString(trace["id"]))
+		return normalizePolicyTraceTimestampMs(n)
+	default:
+		return 0
+	}
+}
+
+func normalizePolicyTraceTimestampMs(value float64) int64 {
+	if value <= 0 {
+		return 0
+	}
+	switch {
+	case value >= 946684800 && value <= 4102444800:
+		return int64(value * 1000)
+	case value >= 946684800000 && value <= 4102444800000:
+		return int64(value)
+	case value >= 946684800000000 && value <= 4102444800000000:
+		return int64(value / 1000)
+	case value >= 946684800000000000 && value <= 4102444800000000000:
+		return int64(value / 1000000)
+	default:
+		return 0
+	}
+}
+
+func extractPolicyStageIdentity(payload []byte) policyStageIdentity {
+	if len(payload) == 0 {
+		return policyStageIdentity{}
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(payload, &root); err != nil {
+		return policyStageIdentity{}
+	}
+	identity := extractPolicyStageIdentityFromMap(root)
+	if nested, ok := root["params"].(map[string]interface{}); ok {
+		identity.mergeMissing(extractPolicyStageIdentityFromMap(nested))
+	}
+	return identity
+}
+
+func extractPolicyStageIdentityFromMap(root map[string]interface{}) policyStageIdentity {
+	if root == nil {
+		return policyStageIdentity{}
+	}
+	metadata, _ := root["metadata"].(map[string]interface{})
+	traceObj, _ := root["trace"].(map[string]interface{})
+	identity := policyStageIdentity{
+		PolicyID:        firstString(root, metadata, traceObj, "policy_id"),
+		TraceID:         firstString(root, metadata, traceObj, "trace_id"),
+		RequestID:       firstString(root, metadata, traceObj, "request_id"),
+		CommandID:       firstString(root, metadata, traceObj, "command_id"),
+		WorkflowID:      firstString(root, metadata, traceObj, "workflow_id"),
+		SourceEventID:   firstString(root, metadata, traceObj, "source_event_id"),
+		SentinelEventID: firstString(root, metadata, traceObj, "sentinel_event_id"),
+		ScopeIdentifier: firstString(root, metadata, traceObj, "scope_identifier"),
+		Tenant:          firstString(root, metadata, traceObj, "tenant", "tenant_id"),
+		Region:          firstString(root, metadata, traceObj, "region"),
+	}
+	if identity.TraceID == "" {
+		identity.TraceID = strings.TrimSpace(asString(traceObj["id"]))
+	}
+	return identity
+}
+
+func (p *policyStageIdentity) mergeMissing(other policyStageIdentity) {
+	if p.PolicyID == "" {
+		p.PolicyID = other.PolicyID
+	}
+	if p.TraceID == "" {
+		p.TraceID = other.TraceID
+	}
+	if p.RequestID == "" {
+		p.RequestID = other.RequestID
+	}
+	if p.CommandID == "" {
+		p.CommandID = other.CommandID
+	}
+	if p.WorkflowID == "" {
+		p.WorkflowID = other.WorkflowID
+	}
+	if p.SourceEventID == "" {
+		p.SourceEventID = other.SourceEventID
+	}
+	if p.SentinelEventID == "" {
+		p.SentinelEventID = other.SentinelEventID
+	}
+	if p.ScopeIdentifier == "" {
+		p.ScopeIdentifier = other.ScopeIdentifier
+	}
+	if p.Tenant == "" {
+		p.Tenant = other.Tenant
+	}
+	if p.Region == "" {
+		p.Region = other.Region
+	}
+}
+
+func firstString(maps ...interface{}) string {
+	if len(maps) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(maps))
+	sources := make([]map[string]interface{}, 0, len(maps))
+	for _, item := range maps {
+		switch typed := item.(type) {
+		case string:
+			keys = append(keys, typed)
+		case map[string]interface{}:
+			if typed != nil {
+				sources = append(sources, typed)
 			}
 		}
 	}
-	return policyID, traceID
+	for _, key := range keys {
+		for _, source := range sources {
+			if value := strings.TrimSpace(asString(source[key])); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
 }
 
 func classifyPolicyPriorityClass(action string, params []byte) string {

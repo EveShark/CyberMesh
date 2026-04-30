@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -434,8 +435,18 @@ func (c *Consumer) process(ctx context.Context, msg *sarama.ConsumerMessage) err
 	// Store with bounded retry for transient DB errors.
 	backoff := c.cfg.StoreRetryBackoff
 	var last error
+	receivedAt := time.Now().UTC()
+	fmt.Fprintf(os.Stderr, "policyack consumer process policy=%s trace=%s ack_event=%s topic=%s partition=%d offset=%d\n",
+		strings.TrimSpace(ack.PolicyId),
+		strings.TrimSpace(ack.TraceId),
+		strings.TrimSpace(ack.AckEventId),
+		msg.Topic,
+		msg.Partition,
+		msg.Offset,
+	)
 	for attempt := 1; attempt <= c.cfg.StoreRetryMax; attempt++ {
-		if err := c.store.Upsert(ctx, &ack, time.Now().UTC()); err != nil {
+		c.store.AppendEnforcementTraceEvents(ctx, &ack, enforcementTraceStagesFromHeaders(msg.Headers))
+		if err := c.store.Upsert(ctx, &ack, receivedAt); err != nil {
 			span.RecordError(err, trace.WithAttributes(attribute.Int("retry.attempt", attempt)))
 			last = err
 			c.storeRetryAttempts.Add(1)
@@ -470,18 +481,6 @@ func (c *Consumer) process(ctx context.Context, msg *sarama.ConsumerMessage) err
 				"offset":              msg.Offset,
 				"signature_present":   len(sig) > 0,
 				"signature_alg":       algo,
-			})
-		}
-		if c.trace != nil {
-			traceID := strings.TrimSpace(ack.TraceId)
-			if traceID == "" {
-				traceID = strings.TrimSpace(ack.QcReference)
-			}
-			c.trace.Record(policytrace.Marker{
-				Stage:       "t_ack",
-				PolicyID:    ack.PolicyId,
-				TraceID:     traceID,
-				TimestampMs: time.Now().UnixMilli(),
 			})
 		}
 		return nil
@@ -563,6 +562,30 @@ func header(headers []*sarama.RecordHeader, key string) []byte {
 		}
 	}
 	return nil
+}
+
+func enforcementTraceStagesFromHeaders(headers []*sarama.RecordHeader) map[string]int64 {
+	out := map[string]int64{}
+	for _, stage := range []string{
+		policytrace.StageEnforcementConsume,
+		policytrace.StageEnforcementApplyDone,
+		policytrace.StageEnforcementPersisted,
+		policytrace.StageAckPublishStart,
+		policytrace.StageAckPublishDone,
+	} {
+		raw := strings.TrimSpace(string(header(headers, "control-trace-stage-"+stage)))
+		if raw == "" {
+			continue
+		}
+		var ts int64
+		if _, err := fmt.Sscanf(raw, "%d", &ts); err == nil && ts > 0 {
+			out[stage] = ts
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func (c *Consumer) sendDLQ(ctx context.Context, msg *sarama.ConsumerMessage, reason string, err error) {

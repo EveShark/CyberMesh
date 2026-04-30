@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -227,10 +228,11 @@ type Server struct {
 	dashboardMetrics     map[string]*dashboardSectionMetric
 
 	// Middleware components
-	rateLimiter   *RateLimiter
-	ipAllowlist   *utils.IPAllowlist
-	sem           chan struct{}
-	routeLimiters map[rateLimitKey]*routeLimiter
+	rateLimiter      *RateLimiter
+	ipAllowlist      *utils.IPAllowlist
+	trustedProxyNets []*net.IPNet
+	sem              chan struct{}
+	routeLimiters    map[rateLimitKey]*routeLimiter
 
 	aiClient     *http.Client
 	aiBaseURL    string
@@ -534,6 +536,20 @@ func NewServer(deps Dependencies) (*Server, error) {
 				utils.ZapBool("dns_disabled", allowlistCfg.DisableDNS))
 		}
 
+	}
+	if len(deps.Config.TrustedProxyCIDRs) > 0 {
+		s.trustedProxyNets = make([]*net.IPNet, 0, len(deps.Config.TrustedProxyCIDRs))
+		for _, rawCIDR := range deps.Config.TrustedProxyCIDRs {
+			cidr := strings.TrimSpace(rawCIDR)
+			if cidr == "" {
+				continue
+			}
+			_, network, err := net.ParseCIDR(cidr)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse trusted proxy CIDR %q: %w", cidr, err)
+			}
+			s.trustedProxyNets = append(s.trustedProxyNets, network)
+		}
 	}
 
 	// Create HTTP server

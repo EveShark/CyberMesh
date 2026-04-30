@@ -38,13 +38,14 @@ type reclaimTimeoutCounter interface {
 }
 
 type Dispatcher struct {
-	cfg    Config
-	store  storeOps
-	pub    Publisher
-	logger *utils.Logger
-	audit  *utils.AuditLogger
-	holder string
-	trace  *policytrace.Collector
+	cfg         Config
+	store       storeOps
+	pub         Publisher
+	logger      *utils.Logger
+	audit       *utils.AuditLogger
+	holder      string
+	trace       *policytrace.Collector
+	traceEvents policytrace.EventStore
 
 	stopCh    chan struct{}
 	doneCh    chan struct{}
@@ -140,7 +141,7 @@ type publishTask struct {
 	done     *sync.WaitGroup
 }
 
-func NewDispatcher(cfg Config, store storeOps, pub Publisher, logger *utils.Logger, audit *utils.AuditLogger, holderID string, trace *policytrace.Collector) (*Dispatcher, error) {
+func NewDispatcher(cfg Config, store storeOps, pub Publisher, logger *utils.Logger, audit *utils.AuditLogger, holderID string, trace *policytrace.Collector, traceEvents ...policytrace.EventStore) (*Dispatcher, error) {
 	if store == nil {
 		return nil, fmt.Errorf("policy outbox: store required")
 	}
@@ -319,18 +320,23 @@ func NewDispatcher(cfg Config, store storeOps, pub Publisher, logger *utils.Logg
 		logger.Info("Policy outbox shard compatibility mode configured",
 			utils.ZapBool("dispatch_shard_compat", cfg.DispatchShardCompat))
 	}
+	var traceEventStore policytrace.EventStore
+	if len(traceEvents) > 0 {
+		traceEventStore = traceEvents[0]
+	}
 
 	return &Dispatcher{
-		cfg:    cfg,
-		store:  store,
-		pub:    pub,
-		logger: logger,
-		audit:  audit,
-		holder: holderID,
-		trace:  trace,
-		stopCh: make(chan struct{}),
-		doneCh: make(chan struct{}),
-		wakeCh: make(chan struct{}, cfg.WakeChannelSize),
+		cfg:         cfg,
+		store:       store,
+		pub:         pub,
+		logger:      logger,
+		audit:       audit,
+		holder:      holderID,
+		trace:       trace,
+		traceEvents: traceEventStore,
+		stopCh:      make(chan struct{}),
+		doneCh:      make(chan struct{}),
+		wakeCh:      make(chan struct{}, cfg.WakeChannelSize),
 		publishLatency: utils.NewLatencyHistogram([]float64{
 			1, 5, 10, 25, 50, 100, 250, 500, 1000, 2000, 5000,
 		}),
@@ -361,12 +367,12 @@ func NewDispatcher(cfg Config, store storeOps, pub Publisher, logger *utils.Logg
 		wakeToClaimLatency: utils.NewLatencyHistogram([]float64{
 			1, 5, 10, 25, 50, 100, 250, 500, 1000, 2000, 5000,
 		}),
-		currentBatchSize:    uint64(cfg.BatchSize),
-		leaseState:          make(map[string]leaseRenewState),
-		publishScopeTotals:  make(map[string]uint64),
-		publishScopeRoutes:  make(map[string]uint64),
-		publishResultTotals: make(map[string]uint64),
-		publishPartitions:   make(map[string]uint64),
+		currentBatchSize:     uint64(cfg.BatchSize),
+		leaseState:           make(map[string]leaseRenewState),
+		publishScopeTotals:   make(map[string]uint64),
+		publishScopeRoutes:   make(map[string]uint64),
+		publishResultTotals:  make(map[string]uint64),
+		publishPartitions:    make(map[string]uint64),
 		connectCooldownUntil: make(map[string]time.Time),
 		connectFailureStreak: make(map[string]int),
 	}, nil
@@ -913,6 +919,7 @@ func (d *Dispatcher) tick(ctx context.Context, wakeAtNs int64) tickOutcome {
 					}
 					d.outboxToClaimLatency.Observe(float64(delayMs))
 				}
+				d.ensureCanonicalCreatedStage(ctx, row)
 				d.recordStageMarker("t_outbox_claimed", row, nowMs, nil, nil)
 			}
 			d.processBatch(ctx, rows, deadline)
@@ -1304,6 +1311,80 @@ func (d *Dispatcher) recordStageMarker(stage string, row Row, tsMs int64, partit
 		}
 		d.trace.Record(marker)
 	}
+	if d.traceEvents != nil && strings.TrimSpace(row.TraceID) != "" && tsMs > 0 {
+		event := policytrace.TraceEvent{
+			PolicyID:        strings.TrimSpace(row.PolicyID),
+			TraceID:         strings.TrimSpace(row.TraceID),
+			Stage:           strings.TrimSpace(stage),
+			StageClass:      policytrace.ClassifyStage(stage),
+			StageSource:     policytrace.StageSourceBackend,
+			TimestampMs:     tsMs,
+			RequestID:       strings.TrimSpace(row.RequestID),
+			CommandID:       strings.TrimSpace(row.CommandID),
+			WorkflowID:      strings.TrimSpace(row.WorkflowID),
+			SourceEventID:   strings.TrimSpace(row.SourceEventID),
+			SentinelEventID: strings.TrimSpace(row.SentinelEventID),
+			OutboxID:        strings.TrimSpace(row.ID),
+			RuleHash:        append([]byte(nil), row.RuleHash...),
+			Height:          row.BlockHeight,
+			TxIndex:         row.TxIndex,
+		}
+		if partition != nil {
+			event.Partition = *partition
+		}
+		if offset != nil {
+			event.Offset = *offset
+		}
+		if err := d.traceEvents.Append(context.Background(), event); err != nil && d.logger != nil {
+			d.logger.Warn("policy outbox trace event append failed",
+				utils.ZapString("stage", stage),
+				utils.ZapString("policy_id", row.PolicyID),
+				utils.ZapString("outbox_id", row.ID),
+				utils.ZapError(err))
+		}
+	}
+}
+
+func (d *Dispatcher) ensureCanonicalCreatedStage(ctx context.Context, row Row) {
+	if d == nil || strings.TrimSpace(row.PolicyID) == "" || row.CreatedAtMs <= 0 {
+		return
+	}
+	traceID := strings.TrimSpace(row.TraceID)
+	if traceID == "" {
+		traceID = "trace:" + strings.TrimSpace(row.PolicyID) + ":" + strings.TrimSpace(row.ID)
+	}
+	event := policytrace.TraceEvent{
+		PolicyID:        strings.TrimSpace(row.PolicyID),
+		TraceID:         traceID,
+		Stage:           policytrace.StageOutboxRowCreated,
+		StageClass:      policytrace.StageClassDurable,
+		StageSource:     policytrace.StageSourceBackend,
+		TimestampMs:     row.CreatedAtMs,
+		RequestID:       strings.TrimSpace(row.RequestID),
+		CommandID:       strings.TrimSpace(row.CommandID),
+		WorkflowID:      strings.TrimSpace(row.WorkflowID),
+		SourceEventID:   strings.TrimSpace(row.SourceEventID),
+		SentinelEventID: strings.TrimSpace(row.SentinelEventID),
+		OutboxID:        strings.TrimSpace(row.ID),
+		RuleHash:        append([]byte(nil), row.RuleHash...),
+		Height:          row.BlockHeight,
+		TxIndex:         row.TxIndex,
+	}
+	if d.traceEvents != nil {
+		if err := d.traceEvents.Append(ctx, event); err == nil {
+			return
+		}
+	}
+	if d.trace != nil {
+		d.trace.Record(policytrace.Marker{
+			Stage:       policytrace.StageOutboxRowCreated,
+			PolicyID:    event.PolicyID,
+			TraceID:     event.TraceID,
+			TimestampMs: event.TimestampMs,
+			Height:      event.Height,
+			OutboxID:    event.OutboxID,
+		})
+	}
 }
 
 func (d *Dispatcher) handleMarkTask(ctx context.Context, task markTask, deadline time.Time) {
@@ -1487,11 +1568,11 @@ func (d *Dispatcher) Stats() DispatcherStats {
 		partitionTotals[key] = count
 	}
 	timeoutCauseTotals := map[string]uint64{
-		"lease_acquire_timeout": atomic.LoadUint64(&d.leaseAcquireTimeouts),
-		"claim_timeout":         atomic.LoadUint64(&d.claimTimeouts),
+		"lease_acquire_timeout":  atomic.LoadUint64(&d.leaseAcquireTimeouts),
+		"claim_timeout":          atomic.LoadUint64(&d.claimTimeouts),
 		"claim_budget_exhausted": atomic.LoadUint64(&d.claimBudgetExhausted),
-		"mark_timeout":          atomic.LoadUint64(&d.markTimeouts),
-		"wake_signal_dropped":   atomic.LoadUint64(&d.wakeSignalsDropped),
+		"mark_timeout":           atomic.LoadUint64(&d.markTimeouts),
+		"wake_signal_dropped":    atomic.LoadUint64(&d.wakeSignalsDropped),
 	}
 	var reclaimTimeouts uint64
 	if c, ok := d.store.(reclaimTimeoutCounter); ok {

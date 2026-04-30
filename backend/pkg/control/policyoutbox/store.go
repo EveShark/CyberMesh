@@ -29,23 +29,24 @@ const (
 )
 
 var errClaimBudgetExhausted = errors.New("policy outbox: claim budget exhausted")
+var errUnsafeAckCorrelation = errors.New("policy outbox: strong correlation selectors required")
 
 type Store struct {
-	db                *sql.DB
-	hasRequestColumn  bool
-	hasCommandColumn  bool
-	hasWorkflowColumn bool
-	hasSourceColumns  bool
-	hasSentinelColumn bool
-	hasDispatchShard  bool
-	reclaimTimeouts   uint64
-	reclaimMu         sync.Mutex
-	reclaimAttemptAt  map[string]time.Time
+	db                 *sql.DB
+	hasRequestColumn   bool
+	hasCommandColumn   bool
+	hasWorkflowColumn  bool
+	hasSourceColumns   bool
+	hasSentinelColumn  bool
+	hasDispatchShard   bool
+	reclaimTimeouts    uint64
+	reclaimMu          sync.Mutex
+	reclaimAttemptAt   map[string]time.Time
 	reclaimMinInterval time.Duration
-	backlogSummaryMu  sync.Mutex
-	backlogSummaryAt  time.Time
-	backlogSummaryTTL time.Duration
-	backlogSummary    BacklogStats
+	backlogSummaryMu   sync.Mutex
+	backlogSummaryAt   time.Time
+	backlogSummaryTTL  time.Duration
+	backlogSummary     BacklogStats
 }
 
 func NewStore(db *sql.DB) (*Store, error) {
@@ -53,8 +54,8 @@ func NewStore(db *sql.DB) (*Store, error) {
 		return nil, fmt.Errorf("policy outbox: db required")
 	}
 	return &Store{
-		db:                db,
-		backlogSummaryTTL: 30 * time.Second,
+		db:                 db,
+		backlogSummaryTTL:  30 * time.Second,
 		reclaimMinInterval: reclaimAttemptMinInterval,
 	}, nil
 }
@@ -1084,40 +1085,217 @@ func (s *Store) MarkTerminal(ctx context.Context, id, holderID string, epoch int
 	return nil
 }
 
-func (s *Store) CorrelateAck(ctx context.Context, policyID, result, reason, controller string, ackedAt time.Time) error {
+type AckCorrelationRequest struct {
+	PolicyID   string
+	CommandID  string
+	TraceID    string
+	RuleHash   []byte
+	Result     string
+	Reason     string
+	Controller string
+	AckedAt    time.Time
+}
+
+func (s *Store) CorrelateAck(ctx context.Context, req AckCorrelationRequest) error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("policy outbox: store not initialized")
 	}
-	if policyID == "" {
+	req.PolicyID = strings.TrimSpace(req.PolicyID)
+	req.CommandID = strings.TrimSpace(req.CommandID)
+	req.TraceID = strings.TrimSpace(req.TraceID)
+	if req.PolicyID == "" {
 		return nil
 	}
-	if ackedAt.IsZero() {
-		ackedAt = time.Now().UTC()
+	if req.AckedAt.IsZero() {
+		req.AckedAt = time.Now().UTC()
 	}
 
-	_, err := s.db.ExecContext(ctx, `
-		WITH latest AS (
+	if req.CommandID != "" {
+		matched, err := s.correlateAckByCommandID(ctx, req)
+		if err != nil {
+			return fmt.Errorf("policy outbox: correlate ack by command_id: %w", err)
+		}
+		if matched {
+			return nil
+		}
+	}
+	if req.TraceID != "" && len(req.RuleHash) > 0 {
+		matched, err := s.correlateAckExact(ctx, req)
+		if err != nil {
+			return fmt.Errorf("policy outbox: correlate ack exact: %w", err)
+		}
+		if matched {
+			return nil
+		}
+	}
+	if req.TraceID != "" {
+		matched, err := s.correlateAckByTraceID(ctx, req)
+		if err != nil {
+			return fmt.Errorf("policy outbox: correlate ack by trace_id: %w", err)
+		}
+		if matched {
+			return nil
+		}
+	}
+	if len(req.RuleHash) > 0 {
+		matched, err := s.correlateAckByRuleHash(ctx, req)
+		if err != nil {
+			return fmt.Errorf("policy outbox: correlate ack by rule_hash: %w", err)
+		}
+		if matched {
+			return nil
+		}
+	}
+	return errUnsafeAckCorrelation
+}
+
+func (s *Store) correlateAckByCommandID(ctx context.Context, req AckCorrelationRequest) (bool, error) {
+	return s.execAckCorrelation(ctx, `
+		WITH chosen AS (
 			SELECT id
 			FROM control_policy_outbox
-			WHERE policy_id=$1
-			  AND status IN ('published', 'retry', 'pending', 'publishing', 'terminal_failed')
-			ORDER BY created_at DESC
+			WHERE policy_id = $1
+			  AND command_id = $2
+			  AND status IN ('publishing', 'published', 'acked')
+			ORDER BY
+			  CASE
+			    WHEN acked_at IS NOT NULL THEN 0
+			    WHEN published_at IS NOT NULL THEN 1
+			    WHEN status = 'published' THEN 2
+			    WHEN status = 'publishing' THEN 3
+			    ELSE 4
+			  END,
+			  CASE WHEN block_height > 0 THEN block_height ELSE 9223372036854775807 END ASC,
+			  CASE WHEN tx_index >= 0 THEN tx_index ELSE 2147483647 END ASC,
+			  created_at ASC,
+			  updated_at ASC,
+			  id ASC
 			LIMIT 1
 		)
 		UPDATE control_policy_outbox
 		SET status='acked',
-			ack_result=$2,
-			ack_reason=$3,
-			ack_controller=$4,
-			published_at=COALESCE(published_at, COALESCE($5, now())),
-			acked_at=$5,
+			ack_result=$3,
+			ack_reason=$4,
+			ack_controller=$5,
+			acked_at=$6,
 			updated_at=now()
-		WHERE id IN (SELECT id FROM latest)
-	`, policyID, result, reason, controller, ackedAt.UTC())
+		WHERE id IN (SELECT id FROM chosen)
+	`, req.PolicyID, req.CommandID, req.Result, req.Reason, req.Controller, req.AckedAt.UTC())
+}
+
+func (s *Store) correlateAckExact(ctx context.Context, req AckCorrelationRequest) (bool, error) {
+	return s.execAckCorrelation(ctx, `
+		WITH chosen AS (
+			SELECT id
+			FROM control_policy_outbox
+			WHERE policy_id = $1
+			  AND rule_hash = $2
+			  AND trace_id = $3
+			  AND status IN ('publishing', 'published', 'acked')
+			ORDER BY
+			  CASE
+			    WHEN acked_at IS NOT NULL THEN 0
+			    WHEN published_at IS NOT NULL THEN 1
+			    WHEN status = 'published' THEN 2
+			    WHEN status = 'publishing' THEN 3
+			    ELSE 4
+			  END,
+			  CASE WHEN block_height > 0 THEN block_height ELSE 9223372036854775807 END ASC,
+			  CASE WHEN tx_index >= 0 THEN tx_index ELSE 2147483647 END ASC,
+			  created_at ASC,
+			  updated_at ASC,
+			  id ASC
+			LIMIT 1
+		)
+		UPDATE control_policy_outbox
+		SET status='acked',
+			ack_result=$4,
+			ack_reason=$5,
+			ack_controller=$6,
+			acked_at=$7,
+			updated_at=now()
+		WHERE id IN (SELECT id FROM chosen)
+	`, req.PolicyID, req.RuleHash, req.TraceID, req.Result, req.Reason, req.Controller, req.AckedAt.UTC())
+}
+
+func (s *Store) correlateAckByTraceID(ctx context.Context, req AckCorrelationRequest) (bool, error) {
+	return s.execAckCorrelation(ctx, `
+		WITH chosen AS (
+			SELECT id
+			FROM control_policy_outbox
+			WHERE policy_id = $1
+			  AND trace_id = $2
+			  AND status IN ('publishing', 'published', 'acked')
+			ORDER BY
+			  CASE
+			    WHEN acked_at IS NOT NULL THEN 0
+			    WHEN published_at IS NOT NULL THEN 1
+			    WHEN status = 'published' THEN 2
+			    WHEN status = 'publishing' THEN 3
+			    ELSE 4
+			  END,
+			  CASE WHEN block_height > 0 THEN block_height ELSE 9223372036854775807 END ASC,
+			  CASE WHEN tx_index >= 0 THEN tx_index ELSE 2147483647 END ASC,
+			  created_at ASC,
+			  updated_at ASC,
+			  id ASC
+			LIMIT 1
+		)
+		UPDATE control_policy_outbox
+		SET status='acked',
+			ack_result=$3,
+			ack_reason=$4,
+			ack_controller=$5,
+			acked_at=$6,
+			updated_at=now()
+		WHERE id IN (SELECT id FROM chosen)
+	`, req.PolicyID, req.TraceID, req.Result, req.Reason, req.Controller, req.AckedAt.UTC())
+}
+
+func (s *Store) correlateAckByRuleHash(ctx context.Context, req AckCorrelationRequest) (bool, error) {
+	return s.execAckCorrelation(ctx, `
+		WITH chosen AS (
+			SELECT id
+			FROM control_policy_outbox
+			WHERE policy_id = $1
+			  AND rule_hash = $2
+			  AND status IN ('publishing', 'published', 'acked')
+			ORDER BY
+			  CASE
+			    WHEN acked_at IS NOT NULL THEN 0
+			    WHEN published_at IS NOT NULL THEN 1
+			    WHEN status = 'published' THEN 2
+			    WHEN status = 'publishing' THEN 3
+			    ELSE 4
+			  END,
+			  CASE WHEN block_height > 0 THEN block_height ELSE 9223372036854775807 END ASC,
+			  CASE WHEN tx_index >= 0 THEN tx_index ELSE 2147483647 END ASC,
+			  created_at ASC,
+			  updated_at ASC,
+			  id ASC
+			LIMIT 1
+		)
+		UPDATE control_policy_outbox
+		SET status='acked',
+			ack_result=$3,
+			ack_reason=$4,
+			ack_controller=$5,
+			acked_at=$6,
+			updated_at=now()
+		WHERE id IN (SELECT id FROM chosen)
+	`, req.PolicyID, req.RuleHash, req.Result, req.Reason, req.Controller, req.AckedAt.UTC())
+}
+
+func (s *Store) execAckCorrelation(ctx context.Context, query string, args ...any) (bool, error) {
+	res, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
-		return fmt.Errorf("policy outbox: correlate ack: %w", err)
+		return false, err
 	}
-	return nil
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
 }
 
 type lifecycleMeta struct {

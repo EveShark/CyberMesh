@@ -74,7 +74,7 @@ func (s *Server) middlewareLogging(next http.Handler) http.Handler {
 		// Log request
 		duration := time.Since(start)
 		requestID := getRequestID(r.Context())
-		clientIP := getClientIP(r)
+		clientIP := s.getClientIP(r)
 
 		// Log request
 		if wrapped.statusCode >= 500 {
@@ -155,7 +155,7 @@ func (s *Server) middlewarePanicRecovery(next http.Handler) http.Handler {
 // middlewareIPAllowlist checks IP allowlist
 func (s *Server) middlewareIPAllowlist(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		clientIP := getClientIP(r)
+		clientIP := s.getClientIP(r)
 		ip := net.ParseIP(clientIP)
 
 		if ip == nil {
@@ -197,8 +197,8 @@ func (s *Server) middlewareRateLimit(next http.Handler) http.Handler {
 			limiter = route.limiter
 			config = route.config
 		}
-		// Use client cert fingerprint or IP as identifier
-		clientID := getClientIdentifier(r)
+		// Use client cert fingerprint or trusted client IP as identifier
+		clientID := s.getClientIdentifier(r)
 
 		allowed, resetTime := limiter.Allow(clientID)
 
@@ -315,31 +315,25 @@ func getRequestID(ctx context.Context) string {
 }
 
 // getClientIP extracts client IP from request
-func getClientIP(r *http.Request) string {
-	// Check X-Forwarded-For header (if behind proxy)
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		ips := strings.Split(xff, ",")
-		if len(ips) > 0 {
-			return strings.TrimSpace(ips[0])
-		}
+func (s *Server) getClientIP(r *http.Request) string {
+	if r == nil {
+		return ""
 	}
-
-	// Check X-Real-IP header
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
+	remoteIP := remoteIPFromRequest(r)
+	if remoteIP == nil {
+		return strings.TrimSpace(r.RemoteAddr)
 	}
-
-	// Use remote addr
-	ip, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
+	if !s.isTrustedProxy(remoteIP) {
+		return remoteIP.String()
 	}
-
-	return ip
+	if forwarded := s.forwardedClientIP(r, remoteIP); forwarded != nil {
+		return forwarded.String()
+	}
+	return remoteIP.String()
 }
 
 // getClientIdentifier returns a unique identifier for the client
-func getClientIdentifier(r *http.Request) string {
+func (s *Server) getClientIdentifier(r *http.Request) string {
 	// Prefer client certificate fingerprint
 	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
 		cert := r.TLS.PeerCertificates[0]
@@ -347,7 +341,75 @@ func getClientIdentifier(r *http.Request) string {
 	}
 
 	// Fallback to IP
-	return fmt.Sprintf("ip:%s", getClientIP(r))
+	return fmt.Sprintf("ip:%s", s.getClientIP(r))
+}
+
+func remoteIPFromRequest(r *http.Request) net.IP {
+	if r == nil {
+		return nil
+	}
+	remoteAddr := strings.TrimSpace(r.RemoteAddr)
+	if remoteAddr == "" {
+		return nil
+	}
+	if ip := net.ParseIP(remoteAddr); ip != nil {
+		return ip
+	}
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return nil
+	}
+	return net.ParseIP(strings.TrimSpace(host))
+}
+
+func parseForwardedChain(r *http.Request) []net.IP {
+	if r == nil {
+		return nil
+	}
+	chain := make([]net.IP, 0, 4)
+	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
+		for _, raw := range strings.Split(xff, ",") {
+			if ip := net.ParseIP(strings.TrimSpace(raw)); ip != nil {
+				chain = append(chain, ip)
+			}
+		}
+	}
+	return chain
+}
+
+func (s *Server) forwardedClientIP(r *http.Request, remoteIP net.IP) net.IP {
+	chain := parseForwardedChain(r)
+	if len(chain) > 0 {
+		// Walk the forwarded chain from the trusted edge back to the first
+		// non-proxy hop. This prevents trusting a spoofed left-most XFF value
+		// when an upstream proxy appends to an existing header.
+		for idx := len(chain) - 1; idx >= 0; idx-- {
+			if s.isTrustedProxy(chain[idx]) {
+				continue
+			}
+			return chain[idx]
+		}
+		// If every forwarded hop is trusted, use the earliest forwarded IP.
+		return chain[0]
+	}
+	if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
+		if ip := net.ParseIP(xri); ip != nil && !ip.Equal(remoteIP) {
+			return ip
+		}
+	}
+	return nil
+}
+
+func (s *Server) isTrustedProxy(ip net.IP) bool {
+	if ip == nil || s == nil || len(s.trustedProxyNets) == 0 {
+		return false
+	}
+	for _, network := range s.trustedProxyNets {
+		if network != nil && network.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // generateRequestID generates a UUIDv7 request ID with UUIDv4 fallback.
@@ -450,7 +512,7 @@ func (s *Server) middlewareGlobalAuth(next http.Handler) http.Handler {
 			if requireAuth {
 				s.logger.WarnContext(r.Context(), "unauthenticated request blocked",
 					utils.ZapString("path", r.URL.Path),
-					utils.ZapString("client_ip", getClientIP(r)))
+					utils.ZapString("client_ip", s.getClientIP(r)))
 				writeErrorFromUtils(w, r, NewUnauthorizedError("authentication required"))
 				return
 			}
@@ -511,7 +573,7 @@ func (s *Server) recordBearerValidationFailure(r *http.Request, err error) {
 		s.logger.WarnContext(r.Context(), "bearer token validation failed",
 			utils.ZapString("request_id", requestID),
 			utils.ZapString("path", r.URL.Path),
-			utils.ZapString("client_ip", getClientIP(r)),
+			utils.ZapString("client_ip", s.getClientIP(r)),
 			utils.ZapString("reason", reason),
 			utils.ZapString("detail", detail))
 	}
@@ -519,7 +581,7 @@ func (s *Server) recordBearerValidationFailure(r *http.Request, err error) {
 		_ = s.audit.Log("api.auth.bearer_invalid", utils.AuditSecurity, map[string]interface{}{
 			"request_id": requestID,
 			"path":       r.URL.Path,
-			"client_ip":  getClientIP(r),
+			"client_ip":  s.getClientIP(r),
 			"reason":     reason,
 			"detail":     detail,
 		})

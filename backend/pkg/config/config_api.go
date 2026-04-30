@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -32,9 +33,10 @@ type APIConfig struct {
 	ShutdownTimeout time.Duration
 
 	// Security
-	RBACEnabled  bool                // Role-based access control
-	IPAllowlist  []string            // Allowed client IPs/CIDRs
-	AllowedRoles map[string][]string // Role -> allowed endpoints mapping
+	RBACEnabled       bool                // Role-based access control
+	IPAllowlist       []string            // Allowed client IPs/CIDRs
+	TrustedProxyCIDRs []string            // Proxies allowed to supply forwarded client IP headers
+	AllowedRoles      map[string][]string // Role -> allowed endpoints mapping
 	// Auth gating (feature-flagged)
 	RequireAuth                   bool     // If true, require auth even outside production (e.g., staging)
 	BearerTokens                  []string // Optional static bearer tokens accepted for auth
@@ -270,6 +272,9 @@ func LoadAPIConfig(cm *utils.ConfigManager) (*APIConfig, error) {
 
 	if allowlist := cm.GetString("API_IP_ALLOWLIST", ""); allowlist != "" {
 		cfg.IPAllowlist = parseCommaSeparated(allowlist)
+	}
+	if trustedProxyCIDRs := cm.GetString("API_TRUSTED_PROXY_CIDRS", ""); trustedProxyCIDRs != "" {
+		cfg.TrustedProxyCIDRs = parseCommaSeparated(trustedProxyCIDRs)
 	}
 
 	// Feature-flagged auth gating
@@ -642,6 +647,16 @@ func (c *APIConfig) Validate() error {
 	}
 
 	// Security validation (audit required in production)
+	for _, cidr := range c.TrustedProxyCIDRs {
+		trimmed := strings.TrimSpace(cidr)
+		if trimmed == "" {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(trimmed); err != nil {
+			return fmt.Errorf("trusted proxy CIDR %q is invalid: %w", trimmed, err)
+		}
+	}
+
 	if c.Environment == "production" && !c.EnableAudit {
 		return &SecurityError{
 			Field:  "EnableAudit",
