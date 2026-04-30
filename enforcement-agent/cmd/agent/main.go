@@ -252,6 +252,11 @@ func main() {
 	if ackCloser != nil {
 		defer ackCloser()
 	}
+	if cfg.Ack.Required && ackPublisher == nil {
+		logger.Fatal("required ACK publisher is unavailable",
+			zap.Bool("ack_enabled", cfg.Ack.Enabled),
+			zap.String("topic", cfg.Ack.Topic))
+	}
 
 	var commandRejectSink controller.CommandRejectSink = noopCommandRejectSinkShim{}
 	commandRejectCfg, err := controller.BuildFastRejectSaramaConfig(
@@ -266,10 +271,16 @@ func main() {
 		cfg.Kafka.SASLPassword,
 	)
 	if err != nil {
+		if cfg.CommandRejectRequired {
+			logger.Fatal("required command reject sink init failed: producer config", zap.Error(err))
+		}
 		logger.Warn("command reject sink disabled: failed to build producer config", zap.Error(err))
 	} else {
 		sink, sinkErr := controller.NewKafkaCommandRejectSink(commandRejectCfg, cfg.Kafka.Brokers, cfg.CommandRejectTopic, cfg.Kafka.GroupID, logger)
 		if sinkErr != nil {
+			if cfg.CommandRejectRequired {
+				logger.Fatal("required command reject sink init failed: create sink", zap.Error(sinkErr))
+			}
 			logger.Warn("command reject sink disabled: failed to create sink", zap.Error(sinkErr))
 		} else {
 			commandRejectSink = sink
@@ -282,6 +293,7 @@ func main() {
 		FastPathMinConfidence:         cfg.FastPathMinConfidence,
 		FastPathSignals:               cfg.FastPathSignalsRequired,
 		AckPublisher:                  ackPublisher,
+		AckRequired:                   cfg.Ack.Required,
 		AckEnqueueTimeout:             cfg.Ack.EnqueueTimeout,
 		ApplyTimeout:                  cfg.ApplyTimeout,
 		ApplyTotalBudget:              cfg.ApplyTotalBudget,
@@ -298,6 +310,7 @@ func main() {
 		ReplayFutureSkew:              cfg.Security.ReplayFutureSkew,
 		ReplayCacheMaxEntries:         cfg.Security.ReplayCacheMaxEntries,
 		CommandRejectSink:             commandRejectSink,
+		CommandRejectRequired:         cfg.CommandRejectRequired,
 		CommandTopic:                  cfg.Kafka.Topic,
 		LifecycleCompactionEnabled:    cfg.LifecycleCompactionEnabled,
 		LifecycleCompactionWindow:     cfg.LifecycleCompactionWindow,

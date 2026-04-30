@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/IBM/sarama"
@@ -56,6 +57,11 @@ type Payload struct {
 	Controller string
 	RuleHash   []byte
 	ProducerID []byte
+}
+
+type traceStageHeader struct {
+	Key   string
+	Value string
 }
 
 // Publisher defines ACK emission contract.
@@ -184,6 +190,9 @@ func (p *KafkaPublisher) Publish(ctx context.Context, payload Payload) error {
 			Key:   sarama.StringEncoder(key),
 			Value: sarama.ByteEncoder(msgBytes),
 		}
+		for _, h := range traceStageHeaders(payload.Event.Spec, appliedTime.UnixMilli(), ackTime.UnixMilli()) {
+			kmsg.Headers = append(kmsg.Headers, sarama.RecordHeader{Key: []byte(h.Key), Value: []byte(h.Value)})
+		}
 		if p.signer != nil {
 			out, serr := p.signer.Sign(ctx, payload, msgBytes)
 			if serr != nil {
@@ -230,6 +239,102 @@ func (p *KafkaPublisher) Publish(ctx context.Context, payload Payload) error {
 		p.metrics.ObserveAckPublish("failure")
 	}
 	return fmt.Errorf("ack publish: %w", lastErr)
+}
+
+func traceStageHeaders(spec policy.PolicySpec, appliedAtMs, ackedAtMs int64) []traceStageHeader {
+	stageValues := map[string]int64{}
+	for stage, ts := range extractTraceStages(spec) {
+		stageValues[stage] = ts
+	}
+	if appliedAtMs > 0 {
+		stageValues["t_enforcement_apply_done"] = appliedAtMs
+	}
+	if ackedAtMs > 0 {
+		stageValues["t_ack_publish_done"] = ackedAtMs
+	}
+	stages := []string{
+		"t_enforcement_consume",
+		"t_enforcement_apply_done",
+		"t_enforcement_persist_done",
+		"t_ack_publish_start",
+		"t_ack_publish_done",
+	}
+	headers := make([]traceStageHeader, 0, len(stages))
+	for _, stage := range stages {
+		ts := stageValues[stage]
+		if ts <= 0 {
+			continue
+		}
+		headers = append(headers, traceStageHeader{
+			Key:   "control-trace-stage-" + stage,
+			Value: fmt.Sprintf("%d", ts),
+		})
+	}
+	return headers
+}
+
+func extractTraceStages(spec policy.PolicySpec) map[string]int64 {
+	if spec.Raw == nil {
+		return nil
+	}
+	trace, _ := spec.Raw["trace"].(map[string]any)
+	if trace == nil {
+		return nil
+	}
+	stages, _ := trace["stages"].(map[string]any)
+	if len(stages) == 0 {
+		return nil
+	}
+	out := make(map[string]int64, len(stages))
+	for stage, raw := range stages {
+		stage = strings.TrimSpace(stage)
+		if stage == "" {
+			continue
+		}
+		if ts := int64StageValue(raw); ts > 0 {
+			out[stage] = ts
+		}
+	}
+	return out
+}
+
+func int64StageValue(raw any) int64 {
+	switch v := raw.(type) {
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	case int32:
+		return int64(v)
+	case int16:
+		return int64(v)
+	case int8:
+		return int64(v)
+	case uint:
+		return int64(v)
+	case uint32:
+		return int64(v)
+	case uint16:
+		return int64(v)
+	case uint8:
+		return int64(v)
+	case float64:
+		if v <= 0 {
+			return 0
+		}
+		return int64(v)
+	case float32:
+		if v <= 0 {
+			return 0
+		}
+		return int64(v)
+	case string:
+		var parsed int64
+		if _, err := fmt.Sscanf(strings.TrimSpace(v), "%d", &parsed); err == nil {
+			return parsed
+		}
+	}
+	return 0
 }
 
 func canonicalAckTimes(appliedAt, ackedAt time.Time) (time.Time, time.Time) {

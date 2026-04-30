@@ -46,7 +46,8 @@ type Config struct {
 		TrustedKeysDir string
 		RejectTopic    string
 	}
-	CommandRejectTopic string
+	CommandRejectTopic    string
+	CommandRejectRequired bool
 
 	RateLimiter struct {
 		Backend   string
@@ -59,6 +60,7 @@ type Config struct {
 
 	Ack struct {
 		Enabled        bool
+		Required       bool
 		PublisherImpl  string
 		Topic          string
 		Brokers        []string
@@ -279,6 +281,7 @@ func Load() (Config, error) {
 	cfg.FastMitigation.TrustedKeysDir = strings.TrimSpace(os.Getenv("FAST_MITIGATION_TRUSTED_KEYS"))
 	cfg.FastMitigation.RejectTopic = strings.TrimSpace(envWithDefault("FAST_MITIGATION_REJECT_TOPIC", "control.fast_mitigation.reject.v1"))
 	cfg.CommandRejectTopic = strings.TrimSpace(envWithDefault("CONTROL_ENFORCEMENT_COMMAND_REJECT_TOPIC", "control.enforcement_command.reject.v1"))
+	cfg.CommandRejectRequired = parseBoolEnv("COMMAND_REJECT_REQUIRED", true)
 
 	// State path is needed early so other subsystems (e.g. ACK queue) can derive defaults.
 	cfg.StatePath = strings.TrimSpace(os.Getenv("ENFORCEMENT_STATE_PATH"))
@@ -297,7 +300,8 @@ func Load() (Config, error) {
 	cfg.RateLimiter.RedisDB = int(parseIntEnv("RATE_LIMIT_REDIS_DB", 0))
 	cfg.RateLimiter.KeyPrefix = strings.TrimSpace(os.Getenv("RATE_LIMIT_KEY_PREFIX"))
 
-	cfg.Ack.Enabled = parseBoolEnv("ACK_ENABLED", false)
+	cfg.Ack.Enabled = parseBoolEnv("ACK_ENABLED", true)
+	cfg.Ack.Required = parseBoolEnv("ACK_REQUIRED", true)
 	cfg.Ack.PublisherImpl = strings.ToLower(envWithDefault("ACK_PUBLISHER_IMPL", "kafkago"))
 	ackTopic := strings.TrimSpace(os.Getenv("ACK_TOPIC"))
 	if ackTopic == "" {
@@ -370,6 +374,12 @@ func Load() (Config, error) {
 		if cfg.FastMitigation.GroupID == "" || !strings.Contains(cfg.FastMitigation.GroupID, cfg.NodeName) {
 			return cfg, fmt.Errorf("FAST_MITIGATION_GROUP must include NODE_NAME when CONTROL_POLICY_CONSUMPTION_MODE=%s", consumptionModeFanoutPerNode)
 		}
+	}
+	if cfg.Ack.Required && !cfg.Ack.Enabled {
+		return cfg, fmt.Errorf("ACK_ENABLED must be true when ACK_REQUIRED=true")
+	}
+	if cfg.CommandRejectRequired && cfg.CommandRejectTopic == "" {
+		return cfg, fmt.Errorf("CONTROL_ENFORCEMENT_COMMAND_REJECT_TOPIC is required when COMMAND_REJECT_REQUIRED=true")
 	}
 
 	cfg.EnforcementBackend = strings.ToLower(envWithDefault("ENFORCEMENT_BACKEND", "iptables"))

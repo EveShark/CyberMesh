@@ -108,7 +108,10 @@ func (p *KafkaGoPublisher) Publish(ctx context.Context, payload Payload) error {
 			return fmt.Errorf("ack publish: marshal payload: %w", err)
 		}
 
-		headers := make([]kafka.Header, 0, 2)
+		headers := make([]kafka.Header, 0, 7)
+		for _, h := range traceStageHeaders(payload.Event.Spec, appliedTime.UnixMilli(), ackTime.UnixMilli()) {
+			headers = append(headers, kafka.Header{Key: h.Key, Value: []byte(h.Value)})
+		}
 		if p.signer != nil {
 			out, serr := p.signer.Sign(ctx, payload, msgBytes)
 			if serr != nil {

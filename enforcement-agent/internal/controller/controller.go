@@ -52,6 +52,7 @@ type Controller struct {
 	pendingMu                     sync.Mutex
 	fastPath                      FastPathConfig
 	acks                          ack.Publisher
+	ackRequired                   bool
 	ackEnqueueTimeout             time.Duration
 	applyTimeout                  time.Duration
 	applyTotalBudget              time.Duration
@@ -76,6 +77,7 @@ type Controller struct {
 	decisions                     []DecisionRecord
 	decMax                        int
 	commandRejects                CommandRejectSink
+	commandRejectRequired         bool
 	commandTopic                  string
 	lifecycleCompactor            *lifecycleCompactor
 	criticalSlots                 chan struct{}
@@ -121,6 +123,7 @@ type Options struct {
 	FastPathMinConfidence         float64
 	FastPathSignals               int64
 	AckPublisher                  ack.Publisher
+	AckRequired                   bool
 	AckEnqueueTimeout             time.Duration
 	ApplyTimeout                  time.Duration
 	ApplyTotalBudget              time.Duration
@@ -137,6 +140,7 @@ type Options struct {
 	ReplayFutureSkew              time.Duration
 	ReplayCacheMaxEntries         int
 	CommandRejectSink             CommandRejectSink
+	CommandRejectRequired         bool
 	CommandTopic                  string
 	LifecycleCompactionEnabled    bool
 	LifecycleCompactionWindow     time.Duration
@@ -201,6 +205,7 @@ func New(trust *policy.TrustedKeys, store *state.Store, backend enforcer.Enforce
 			SignalsRequired: opts.FastPathSignals,
 		},
 		acks:                         opts.AckPublisher,
+		ackRequired:                  opts.AckRequired,
 		ackEnqueueTimeout:            opts.AckEnqueueTimeout,
 		applyTimeout:                 opts.ApplyTimeout,
 		applyTotalBudget:             opts.ApplyTotalBudget,
@@ -224,6 +229,7 @@ func New(trust *policy.TrustedKeys, store *state.Store, backend enforcer.Enforce
 		replaySeen:                    make(map[string]time.Time, replayMax),
 		decMax:                        500,
 		commandRejects:                opts.CommandRejectSink,
+		commandRejectRequired:         opts.CommandRejectRequired,
 		commandTopic:                  strings.TrimSpace(opts.CommandTopic),
 		emitAcceptedAck:               opts.EmitAcceptedAck,
 		criticalMode:                  strings.ToLower(strings.TrimSpace(opts.CriticalMode)),
@@ -366,7 +372,9 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 		if c.logger != nil {
 			c.logger.Warn("failed to unmarshal policy", zap.Error(err), zap.Int("value_bytes", len(msg.Value)))
 		}
-		c.publishCommandReject(ctx, msg, err)
+		if rejectErr := c.publishCommandReject(ctx, msg, err); rejectErr != nil {
+			return rejectErr
+		}
 		return nil
 	}
 
@@ -378,7 +386,9 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 		if c.logger != nil {
 			c.logger.Warn("policy verification failed", zap.String("policy_id", event.PolicyId), zap.Error(err))
 		}
-		c.publishCommandReject(ctx, msg, err)
+		if rejectErr := c.publishCommandReject(ctx, msg, err); rejectErr != nil {
+			return rejectErr
+		}
 		return nil
 	}
 	span.SetAttributes(attribute.String("policy.id", evt.Spec.ID))
@@ -440,7 +450,9 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 				zap.Error(replayErr))
 		}
 		if replayReason == "replay_invalid_timestamp" || replayReason == "replay_future_timestamp" {
-			c.publishCommandReject(ctx, msg, replayErr)
+			if rejectErr := c.publishCommandReject(ctx, msg, replayErr); rejectErr != nil {
+				return rejectErr
+			}
 		}
 		c.emitAck(ctx, evt, requiresAck, fastPath, ack.ResultFailed, replayReason, replayErr.Error(), appliedAt)
 		return nil
@@ -459,8 +471,7 @@ func (c *Controller) HandleMessage(ctx context.Context, msg *sarama.ConsumerMess
 				if c.metrics != nil {
 					c.metrics.ObserveRejectPublishFail()
 				}
-				errorCode = "shed_expired_policy_reject_publish_failed"
-				reason = reason + "; reject artifact publish failed: " + rejectErr.Error()
+				return rejectErr
 			}
 			if c.logger != nil {
 				fields := []zap.Field{
@@ -935,7 +946,13 @@ func (c *Controller) MessageLane(msg *sarama.ConsumerMessage) string {
 }
 
 func (c *Controller) publishCommandReject(ctx context.Context, msg *sarama.ConsumerMessage, reason error) error {
-	if c == nil || c.commandRejects == nil || msg == nil || reason == nil {
+	if c == nil || msg == nil || reason == nil {
+		return nil
+	}
+	if c.commandRejects == nil {
+		if c.commandRejectRequired {
+			return errors.New("command reject sink unavailable")
+		}
 		return nil
 	}
 	ctx, span := observability.Tracer("enforcement-agent/controller").Start(
@@ -949,8 +966,8 @@ func (c *Controller) publishCommandReject(ctx context.Context, msg *sarama.Consu
 		),
 	)
 	defer span.End()
-	// Best-effort reject artifact publication should not be canceled by the
-	// caller's consume-loop context. Use a short detached budget.
+	// Keep reject publication detached from the consume-loop context so caller
+	// cancellation cannot silently bypass the reject artifact path.
 	publishCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
 	if err := c.commandRejects.PublishReject(publishCtx, msg, reason); err != nil {
@@ -1800,6 +1817,14 @@ func (c *Controller) emitAck(ctx context.Context, evt policy.Event, requiresAck 
 	}()
 
 	if !ackAttempted {
+		if requiresAck && c.acks == nil {
+			ackStatus = "publisher_unavailable"
+			if c.logger != nil {
+				c.logger.Error("ack publisher unavailable for required acknowledgement", zap.String("policy_id", evt.Spec.ID))
+			}
+			span.SetStatus(codes.Error, "ack_publisher_unavailable")
+			return
+		}
 		if c.metrics != nil && !appliedAt.IsZero() {
 			c.metrics.ObserveApplyToAckEnqueue("skipped", time.Since(appliedAt))
 		}
@@ -2122,8 +2147,7 @@ func (c *Controller) applyWithTerminalHandling(
 				if c.metrics != nil {
 					c.metrics.ObserveRejectPublishFail()
 				}
-				errorCode = "apply_retry_exhausted_reject_publish_failed"
-				reason = reason + "; reject artifact publish failed: " + rejectErr.Error()
+				return fmt.Errorf("publish command reject for retry-exhausted policy %s: %w", spec.ID, rejectErr)
 			}
 		}
 	} else {
@@ -2135,12 +2159,7 @@ func (c *Controller) applyWithTerminalHandling(
 				if c.metrics != nil {
 					c.metrics.ObserveRejectPublishFail()
 				}
-				if classOK && class == consumercontract.ErrorClassPermanent {
-					errorCode = "apply_error_reject_publish_failed"
-				} else {
-					errorCode = "apply_terminal_reject_publish_failed"
-				}
-				reason = reason + "; reject artifact publish failed: " + rejectErr.Error()
+				return fmt.Errorf("publish command reject for terminal policy %s: %w", spec.ID, rejectErr)
 			}
 		}
 	}
@@ -2349,7 +2368,11 @@ func (c *Controller) shouldCompactEvent(evt policy.Event, eventTS time.Time, has
 }
 
 func (c *Controller) emitStageMarker(evt policy.Event, stage string, tMs int64, extras ...zap.Field) {
-	if c == nil || c.logger == nil || strings.TrimSpace(stage) == "" {
+	if c == nil || strings.TrimSpace(stage) == "" {
+		return
+	}
+	recordPolicyTraceStage(evt.Spec, stage, tMs)
+	if c.logger == nil {
 		return
 	}
 	fields := []zap.Field{
@@ -2362,6 +2385,24 @@ func (c *Controller) emitStageMarker(evt policy.Event, stage string, tMs int64, 
 	}
 	fields = append(fields, extras...)
 	c.logger.Info("policy stage marker", fields...)
+}
+
+func recordPolicyTraceStage(spec policy.PolicySpec, stage string, tMs int64) {
+	stage = strings.TrimSpace(stage)
+	if stage == "" || tMs <= 0 || spec.Raw == nil {
+		return
+	}
+	trace, _ := spec.Raw["trace"].(map[string]any)
+	if trace == nil {
+		trace = map[string]any{}
+		spec.Raw["trace"] = trace
+	}
+	stages, _ := trace["stages"].(map[string]any)
+	if stages == nil {
+		stages = map[string]any{}
+		trace["stages"] = stages
+	}
+	stages[stage] = tMs
 }
 
 func traceIDFromSpec(spec policy.PolicySpec) string {
