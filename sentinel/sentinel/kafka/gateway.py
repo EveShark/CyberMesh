@@ -99,6 +99,13 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 def _metric_modality_token(value: Any) -> str:
     token = str(value or "").strip().lower()
     token = token.replace("-", "_").replace(".", "_").replace(" ", "_")
@@ -152,6 +159,48 @@ def _set_event_stage_label(event: CanonicalEvent, key: str, timestamp_ms: int) -
     labels = dict(event.labels or {})
     labels[str(key)] = str(int(timestamp_ms))
     event.labels = labels
+
+
+def _publish_trace_event(kafka: KafkaClient, topic: str, event: CanonicalEvent, stage: str, timestamp_ms: int) -> None:
+    if not topic:
+        return
+    try:
+        labels = event.labels if isinstance(event.labels, dict) else {}
+        source_event_id = str(labels.get("source_event_id") or event.id).strip()
+        trace_id = str(labels.get("trace_id") or derive_trace_id("", source_event_id, str(event.id))).strip()
+        stage_source = "telemetry" if stage == "t_telemetry_ingest" else "sentinel"
+        payload: Dict[str, Any] = {
+            "policy_id": str(labels.get("policy_id") or source_event_id),
+            "trace_id": trace_id,
+            "stage": stage,
+            "stage_source": stage_source,
+            "timestamp_ms": int(timestamp_ms),
+            "source_event_id": source_event_id,
+            "sentinel_event_id": str(event.id),
+            "scope_identifier": str(labels.get("scope_identifier") or "").strip(),
+            "tenant": str(labels.get("tenant") or event.tenant_id or "").strip(),
+            "region": str(labels.get("region") or "").strip(),
+            "details": {
+                "modality": event.modality.value,
+                "source": str(event.source),
+            },
+        }
+        kafka.produce(
+            topic=topic,
+            key=trace_id.encode("utf-8"),
+            value=_safe_json_dumps(payload),
+            headers={"schema_version": "control.trace.event.v1", "encoding": "json"},
+        )
+    except Exception:  # pylint: disable=broad-except
+        logger.warning(
+            "failed to publish control trace event",
+            exc_info=True,
+            extra={
+                "stage": stage,
+                "event_id": str(getattr(event, "id", "")),
+                "topic": topic,
+            },
+        )
 
 
 def _input_reference_id(event: CanonicalEvent) -> str:
@@ -266,6 +315,7 @@ def _build_canonical_event(payload: Dict[str, Any], envelope: Dict[str, Any]) ->
         event_id=str(event_id),
     )
     normalized_labels.setdefault("source_event_ts_ms", str(int(ts * 1000)))
+    normalized_labels.setdefault("telemetry_ingest_ts_ms", str(int(time.time() * 1000)))
     return CanonicalEvent(
         id=str(event_id),
         timestamp=ts,
@@ -394,7 +444,11 @@ class KafkaGatewayWorker:
                         time.perf_counter() - validate_start,
                         "ok",
                     )
-                    _set_event_stage_label(event, "t_sentinel_consume_ms", int(time.time() * 1000))
+                    sentinel_consume_ms = int(time.time() * 1000)
+                    telemetry_ingest_ms = _safe_int(event.labels.get("telemetry_ingest_ts_ms"), sentinel_consume_ms)
+                    _publish_trace_event(self.kafka, self.config.trace_events_topic, event, "t_telemetry_ingest", telemetry_ingest_ms)
+                    _set_event_stage_label(event, "t_sentinel_consume_ms", sentinel_consume_ms)
+                    _publish_trace_event(self.kafka, self.config.trace_events_topic, event, "t_sentinel_consume", sentinel_consume_ms)
                     _emit_stage_marker("t_sentinel_consume", event)
                     if span is not None:
                         span.set_attribute("event.id", event.id)
@@ -421,7 +475,11 @@ class KafkaGatewayWorker:
                         time.perf_counter() - decode_start,
                         "ok",
                     )
-                    _set_event_stage_label(event, "t_sentinel_consume_ms", int(time.time() * 1000))
+                    sentinel_consume_ms = int(time.time() * 1000)
+                    telemetry_ingest_ms = _safe_int(event.labels.get("telemetry_ingest_ts_ms"), sentinel_consume_ms)
+                    _publish_trace_event(self.kafka, self.config.trace_events_topic, event, "t_telemetry_ingest", telemetry_ingest_ms)
+                    _set_event_stage_label(event, "t_sentinel_consume_ms", sentinel_consume_ms)
+                    _publish_trace_event(self.kafka, self.config.trace_events_topic, event, "t_sentinel_consume", sentinel_consume_ms)
                     _emit_stage_marker("t_sentinel_consume", event)
                     if span is not None:
                         span.set_attribute("event.id", event.id)
@@ -448,7 +506,9 @@ class KafkaGatewayWorker:
                     time.perf_counter() - analyze_start,
                     "ok",
                 )
-                _set_event_stage_label(event, "t_sentinel_analysis_done_ms", int(time.time() * 1000))
+                sentinel_analysis_done_ms = int(time.time() * 1000)
+                _set_event_stage_label(event, "t_sentinel_analysis_done_ms", sentinel_analysis_done_ms)
+                _publish_trace_event(self.kafka, self.config.trace_events_topic, event, "t_sentinel_analysis_done", sentinel_analysis_done_ms)
                 _emit_stage_marker("t_sentinel_analysis_done", event)
             except Exception as exc:  # pylint: disable=broad-except
                 _metrics.record_operation("gateway_analyze", time.perf_counter() - analyze_start, "error")
@@ -468,6 +528,10 @@ class KafkaGatewayWorker:
 
             publish_start = time.perf_counter()
             try:
+                sentinel_emit_ms = int(time.time() * 1000)
+                _set_event_stage_label(event, "t_sentinel_emit_ms", sentinel_emit_ms)
+                _publish_trace_event(self.kafka, self.config.trace_events_topic, event, "t_sentinel_emit", sentinel_emit_ms)
+                _emit_stage_marker("t_sentinel_emit", event)
                 payload, schema_version = self._serialize_result(event, result)
                 self.kafka.produce(
                     topic=self.config.output_topic,
@@ -487,6 +551,8 @@ class KafkaGatewayWorker:
                     time.perf_counter() - publish_start,
                     "ok",
                 )
+                sentinel_publish_ack_ms = int(time.time() * 1000)
+                _publish_trace_event(self.kafka, self.config.trace_events_topic, event, "t_sentinel_publish_ack", sentinel_publish_ack_ms)
                 _emit_stage_marker("t_sentinel_publish_ack", event)
             except Exception as exc:  # pylint: disable=broad-except
                 _metrics.record_operation("gateway_publish", time.perf_counter() - publish_start, "error")
@@ -620,7 +686,7 @@ class KafkaGatewayWorker:
         )
         labels["source_event_ts_ms"] = str(labels.get("source_event_ts_ms") or int(float(event.timestamp) * 1000.0))
         labels["sentinel_source"] = "sentinel.kafka.gateway"
-        labels["t_sentinel_emit_ms"] = str(int(time.time() * 1000))
+        labels["t_sentinel_emit_ms"] = str(labels.get("t_sentinel_emit_ms") or int(time.time() * 1000))
         return {
             "event_id": event.id,
             "tenant_id": event.tenant_id,
@@ -685,7 +751,7 @@ class KafkaGatewayWorker:
         )
         result_labels["source_event_ts_ms"] = str(result_labels.get("source_event_ts_ms") or int(float(event.timestamp) * 1000.0))
         result_labels["sentinel_source"] = "sentinel.kafka.gateway"
-        result_labels["t_sentinel_emit_ms"] = str(int(time.time() * 1000))
+        result_labels["t_sentinel_emit_ms"] = str(result_labels.get("t_sentinel_emit_ms") or int(time.time() * 1000))
         if result_labels:
             msg.labels.update({str(k): str(v) for k, v in result_labels.items()})
 

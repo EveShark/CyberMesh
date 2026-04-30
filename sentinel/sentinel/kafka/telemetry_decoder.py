@@ -351,6 +351,8 @@ def _ensure_trace_labels(
     out.setdefault("source_event_ts_ms", str(source_event_ts_ms or int(float(timestamp_s) * 1000.0)))
     if telemetry_ingest_ts_ms > 0:
         out.setdefault("telemetry_ingest_ts_ms", str(telemetry_ingest_ts_ms))
+    else:
+        out.setdefault("telemetry_ingest_ts_ms", str(int(time.time() * 1000)))
     if flow_id:
         out.setdefault("flow_id", flow_id)
     source_id = _first_non_empty(payload.get("source_id"))

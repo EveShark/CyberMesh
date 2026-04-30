@@ -64,6 +64,7 @@ class KafkaWorkerConfig:
     output_topic: str
     output_encoding: str
     dlq_topic: str
+    trace_events_topic: str
     consumer_group_id: str
     auto_offset_reset: str
     max_message_size: int
@@ -193,6 +194,7 @@ def load_kafka_worker_config() -> KafkaWorkerConfig:
         output_topic=output_topic,
         output_encoding=_get_env("KAFKA_OUTPUT_ENCODING", "protobuf").strip().lower() or "protobuf",
         dlq_topic=dlq_topic,
+        trace_events_topic=_get_env("TOPIC_CONTROL_TRACE_EVENTS", "control.trace.events.v1"),
         consumer_group_id=_get_env("KAFKA_CONSUMER_GROUP_ID", "sentinel-standalone"),
         auto_offset_reset=_get_env("KAFKA_CONSUMER_AUTO_OFFSET_RESET", "latest"),
         max_message_size=_get_int("KAFKA_MAX_MESSAGE_SIZE", 1_048_576),
