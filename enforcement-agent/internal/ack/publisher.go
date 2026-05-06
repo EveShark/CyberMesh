@@ -26,6 +26,10 @@ type syncProducer interface {
 	Close() error
 }
 
+type batchSyncProducer interface {
+	SendMessages([]*sarama.ProducerMessage) error
+}
+
 // Result enumerates ACK results.
 type Result string
 
@@ -151,64 +155,13 @@ func (p *KafkaPublisher) Publish(ctx context.Context, payload Payload) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		appliedTime, ackTime := canonicalAckTimes(payload.AppliedAt, payload.AckedAt)
-		ackEvent := &pb.PolicyAckEvent{
-			PolicyId:           payload.Event.Spec.ID,
-			ScopeIdentifier:    payload.Scope,
-			Tenant:             payload.Tenant,
-			Region:             payload.Region,
-			Result:             string(payload.Result),
-			Reason:             payload.Reason,
-			ErrorCode:          payload.ErrorCode,
-			AppliedAt:          appliedTime.Unix(),
-			AppliedAtMs:        appliedTime.UnixMilli(),
-			AckedAt:            ackTime.Unix(),
-			AckedAtMs:          ackTime.UnixMilli(),
-			QcReference:        effectiveQCRef(payload),
-			TraceId:            extractTraceID(payload.Event.Spec),
-			SourceEventId:      extractSourceEventID(payload.Event.Spec),
-			SentinelEventId:    extractSentinelEventID(payload.Event.Spec),
-			AckEventId:         ackEventID,
-			RequestId:          extractRequestID(payload.Event.Spec),
-			CommandId:          extractCommandID(payload.Event.Spec),
-			WorkflowId:         extractWorkflowID(payload.Event.Spec),
-			ControllerInstance: payload.Controller,
-			FastPath:           payload.FastPath,
-			RuleHash:           append([]byte(nil), payload.RuleHash...),
-			ProducerId:         append([]byte(nil), payload.ProducerID...),
-		}
-		msgBytes, err := proto.Marshal(ackEvent)
+		kmsg, err := p.buildMessage(ctx, payload, ackEventID)
 		if err != nil {
 			span.RecordError(err)
-			span.SetStatus(codes.Error, "ack_marshal_failed")
-			p.logError("marshal ack payload", payload.Event.Spec.ID, err)
-			return fmt.Errorf("ack publish: marshal payload: %w", err)
+			span.SetStatus(codes.Error, "ack_message_build_failed")
+			p.logError("build ack payload", payload.Event.Spec.ID, err)
+			return err
 		}
-		key := payload.Event.Spec.ID
-		kmsg := &sarama.ProducerMessage{
-			Topic: p.topic,
-			Key:   sarama.StringEncoder(key),
-			Value: sarama.ByteEncoder(msgBytes),
-		}
-		for _, h := range traceStageHeaders(payload.Event.Spec, appliedTime.UnixMilli(), ackTime.UnixMilli()) {
-			kmsg.Headers = append(kmsg.Headers, sarama.RecordHeader{Key: []byte(h.Key), Value: []byte(h.Value)})
-		}
-		if p.signer != nil {
-			out, serr := p.signer.Sign(ctx, payload, msgBytes)
-			if serr != nil {
-				span.RecordError(serr)
-				span.SetStatus(codes.Error, "ack_sign_failed")
-				p.logError("sign ack payload", payload.Event.Spec.ID, serr)
-				return fmt.Errorf("ack publish: sign payload: %w", serr)
-			}
-			if len(out.Signature) > 0 {
-				kmsg.Headers = append(kmsg.Headers, sarama.RecordHeader{Key: []byte("ack-signature"), Value: out.Signature})
-				if out.Algorithm != "" {
-					kmsg.Headers = append(kmsg.Headers, sarama.RecordHeader{Key: []byte("ack-signature-alg"), Value: []byte(out.Algorithm)})
-				}
-			}
-		}
-		kmsg.Headers = observability.InjectContextToSaramaHeaders(ctx, kmsg.Headers)
 		_, _, err = p.producer.SendMessage(kmsg)
 		if err == nil {
 			span.SetStatus(codes.Ok, "ack_publish_ok")
@@ -239,6 +192,61 @@ func (p *KafkaPublisher) Publish(ctx context.Context, payload Payload) error {
 		p.metrics.ObserveAckPublish("failure")
 	}
 	return fmt.Errorf("ack publish: %w", lastErr)
+}
+
+func (p *KafkaPublisher) buildMessage(ctx context.Context, payload Payload, ackEventID string) (*sarama.ProducerMessage, error) {
+	appliedTime, ackTime := canonicalAckTimes(payload.AppliedAt, payload.AckedAt)
+	ackEvent := &pb.PolicyAckEvent{
+		PolicyId:           payload.Event.Spec.ID,
+		ScopeIdentifier:    payload.Scope,
+		Tenant:             payload.Tenant,
+		Region:             payload.Region,
+		Result:             string(payload.Result),
+		Reason:             payload.Reason,
+		ErrorCode:          payload.ErrorCode,
+		AppliedAt:          appliedTime.Unix(),
+		AppliedAtMs:        appliedTime.UnixMilli(),
+		AckedAt:            ackTime.Unix(),
+		AckedAtMs:          ackTime.UnixMilli(),
+		QcReference:        effectiveQCRef(payload),
+		TraceId:            extractTraceID(payload.Event.Spec),
+		SourceEventId:      extractSourceEventID(payload.Event.Spec),
+		SentinelEventId:    extractSentinelEventID(payload.Event.Spec),
+		AckEventId:         ackEventID,
+		RequestId:          extractRequestID(payload.Event.Spec),
+		CommandId:          extractCommandID(payload.Event.Spec),
+		WorkflowId:         extractWorkflowID(payload.Event.Spec),
+		ControllerInstance: payload.Controller,
+		FastPath:           payload.FastPath,
+		RuleHash:           append([]byte(nil), payload.RuleHash...),
+		ProducerId:         append([]byte(nil), payload.ProducerID...),
+	}
+	msgBytes, err := proto.Marshal(ackEvent)
+	if err != nil {
+		return nil, fmt.Errorf("ack publish: marshal payload: %w", err)
+	}
+	kmsg := &sarama.ProducerMessage{
+		Topic: p.topic,
+		Key:   sarama.StringEncoder(payload.Event.Spec.ID),
+		Value: sarama.ByteEncoder(msgBytes),
+	}
+	for _, h := range traceStageHeaders(payload.Event.Spec, appliedTime.UnixMilli(), ackTime.UnixMilli()) {
+		kmsg.Headers = append(kmsg.Headers, sarama.RecordHeader{Key: []byte(h.Key), Value: []byte(h.Value)})
+	}
+	if p.signer != nil {
+		out, serr := p.signer.Sign(ctx, payload, msgBytes)
+		if serr != nil {
+			return nil, fmt.Errorf("ack publish: sign payload: %w", serr)
+		}
+		if len(out.Signature) > 0 {
+			kmsg.Headers = append(kmsg.Headers, sarama.RecordHeader{Key: []byte("ack-signature"), Value: out.Signature})
+			if out.Algorithm != "" {
+				kmsg.Headers = append(kmsg.Headers, sarama.RecordHeader{Key: []byte("ack-signature-alg"), Value: []byte(out.Algorithm)})
+			}
+		}
+	}
+	kmsg.Headers = observability.InjectContextToSaramaHeaders(ctx, kmsg.Headers)
+	return kmsg, nil
 }
 
 func traceStageHeaders(spec policy.PolicySpec, appliedAtMs, ackedAtMs int64) []traceStageHeader {
@@ -472,15 +480,62 @@ func extractWorkflowID(spec policy.PolicySpec) string {
 	return ""
 }
 
-// PublishBatch emits multiple payloads sequentially.
+// PublishBatch emits multiple payloads as one producer batch when supported.
 func (p *KafkaPublisher) PublishBatch(ctx context.Context, payloads []Payload) error {
-	var firstErr error
+	if len(payloads) == 0 {
+		return nil
+	}
+	batcher, ok := p.producer.(batchSyncProducer)
+	if !ok {
+		var firstErr error
+		for _, payload := range payloads {
+			if err := p.Publish(ctx, payload); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		return firstErr
+	}
+	messages := make([]*sarama.ProducerMessage, 0, len(payloads))
 	for _, payload := range payloads {
-		if err := p.Publish(ctx, payload); err != nil && firstErr == nil {
+		msg, err := p.buildMessage(ctx, payload, newAckEventID())
+		if err != nil {
+			return err
+		}
+		messages = append(messages, msg)
+	}
+	var firstErr error
+	backoff := p.retryBackoff
+	for attempt := 0; attempt < p.retryMax; attempt++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err := batcher.SendMessages(messages); err != nil {
 			firstErr = err
+			if p.metrics != nil {
+				p.metrics.ObserveAckRetry()
+			}
+			if attempt+1 >= p.retryMax {
+				break
+			}
+			if !waitForRetryBackoff(ctx, backoff) {
+				return ctx.Err()
+			}
+			backoff *= 2
+			continue
+		}
+		if p.metrics != nil {
+			for range payloads {
+				p.metrics.ObserveAckPublish("success")
+			}
+		}
+		return nil
+	}
+	if p.metrics != nil {
+		for range payloads {
+			p.metrics.ObserveAckPublish("failure")
 		}
 	}
-	return firstErr
+	return fmt.Errorf("ack publish batch: %w", firstErr)
 }
 
 // Close flushes producer.

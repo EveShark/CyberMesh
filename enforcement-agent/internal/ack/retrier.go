@@ -16,6 +16,7 @@ type RetryingPublisher struct {
 	logger          *zap.Logger
 	interval        time.Duration
 	maxHeadAttempts int
+	drainBatchSize  int
 	stopCh          chan struct{}
 	stopped         chan struct{}
 }
@@ -36,6 +37,7 @@ type RetrierOptions struct {
 	Logger          *zap.Logger
 	Interval        time.Duration
 	MaxHeadAttempts int
+	DrainBatchSize  int
 }
 
 // NewRetryingPublisher constructs wrapper.
@@ -54,6 +56,10 @@ func NewRetryingPublisher(opts RetrierOptions) (*RetryingPublisher, error) {
 	if maxHeadAttempts <= 0 {
 		maxHeadAttempts = 3
 	}
+	drainBatchSize := opts.DrainBatchSize
+	if drainBatchSize <= 0 {
+		drainBatchSize = 1
+	}
 	r := &RetryingPublisher{
 		queue:           opts.Queue,
 		backend:         opts.Backend,
@@ -61,6 +67,7 @@ func NewRetryingPublisher(opts RetrierOptions) (*RetryingPublisher, error) {
 		logger:          opts.Logger,
 		interval:        interval,
 		maxHeadAttempts: maxHeadAttempts,
+		drainBatchSize:  drainBatchSize,
 		stopCh:          make(chan struct{}),
 		stopped:         make(chan struct{}),
 	}
@@ -118,6 +125,12 @@ func (r *RetryingPublisher) loop() {
 }
 
 func (r *RetryingPublisher) drain(ctx context.Context) {
+	if r.drainBatchSize > 1 {
+		if batchQueue, ok := r.queue.(BatchQueue); ok {
+			r.drainBatches(ctx, batchQueue)
+			return
+		}
+	}
 	var (
 		currentID uint64
 		attempts  int
@@ -188,6 +201,65 @@ func (r *RetryingPublisher) drain(ctx context.Context) {
 		}
 		currentID = 0
 		attempts = 0
+	}
+}
+
+func (r *RetryingPublisher) drainBatches(ctx context.Context, batchQueue BatchQueue) {
+	for {
+		select {
+		case <-r.stopCh:
+			return
+		default:
+		}
+		ids, payloads, err := batchQueue.PeekBatch(ctx, r.drainBatchSize)
+		if errors.Is(err, ErrQueueEmpty) {
+			r.observeDepth(ctx)
+			return
+		}
+		if err != nil {
+			if r.metrics != nil {
+				r.metrics.ObserveAckQueueFailure()
+			}
+			if r.logger != nil {
+				r.logger.Error("ack retrier: batch peek failed", zap.Error(err))
+			}
+			return
+		}
+		if len(ids) == 0 || len(ids) != len(payloads) {
+			return
+		}
+		if err := r.backend.PublishBatch(ctx, payloads); err != nil {
+			if r.logger != nil {
+				r.logger.Error("ack retrier: batch publish failed", zap.Error(err), zap.Int("batch_size", len(payloads)))
+			}
+			if r.metrics != nil {
+				r.metrics.ObserveAckQueueFailure()
+			}
+			r.sleepOrStop()
+			continue
+		}
+		for _, id := range ids {
+			if err := r.queue.Delete(ctx, id); err != nil {
+				if r.logger != nil {
+					r.logger.Warn("ack retrier: delete failed", zap.Error(err), zap.Uint64("queue_id", id))
+				}
+				if r.metrics != nil {
+					r.metrics.ObserveAckQueueFailure()
+				}
+				break
+			}
+		}
+		r.observeDepth(ctx)
+		if r.metrics != nil {
+			ackObservedAt := time.Now().UTC()
+			for _, payload := range payloads {
+				if !payload.AppliedAt.IsZero() {
+					if latency := ackObservedAt.Sub(payload.AppliedAt).Seconds(); latency >= 0 {
+						r.metrics.ObserveAckLatency(latency)
+					}
+				}
+			}
+		}
 	}
 }
 

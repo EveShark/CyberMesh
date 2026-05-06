@@ -71,6 +71,7 @@ type Config struct {
 		RetryBackoff   time.Duration
 		Retrier        struct {
 			MaxHeadAttempts int
+			DrainBatchSize  int
 		}
 		QueuePath    string
 		QueueMaxSize int
@@ -352,6 +353,10 @@ func Load() (Config, error) {
 	cfg.Ack.Batch.MaxSize = int(parseIntEnv("ACK_BATCH_MAX_SIZE", 96))
 	if cfg.Ack.Batch.MaxSize <= 0 {
 		cfg.Ack.Batch.MaxSize = 96
+	}
+	cfg.Ack.Retrier.DrainBatchSize = int(parseIntEnv("ACK_RETRIER_DRAIN_BATCH_SIZE", int64(cfg.Ack.Batch.MaxSize)))
+	if cfg.Ack.Retrier.DrainBatchSize <= 0 {
+		cfg.Ack.Retrier.DrainBatchSize = cfg.Ack.Batch.MaxSize
 	}
 	cfg.Ack.Batch.Interval = parseDurationEnv("ACK_BATCH_INTERVAL", 50*time.Millisecond)
 	if cfg.Ack.Batch.Interval <= 0 {

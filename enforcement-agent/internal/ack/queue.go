@@ -31,6 +31,10 @@ type Queue interface {
 	Close() error
 }
 
+type BatchQueue interface {
+	PeekBatch(ctx context.Context, limit int) ([]uint64, []Payload, error)
+}
+
 // BoltQueue implements Queue using bbolt.
 type BoltQueue struct {
 	db       *bolt.DB
@@ -136,6 +140,37 @@ func (q *BoltQueue) Peek(ctx context.Context) (uint64, Payload, error) {
 		return 0, Payload{}, ErrQueueEmpty
 	}
 	return id, payload, err
+}
+
+func (q *BoltQueue) PeekBatch(ctx context.Context, limit int) ([]uint64, []Payload, error) {
+	if limit <= 0 {
+		limit = 1
+	}
+	ids := make([]uint64, 0, limit)
+	payloads := make([]Payload, 0, limit)
+	err := q.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(queueBucket)
+		if bucket == nil {
+			return errors.New("ack queue: bucket missing")
+		}
+		cursor := bucket.Cursor()
+		for k, v := cursor.First(); k != nil && len(ids) < limit; k, v = cursor.Next() {
+			var payload Payload
+			if err := json.Unmarshal(v, &payload); err != nil {
+				return err
+			}
+			ids = append(ids, binary.BigEndian.Uint64(k[:8]))
+			payloads = append(payloads, payload)
+		}
+		if len(ids) == 0 {
+			return ErrQueueEmpty
+		}
+		return nil
+	})
+	if errors.Is(err, ErrQueueEmpty) {
+		return nil, nil, ErrQueueEmpty
+	}
+	return ids, payloads, err
 }
 
 func (q *BoltQueue) Delete(ctx context.Context, id uint64) error {

@@ -1228,6 +1228,7 @@ func buildAckPublisherSarama(ctx context.Context, cfg config.Config, recorder *m
 		Logger:          logger,
 		Interval:        cfg.Ack.RetryBackoff,
 		MaxHeadAttempts: cfg.Ack.Retrier.MaxHeadAttempts,
+		DrainBatchSize:  cfg.Ack.Retrier.DrainBatchSize,
 	})
 	if err != nil {
 		queue.Close()
@@ -1384,6 +1385,7 @@ func buildAckPublisherKafkaGo(ctx context.Context, cfg config.Config, recorder *
 		Logger:          logger,
 		Interval:        cfg.Ack.RetryBackoff,
 		MaxHeadAttempts: cfg.Ack.Retrier.MaxHeadAttempts,
+		DrainBatchSize:  cfg.Ack.Retrier.DrainBatchSize,
 	})
 	if err != nil {
 		queue.Close()
