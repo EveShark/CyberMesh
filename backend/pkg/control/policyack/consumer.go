@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -81,6 +80,7 @@ type CausalStats struct {
 	CorrelationExact           uint64
 	CorrelationFallbackHash    uint64
 	CorrelationFallbackTrace   uint64
+	CorrelationCommitted       uint64
 	CorrelationNoMatch         uint64
 	CorrelationErrors          uint64
 	AIEventUnitCorrections     uint64
@@ -249,8 +249,8 @@ func (h *handler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.Co
 	}
 	workCh := make(chan workItem, queueSize)
 	errCh := make(chan error, 1)
-	ctx, cancel := context.WithCancel(sess.Context())
-	defer cancel()
+	claimCtx, stopClaim := context.WithCancel(sess.Context())
+	defer stopClaim()
 
 	var wg sync.WaitGroup
 	workerFn := func() {
@@ -259,7 +259,7 @@ func (h *handler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.Co
 			if item.msg == nil {
 				continue
 			}
-			msgCtx := observability.ExtractContextFromSaramaHeaders(ctx, item.msg.Headers)
+			msgCtx := observability.ExtractContextFromSaramaHeaders(sess.Context(), item.msg.Headers)
 			err := h.c.process(msgCtx, item.msg)
 			if err == nil {
 				sess.MarkMessage(item.msg, "")
@@ -279,11 +279,11 @@ func (h *handler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.Co
 					h.c.softThrottleActivations.Add(1)
 					select {
 					case <-time.After(h.c.cfg.SoftThrottleSleep):
-					case <-ctx.Done():
+					case <-claimCtx.Done():
 					}
 				}
 			}
-			cancel()
+			stopClaim()
 			return
 		}
 	}
@@ -299,7 +299,7 @@ func (h *handler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.Co
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-claimCtx.Done():
 			select {
 			case err := <-errCh:
 				return err
@@ -324,7 +324,7 @@ func (h *handler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.Co
 			case workCh <- workItem{msg: msg}:
 			case err := <-errCh:
 				return err
-			case <-ctx.Done():
+			case <-claimCtx.Done():
 				select {
 				case err := <-errCh:
 					return err
@@ -436,17 +436,9 @@ func (c *Consumer) process(ctx context.Context, msg *sarama.ConsumerMessage) err
 	backoff := c.cfg.StoreRetryBackoff
 	var last error
 	receivedAt := time.Now().UTC()
-	fmt.Fprintf(os.Stderr, "policyack consumer process policy=%s trace=%s ack_event=%s topic=%s partition=%d offset=%d\n",
-		strings.TrimSpace(ack.PolicyId),
-		strings.TrimSpace(ack.TraceId),
-		strings.TrimSpace(ack.AckEventId),
-		msg.Topic,
-		msg.Partition,
-		msg.Offset,
-	)
+	enforcementStages := enforcementTraceStagesFromHeaders(msg.Headers)
 	for attempt := 1; attempt <= c.cfg.StoreRetryMax; attempt++ {
-		c.store.AppendEnforcementTraceEvents(ctx, &ack, enforcementTraceStagesFromHeaders(msg.Headers))
-		if err := c.store.Upsert(ctx, &ack, receivedAt); err != nil {
+		if err := c.store.UpsertWithTraceStages(ctx, &ack, receivedAt, enforcementStages); err != nil {
 			span.RecordError(err, trace.WithAttributes(attribute.Int("retry.attempt", attempt)))
 			last = err
 			c.storeRetryAttempts.Add(1)
@@ -695,6 +687,7 @@ func (c *Consumer) CausalStats() CausalStats {
 		CorrelationExact:           s.CorrelationExact,
 		CorrelationFallbackHash:    s.CorrelationFallbackHash,
 		CorrelationFallbackTrace:   s.CorrelationFallbackTrace,
+		CorrelationCommitted:       s.CorrelationCommitted,
 		CorrelationNoMatch:         s.CorrelationNoMatch,
 		CorrelationErrors:          s.CorrelationErrors,
 		AIEventUnitCorrections:     s.AIEventUnitCorrections,

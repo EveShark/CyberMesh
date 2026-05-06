@@ -26,45 +26,54 @@ const (
 )
 
 const (
-	StageTelemetryIngest      = "t_telemetry_ingest"
-	StageSentinelConsume      = "t_sentinel_consume"
-	StageSentinelAnalysisDone = "t_sentinel_analysis_done"
-	StageSentinelEmit         = "t_sentinel_emit"
-	StageAISentinelConsume    = "t_ai_sentinel_consume"
-	StageAIDecisionDone       = "t_ai_decision_done"
-	StageAIProducerSendStart  = "t_ai_producer_send_start"
-	StageAIProducerAck        = "t_ai_producer_ack"
-	StageNonceIdempotencyOK   = "t_nonce_idempotency_ok"
-	StageOutboxClaimed        = "t_outbox_claimed"
-	StageControlPublishStart  = "t_control_publish_start"
-	StageSentinelPublishAck   = "t_sentinel_publish_ack"
-	StagePolicyHandlerEnter   = "t_policy_handler_enter"
-	StageDecodeDone           = "t_decode_done"
-	StageBackendConsume       = "t_backend_consume"
-	StageBackendVerifiedDone  = "t_backend_verified_done"
-	StageMempoolEnqueued      = "t_mempool_enqueued"
-	StageLeaderSelected       = "t_leader_selected"
-	StageProposeStart         = "t_propose_start"
-	StageProposalBroadcast    = "t_proposal_broadcast"
-	StageQCFormed             = "t_qc_formed"
-	StageCommit               = "t_commit"
-	StageStateApplyDone       = "t_state_apply_done"
-	StageOutboxRowCreated     = "t_outbox_row_created"
-	StageOutboxRowReused      = "t_outbox_row_reused"
-	StageOutboxRowRefreshed   = "t_outbox_row_refreshed"
-	StageControlPublishAck    = "t_control_publish_ack"
-	StageOutboxMarkDone       = "t_outbox_mark_published_done"
-	StageAckReceived          = "t_ack_received"
-	StageAckPersisted         = "t_ack_persisted"
-	StageAck                  = "t_ack"
-	StageEnforcementConsume   = "t_enforcement_consume"
-	StageEnforcementApplyDone = "t_enforcement_apply_done"
-	StageEnforcementPersisted = "t_enforcement_persist_done"
-	StageAckPublishStart      = "t_ack_publish_start"
-	StageAckPublishDone       = "t_ack_publish_done"
-	StageAckUnresolved        = "t_ack_unresolved"
-	StageAckAmbiguous         = "t_ack_ambiguous"
-	StageGuardrailRejected    = "t_guardrail_rejected"
+	StageTelemetryIngest        = "t_telemetry_ingest"
+	StageSentinelConsume        = "t_sentinel_consume"
+	StageSentinelAnalysisDone   = "t_sentinel_analysis_done"
+	StageSentinelEmit           = "t_sentinel_emit"
+	StageAISentinelConsume      = "t_ai_sentinel_consume"
+	StageAIDecisionDone         = "t_ai_decision_done"
+	StageAIProducerSendStart    = "t_ai_producer_send_start"
+	StageAIProducerAck          = "t_ai_producer_ack"
+	StageNonceIdempotencyOK     = "t_nonce_idempotency_ok"
+	StageOutboxClaimed          = "t_outbox_claimed"
+	StageControlPublishStart    = "t_control_publish_start"
+	StageSentinelPublishAck     = "t_sentinel_publish_ack"
+	StagePolicyHandlerEnter     = "t_policy_handler_enter"
+	StageDecodeDone             = "t_decode_done"
+	StageBackendConsume         = "t_backend_consume"
+	StageBackendVerifiedDone    = "t_backend_verified_done"
+	StageMempoolEnqueued        = "t_mempool_enqueued"
+	StageLeaderSelected         = "t_leader_selected"
+	StageProposeStart           = "t_propose_start"
+	StageProposalBroadcast      = "t_proposal_broadcast"
+	StageQCFormed               = "t_qc_formed"
+	StageCommit                 = "t_commit"
+	StageStateApplyDone         = "t_state_apply_done"
+	StageCommittedPublishStart  = "t_committed_publish_start"
+	StageCommittedPublishAck    = "t_committed_publish_ack"
+	StageCommittedPublishFailed = "t_committed_publish_failed"
+	StageFastPublishStart       = "t_fast_publish_start"
+	StageFastPublishAck         = "t_fast_publish_ack"
+	StageFastPublishFailed      = "t_fast_publish_failed"
+	StageOutboxReplayNoop       = "t_outbox_replay_noop"
+	StageAckedWithoutPublish    = "t_acked_without_publish_marker"
+	StageDuplicatePolicyCommand = "t_duplicate_policy_command"
+	StageOutboxRowCreated       = "t_outbox_row_created"
+	StageOutboxRowReused        = "t_outbox_row_reused"
+	StageOutboxRowRefreshed     = "t_outbox_row_refreshed"
+	StageControlPublishAck      = "t_control_publish_ack"
+	StageOutboxMarkDone         = "t_outbox_mark_published_done"
+	StageAckReceived            = "t_ack_received"
+	StageAckPersisted           = "t_ack_persisted"
+	StageAck                    = "t_ack"
+	StageEnforcementConsume     = "t_enforcement_consume"
+	StageEnforcementApplyDone   = "t_enforcement_apply_done"
+	StageEnforcementPersisted   = "t_enforcement_persist_done"
+	StageAckPublishStart        = "t_ack_publish_start"
+	StageAckPublishDone         = "t_ack_publish_done"
+	StageAckUnresolved          = "t_ack_unresolved"
+	StageAckAmbiguous           = "t_ack_ambiguous"
+	StageGuardrailRejected      = "t_guardrail_rejected"
 )
 
 var (
@@ -72,45 +81,54 @@ var (
 )
 
 var stageClassByName = map[string]StageClass{
-	StageTelemetryIngest:      StageClassRuntime,
-	StageSentinelConsume:      StageClassRuntime,
-	StageSentinelAnalysisDone: StageClassRuntime,
-	StageSentinelEmit:         StageClassRuntime,
-	StageAISentinelConsume:    StageClassRuntime,
-	StageAIDecisionDone:       StageClassRuntime,
-	StageAIProducerSendStart:  StageClassRuntime,
-	StageAIProducerAck:        StageClassRuntime,
-	StageNonceIdempotencyOK:   StageClassRuntime,
-	StageOutboxClaimed:        StageClassRuntime,
-	StageControlPublishStart:  StageClassRuntime,
-	StageSentinelPublishAck:   StageClassRuntime,
-	StagePolicyHandlerEnter:   StageClassRuntime,
-	StageDecodeDone:           StageClassRuntime,
-	StageBackendConsume:       StageClassRuntime,
-	StageBackendVerifiedDone:  StageClassRuntime,
-	StageMempoolEnqueued:      StageClassRuntime,
-	StageLeaderSelected:       StageClassRuntime,
-	StageProposeStart:         StageClassRuntime,
-	StageProposalBroadcast:    StageClassRuntime,
-	StageQCFormed:             StageClassRuntime,
-	StageCommit:               StageClassRuntime,
-	StageStateApplyDone:       StageClassRuntime,
-	StageOutboxRowCreated:     StageClassDurable,
-	StageOutboxRowReused:      StageClassDurable,
-	StageOutboxRowRefreshed:   StageClassDurable,
-	StageControlPublishAck:    StageClassDurable,
-	StageOutboxMarkDone:       StageClassDurable,
-	StageAckReceived:          StageClassDurable,
-	StageAckPersisted:         StageClassDurable,
-	StageAck:                  StageClassDurable,
-	StageEnforcementConsume:   StageClassRuntime,
-	StageEnforcementApplyDone: StageClassRuntime,
-	StageEnforcementPersisted: StageClassRuntime,
-	StageAckPublishStart:      StageClassRuntime,
-	StageAckPublishDone:       StageClassRuntime,
-	StageAckUnresolved:        StageClassAnomaly,
-	StageAckAmbiguous:         StageClassAnomaly,
-	StageGuardrailRejected:    StageClassAnomaly,
+	StageTelemetryIngest:        StageClassRuntime,
+	StageSentinelConsume:        StageClassRuntime,
+	StageSentinelAnalysisDone:   StageClassRuntime,
+	StageSentinelEmit:           StageClassRuntime,
+	StageAISentinelConsume:      StageClassRuntime,
+	StageAIDecisionDone:         StageClassRuntime,
+	StageAIProducerSendStart:    StageClassRuntime,
+	StageAIProducerAck:          StageClassRuntime,
+	StageNonceIdempotencyOK:     StageClassRuntime,
+	StageOutboxClaimed:          StageClassRuntime,
+	StageControlPublishStart:    StageClassRuntime,
+	StageSentinelPublishAck:     StageClassRuntime,
+	StagePolicyHandlerEnter:     StageClassRuntime,
+	StageDecodeDone:             StageClassRuntime,
+	StageBackendConsume:         StageClassRuntime,
+	StageBackendVerifiedDone:    StageClassRuntime,
+	StageMempoolEnqueued:        StageClassRuntime,
+	StageLeaderSelected:         StageClassRuntime,
+	StageProposeStart:           StageClassRuntime,
+	StageProposalBroadcast:      StageClassRuntime,
+	StageQCFormed:               StageClassRuntime,
+	StageCommit:                 StageClassRuntime,
+	StageStateApplyDone:         StageClassRuntime,
+	StageCommittedPublishStart:  StageClassRuntime,
+	StageCommittedPublishAck:    StageClassRuntime,
+	StageCommittedPublishFailed: StageClassAnomaly,
+	StageFastPublishStart:       StageClassRuntime,
+	StageFastPublishAck:         StageClassRuntime,
+	StageFastPublishFailed:      StageClassAnomaly,
+	StageOutboxReplayNoop:       StageClassAnomaly,
+	StageAckedWithoutPublish:    StageClassAnomaly,
+	StageDuplicatePolicyCommand: StageClassAnomaly,
+	StageOutboxRowCreated:       StageClassDurable,
+	StageOutboxRowReused:        StageClassDurable,
+	StageOutboxRowRefreshed:     StageClassDurable,
+	StageControlPublishAck:      StageClassDurable,
+	StageOutboxMarkDone:         StageClassDurable,
+	StageAckReceived:            StageClassDurable,
+	StageAckPersisted:           StageClassDurable,
+	StageAck:                    StageClassDurable,
+	StageEnforcementConsume:     StageClassRuntime,
+	StageEnforcementApplyDone:   StageClassRuntime,
+	StageEnforcementPersisted:   StageClassRuntime,
+	StageAckPublishStart:        StageClassRuntime,
+	StageAckPublishDone:         StageClassRuntime,
+	StageAckUnresolved:          StageClassAnomaly,
+	StageAckAmbiguous:           StageClassAnomaly,
+	StageGuardrailRejected:      StageClassAnomaly,
 }
 
 // TraceEvent is the append-only canonical event model for control-plane lifecycle tracking.
@@ -235,14 +253,17 @@ func RuntimeEventFromMarker(marker Marker, source string) TraceEvent {
 		WorkflowID:       marker.WorkflowID,
 		SourceEventID:    marker.SourceEventID,
 		SentinelEventID:  marker.SentinelEventID,
+		AckEventID:       marker.AckEventID,
 		ScopeIdentifier:  marker.ScopeIdentifier,
 		Tenant:           marker.Tenant,
 		Region:           marker.Region,
 		Reason:           marker.Reason,
 		Height:           marker.Height,
+		TxIndex:          marker.TxIndex,
 		View:             marker.View,
 		QCTsMs:           marker.QCTsMs,
 		OutboxID:         marker.OutboxID,
+		RuleHash:         append([]byte(nil), marker.RuleHash...),
 		Partition:        marker.Partition,
 		Offset:           marker.Offset,
 		RuntimeMarkerRef: marker.PolicyID + ":" + marker.Stage,

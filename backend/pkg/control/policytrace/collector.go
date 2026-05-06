@@ -34,11 +34,14 @@ type Marker struct {
 	Reason          string
 	TimestampMs     int64
 	Height          uint64
+	TxIndex         int
 	View            uint64
 	QCTsMs          int64
 	OutboxID        string
+	AckEventID      string
 	Partition       int32
 	Offset          int64
+	RuleHash        []byte
 }
 
 // Collector keeps a bounded in-memory runtime trace lane keyed by policy ID.

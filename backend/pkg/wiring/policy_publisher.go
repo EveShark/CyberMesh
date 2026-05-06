@@ -66,16 +66,16 @@ type policyPublisher struct {
 const minIPv6Prefix = 64
 
 var supportedPolicyActions = map[string]struct{}{
-	"drop":            {},
-	"reject":          {},
-	"remove":          {},
-	"force_reauth":    {},
-	"disable_export":  {},
-	"freeze_user":     {},
-	"freeze_tenant":   {},
-	"throttle_action": {},
+	"drop":                     {},
+	"reject":                   {},
+	"remove":                   {},
+	"force_reauth":             {},
+	"disable_export":           {},
+	"freeze_user":              {},
+	"freeze_tenant":            {},
+	"throttle_action":          {},
 	"disable_ai_api_for_scope": {},
-	"rate_limit":      {},
+	"rate_limit":               {},
 }
 
 type policyDLQRecord struct {
@@ -87,6 +87,14 @@ type policyDLQRecord struct {
 	PayloadBase64  string    `json:"payload_base64,omitempty"`
 	ProducerID     string    `json:"producer_id,omitempty"`
 	GuardrailStage string    `json:"guardrail_stage,omitempty"`
+}
+
+type fastPolicyPublishResult struct {
+	PolicyID  string
+	TraceID   string
+	Partition int32
+	Offset    int64
+	Err       error
 }
 
 func newPolicyPublisher(producer *kafka.Producer, cfgMgr *utils.ConfigManager, topic string, logger *utils.Logger, audit *utils.AuditLogger, trace *policytrace.Collector) (*policyPublisher, error) {
@@ -326,6 +334,153 @@ func (p *policyPublisher) PublishFromOutbox(ctx context.Context, height uint64, 
 		})
 	}
 	return policyID, partition, offset, nil
+}
+
+func (p *policyPublisher) PublishFastAfterCommit(ctx context.Context, height uint64, ts int64, payloads [][]byte) []fastPolicyPublishResult {
+	policies := make([]committedPolicyPayload, 0, len(payloads))
+	for _, payload := range payloads {
+		policies = append(policies, committedPolicyPayload{
+			Payload:     payload,
+			TxIndex:     -1,
+			BlockHeight: height,
+			BlockTS:     ts,
+		})
+	}
+	return p.PublishCommittedFastAfterCommit(ctx, policies)
+}
+
+func (p *policyPublisher) PublishCommittedFastAfterCommit(ctx context.Context, policies []committedPolicyPayload) []fastPolicyPublishResult {
+	if p == nil || !p.enabled || len(policies) == 0 {
+		return nil
+	}
+	height := policies[0].BlockHeight
+	ts := policies[0].BlockTS
+	blockTime := time.Unix(ts, 0)
+	if blockTime.IsZero() {
+		blockTime = time.Now().UTC()
+	}
+	seen := make(map[string]struct{}, len(policies))
+	results := make([]fastPolicyPublishResult, 0, len(policies))
+	for _, policy := range policies {
+		raw := policy.Payload
+		if len(raw) == 0 {
+			continue
+		}
+		if policy.BlockHeight != 0 {
+			height = policy.BlockHeight
+		}
+		if policy.BlockTS > 0 {
+			blockTime = time.Unix(policy.BlockTS, 0)
+		}
+		dedupeToken := buildPolicyDedupKey(raw)
+		if dedupeToken != "" {
+			if _, exists := seen[dedupeToken]; exists {
+				p.recordDedupeSuppressed("fast_same_batch")
+				continue
+			}
+			seen[dedupeToken] = struct{}{}
+			if p.alreadyPublishedRecently(dedupeToken, blockTime) {
+				p.recordDedupeSuppressed("fast_within_window")
+				continue
+			}
+		}
+		result := p.publishFastPayload(ctx, height, blockTime, raw, dedupeToken, policy.TxIndex)
+		results = append(results, result)
+	}
+	return results
+}
+
+func (p *policyPublisher) publishFastPayload(ctx context.Context, height uint64, blockTime time.Time, raw []byte, dedupeToken string, txIndex int) fastPolicyPublishResult {
+	evt, policyID, reason, err := p.prepareEvent(height, blockTime, raw)
+	if dedupeToken == "" {
+		dedupeToken = firstNonEmpty(buildPolicyDedupKey(raw), policyID)
+	}
+	if reason != "" || err != nil {
+		p.guardrailReject(ctx, policyID, height, reason, err, raw)
+		if err == nil {
+			err = fmt.Errorf("%s", reason)
+		}
+		return fastPolicyPublishResult{PolicyID: policyID, TraceID: extractTraceIDForGuardrail(raw), Err: err}
+	}
+
+	identity := extractPolicyDedupIdentity(evt.GetRuleData())
+	traceID := identity.TraceID
+	if traceID == "" {
+		identity = extractPolicyDedupIdentity(raw)
+		traceID = identity.TraceID
+	}
+	if traceID == "" {
+		traceID = "synthetic:policy:" + policyID
+	}
+
+	startMs := time.Now().UnixMilli()
+	p.recordFastPublishMarker(policytrace.StageCommittedPublishStart, policyID, traceID, identity, height, txIndex, evt.GetRuleHash(), startMs, nil, nil, "")
+
+	routingKey := ""
+	if p.scopeRouting {
+		_, routingKey, _ = policyoutbox.DeriveScopeIdentifierWithOptions(evt.GetRuleData(), policyoutbox.RoutingOptions{
+			ClusterShardingMode: p.clusterShardingMode,
+			ClusterShardBuckets: p.clusterShardBuckets,
+			ClusterShardLanes:   p.clusterShardLanes,
+		})
+	}
+
+	if p.producer == nil {
+		err := fmt.Errorf("policy producer unavailable")
+		p.guardrailReject(ctx, policyID, height, "fast_policy_publish_failed", err, evt.GetRuleData())
+		nowMs := time.Now().UnixMilli()
+		p.recordFastPublishMarker(policytrace.StageCommittedPublishFailed, policyID, traceID, identity, height, txIndex, evt.GetRuleHash(), nowMs, nil, nil, err.Error())
+		return fastPolicyPublishResult{PolicyID: policyID, TraceID: traceID, Err: err}
+	}
+
+	partition, offset, err := p.producer.PublishPolicyWithRoutingKey(ctx, evt, routingKey)
+	if err != nil {
+		p.guardrailReject(ctx, policyID, height, "fast_policy_publish_failed", err, evt.GetRuleData())
+		nowMs := time.Now().UnixMilli()
+		p.recordFastPublishMarker(policytrace.StageCommittedPublishFailed, policyID, traceID, identity, height, txIndex, evt.GetRuleHash(), nowMs, nil, nil, err.Error())
+		return fastPolicyPublishResult{PolicyID: policyID, TraceID: traceID, Partition: partition, Offset: offset, Err: err}
+	}
+
+	ackMs := time.Now().UnixMilli()
+	p.recordFastPublishMarker(policytrace.StageCommittedPublishAck, policyID, traceID, identity, height, txIndex, evt.GetRuleHash(), ackMs, &partition, &offset, "")
+	if p.audit != nil {
+		_ = p.audit.Info("policy_published_fast_commit", map[string]interface{}{
+			"policy_id": policyID,
+			"height":    height,
+			"partition": partition,
+			"offset":    offset,
+		})
+	}
+	if dedupeToken != "" {
+		p.markPublished(dedupeToken, blockTime)
+	}
+	return fastPolicyPublishResult{PolicyID: policyID, TraceID: traceID, Partition: partition, Offset: offset}
+}
+
+func (p *policyPublisher) recordFastPublishMarker(stage, policyID, traceID string, identity policyDedupIdentity, height uint64, txIndex int, ruleHash []byte, tsMs int64, partition *int32, offset *int64, reason string) {
+	if p == nil || p.trace == nil || strings.TrimSpace(policyID) == "" || strings.TrimSpace(traceID) == "" || tsMs <= 0 {
+		return
+	}
+	marker := policytrace.Marker{
+		Stage:       stage,
+		PolicyID:    strings.TrimSpace(policyID),
+		TraceID:     strings.TrimSpace(traceID),
+		RequestID:   identity.RequestID,
+		CommandID:   identity.CommandID,
+		WorkflowID:  identity.WorkflowID,
+		Reason:      strings.TrimSpace(reason),
+		TimestampMs: tsMs,
+		Height:      height,
+		TxIndex:     txIndex,
+		RuleHash:    append([]byte(nil), ruleHash...),
+	}
+	if partition != nil {
+		marker.Partition = *partition
+	}
+	if offset != nil {
+		marker.Offset = *offset
+	}
+	p.trace.Record(marker)
 }
 
 func (p *policyPublisher) alreadyPublishedRecently(key string, now time.Time) bool {

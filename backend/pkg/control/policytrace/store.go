@@ -60,6 +60,8 @@ func markerStageSource(stage string) string {
 		return StageSourceAI
 	case StageEnforcementConsume, StageEnforcementApplyDone, StageEnforcementPersisted, StageAckPublishStart, StageAckPublishDone:
 		return StageSourceEnforcement
+	case StageCommittedPublishStart, StageCommittedPublishAck, StageCommittedPublishFailed:
+		return StageSourceBackend
 	default:
 		return StageSourceBackend
 	}

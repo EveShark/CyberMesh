@@ -118,6 +118,7 @@ func (s *Service) onCommit(ctx context.Context, b api.Block, qc api.QC) error {
 		return err
 	}
 	s.logPolicyStageForBlock("t_state_apply_done", ab, 0, ab.GetHeight(), 0)
+	s.publishCommittedPoliciesAfterStateApply(ctx, ab)
 
 	// Update metrics
 	s.metrics.IncrementBlocksCommitted()
@@ -499,6 +500,12 @@ func shouldPublishPolicyFromCommit(commitEnabled bool, proposerOnly bool, localN
 func (s *Service) shouldPublishPolicyOnCommit(ab *block.AppBlock) bool {
 	if s == nil || ab == nil || s.policyPublisher == nil {
 		return false
+	}
+	if s.eng == nil {
+		if s.policyCommitProposerOnly {
+			return false
+		}
+		return s.policyPublishOnCommit
 	}
 	status := s.eng.GetStatus()
 	allowed := shouldPublishPolicyFromCommit(s.policyPublishOnCommit, s.policyCommitProposerOnly, status.NodeID, ab.Proposer())

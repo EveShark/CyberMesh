@@ -33,6 +33,10 @@ type storeOps interface {
 	MarkTerminal(ctx context.Context, id, holderID string, epoch int64, retries int, errMsg string) error
 }
 
+type terminalAckSkipper interface {
+	MarkAckedIfTerminalAckExists(ctx context.Context, row Row, holderID string, epoch int64, leaseKey string) (bool, error)
+}
+
 type reclaimTimeoutCounter interface {
 	ReclaimTimeoutsTotal() uint64
 }
@@ -1156,6 +1160,22 @@ func (d *Dispatcher) publishRow(ctx context.Context, row Row, deadline time.Time
 	defer cancel()
 
 	start := time.Now()
+	if skipper, ok := d.store.(terminalAckSkipper); ok {
+		skipCtx := opCtx
+		skipped, err := skipper.MarkAckedIfTerminalAckExists(skipCtx, row, d.holder, row.LeaseEpoch, d.leaseKeyForRow(row))
+		if err != nil && d.logger != nil {
+			d.logger.WarnContext(ctx, "policy outbox fast-ack skip check failed",
+				utils.ZapError(err),
+				utils.ZapString("policy_id", row.PolicyID),
+				utils.ZapString("outbox_id", row.ID))
+		}
+		if skipped {
+			nowMs := time.Now().UnixMilli()
+			d.recordStageMarker(policytrace.StageOutboxReplayNoop, row, nowMs, nil, nil)
+			d.observePublishResult(d.cfg.PolicyTopic, "acked_noop", nil)
+			return markTask{}, false
+		}
+	}
 	d.recordStageMarker("t_control_publish_start", row, start.UnixMilli(), nil, nil)
 	scopeKind, scopeIdentifier, scopeFallback := "legacy", "", false
 	scopeBucketed := false

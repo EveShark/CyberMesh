@@ -116,7 +116,11 @@ func NewStorage(
 	}
 
 	var encMode cbor.EncMode
-	if em, err := cbor.CanonicalEncOptions().EncMode(); err == nil {
+	encOpts := cbor.CanonicalEncOptions()
+	// Votes and QCs are signature material. Preserve the same timestamp
+	// precision as the network encoder so persisted artifacts verify after restart.
+	encOpts.Time = cbor.TimeRFC3339Nano
+	if em, err := encOpts.EncMode(); err == nil {
 		encMode = em
 	} else if logger != nil {
 		logger.WarnContext(context.Background(), "failed to initialize cbor encoder", "error", err)

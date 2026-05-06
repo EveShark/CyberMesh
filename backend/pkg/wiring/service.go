@@ -91,6 +91,8 @@ type Service struct {
 	policyPublisher                             *policyPublisher
 	policyPublishOnCommit                       bool
 	policyPublishOnPersistence                  bool
+	policyFastPublishAfterApply                 bool
+	policyFastPublishTimeout                    time.Duration
 	policyCommitProposerOnly                    bool
 	persistCommitProposerOnly                   bool
 	persistWriterMode                           string
@@ -461,6 +463,8 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 	// Default remains "both" for backward compatibility.
 	s.policyPublishOnCommit = true
 	s.policyPublishOnPersistence = true
+	s.policyFastPublishAfterApply = false
+	s.policyFastPublishTimeout = 2 * time.Second
 	s.policyCommitProposerOnly = false
 	s.persistCommitProposerOnly = false
 	s.persistWriterMode = "proposer"
@@ -543,6 +547,16 @@ func NewService(cfg Config, eng *api.ConsensusEngine, mp *mempool.Mempool, build
 				utils.ZapBool("publish_on_commit", s.policyPublishOnCommit),
 				utils.ZapBool("publish_on_persistence", s.policyPublishOnPersistence),
 				utils.ZapBool("commit_writer_proposer_only", s.policyCommitProposerOnly))
+		}
+		s.policyFastPublishAfterApply = cfg.ConfigManager.GetBool("CONTROL_POLICY_FAST_PUBLISH_AFTER_APPLY", false)
+		s.policyFastPublishTimeout = cfg.ConfigManager.GetDuration("CONTROL_POLICY_FAST_PUBLISH_TIMEOUT", s.policyFastPublishTimeout)
+		if s.policyFastPublishTimeout <= 0 {
+			s.policyFastPublishTimeout = 2 * time.Second
+		}
+		if log != nil {
+			log.Info("Configured committed policy fast publish",
+				utils.ZapBool("enabled", s.policyFastPublishAfterApply),
+				utils.ZapDuration("timeout", s.policyFastPublishTimeout))
 		}
 
 		// Persistence writer mode controls how many validators enqueue full block persistence
@@ -2008,6 +2022,7 @@ func (s *Service) GetPolicyAckCausalStats() (apiserver.PolicyAckCausalStats, boo
 		CorrelationExact:           stats.CorrelationExact,
 		CorrelationFallbackHash:    stats.CorrelationFallbackHash,
 		CorrelationFallbackTrace:   stats.CorrelationFallbackTrace,
+		CorrelationCommitted:       stats.CorrelationCommitted,
 		CorrelationNoMatch:         stats.CorrelationNoMatch,
 		CorrelationErrors:          stats.CorrelationErrors,
 		AIEventUnitCorrections:     stats.AIEventUnitCorrections,

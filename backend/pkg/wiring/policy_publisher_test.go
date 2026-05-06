@@ -3,6 +3,7 @@ package wiring
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +18,9 @@ type fakePolicyProducer struct {
 	published   int
 	routingKeys []string
 	events      []*pb.PolicyUpdateEvent
+	partition   int32
+	offset      int64
+	err         error
 }
 
 func (f *fakePolicyProducer) PublishPolicy(ctx context.Context, evt *pb.PolicyUpdateEvent) error {
@@ -28,14 +32,14 @@ func (f *fakePolicyProducer) PublishPolicy(ctx context.Context, evt *pb.PolicyUp
 func (f *fakePolicyProducer) PublishPolicyWithAck(ctx context.Context, evt *pb.PolicyUpdateEvent) (int32, int64, error) {
 	f.published++
 	f.events = append(f.events, evt)
-	return 0, 0, nil
+	return f.partition, f.offset, f.err
 }
 
 func (f *fakePolicyProducer) PublishPolicyWithRoutingKey(ctx context.Context, evt *pb.PolicyUpdateEvent, routingKey string) (int32, int64, error) {
 	f.published++
 	f.routingKeys = append(f.routingKeys, routingKey)
 	f.events = append(f.events, evt)
-	return 0, 0, nil
+	return f.partition, f.offset, f.err
 }
 
 func (f *fakePolicyProducer) PublishDLQ(ctx context.Context, topic string, key sarama.Encoder, payload []byte, headers []sarama.RecordHeader) (int32, int64, error) {
@@ -536,6 +540,198 @@ func TestPolicyPublisher_GuardrailRejectRecordsTraceMarker(t *testing.T) {
 	if markers[0].TraceID != "trace-abc-123" {
 		t.Fatalf("expected trace ID from payload, got %q", markers[0].TraceID)
 	}
+}
+
+func TestPolicyPublisher_PublishFastAfterCommitRecordsStartAndAck(t *testing.T) {
+	trace := policytrace.NewCollector(16, 8)
+	fp := &fakePolicyProducer{partition: 3, offset: 44}
+	pp := &policyPublisher{
+		producer:      fp,
+		enabled:       true,
+		dedupeWindow:  5 * time.Minute,
+		publishedAt:   map[string]time.Time{},
+		maxCacheSize:  1024,
+		blockDuration: time.Second,
+		rateLimiter:   newPolicyRateLimiter(0),
+		trace:         trace,
+	}
+
+	payload := []byte(`{
+	  "schema_version": 1,
+	  "policy_id": "89111111-1111-4111-8111-111111111111",
+	  "rule_type": "block",
+	  "action": "drop",
+	  "trace_id": "trace-fast-1",
+	  "command_id": "cmd-fast-1",
+	  "request_id": "req-fast-1",
+	  "workflow_id": "wf-fast-1",
+	  "target": { "ips": ["10.0.0.8"], "direction": "ingress", "scope": "cluster" },
+	  "guardrails": { "ttl_seconds": 60, "requires_ack": true }
+	}`)
+
+	results := pp.PublishFastAfterCommit(context.Background(), 802, time.Now().Unix(), [][]byte{payload})
+	if len(results) != 1 {
+		t.Fatalf("expected 1 fast publish result, got %d", len(results))
+	}
+	if results[0].Err != nil {
+		t.Fatalf("fast publish returned error: %v", results[0].Err)
+	}
+	if results[0].Partition != 3 || results[0].Offset != 44 {
+		t.Fatalf("unexpected Kafka coordinates: partition=%d offset=%d", results[0].Partition, results[0].Offset)
+	}
+	markers := trace.GetPolicy("89111111-1111-4111-8111-111111111111")
+	if len(markers) != 2 {
+		t.Fatalf("expected start and ack markers, got %#v", markers)
+	}
+	start := markerByStage(markers, policytrace.StageCommittedPublishStart)
+	if start == nil {
+		t.Fatalf("missing %s marker: %#v", policytrace.StageCommittedPublishStart, markers)
+	}
+	ack := markerByStage(markers, policytrace.StageCommittedPublishAck)
+	if ack == nil {
+		t.Fatalf("missing %s marker: %#v", policytrace.StageCommittedPublishAck, markers)
+	}
+	if ack.Partition != 3 || ack.Offset != 44 {
+		t.Fatalf("ack marker missing Kafka coordinates: %#v", *ack)
+	}
+	if ack.CommandID != "cmd-fast-1" || ack.RequestID != "req-fast-1" || ack.WorkflowID != "wf-fast-1" {
+		t.Fatalf("ack marker missing command lineage: %#v", *ack)
+	}
+}
+
+func TestPolicyPublisher_PublishCommittedFastAfterCommitRecordsTxIndexAndRuleHash(t *testing.T) {
+	trace := policytrace.NewCollector(16, 8)
+	fp := &fakePolicyProducer{partition: 1, offset: 9}
+	pp := &policyPublisher{
+		producer:      fp,
+		enabled:       true,
+		dedupeWindow:  5 * time.Minute,
+		publishedAt:   map[string]time.Time{},
+		maxCacheSize:  1024,
+		blockDuration: time.Second,
+		rateLimiter:   newPolicyRateLimiter(0),
+		trace:         trace,
+	}
+
+	payload := []byte(`{
+	  "schema_version": 1,
+	  "policy_id": "89111111-1111-4111-8111-111111111112",
+	  "rule_type": "block",
+	  "action": "drop",
+	  "trace_id": "trace-fast-2",
+	  "command_id": "cmd-fast-2",
+	  "target": { "ips": ["10.0.0.18"], "direction": "ingress", "scope": "cluster" },
+	  "guardrails": { "ttl_seconds": 60, "requires_ack": true }
+	}`)
+
+	results := pp.PublishCommittedFastAfterCommit(context.Background(), []committedPolicyPayload{{
+		Payload:     payload,
+		TxIndex:     6,
+		BlockHeight: 901,
+		BlockTS:     time.Now().Unix(),
+	}})
+	if len(results) != 1 || results[0].Err != nil {
+		t.Fatalf("PublishCommittedFastAfterCommit() results = %#v", results)
+	}
+	markers := trace.GetPolicy("89111111-1111-4111-8111-111111111112")
+	if len(markers) != 2 {
+		t.Fatalf("expected two fast markers, got %#v", markers)
+	}
+	if markers[0].TxIndex != 6 || markers[1].TxIndex != 6 {
+		t.Fatalf("expected tx index 6 on markers, got %#v", markers)
+	}
+	if len(markers[0].RuleHash) == 0 || len(markers[1].RuleHash) == 0 {
+		t.Fatalf("expected rule hash on fast publish markers")
+	}
+}
+
+func TestPolicyPublisher_PublishFastAfterCommitRecordsFailure(t *testing.T) {
+	trace := policytrace.NewCollector(16, 8)
+	fp := &fakePolicyProducer{err: errors.New("broker unavailable")}
+	pp := &policyPublisher{
+		producer:         fp,
+		enabled:          true,
+		dedupeWindow:     5 * time.Minute,
+		publishedAt:      map[string]time.Time{},
+		maxCacheSize:     1024,
+		blockDuration:    time.Second,
+		rateLimiter:      newPolicyRateLimiter(0),
+		trace:            trace,
+		guardrailHits:    map[string]uint64{},
+		dedupeSuppressed: map[string]uint64{},
+	}
+
+	payload := []byte(`{
+	  "schema_version": 1,
+	  "policy_id": "89222222-2222-4222-8222-222222222222",
+	  "rule_type": "block",
+	  "action": "drop",
+	  "trace_id": "trace-fast-failure",
+	  "target": { "ips": ["10.0.0.9"], "direction": "ingress", "scope": "cluster" },
+	  "guardrails": { "ttl_seconds": 60, "requires_ack": true }
+	}`)
+
+	results := pp.PublishFastAfterCommit(context.Background(), 803, time.Now().Unix(), [][]byte{payload})
+	if len(results) != 1 {
+		t.Fatalf("expected 1 fast publish result, got %d", len(results))
+	}
+	if results[0].Err == nil {
+		t.Fatalf("expected fast publish error")
+	}
+	markers := trace.GetPolicy("89222222-2222-4222-8222-222222222222")
+	if len(markers) != 3 {
+		t.Fatalf("expected start, guardrail, and failed markers, got %#v", markers)
+	}
+	if markerByStage(markers, policytrace.StageCommittedPublishStart) == nil {
+		t.Fatalf("missing %s marker: %#v", policytrace.StageCommittedPublishStart, markers)
+	}
+	if markerByStage(markers, policytrace.StageCommittedPublishFailed) == nil {
+		t.Fatalf("missing %s marker: %#v", policytrace.StageCommittedPublishFailed, markers)
+	}
+}
+
+func TestPolicyPublisher_PublishFastAfterCommitUsesDedupeWindow(t *testing.T) {
+	fp := &fakePolicyProducer{}
+	pp := &policyPublisher{
+		producer:      fp,
+		enabled:       true,
+		dedupeWindow:  5 * time.Minute,
+		publishedAt:   map[string]time.Time{},
+		maxCacheSize:  1024,
+		blockDuration: time.Second,
+		rateLimiter:   newPolicyRateLimiter(0),
+	}
+	payload := []byte(`{
+	  "schema_version": 1,
+	  "policy_id": "89333333-3333-4333-8333-333333333333",
+	  "rule_type": "block",
+	  "action": "drop",
+	  "trace_id": "trace-fast-dedupe",
+	  "target": { "ips": ["10.0.0.10"], "direction": "ingress", "scope": "cluster" },
+	  "guardrails": { "ttl_seconds": 60, "requires_ack": true }
+	}`)
+
+	now := time.Now().Unix()
+	first := pp.PublishFastAfterCommit(context.Background(), 804, now, [][]byte{payload})
+	second := pp.PublishFastAfterCommit(context.Background(), 805, now+1, [][]byte{payload})
+	if len(first) != 1 {
+		t.Fatalf("expected first fast publish result, got %d", len(first))
+	}
+	if len(second) != 0 {
+		t.Fatalf("expected second fast publish to be deduped, got %d results", len(second))
+	}
+	if fp.published != 1 {
+		t.Fatalf("expected one producer publish, got %d", fp.published)
+	}
+}
+
+func markerByStage(markers []policytrace.Marker, stage string) *policytrace.Marker {
+	for i := range markers {
+		if markers[i].Stage == stage {
+			return &markers[i]
+		}
+	}
+	return nil
 }
 
 func TestPolicyPublisher_DedupWindowDoesNotSuppressDifferentPolicyIDs(t *testing.T) {

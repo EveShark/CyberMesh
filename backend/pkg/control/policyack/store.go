@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +25,7 @@ type Store struct {
 	db             *sql.DB
 	traceEvents    *policytrace.Store
 	traceCollector *policytrace.Collector
+	refreshSem     chan struct{}
 	stats          ackStoreStats
 	schemaMu       sync.Mutex
 	schemaReady    bool
@@ -49,6 +49,7 @@ type ackStoreStats struct {
 	correlationExact         atomic.Uint64
 	correlationFallbackHash  atomic.Uint64
 	correlationFallbackTrace atomic.Uint64
+	correlationCommitted     atomic.Uint64
 	correlationNoMatch       atomic.Uint64
 	correlationErrors        atomic.Uint64
 	aiEventUnitFixes         atomic.Uint64
@@ -69,6 +70,7 @@ type StoreStats struct {
 	CorrelationExact           uint64
 	CorrelationFallbackHash    uint64
 	CorrelationFallbackTrace   uint64
+	CorrelationCommitted       uint64
 	CorrelationNoMatch         uint64
 	CorrelationErrors          uint64
 	AIEventUnitCorrections     uint64
@@ -106,7 +108,8 @@ func NewStore(db *sql.DB) (*Store, error) {
 		return nil, fmt.Errorf("policy ack store: db required")
 	}
 	return &Store{
-		db: db,
+		db:         db,
+		refreshSem: make(chan struct{}, 2),
 		eventsCols: ackOptionalColumns{
 			ackEventID:      true,
 			requestID:       true,
@@ -164,6 +167,10 @@ func (s *Store) SetPolicyTraceCollector(collector *policytrace.Collector) {
 }
 
 func (s *Store) Upsert(ctx context.Context, evt *pb.PolicyAckEvent, observedAt time.Time) error {
+	return s.UpsertWithTraceStages(ctx, evt, observedAt, nil)
+}
+
+func (s *Store) UpsertWithTraceStages(ctx context.Context, evt *pb.PolicyAckEvent, observedAt time.Time, enforcementStages map[string]int64) error {
 	policyID := ""
 	result := ""
 	if evt != nil {
@@ -204,15 +211,23 @@ func (s *Store) Upsert(ctx context.Context, evt *pb.PolicyAckEvent, observedAt t
 	if observedAt.IsZero() {
 		observedAt = time.Now().UTC()
 	}
-	enforcementStages := map[string]int64{}
+	derivedStages := map[string]int64{}
+	for stage, ts := range enforcementStages {
+		if ts > 0 {
+			derivedStages[stage] = ts
+		}
+	}
 	if appliedAt.Valid {
-		enforcementStages[policytrace.StageEnforcementApplyDone] = appliedAt.Time.UTC().UnixMilli()
+		derivedStages[policytrace.StageEnforcementApplyDone] = appliedAt.Time.UTC().UnixMilli()
 	}
 	if ackedAt.Valid {
-		enforcementStages[policytrace.StageAckPublishDone] = ackedAt.Time.UTC().UnixMilli()
+		derivedStages[policytrace.StageAckPublishDone] = ackedAt.Time.UTC().UnixMilli()
 	}
-	s.AppendEnforcementTraceEvents(ctx, evt, enforcementStages)
-	s.appendAckTraceEvent(ctx, evt, policytrace.StageAckReceived, policytrace.StageClassDurable, observedAt.UTC().UnixMilli(), "ack message received by backend", nil)
+	traceEvents := s.buildEnforcementTraceEvents(evt, derivedStages)
+	if receivedEvent, ok := s.buildAckTraceEvent(evt, policytrace.StageAckReceived, policytrace.StageClassDurable, policytrace.StageSourceBackend, observedAt.UTC().UnixMilli(), "ack message received by backend", nil); ok {
+		traceEvents = append(traceEvents, receivedEvent)
+	}
+	s.appendPolicyTraceEvents(ctx, traceEvents)
 
 	if err := s.insertEvent(ctx, evt, appliedAt, ackedAt, observedAt.UTC()); err != nil {
 		span.RecordError(err)
@@ -231,7 +246,9 @@ func (s *Store) Upsert(ctx context.Context, evt *pb.PolicyAckEvent, observedAt t
 	if ackPersistedAtMs < observedAt.UTC().UnixMilli() {
 		ackPersistedAtMs = observedAt.UTC().UnixMilli()
 	}
-	s.appendAckTraceEvent(ctx, evt, policytrace.StageAckPersisted, policytrace.StageClassDurable, ackPersistedAtMs, "ack summary persisted", nil)
+	if persistedEvent, ok := s.buildAckTraceEvent(evt, policytrace.StageAckPersisted, policytrace.StageClassDurable, policytrace.StageSourceBackend, ackPersistedAtMs, "ack summary persisted", nil); ok {
+		s.appendPolicyTraceEvents(ctx, []policytrace.TraceEvent{persistedEvent})
+	}
 	if !isTerminalAckResult(evt.Result) {
 		return nil
 	}
@@ -276,6 +293,8 @@ func (s *Store) Upsert(ctx context.Context, evt *pb.PolicyAckEvent, observedAt t
 		s.stats.correlationFallbackHash.Add(1)
 	case correlationFallbackTrace:
 		s.stats.correlationFallbackTrace.Add(1)
+	case correlationFastPath:
+		s.stats.correlationCommitted.Add(1)
 	default:
 		s.stats.correlationNoMatch.Add(1)
 	}
@@ -345,34 +364,7 @@ func (s *Store) Upsert(ctx context.Context, evt *pb.PolicyAckEvent, observedAt t
 		}
 	}
 
-	if err := policystate.Refresh(ctx, s.db, s.db, evt.PolicyId); err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, "policy_state_refresh_failed")
-		return fmt.Errorf("policy ack store: refresh policy state failed: %w", err)
-	}
-	if meta, metaErr := s.loadAckedLifecycleMeta(ctx, evt); metaErr == nil && strings.TrimSpace(meta.OutboxID) != "" {
-		workflowID := meta.WorkflowID
-		if workflowID == "" {
-			workflowID = strings.TrimSpace(evt.WorkflowId)
-		}
-		requestID := meta.RequestID
-		if requestID == "" {
-			requestID = strings.TrimSpace(evt.RequestId)
-		}
-		if _, auditErr := lifecycleaudit.InsertOutboxEvent(ctx, s.db, lifecycleaudit.OutboxEvent{
-			ActionType:  lifecycleaudit.ActionPolicyAcked,
-			OutboxID:    meta.OutboxID,
-			PolicyID:    evt.PolicyId,
-			WorkflowID:  workflowID,
-			RequestID:   requestID,
-			ReasonCode:  "auto.policy_acked",
-			ReasonText:  ackReasonText(evt),
-			AfterStatus: "acked",
-			TenantScope: strings.TrimSpace(evt.Tenant),
-		}); auditErr != nil {
-			// Best-effort: lifecycle audit should not block ACK persistence.
-		}
-	}
+	s.refreshPolicyStateAfterAck(evt)
 
 	span.SetStatus(codes.Ok, "ack_upserted")
 	return nil
@@ -392,55 +384,68 @@ func (s *Store) appendPolicyTraceEvent(ctx context.Context, event policytrace.Tr
 	if s == nil {
 		return
 	}
+	s.appendPolicyTraceEvents(ctx, []policytrace.TraceEvent{event})
+}
+
+func (s *Store) appendPolicyTraceEvents(ctx context.Context, events []policytrace.TraceEvent) {
+	if s == nil || len(events) == 0 {
+		return
+	}
+	if s.traceCollector != nil {
+		for _, event := range events {
+			s.recordTraceFallback(event)
+		}
+		return
+	}
 	traceStore := s.traceEvents
 	if traceStore == nil && s.db != nil {
 		traceStore = policytrace.NewStore(s.db)
 	}
 	if traceStore == nil {
-		if strings.HasPrefix(event.Stage, "t_ack") {
-			fmt.Fprintf(os.Stderr, "policyack trace append fallback-no-store policy=%s trace=%s stage=%s\n", event.PolicyID, event.TraceID, event.Stage)
-		}
-		if s.traceCollector != nil {
-			s.traceCollector.Record(policytrace.Marker{
-				Stage:       event.Stage,
-				PolicyID:    event.PolicyID,
-				TraceID:     event.TraceID,
-				Reason:      event.Reason,
-				TimestampMs: event.TimestampMs,
-				Height:      event.Height,
-				View:        event.View,
-				QCTsMs:      event.QCTsMs,
-				OutboxID:    event.OutboxID,
-				Partition:   event.Partition,
-				Offset:      event.Offset,
-			})
+		for _, event := range events {
+			s.recordTraceFallback(event)
 		}
 		return
 	}
-	if err := traceStore.Append(ctx, event); err != nil {
-		if strings.HasPrefix(event.Stage, "t_ack") {
-			fmt.Fprintf(os.Stderr, "policyack trace append failed policy=%s trace=%s stage=%s err=%v\n", event.PolicyID, event.TraceID, event.Stage, err)
-		}
-		if s.traceCollector != nil {
-			s.traceCollector.Record(policytrace.Marker{
-				Stage:       event.Stage,
-				PolicyID:    event.PolicyID,
-				TraceID:     event.TraceID,
-				Reason:      event.Reason,
-				TimestampMs: event.TimestampMs,
-				Height:      event.Height,
-				View:        event.View,
-				QCTsMs:      event.QCTsMs,
-				OutboxID:    event.OutboxID,
-				Partition:   event.Partition,
-				Offset:      event.Offset,
-			})
+	if err := traceStore.AppendBatch(ctx, events); err != nil {
+		for _, event := range events {
+			if singleErr := traceStore.Append(ctx, event); singleErr == nil {
+				continue
+			}
+			s.recordTraceFallback(event)
 		}
 		return
 	}
-	if strings.HasPrefix(event.Stage, "t_ack") {
-		fmt.Fprintf(os.Stderr, "policyack trace append ok policy=%s trace=%s stage=%s\n", event.PolicyID, event.TraceID, event.Stage)
+}
+
+func (s *Store) recordTraceFallback(event policytrace.TraceEvent) {
+	if s == nil || s.traceCollector == nil {
+		return
 	}
+	s.traceCollector.Record(policytrace.Marker{
+		Stage:           event.Stage,
+		PolicyID:        event.PolicyID,
+		TraceID:         event.TraceID,
+		RequestID:       event.RequestID,
+		CommandID:       event.CommandID,
+		WorkflowID:      event.WorkflowID,
+		SourceEventID:   event.SourceEventID,
+		SentinelEventID: event.SentinelEventID,
+		ScopeIdentifier: event.ScopeIdentifier,
+		Tenant:          event.Tenant,
+		Region:          event.Region,
+		Reason:          event.Reason,
+		TimestampMs:     event.TimestampMs,
+		Height:          event.Height,
+		TxIndex:         event.TxIndex,
+		View:            event.View,
+		QCTsMs:          event.QCTsMs,
+		OutboxID:        event.OutboxID,
+		AckEventID:      event.AckEventID,
+		Partition:       event.Partition,
+		Offset:          event.Offset,
+		RuleHash:        append([]byte(nil), event.RuleHash...),
+	})
 }
 
 func (s *Store) appendAckTraceEvent(ctx context.Context, evt *pb.PolicyAckEvent, stage string, stageClass policytrace.StageClass, timestampMs int64, reason string, details map[string]string) {
@@ -448,8 +453,16 @@ func (s *Store) appendAckTraceEvent(ctx context.Context, evt *pb.PolicyAckEvent,
 }
 
 func (s *Store) appendAckTraceEventWithSource(ctx context.Context, evt *pb.PolicyAckEvent, stage string, stageClass policytrace.StageClass, stageSource string, timestampMs int64, reason string, details map[string]string) {
-	if s == nil || evt == nil || strings.TrimSpace(evt.GetPolicyId()) == "" || timestampMs <= 0 {
+	event, ok := s.buildAckTraceEvent(evt, stage, stageClass, stageSource, timestampMs, reason, details)
+	if !ok {
 		return
+	}
+	s.appendPolicyTraceEvent(ctx, event)
+}
+
+func (s *Store) buildAckTraceEvent(evt *pb.PolicyAckEvent, stage string, stageClass policytrace.StageClass, stageSource string, timestampMs int64, reason string, details map[string]string) (policytrace.TraceEvent, bool) {
+	if s == nil || evt == nil || strings.TrimSpace(evt.GetPolicyId()) == "" || timestampMs <= 0 {
+		return policytrace.TraceEvent{}, false
 	}
 	if strings.TrimSpace(stageSource) == "" {
 		stageSource = policytrace.StageSourceBackend
@@ -461,7 +474,7 @@ func (s *Store) appendAckTraceEventWithSource(ctx context.Context, evt *pb.Polic
 	if traceID == "" {
 		traceID = "ack:" + strings.TrimSpace(evt.GetPolicyId())
 	}
-	event := policytrace.TraceEvent{
+	return policytrace.TraceEvent{
 		PolicyID:        strings.TrimSpace(evt.GetPolicyId()),
 		TraceID:         traceID,
 		Stage:           stage,
@@ -480,14 +493,62 @@ func (s *Store) appendAckTraceEventWithSource(ctx context.Context, evt *pb.Polic
 		Region:          strings.TrimSpace(evt.GetRegion()),
 		Reason:          strings.TrimSpace(reason),
 		Details:         details,
-	}
-	s.appendPolicyTraceEvent(ctx, event)
+	}, true
 }
 
 func (s *Store) AppendEnforcementTraceEvents(ctx context.Context, evt *pb.PolicyAckEvent, stageTimes map[string]int64) {
-	if s == nil || evt == nil || len(stageTimes) == 0 {
+	s.appendPolicyTraceEvents(ctx, s.buildEnforcementTraceEvents(evt, stageTimes))
+}
+
+func (s *Store) refreshPolicyStateAfterAck(evt *pb.PolicyAckEvent) {
+	if s == nil || s.db == nil || evt == nil || strings.TrimSpace(evt.PolicyId) == "" {
 		return
 	}
+	sem := s.refreshSem
+	if sem == nil {
+		sem = make(chan struct{}, 1)
+		s.refreshSem = sem
+	}
+	select {
+	case sem <- struct{}{}:
+	default:
+		return
+	}
+	snapshot := *evt
+	go func() {
+		defer func() { <-sem }()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = policystate.Refresh(ctx, s.db, s.db, snapshot.PolicyId)
+		if meta, metaErr := s.loadAckedLifecycleMeta(ctx, &snapshot); metaErr == nil && strings.TrimSpace(meta.OutboxID) != "" {
+			workflowID := meta.WorkflowID
+			if workflowID == "" {
+				workflowID = strings.TrimSpace(snapshot.WorkflowId)
+			}
+			requestID := meta.RequestID
+			if requestID == "" {
+				requestID = strings.TrimSpace(snapshot.RequestId)
+			}
+			_, _ = lifecycleaudit.InsertOutboxEvent(ctx, s.db, lifecycleaudit.OutboxEvent{
+				ActionType:  lifecycleaudit.ActionPolicyAcked,
+				OutboxID:    meta.OutboxID,
+				PolicyID:    snapshot.PolicyId,
+				WorkflowID:  workflowID,
+				RequestID:   requestID,
+				ReasonCode:  "auto.policy_acked",
+				ReasonText:  ackReasonText(&snapshot),
+				AfterStatus: "acked",
+				TenantScope: strings.TrimSpace(snapshot.Tenant),
+			})
+		}
+	}()
+}
+
+func (s *Store) buildEnforcementTraceEvents(evt *pb.PolicyAckEvent, stageTimes map[string]int64) []policytrace.TraceEvent {
+	if s == nil || evt == nil || len(stageTimes) == 0 {
+		return nil
+	}
+	events := make([]policytrace.TraceEvent, 0, len(stageTimes))
 	for _, stage := range []string{
 		policytrace.StageEnforcementConsume,
 		policytrace.StageEnforcementApplyDone,
@@ -499,8 +560,11 @@ func (s *Store) AppendEnforcementTraceEvents(ctx context.Context, evt *pb.Policy
 		if ts <= 0 {
 			continue
 		}
-		s.appendAckTraceEventWithSource(ctx, evt, stage, policytrace.StageClassRuntime, policytrace.StageSourceEnforcement, ts, "enforcement runtime stage from ACK producer", nil)
+		if event, ok := s.buildAckTraceEvent(evt, stage, policytrace.StageClassRuntime, policytrace.StageSourceEnforcement, ts, "enforcement runtime stage from ACK producer", nil); ok {
+			events = append(events, event)
+		}
 	}
+	return events
 }
 
 func (s *Store) insertEvent(ctx context.Context, evt *pb.PolicyAckEvent, appliedAt, ackedAt sql.NullTime, observedAt time.Time) error {
@@ -540,6 +604,7 @@ func (s *Store) Stats() StoreStats {
 		CorrelationExact:           s.stats.correlationExact.Load(),
 		CorrelationFallbackHash:    s.stats.correlationFallbackHash.Load(),
 		CorrelationFallbackTrace:   s.stats.correlationFallbackTrace.Load(),
+		CorrelationCommitted:       s.stats.correlationCommitted.Load(),
 		CorrelationNoMatch:         s.stats.correlationNoMatch.Load(),
 		CorrelationErrors:          s.stats.correlationErrors.Load(),
 		AIEventUnitCorrections:     s.stats.aiEventUnitFixes.Load(),
@@ -581,6 +646,7 @@ const (
 	correlationExact         correlationMode = "exact"
 	correlationFallbackHash  correlationMode = "fallback_hash"
 	correlationFallbackTrace correlationMode = "fallback_trace"
+	correlationFastPath      correlationMode = "committed_publish_ack"
 	correlationUnresolved    correlationMode = "unresolved"
 	correlationAmbiguous     correlationMode = "ambiguous"
 )
@@ -606,6 +672,7 @@ func (s *Store) correlateOutbox(ctx context.Context, evt *pb.PolicyAckEvent, ack
 	hashCutoff := correlationCutoff(ackedAt, trustedNow, hashCorrelationMaxAge)
 	traceCutoff := correlationCutoff(ackedAt, trustedNow, traceCorrelationMaxAge)
 	exactCutoff := correlationCutoff(ackedAt, trustedNow, exactCorrelationMaxAge)
+	strongCommittedIdentity := strings.TrimSpace(evt.PolicyId) != "" && traceID != "" && (commandID != "" || hasRuleHash)
 
 	if commandID != "" {
 		aiTs, sourceTs, pubAt, ackAt, err := s.correlateByCommandID(ctx, evt.PolicyId, commandID, evt.Result, evt.Reason, evt.ControllerInstance, ackedAt, exactCutoff)
@@ -647,7 +714,97 @@ func (s *Store) correlateOutbox(ctx context.Context, evt *pb.PolicyAckEvent, ack
 		}
 	}
 
+	if strongCommittedIdentity && (evt.FastPath || s.committedPublishAckEventExists(ctx, evt.PolicyId, traceID, commandID) || !s.outboxCandidateExists(ctx, evt.PolicyId, traceID, commandID, evt.RuleHash)) {
+		ackAt := ackedAt
+		if !ackAt.Valid {
+			ackAt = sql.NullTime{Time: trustedNow.UTC(), Valid: true}
+		}
+		return sql.NullInt64{}, sql.NullInt64{}, sql.NullTime{}, ackAt, correlationFastPath, nil
+	}
+
 	return sql.NullInt64{}, sql.NullInt64{}, sql.NullTime{}, sql.NullTime{}, correlationNone, nil
+}
+
+func (s *Store) outboxCandidateExists(ctx context.Context, policyID, traceID, commandID string, ruleHash []byte) bool {
+	if s == nil || s.db == nil || strings.TrimSpace(policyID) == "" {
+		return false
+	}
+	clauses := []string{"policy_id = $1"}
+	args := []interface{}{strings.TrimSpace(policyID)}
+	nextArg := 2
+	if strings.TrimSpace(traceID) != "" {
+		clauses = append(clauses, fmt.Sprintf("trace_id = $%d", nextArg))
+		args = append(args, strings.TrimSpace(traceID))
+		nextArg++
+	}
+	if strings.TrimSpace(commandID) != "" {
+		clauses = append(clauses, fmt.Sprintf("command_id = $%d", nextArg))
+		args = append(args, strings.TrimSpace(commandID))
+		nextArg++
+	}
+	if len(ruleHash) > 0 {
+		clauses = append(clauses, fmt.Sprintf("rule_hash = $%d", nextArg))
+		args = append(args, ruleHash)
+	}
+	var exists bool
+	query := `
+		SELECT EXISTS (
+			SELECT 1
+			FROM control_policy_outbox
+			WHERE ` + strings.Join(clauses, " AND ") + `
+			LIMIT 1
+		)
+	`
+	if err := s.db.QueryRowContext(ctx, query, args...).Scan(&exists); err != nil {
+		return true
+	}
+	return exists
+}
+
+func (s *Store) fastPublishAckEventExists(ctx context.Context, policyID, traceID string, cutoff time.Time) bool {
+	return s.committedPublishAckEventExistsAfter(ctx, policyID, traceID, "", cutoff)
+}
+
+func (s *Store) committedPublishAckEventExists(ctx context.Context, policyID, traceID, commandID string) bool {
+	return s.committedPublishAckEventExistsAfter(ctx, policyID, traceID, commandID, time.Time{})
+}
+
+func (s *Store) committedPublishAckEventExistsAfter(ctx context.Context, policyID, traceID, commandID string, cutoff time.Time) bool {
+	if s == nil || s.db == nil || strings.TrimSpace(policyID) == "" || strings.TrimSpace(traceID) == "" {
+		return false
+	}
+	clauses := []string{
+		"policy_id = $1",
+		"trace_id = $2",
+		"stage IN ($3, $4)",
+	}
+	args := []any{
+		strings.TrimSpace(policyID),
+		strings.TrimSpace(traceID),
+		policytrace.StageCommittedPublishAck,
+		policytrace.StageFastPublishAck,
+	}
+	if strings.TrimSpace(commandID) != "" {
+		args = append(args, strings.TrimSpace(commandID))
+		clauses = append(clauses, fmt.Sprintf("NULLIF(command_id, '') = $%d", len(args)))
+	}
+	if !cutoff.IsZero() {
+		args = append(args, cutoff.UnixMilli())
+		clauses = append(clauses, fmt.Sprintf("timestamp_ms >= $%d", len(args)))
+	}
+	var exists bool
+	err := s.db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM control_policy_trace_events
+			WHERE `+strings.Join(clauses, "\n\t\t\t  AND ")+`
+			LIMIT 1
+		)
+	`, args...).Scan(&exists)
+	if err != nil {
+		return false
+	}
+	return exists
 }
 
 func (s *Store) correlateByCommandID(ctx context.Context, policyID, commandID, result, reason, controller string, ackedAt sql.NullTime, cutoff time.Time) (sql.NullInt64, sql.NullInt64, sql.NullTime, sql.NullTime, error) {
@@ -656,7 +813,7 @@ func (s *Store) correlateByCommandID(ctx context.Context, policyID, commandID, r
 		FROM control_policy_outbox
 		WHERE policy_id = $1
 		  AND command_id = $2
-		  AND status IN ('publishing', 'published', 'acked')
+		  AND status IN ('pending', 'retry', 'publishing', 'published', 'acked')
 		  AND created_at >= $3
 	`, policyID, commandID, cutoff)
 	if err != nil {
@@ -678,7 +835,7 @@ func (s *Store) correlateByCommandID(ctx context.Context, policyID, commandID, r
 			FROM control_policy_outbox
 			WHERE policy_id = $1
 			  AND command_id = $2
-			  AND status IN ('publishing', 'published', 'acked')
+			  AND status IN ('pending', 'retry', 'publishing', 'published', 'acked')
 			  AND created_at >= $7
 			ORDER BY
 			  CASE
@@ -718,7 +875,7 @@ func (s *Store) correlateExact(ctx context.Context, policyID string, ruleHash []
 		WHERE policy_id = $1
 		  AND rule_hash = $2
 		  AND trace_id = $3
-		  AND status IN ('publishing', 'published', 'acked')
+		  AND status IN ('pending', 'retry', 'publishing', 'published', 'acked')
 		  AND created_at >= $4
 	`, policyID, ruleHash, traceID, cutoff)
 	if err != nil {
@@ -741,7 +898,7 @@ func (s *Store) correlateExact(ctx context.Context, policyID string, ruleHash []
 			WHERE policy_id = $1
 			  AND rule_hash = $2
 			  AND trace_id = $3
-			  AND status IN ('publishing', 'published', 'acked')
+			  AND status IN ('pending', 'retry', 'publishing', 'published', 'acked')
 			  AND created_at >= $8
 			ORDER BY
 			  CASE
@@ -780,7 +937,7 @@ func (s *Store) correlateByRuleHash(ctx context.Context, policyID string, ruleHa
 		FROM control_policy_outbox
 		WHERE policy_id = $1
 		  AND rule_hash = $2
-		  AND status IN ('publishing', 'published', 'acked')
+		  AND status IN ('pending', 'retry', 'publishing', 'published', 'acked')
 		  AND created_at >= $3
 	`, policyID, ruleHash, cutoff)
 	if err != nil {
@@ -802,7 +959,7 @@ func (s *Store) correlateByRuleHash(ctx context.Context, policyID string, ruleHa
 			FROM control_policy_outbox
 			WHERE policy_id = $1
 			  AND rule_hash = $2
-			  AND status IN ('publishing', 'published', 'acked')
+			  AND status IN ('pending', 'retry', 'publishing', 'published', 'acked')
 			  AND created_at >= $7
 			ORDER BY
 			  CASE
@@ -841,7 +998,7 @@ func (s *Store) correlateByTraceID(ctx context.Context, policyID, traceID, resul
 		FROM control_policy_outbox
 		WHERE policy_id = $1
 		  AND trace_id = $2
-		  AND status IN ('publishing', 'published', 'acked')
+		  AND status IN ('pending', 'retry', 'publishing', 'published', 'acked')
 		  AND created_at >= $3
 	`, policyID, traceID, cutoff)
 	if err != nil {
@@ -863,7 +1020,7 @@ func (s *Store) correlateByTraceID(ctx context.Context, policyID, traceID, resul
 			FROM control_policy_outbox
 			WHERE policy_id = $1
 			  AND trace_id = $2
-			  AND status IN ('publishing', 'published', 'acked')
+			  AND status IN ('pending', 'retry', 'publishing', 'published', 'acked')
 			  AND created_at >= $7
 			ORDER BY
 			  CASE
@@ -915,7 +1072,7 @@ func (s *Store) correlateExactLegacy(ctx context.Context, policyID string, ruleH
 			WHERE policy_id = $1
 			  AND rule_hash = $2
 			  AND trace_id = $3
-			  AND status IN ('publishing', 'published', 'acked')
+			  AND status IN ('pending', 'retry', 'publishing', 'published', 'acked')
 			  AND created_at >= $8
 			ORDER BY
 			  CASE
@@ -955,7 +1112,7 @@ func (s *Store) correlateByCommandIDLegacy(ctx context.Context, policyID, comman
 			FROM control_policy_outbox
 			WHERE policy_id = $1
 			  AND command_id = $2
-			  AND status IN ('publishing', 'published', 'acked')
+			  AND status IN ('pending', 'retry', 'publishing', 'published', 'acked')
 			  AND created_at >= $7
 			ORDER BY
 			  CASE
@@ -995,7 +1152,7 @@ func (s *Store) correlateByRuleHashLegacy(ctx context.Context, policyID string, 
 			FROM control_policy_outbox
 			WHERE policy_id = $1
 			  AND rule_hash = $2
-			  AND status IN ('publishing', 'published', 'acked')
+			  AND status IN ('pending', 'retry', 'publishing', 'published', 'acked')
 			  AND created_at >= $7
 			ORDER BY
 			  CASE
@@ -1035,7 +1192,7 @@ func (s *Store) correlateByTraceIDLegacy(ctx context.Context, policyID, traceID,
 			FROM control_policy_outbox
 			WHERE policy_id = $1
 			  AND trace_id = $2
-			  AND status IN ('publishing', 'published', 'acked')
+			  AND status IN ('pending', 'retry', 'publishing', 'published', 'acked')
 			  AND created_at >= $7
 			ORDER BY
 			  CASE

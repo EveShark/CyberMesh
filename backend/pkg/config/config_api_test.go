@@ -287,12 +287,12 @@ func TestDefaultRoleMappingIncludesControlLeaseAdminPlatformConfigRoutes(t *test
 		t.Fatal("expected control_lease_admin to be present in default role mapping")
 	}
 	want := map[string]struct{}{
-		"/health":                {},
-		"/ready":                 {},
-		"/control/leases":        {},
-		"/control/safe-mode":     {},
+		"/health":                 {},
+		"/ready":                  {},
+		"/control/leases":         {},
+		"/control/safe-mode":      {},
 		"/control/runtime:repair": {},
-		"/control/kill-switch":   {},
+		"/control/kill-switch":    {},
 	}
 	for _, endpoint := range endpoints {
 		delete(want, endpoint)
@@ -351,5 +351,50 @@ func TestLoadAPIConfigAllowsJWTBackedRBACWithoutMTLS(t *testing.T) {
 	}
 	if cfg.RequiresMTLS() {
 		t.Fatal("expected JWT-backed RBAC to avoid mTLS requirement when client CA is unset")
+	}
+}
+
+func TestLoadAPIConfigParsesTrustedProxyCIDRs(t *testing.T) {
+	t.Parallel()
+
+	cm, err := utils.NewConfigManager(&utils.ConfigManagerConfig{
+		Source: staticConfigSource{
+			"ENVIRONMENT":             "development",
+			"API_TLS_ENABLED":         "false",
+			"API_TRUSTED_PROXY_CIDRS": "10.0.0.0/8,192.168.0.0/16",
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewConfigManager: %v", err)
+	}
+
+	cfg, err := LoadAPIConfig(cm)
+	if err != nil {
+		t.Fatalf("LoadAPIConfig: %v", err)
+	}
+	if len(cfg.TrustedProxyCIDRs) != 2 {
+		t.Fatalf("trusted_proxy_cidrs=%#v", cfg.TrustedProxyCIDRs)
+	}
+	if cfg.TrustedProxyCIDRs[0] != "10.0.0.0/8" || cfg.TrustedProxyCIDRs[1] != "192.168.0.0/16" {
+		t.Fatalf("trusted_proxy_cidrs=%#v", cfg.TrustedProxyCIDRs)
+	}
+}
+
+func TestLoadAPIConfigRejectsInvalidTrustedProxyCIDR(t *testing.T) {
+	t.Parallel()
+
+	cm, err := utils.NewConfigManager(&utils.ConfigManagerConfig{
+		Source: staticConfigSource{
+			"ENVIRONMENT":             "development",
+			"API_TLS_ENABLED":         "false",
+			"API_TRUSTED_PROXY_CIDRS": "not-a-cidr",
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewConfigManager: %v", err)
+	}
+
+	if _, err := LoadAPIConfig(cm); err == nil {
+		t.Fatal("expected invalid trusted proxy CIDR error")
 	}
 }

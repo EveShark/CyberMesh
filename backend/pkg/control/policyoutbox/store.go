@@ -381,10 +381,10 @@ func (s *Store) ClaimPending(ctx context.Context, holderID string, epoch int64, 
 	if s.hasSourceColumns {
 		sourceEventTSSelect = "COALESCE(source_event_ts_ms, 0)"
 	}
-	// Keep claim RETURNING minimal to reduce timeout risk on the lock+update path.
-	// Only include fields required by publish/mark/latency markers.
+	// Keep claim RETURNING bounded, but include identity fields needed to make
+	// fast-publish/outbox-replay coordination strongly correlated.
 	returningClause := `
-		RETURNING id::STRING, COALESCE(dispatch_shard, '` + dispatchShardLabel(0) + `'), block_height, block_ts, CAST(EXTRACT(EPOCH FROM created_at) * 1000 AS INT8), policy_id, COALESCE(trace_id, ''), COALESCE(ai_event_ts_ms, 0), ` + sourceEventTSSelect + `, payload, retries, lease_epoch`
+		RETURNING id::STRING, COALESCE(dispatch_shard, '` + dispatchShardLabel(0) + `'), block_height, block_ts, CAST(EXTRACT(EPOCH FROM created_at) * 1000 AS INT8), COALESCE(tx_index, -1), policy_id, COALESCE(request_id, ''), COALESCE(command_id, ''), COALESCE(workflow_id, ''), COALESCE(trace_id, ''), COALESCE(ai_event_ts_ms, 0), ` + sourceEventTSSelect + `, COALESCE(source_event_id, ''), COALESCE(sentinel_event_id, ''), rule_hash, payload, retries, lease_epoch`
 	pendingQuery += returningClause
 	reclaimQuery += returningClause
 	if shardCompat {
@@ -617,12 +617,20 @@ func (s *Store) claimPendingOnce(ctx context.Context, query string, args ...any)
 		}
 	}
 	out := make([]Row, 0, capHint)
+	cols, _ := rows.Columns()
 	for rows.Next() {
 		var r Row
 		var scanErr error
-		scanErr = rows.Scan(
-			&r.ID, &r.DispatchShard, &r.BlockHeight, &r.BlockTS, &r.CreatedAtMs, &r.PolicyID, &r.TraceID, &r.AIEventTsMs, &r.SourceEventTsMs, &r.Payload, &r.Retries, &r.LeaseEpoch,
-		)
+		if len(cols) == 12 {
+			scanErr = rows.Scan(
+				&r.ID, &r.DispatchShard, &r.BlockHeight, &r.BlockTS, &r.CreatedAtMs, &r.PolicyID, &r.TraceID, &r.AIEventTsMs, &r.SourceEventTsMs, &r.Payload, &r.Retries, &r.LeaseEpoch,
+			)
+			r.TxIndex = -1
+		} else {
+			scanErr = rows.Scan(
+				&r.ID, &r.DispatchShard, &r.BlockHeight, &r.BlockTS, &r.CreatedAtMs, &r.TxIndex, &r.PolicyID, &r.RequestID, &r.CommandID, &r.WorkflowID, &r.TraceID, &r.AIEventTsMs, &r.SourceEventTsMs, &r.SourceEventID, &r.SentinelEventID, &r.RuleHash, &r.Payload, &r.Retries, &r.LeaseEpoch,
+			)
+		}
 		if scanErr != nil {
 			return nil, fmt.Errorf("policy outbox: claim scan: %w", scanErr)
 		}
@@ -800,6 +808,22 @@ func isClaimConnectErr(err error) bool {
 		strings.Contains(msg, "i/o timeout") ||
 		strings.Contains(msg, "connection refused") ||
 		strings.Contains(msg, "no route to host")
+}
+
+func isPolicyAckTableMissingErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "42P01" {
+		return true
+	}
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) && string(pqErr.Code) == "42P01" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "policy_acks") &&
+		strings.Contains(strings.ToLower(err.Error()), "does not exist")
 }
 
 func (s *Store) MarkPublished(ctx context.Context, id, holderID string, epoch int64, leaseKey string, topic string, partition int32, offset int64) error {
@@ -1085,6 +1109,79 @@ func (s *Store) MarkTerminal(ctx context.Context, id, holderID string, epoch int
 	return nil
 }
 
+func (s *Store) MarkAckedIfTerminalAckExists(ctx context.Context, row Row, holderID string, epoch int64, leaseKey string) (bool, error) {
+	if s == nil || s.db == nil {
+		return false, fmt.Errorf("policy outbox: store not initialized")
+	}
+	row.PolicyID = strings.TrimSpace(row.PolicyID)
+	row.CommandID = strings.TrimSpace(row.CommandID)
+	row.TraceID = strings.TrimSpace(row.TraceID)
+	if row.PolicyID == "" || strings.TrimSpace(row.ID) == "" {
+		return false, nil
+	}
+	if row.CommandID == "" && (row.TraceID == "" || len(row.RuleHash) == 0) {
+		return false, nil
+	}
+
+	matchPredicates := make([]string, 0, 2)
+	args := []any{row.PolicyID}
+	if row.CommandID != "" {
+		args = append(args, row.CommandID)
+		matchPredicates = append(matchPredicates, fmt.Sprintf("NULLIF(command_id, '') = $%d", len(args)))
+	}
+	if row.TraceID != "" && len(row.RuleHash) > 0 {
+		args = append(args, row.TraceID, row.RuleHash)
+		traceArg := len(args) - 1
+		hashArg := len(args)
+		matchPredicates = append(matchPredicates, fmt.Sprintf("(NULLIF(trace_id, '') = $%d AND rule_hash = $%d)", traceArg, hashArg))
+	}
+	if len(matchPredicates) == 0 {
+		return false, nil
+	}
+	idArg := len(args) + 1
+	holderArg := len(args) + 2
+	epochArg := len(args) + 3
+	args = append(args, row.ID, holderID, epoch)
+
+	query := fmt.Sprintf(`
+		WITH terminal_ack AS (
+			SELECT result, reason, controller_instance, acked_at
+			FROM policy_acks
+			WHERE policy_id = $1
+			  AND result IN ('applied', 'noop', 'rejected', 'timeout', 'retry_exhausted', 'failed')
+			  AND (%s)
+			ORDER BY observed_at DESC, acked_at DESC
+			LIMIT 1
+		)
+		UPDATE control_policy_outbox
+		SET status='acked',
+			ack_result=(SELECT result FROM terminal_ack),
+			ack_reason=COALESCE((SELECT reason FROM terminal_ack), 'outbox replay skipped after prior terminal ack'),
+			ack_controller=(SELECT controller_instance FROM terminal_ack),
+			acked_at=COALESCE((SELECT acked_at FROM terminal_ack), now()),
+			last_error=NULL,
+			updated_at=now()
+		WHERE id=$%d::UUID
+		  AND lease_holder=$%d
+		  AND lease_epoch=$%d
+		  AND status='publishing'
+		  AND EXISTS (SELECT 1 FROM terminal_ack)
+	`, strings.Join(matchPredicates, " OR "), idArg, holderArg, epochArg)
+
+	res, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		if isPolicyAckTableMissingErr(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("policy outbox: mark acked from terminal ack: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
 type AckCorrelationRequest struct {
 	PolicyID   string
 	CommandID  string
@@ -1156,7 +1253,7 @@ func (s *Store) correlateAckByCommandID(ctx context.Context, req AckCorrelationR
 			FROM control_policy_outbox
 			WHERE policy_id = $1
 			  AND command_id = $2
-			  AND status IN ('publishing', 'published', 'acked')
+			  AND status IN ('pending', 'retry', 'publishing', 'published', 'acked')
 			ORDER BY
 			  CASE
 			    WHEN acked_at IS NOT NULL THEN 0
@@ -1191,7 +1288,7 @@ func (s *Store) correlateAckExact(ctx context.Context, req AckCorrelationRequest
 			WHERE policy_id = $1
 			  AND rule_hash = $2
 			  AND trace_id = $3
-			  AND status IN ('publishing', 'published', 'acked')
+			  AND status IN ('pending', 'retry', 'publishing', 'published', 'acked')
 			ORDER BY
 			  CASE
 			    WHEN acked_at IS NOT NULL THEN 0
@@ -1225,7 +1322,7 @@ func (s *Store) correlateAckByTraceID(ctx context.Context, req AckCorrelationReq
 			FROM control_policy_outbox
 			WHERE policy_id = $1
 			  AND trace_id = $2
-			  AND status IN ('publishing', 'published', 'acked')
+			  AND status IN ('pending', 'retry', 'publishing', 'published', 'acked')
 			ORDER BY
 			  CASE
 			    WHEN acked_at IS NOT NULL THEN 0
@@ -1259,7 +1356,7 @@ func (s *Store) correlateAckByRuleHash(ctx context.Context, req AckCorrelationRe
 			FROM control_policy_outbox
 			WHERE policy_id = $1
 			  AND rule_hash = $2
-			  AND status IN ('publishing', 'published', 'acked')
+			  AND status IN ('pending', 'retry', 'publishing', 'published', 'acked')
 			ORDER BY
 			  CASE
 			    WHEN acked_at IS NOT NULL THEN 0

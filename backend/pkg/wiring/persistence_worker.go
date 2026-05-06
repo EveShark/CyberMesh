@@ -816,6 +816,14 @@ type commitMetadata struct {
 	evidenceCount  int
 	policyCount    int
 	policyPayloads [][]byte
+	policies       []committedPolicyPayload
+}
+
+type committedPolicyPayload struct {
+	Payload     []byte
+	TxIndex     int
+	BlockHeight uint64
+	BlockTS     int64
 }
 
 func extractCommitMetadata(block *block.AppBlock, logger *utils.Logger) commitMetadata {
@@ -831,7 +839,7 @@ func extractCommitMetadata(block *block.AppBlock, logger *utils.Logger) commitMe
 	meta := commitMetadata{}
 	limitReached := false
 
-	for _, tx := range txs {
+	for txIndex, tx := range txs {
 		switch tx.Type() {
 		case state.TxEvent:
 			meta.anomalyCount++
@@ -876,6 +884,12 @@ func extractCommitMetadata(block *block.AppBlock, logger *utils.Logger) commitMe
 				payloadCopy := make([]byte, len(policyTx.Data))
 				copy(payloadCopy, policyTx.Data)
 				meta.policyPayloads = append(meta.policyPayloads, payloadCopy)
+				meta.policies = append(meta.policies, committedPolicyPayload{
+					Payload:     append([]byte(nil), payloadCopy...),
+					TxIndex:     txIndex,
+					BlockHeight: block.GetHeight(),
+					BlockTS:     block.GetTimestamp().Unix(),
+				})
 			}
 		}
 	}

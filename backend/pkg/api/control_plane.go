@@ -1572,6 +1572,12 @@ func materializeControlTraceFromCanonicalEvents(events []controlTraceEventRow, o
 		return stages[i].TimestampMs < stages[j].TimestampMs
 	})
 
+	if selectedAckEventID != "" {
+		var attemptAnomalies []materializedTraceAnomalyDTO
+		stages, attemptAnomalies = canonicalizeSelectedAckAttemptStages(stages)
+		anomalies = append(anomalies, attemptAnomalies...)
+	}
+
 	outboxCreatedMs := stageTimestamp(stages, policytrace.StageOutboxRowCreated)
 	if outboxCreatedMs > 0 {
 		filteredStages := make([]materializedTraceStageDTO, 0, len(stages))
@@ -1654,6 +1660,14 @@ func materializeControlTraceFromCanonicalEvents(events []controlTraceEventRow, o
 	appendLatency("ai_decision_to_backend_consume", aiEventTsMs, stageTimestamp(stages, policytrace.StageBackendConsume), policytrace.StageAIDecisionDone, policytrace.StageBackendConsume)
 	appendLatency("backend_consume_to_commit", stageTimestamp(stages, policytrace.StageBackendConsume), stageTimestamp(stages, policytrace.StageCommit), policytrace.StageBackendConsume, policytrace.StageCommit)
 	appendLatency("commit_to_publish", stageTimestamp(stages, policytrace.StageCommit), publishedMs, policytrace.StageCommit, policytrace.StageControlPublishAck)
+	committedPublishStartMs := stageTimestampAny(stages, policytrace.StageCommittedPublishStart, policytrace.StageFastPublishStart)
+	committedPublishAckMs := stageTimestampAny(stages, policytrace.StageCommittedPublishAck, policytrace.StageFastPublishAck)
+	appendLatency("state_apply_to_committed_publish_start", stageTimestamp(stages, policytrace.StageStateApplyDone), committedPublishStartMs, policytrace.StageStateApplyDone, policytrace.StageCommittedPublishStart)
+	appendLatency("committed_publish_start_to_ack", committedPublishStartMs, committedPublishAckMs, policytrace.StageCommittedPublishStart, policytrace.StageCommittedPublishAck)
+	appendLatency("committed_publish_ack_to_enforcement_consume", committedPublishAckMs, stageTimestamp(stages, policytrace.StageEnforcementConsume), policytrace.StageCommittedPublishAck, policytrace.StageEnforcementConsume)
+	appendLatency("state_apply_to_fast_publish_start", stageTimestamp(stages, policytrace.StageStateApplyDone), committedPublishStartMs, policytrace.StageStateApplyDone, policytrace.StageFastPublishStart)
+	appendLatency("fast_publish_start_to_ack", committedPublishStartMs, committedPublishAckMs, policytrace.StageFastPublishStart, policytrace.StageFastPublishAck)
+	appendLatency("fast_publish_ack_to_enforcement_consume", committedPublishAckMs, stageTimestamp(stages, policytrace.StageEnforcementConsume), policytrace.StageFastPublishAck, policytrace.StageEnforcementConsume)
 	appendLatency("publish_to_enforcement_consume", publishedMs, stageTimestamp(stages, policytrace.StageEnforcementConsume), policytrace.StageControlPublishAck, policytrace.StageEnforcementConsume)
 	appendLatency("enforcement_consume_to_apply", stageTimestamp(stages, policytrace.StageEnforcementConsume), stageTimestamp(stages, policytrace.StageEnforcementApplyDone), policytrace.StageEnforcementConsume, policytrace.StageEnforcementApplyDone)
 	appendLatency("enforcement_apply_to_ack_publish_start", stageTimestamp(stages, policytrace.StageEnforcementApplyDone), stageTimestamp(stages, policytrace.StageAckPublishStart), policytrace.StageEnforcementApplyDone, policytrace.StageAckPublishStart)
@@ -1671,6 +1685,31 @@ func materializeControlTraceFromCanonicalEvents(events []controlTraceEventRow, o
 			Message:          "canonical trace has ACK state but no publish stage",
 			RelatedStages:    []string{policytrace.StageControlPublishAck, "t_outbox_acked", "t_policy_ack"},
 			SelectedOutboxID: selectedOutboxID,
+		})
+		anomalies = append(anomalies, materializedTraceAnomalyDTO{
+			Code:             policytrace.StageAckedWithoutPublish,
+			Message:          "ACK exists without a matching publish marker in the selected causal chain",
+			RelatedStages:    []string{policytrace.StageControlPublishAck, policytrace.StageAckPersisted},
+			SelectedOutboxID: selectedOutboxID,
+		})
+	}
+	if stageTimestampAny(stages, policytrace.StageCommittedPublishAck, policytrace.StageFastPublishAck) > 0 && stageTimestamp(stages, policytrace.StageOutboxReplayNoop) > 0 {
+		anomalies = append(anomalies, materializedTraceAnomalyDTO{
+			Code:          "outbox_replay_after_committed_publish",
+			Message:       "durable outbox replay observed an existing committed-publish ACK and no-oped",
+			RelatedStages: []string{policytrace.StageCommittedPublishAck, policytrace.StageOutboxReplayNoop},
+		})
+		anomalies = append(anomalies, materializedTraceAnomalyDTO{
+			Code:          "outbox_replay_after_fast_publish",
+			Message:       "durable outbox replay observed an existing committed-publish ACK and no-oped",
+			RelatedStages: []string{policytrace.StageFastPublishAck, policytrace.StageOutboxReplayNoop},
+		})
+	}
+	if hasDuplicatePolicyCommand(outbox, acks) {
+		anomalies = append(anomalies, materializedTraceAnomalyDTO{
+			Code:          "duplicate_policy_command",
+			Message:       "multiple records share the same policy command identity",
+			RelatedStages: []string{policytrace.StageOutboxRowCreated, policytrace.StageAckPersisted},
 		})
 	}
 	appendCanonicalTraceCompletenessAnomalies(&anomalies, stages)
@@ -1697,6 +1736,38 @@ func materializeControlTraceFromCanonicalEvents(events []controlTraceEventRow, o
 		Latencies:           latencies,
 		Anomalies:           anomalies,
 	}
+}
+
+func hasDuplicatePolicyCommand(outbox []controlOutboxRow, acks []policyAckRow) bool {
+	outboxSeen := make(map[string]struct{})
+	for _, row := range outbox {
+		policyID := strings.TrimSpace(row.PolicyID)
+		commandID := strings.TrimSpace(row.CommandID.String)
+		traceID := strings.TrimSpace(row.TraceID.String)
+		if policyID == "" || (commandID == "" && traceID == "") {
+			continue
+		}
+		key := policyID + "|" + commandID + "|" + traceID
+		if _, ok := outboxSeen[key]; ok {
+			return true
+		}
+		outboxSeen[key] = struct{}{}
+	}
+	ackSeen := make(map[string]struct{})
+	for _, row := range acks {
+		policyID := strings.TrimSpace(row.PolicyID)
+		commandID := strings.TrimSpace(row.CommandID.String)
+		traceID := strings.TrimSpace(row.TraceID.String)
+		if policyID == "" || (commandID == "" && traceID == "") {
+			continue
+		}
+		key := policyID + "|" + commandID + "|" + traceID
+		if _, ok := ackSeen[key]; ok {
+			return true
+		}
+		ackSeen[key] = struct{}{}
+	}
+	return false
 }
 
 func isPostOutboxReplayRuntimeStage(stage materializedTraceStageDTO, outboxCreatedMs int64) bool {
@@ -1859,10 +1930,147 @@ func eventMatchesSelectedCausalChain(event controlTraceEventRow, selectedOutboxI
 	if selectedOutboxID != "" && eventStageBelongsToOutbox(stage) && event.OutboxID.Valid && strings.TrimSpace(event.OutboxID.String) != selectedOutboxID {
 		return false
 	}
-	if selectedAckEventID != "" && eventStageBelongsToAck(stage) && event.AckEventID.Valid && strings.TrimSpace(event.AckEventID.String) != selectedAckEventID {
-		return false
+	if selectedAckEventID != "" && eventStageBelongsToAck(stage) {
+		if !event.AckEventID.Valid {
+			return false
+		}
+		if strings.TrimSpace(event.AckEventID.String) != selectedAckEventID {
+			return false
+		}
 	}
 	return true
+}
+
+func canonicalizeSelectedAckAttemptStages(stages []materializedTraceStageDTO) ([]materializedTraceStageDTO, []materializedTraceAnomalyDTO) {
+	enforcementConsumeMs := firstStageTimestamp(stages, policytrace.StageEnforcementConsume)
+	if enforcementConsumeMs <= 0 {
+		return stages, nil
+	}
+
+	selected := make(map[string]int64, 12)
+	if ts := firstStageTimestampAtOrAfter(stages, policytrace.StageEnforcementConsume, enforcementConsumeMs); ts > 0 {
+		selected[policytrace.StageEnforcementConsume] = ts
+	}
+	if ts := firstStageTimestampAtOrAfter(stages, policytrace.StageEnforcementApplyDone, enforcementConsumeMs); ts > 0 {
+		selected[policytrace.StageEnforcementApplyDone] = ts
+	}
+	applyDoneMs := selected[policytrace.StageEnforcementApplyDone]
+	ackStartFloor := enforcementConsumeMs
+	if applyDoneMs > 0 {
+		ackStartFloor = applyDoneMs
+	}
+	if ts := firstStageTimestampAtOrAfter(stages, policytrace.StageAckPublishStart, ackStartFloor); ts > 0 {
+		selected[policytrace.StageAckPublishStart] = ts
+	}
+	ackDoneFloor := selected[policytrace.StageAckPublishStart]
+	if ackDoneFloor <= 0 {
+		ackDoneFloor = ackStartFloor
+	}
+	if ts := firstStageTimestampAtOrAfter(stages, policytrace.StageAckPublishDone, ackDoneFloor); ts > 0 {
+		selected[policytrace.StageAckPublishDone] = ts
+	}
+	ackReceivedFloor := selected[policytrace.StageAckPublishDone]
+	if ackReceivedFloor <= 0 {
+		ackReceivedFloor = ackDoneFloor
+	}
+	if ts := firstStageTimestampAtOrAfter(stages, policytrace.StageAckReceived, ackReceivedFloor); ts > 0 {
+		selected[policytrace.StageAckReceived] = ts
+	}
+	ackPersistedFloor := selected[policytrace.StageAckReceived]
+	if ackPersistedFloor <= 0 {
+		ackPersistedFloor = ackReceivedFloor
+	}
+	if ts := firstStageTimestampAtOrAfter(stages, policytrace.StageAckPersisted, ackPersistedFloor); ts > 0 {
+		selected[policytrace.StageAckPersisted] = ts
+	}
+
+	if stage, ts := lastStageTimestampAtOrBeforeAny(stages, []string{policytrace.StageCommittedPublishAck, policytrace.StageFastPublishAck}, enforcementConsumeMs); ts > 0 {
+		selected[stage] = ts
+		if startStage, startTs := lastStageTimestampAtOrBeforeAny(stages, []string{policytrace.StageCommittedPublishStart, policytrace.StageFastPublishStart}, ts); startTs > 0 {
+			selected[startStage] = startTs
+			if stateApplyTs := lastStageTimestampAtOrBefore(stages, policytrace.StageStateApplyDone, startTs); stateApplyTs > 0 {
+				selected[policytrace.StageStateApplyDone] = stateApplyTs
+				if commitTs := lastStageTimestampAtOrBefore(stages, policytrace.StageCommit, stateApplyTs); commitTs > 0 {
+					selected[policytrace.StageCommit] = commitTs
+				}
+			}
+		}
+	}
+
+	selectedPublishStages := map[string]struct{}{}
+	for _, stage := range []string{
+		policytrace.StageCommittedPublishStart,
+		policytrace.StageCommittedPublishAck,
+		policytrace.StageFastPublishStart,
+		policytrace.StageFastPublishAck,
+	} {
+		if selected[stage] > 0 {
+			selectedPublishStages[stage] = struct{}{}
+		}
+	}
+
+	dropped := 0
+	filtered := make([]materializedTraceStageDTO, 0, len(stages))
+	kept := make(map[string]bool, len(selected))
+	for _, stage := range stages {
+		name := strings.TrimSpace(stage.Stage)
+		if desiredTs, ok := selected[name]; ok {
+			if stage.TimestampMs == desiredTs && !kept[name] {
+				filtered = append(filtered, stage)
+				kept[name] = true
+			} else {
+				dropped++
+			}
+			continue
+		}
+		if isAttemptScopedStage(name) {
+			dropped++
+			continue
+		}
+		if isCommittedPublishStage(name) && len(selectedPublishStages) > 0 {
+			dropped++
+			continue
+		}
+		filtered = append(filtered, stage)
+	}
+	if dropped == 0 {
+		return filtered, nil
+	}
+	return filtered, []materializedTraceAnomalyDTO{{
+		Code:          "duplicate_policy_attempts_collapsed",
+		Message:       "multiple publish/enforcement/ACK attempts shared the selected trace; latency projection uses the selected ACK causal attempt",
+		RelatedStages: []string{policytrace.StageCommittedPublishAck, policytrace.StageEnforcementConsume, policytrace.StageAckPersisted},
+	}}
+}
+
+func isAttemptScopedStage(stage string) bool {
+	switch strings.TrimSpace(stage) {
+	case policytrace.StageCommit,
+		policytrace.StageStateApplyDone,
+		policytrace.StageEnforcementConsume,
+		policytrace.StageEnforcementApplyDone,
+		policytrace.StageEnforcementPersisted,
+		policytrace.StageAckPublishStart,
+		policytrace.StageAckPublishDone,
+		policytrace.StageAckReceived,
+		policytrace.StageAckPersisted,
+		policytrace.StageAck:
+		return true
+	default:
+		return false
+	}
+}
+
+func isCommittedPublishStage(stage string) bool {
+	switch strings.TrimSpace(stage) {
+	case policytrace.StageCommittedPublishStart,
+		policytrace.StageCommittedPublishAck,
+		policytrace.StageFastPublishStart,
+		policytrace.StageFastPublishAck:
+		return true
+	default:
+		return false
+	}
 }
 
 func eventStageBelongsToOutbox(stage string) bool {
@@ -2387,6 +2595,15 @@ func stageTimestamp(stages []materializedTraceStageDTO, stage string) int64 {
 	return 0
 }
 
+func stageTimestampAny(stages []materializedTraceStageDTO, stageNames ...string) int64 {
+	for _, stage := range stageNames {
+		if ts := stageTimestamp(stages, stage); ts > 0 {
+			return ts
+		}
+	}
+	return 0
+}
+
 func firstStageTimestamp(stages []materializedTraceStageDTO, stage string) int64 {
 	for _, item := range stages {
 		if item.Stage == stage && item.TimestampMs > 0 {
@@ -2403,6 +2620,51 @@ func lastStageTimestamp(stages []materializedTraceStageDTO, stage string) int64 
 		}
 	}
 	return 0
+}
+
+func firstStageTimestampAtOrAfter(stages []materializedTraceStageDTO, stage string, floor int64) int64 {
+	var ts int64
+	for _, item := range stages {
+		if item.Stage != stage || item.TimestampMs < floor {
+			continue
+		}
+		if ts == 0 || item.TimestampMs < ts {
+			ts = item.TimestampMs
+		}
+	}
+	return ts
+}
+
+func lastStageTimestampAtOrBefore(stages []materializedTraceStageDTO, stage string, ceiling int64) int64 {
+	var ts int64
+	for _, item := range stages {
+		if item.Stage != stage || item.TimestampMs > ceiling {
+			continue
+		}
+		if item.TimestampMs > ts {
+			ts = item.TimestampMs
+		}
+	}
+	return ts
+}
+
+func lastStageTimestampAtOrBeforeAny(stages []materializedTraceStageDTO, stageNames []string, ceiling int64) (string, int64) {
+	stageSet := make(map[string]struct{}, len(stageNames))
+	for _, stage := range stageNames {
+		stageSet[stage] = struct{}{}
+	}
+	var selectedStage string
+	var ts int64
+	for _, item := range stages {
+		if _, ok := stageSet[item.Stage]; !ok || item.TimestampMs > ceiling {
+			continue
+		}
+		if item.TimestampMs > ts {
+			selectedStage = item.Stage
+			ts = item.TimestampMs
+		}
+	}
+	return selectedStage, ts
 }
 
 func selectMaterializedTraceRows(outbox []controlOutboxRow, acks []policyAckRow, runtime []runtimeTraceMarkerDTO) (*controlOutboxRow, *policyAckRow, string) {

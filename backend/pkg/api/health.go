@@ -27,12 +27,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-
-	readiness, _ := s.buildReadinessResponse(ctx)
-	response := healthResponseFromReadiness(readiness)
-
+	response := HealthResponse{
+		Status:    "healthy",
+		Timestamp: time.Now().Unix(),
+		Version:   apiVersion,
+	}
 	writeJSONResponse(w, r, NewSuccessResponse(response), http.StatusOK)
 }
 

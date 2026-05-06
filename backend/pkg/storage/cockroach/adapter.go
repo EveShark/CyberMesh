@@ -216,6 +216,7 @@ type outboxPrepared struct {
 	txIndex         int
 	policyID        string
 	ruleHash        [32]byte
+	legacyRuleHash  [32]byte
 	semanticKey     string
 	dispatchShard   string
 	payload         []byte
@@ -234,6 +235,25 @@ type parsedPolicyTraceStage struct {
 	stage       string
 	timestampMs int64
 	source      string
+}
+
+type policyOutboxCommandContract struct {
+	SchemaVersion  string
+	CommandID      string
+	RequestID      string
+	TraceID        string
+	WorkflowID     string
+	PolicyID       string
+	ActionType     string
+	ControlAction  string
+	RuleType       string
+	RuleHashHex    string
+	IdempotencyKey string
+	Tenant         string
+	Region         string
+	ScopeID        string
+	TTLSeconds     int64
+	IssuedAtMs     int64
 }
 
 type batchTunerState struct {
@@ -1697,7 +1717,7 @@ func (a *adapter) outboxActiveTemplate(rows int) string {
 	}
 	q.WriteString(`
 			)
-			  AND status IN ('pending', 'retry', 'publishing', 'published')
+			  AND status IN ('pending', 'retry', 'publishing', 'published', 'acked')
 	`)
 	sql := q.String()
 	a.sqlTpl.outboxActive.Store(rows, sql)
@@ -1728,7 +1748,7 @@ func (a *adapter) outboxActiveRowsTemplate(rows int) string {
 	}
 	q.WriteString(`
 			)
-			  AND status IN ('pending', 'retry', 'publishing', 'published')
+			  AND status IN ('pending', 'retry', 'publishing', 'published', 'acked')
 	`)
 	sql := q.String()
 	a.sqlTpl.outboxActiveRows.Store(rows, sql)
@@ -3535,6 +3555,222 @@ func parsePolicyCommandID(raw []byte) string {
 	return commandID
 }
 
+func normalizePolicyOutboxPayload(raw []byte, blockTime time.Time) ([]byte, error) {
+	if len(raw) == 0 {
+		return raw, nil
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return raw, nil
+	}
+	policyID := strings.TrimSpace(extractString(root, "policy_id"))
+	if policyID == "" {
+		return raw, nil
+	}
+	action := strings.ToLower(strings.TrimSpace(extractString(root, "action")))
+	ruleType := strings.ToLower(strings.TrimSpace(extractString(root, "rule_type")))
+	controlAction := strings.ToLower(strings.TrimSpace(extractString(root, "control_action")))
+	if controlAction == "" {
+		controlAction = "add"
+		if action == "remove" {
+			controlAction = "remove"
+		}
+	}
+	if blockTime.IsZero() {
+		blockTime = time.Now().UTC()
+	}
+	rawHash := sha256.Sum256(raw)
+	contract := policyOutboxCommandContract{
+		SchemaVersion: "enforcement.command.v1",
+		PolicyID:      policyID,
+		ActionType:    action,
+		ControlAction: controlAction,
+		RuleType:      ruleType,
+		RuleHashHex:   hex.EncodeToString(rawHash[:]),
+		Tenant:        strings.TrimSpace(extractString(root, "tenant")),
+		Region:        strings.TrimSpace(extractString(root, "region")),
+		ScopeID:       firstPolicyOutboxString(raw, "scope_identifier", "scope_id"),
+		TTLSeconds:    extractPolicyOutboxTTLSeconds(root),
+		IssuedAtMs:    blockTime.UTC().UnixMilli(),
+	}
+	contract.TraceID = firstPolicyOutboxString(raw, "trace_id")
+	contract.RequestID = firstPolicyOutboxString(raw, "request_id")
+	contract.CommandID = firstPolicyOutboxString(raw, "command_id")
+	contract.WorkflowID = firstPolicyOutboxString(raw, "workflow_id")
+	if contract.CommandID == "" {
+		contract.CommandID = synthesizePolicyOutboxID("cmd", contract.PolicyID, contract.ActionType, contract.TraceID, contract.RuleHashHex)
+	}
+	if contract.RequestID == "" {
+		contract.RequestID = synthesizePolicyOutboxID("req", contract.PolicyID, contract.TraceID, contract.CommandID)
+	}
+	if contract.TraceID == "" {
+		contract.TraceID = synthesizePolicyOutboxID("trace", contract.PolicyID, contract.CommandID, contract.RuleHashHex)
+	}
+	if contract.IdempotencyKey == "" {
+		contract.IdempotencyKey = synthesizePolicyOutboxID("idem", contract.PolicyID, contract.CommandID, contract.ActionType, contract.RuleHashHex)
+	}
+	enrichPolicyOutboxPayload(root, contract)
+	normalized, err := json.Marshal(root)
+	if err != nil {
+		return nil, fmt.Errorf("normalize policy outbox payload: %w", err)
+	}
+	return normalized, nil
+}
+
+func firstPolicyOutboxString(raw []byte, keys ...string) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return ""
+	}
+	for _, key := range keys {
+		if value := extractPolicyOutboxStringHierarchy(root, key); value != "" {
+			return value
+		}
+		if params, ok := root["params"].(map[string]interface{}); ok {
+			if value := extractPolicyOutboxStringHierarchy(params, key); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+func extractPolicyOutboxStringHierarchy(root map[string]interface{}, key string) string {
+	if root == nil || strings.TrimSpace(key) == "" {
+		return ""
+	}
+	if value := extractString(root, key); value != "" {
+		return value
+	}
+	if metadata, ok := root["metadata"].(map[string]interface{}); ok {
+		if value := extractString(metadata, key); value != "" {
+			return value
+		}
+	}
+	if trace, ok := root["trace"].(map[string]interface{}); ok {
+		if value := extractString(trace, key); value != "" {
+			return value
+		}
+		if key == "trace_id" {
+			if value := extractString(trace, "id"); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+func synthesizePolicyOutboxID(prefix string, parts ...string) string {
+	filtered := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			filtered = append(filtered, part)
+		}
+	}
+	sum := sha256.Sum256([]byte(strings.Join(filtered, "|")))
+	return prefix + "-" + hex.EncodeToString(sum[:8])
+}
+
+func extractPolicyOutboxTTLSeconds(root map[string]interface{}) int64 {
+	if root == nil {
+		return 0
+	}
+	guardrails, ok := root["guardrails"].(map[string]interface{})
+	if !ok {
+		return 0
+	}
+	return extractInt64(guardrails, "ttl_seconds")
+}
+
+func enrichPolicyOutboxPayload(root map[string]interface{}, contract policyOutboxCommandContract) {
+	metadata := ensurePolicyOutboxNestedMap(root, "metadata")
+	trace := ensurePolicyOutboxNestedMap(root, "trace")
+	params := ensurePolicyOutboxNestedMap(root, "params")
+
+	setPolicyOutboxString(root, "policy_id", contract.PolicyID)
+	setPolicyOutboxString(root, "command_id", contract.CommandID)
+	setPolicyOutboxString(root, "request_id", contract.RequestID)
+	setPolicyOutboxString(root, "trace_id", contract.TraceID)
+	setPolicyOutboxString(root, "workflow_id", contract.WorkflowID)
+	setPolicyOutboxString(root, "idempotency_key", contract.IdempotencyKey)
+	setPolicyOutboxString(root, "action", contract.ActionType)
+	setPolicyOutboxString(root, "control_action", contract.ControlAction)
+	setPolicyOutboxString(root, "rule_type", contract.RuleType)
+	setPolicyOutboxString(root, "scope_identifier", contract.ScopeID)
+	setPolicyOutboxString(root, "tenant", contract.Tenant)
+	setPolicyOutboxString(root, "region", contract.Region)
+	setPolicyOutboxString(root, "command_schema_version", contract.SchemaVersion)
+	setPolicyOutboxInt(root, "issued_at_ms", contract.IssuedAtMs)
+	setPolicyOutboxInt(root, "ttl_seconds", contract.TTLSeconds)
+
+	setPolicyOutboxString(metadata, "policy_id", contract.PolicyID)
+	setPolicyOutboxString(metadata, "command_id", contract.CommandID)
+	setPolicyOutboxString(metadata, "request_id", contract.RequestID)
+	setPolicyOutboxString(metadata, "trace_id", contract.TraceID)
+	setPolicyOutboxString(metadata, "workflow_id", contract.WorkflowID)
+	setPolicyOutboxString(metadata, "idempotency_key", contract.IdempotencyKey)
+	setPolicyOutboxString(metadata, "scope_identifier", contract.ScopeID)
+	setPolicyOutboxString(metadata, "tenant", contract.Tenant)
+	setPolicyOutboxString(metadata, "region", contract.Region)
+	setPolicyOutboxString(metadata, "command_schema_version", contract.SchemaVersion)
+	setPolicyOutboxInt(metadata, "issued_at_ms", contract.IssuedAtMs)
+	setPolicyOutboxInt(metadata, "ttl_seconds", contract.TTLSeconds)
+
+	setPolicyOutboxString(trace, "id", contract.TraceID)
+	setPolicyOutboxString(trace, "trace_id", contract.TraceID)
+	setPolicyOutboxString(trace, "policy_id", contract.PolicyID)
+	setPolicyOutboxString(trace, "command_id", contract.CommandID)
+	setPolicyOutboxString(trace, "request_id", contract.RequestID)
+	setPolicyOutboxString(trace, "workflow_id", contract.WorkflowID)
+	setPolicyOutboxString(trace, "scope_identifier", contract.ScopeID)
+	setPolicyOutboxString(trace, "tenant", contract.Tenant)
+	setPolicyOutboxString(trace, "region", contract.Region)
+	setPolicyOutboxInt(trace, "issued_at_ms", contract.IssuedAtMs)
+
+	setPolicyOutboxString(params, "policy_id", contract.PolicyID)
+	setPolicyOutboxString(params, "command_id", contract.CommandID)
+	setPolicyOutboxString(params, "request_id", contract.RequestID)
+	setPolicyOutboxString(params, "trace_id", contract.TraceID)
+	setPolicyOutboxString(params, "workflow_id", contract.WorkflowID)
+}
+
+func ensurePolicyOutboxNestedMap(root map[string]interface{}, key string) map[string]interface{} {
+	if root == nil {
+		return map[string]interface{}{}
+	}
+	if existing, ok := root[key].(map[string]interface{}); ok && existing != nil {
+		return existing
+	}
+	created := map[string]interface{}{}
+	root[key] = created
+	return created
+}
+
+func setPolicyOutboxString(root map[string]interface{}, key, value string) {
+	if root == nil || strings.TrimSpace(key) == "" {
+		return
+	}
+	if value = strings.TrimSpace(value); value == "" {
+		delete(root, key)
+		return
+	}
+	root[key] = value
+}
+
+func setPolicyOutboxInt(root map[string]interface{}, key string, value int64) {
+	if root == nil || strings.TrimSpace(key) == "" {
+		return
+	}
+	if value <= 0 {
+		delete(root, key)
+		return
+	}
+	root[key] = value
+}
+
 func parsePolicyWorkflowID(raw []byte) string {
 	var payload map[string]interface{}
 	if err := json.Unmarshal(raw, &payload); err != nil {
@@ -3841,6 +4077,10 @@ func skipPolicyFingerprintKey(key string, ctx policySemanticFingerprintContext) 
 		return ctx.atRoot || ctx.inMetadata || ctx.inTrace
 	case "workflow_id":
 		return ctx.atRoot || ctx.inMetadata || ctx.inTrace
+	case "idempotency_key", "command_schema_version", "issued_at_ms":
+		return ctx.atRoot || ctx.inMetadata || ctx.inTrace
+	case "ttl_seconds":
+		return ctx.atRoot || ctx.inMetadata || ctx.inTrace
 	}
 	return false
 }
@@ -3955,10 +4195,17 @@ func (a *adapter) upsertPolicyOutbox(ctx context.Context, tx *sql.Tx, blockHeigh
 	if len(payload) == 0 {
 		return fmt.Errorf("%w: empty policy payload", ErrInvalidData)
 	}
+	semanticPayload := payload
+	legacyRuleHash := sha256.Sum256(semanticPayload)
+	normalizedPayload, normalizeErr := normalizePolicyOutboxPayload(payload, time.Unix(blockTS, 0).UTC())
+	if normalizeErr != nil {
+		return normalizeErr
+	}
+	payload = normalizedPayload
 
 	ruleHash := sha256.Sum256(payload)
-	semanticKey := policyOutboxSemanticFingerprint(payload)
-	dispatchShard := a.derivePolicyOutboxDispatchShard(payload)
+	semanticKey := policyOutboxSemanticFingerprint(semanticPayload)
+	dispatchShard := a.derivePolicyOutboxDispatchShard(semanticPayload)
 	policyID := parsePolicyID(payload)
 	if policyID == "" {
 		policyID = "invalid:" + hex.EncodeToString(ruleHash[:8])
@@ -4099,7 +4346,7 @@ func (a *adapter) upsertPolicyOutbox(ctx context.Context, tx *sql.Tx, blockHeigh
 	if strings.TrimSpace(existingPolicyID) != policyID {
 		return fmt.Errorf("%w: outbox policy_id mismatch at height %d index %d", ErrIntegrityViolation, blockHeight, txIndex)
 	}
-	if !bytes.Equal(existingRuleHash, ruleHash[:]) {
+	if !bytes.Equal(existingRuleHash, ruleHash[:]) && !bytes.Equal(existingRuleHash, legacyRuleHash[:]) {
 		return fmt.Errorf("%w: outbox rule_hash mismatch at height %d index %d", ErrIntegrityViolation, blockHeight, txIndex)
 	}
 	return nil
@@ -4139,9 +4386,16 @@ func (a *adapter) upsertPolicyOutboxBatch(ctx context.Context, tx *sql.Tx, rows 
 		if len(row.payload) == 0 {
 			return fmt.Errorf("%w: empty policy payload", ErrInvalidData)
 		}
+		semanticPayload := row.payload
+		legacyRuleHash := sha256.Sum256(semanticPayload)
+		normalizedPayload, normalizeErr := normalizePolicyOutboxPayload(row.payload, time.Unix(row.blockTS, 0).UTC())
+		if normalizeErr != nil {
+			return normalizeErr
+		}
+		row.payload = normalizedPayload
 		ruleHash := sha256.Sum256(row.payload)
-		semanticKey := policyOutboxSemanticFingerprint(row.payload)
-		dispatchShard := a.derivePolicyOutboxDispatchShard(row.payload)
+		semanticKey := policyOutboxSemanticFingerprint(semanticPayload)
+		dispatchShard := a.derivePolicyOutboxDispatchShard(semanticPayload)
 		policyID := parsePolicyID(row.payload)
 		if policyID == "" {
 			policyID = "invalid:" + hex.EncodeToString(ruleHash[:8])
@@ -4163,6 +4417,7 @@ func (a *adapter) upsertPolicyOutboxBatch(ctx context.Context, tx *sql.Tx, rows 
 			txIndex:         row.txIndex,
 			policyID:        policyID,
 			ruleHash:        ruleHash,
+			legacyRuleHash:  legacyRuleHash,
 			semanticKey:     semanticKey,
 			dispatchShard:   dispatchShard,
 			payload:         row.payload,
@@ -4370,7 +4625,7 @@ func (a *adapter) upsertPolicyOutboxBatch(ctx context.Context, tx *sql.Tx, rows 
 					if ex.policyID != row.policyID {
 						return fmt.Errorf("%w: outbox policy_id mismatch at height %d index %d", ErrIntegrityViolation, row.blockHeight, row.txIndex)
 					}
-					if !bytes.Equal(ex.ruleHash, row.ruleHash[:]) {
+					if !bytes.Equal(ex.ruleHash, row.ruleHash[:]) && !bytes.Equal(ex.ruleHash, row.legacyRuleHash[:]) {
 						return fmt.Errorf("%w: outbox rule_hash mismatch at height %d index %d", ErrIntegrityViolation, row.blockHeight, row.txIndex)
 					}
 				}

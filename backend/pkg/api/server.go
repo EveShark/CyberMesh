@@ -153,6 +153,7 @@ type PolicyAckCausalStats struct {
 	CorrelationExact           uint64
 	CorrelationFallbackHash    uint64
 	CorrelationFallbackTrace   uint64
+	CorrelationCommitted       uint64
 	CorrelationNoMatch         uint64
 	CorrelationErrors          uint64
 	AIEventUnitCorrections     uint64
