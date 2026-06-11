@@ -1,6 +1,6 @@
 import { Helmet } from "react-helmet-async";
 import { toast } from "@/hooks/common/use-toast";
-import { isDemoMode } from "@/config/demo-mode";
+import { isPreviewMode } from "@/config/demo-mode";
 import {
   SystemHealthHeader,
   UptimeResourcesPanel,
@@ -99,7 +99,7 @@ const SystemHealth = () => {
             <AILoopPanel data={healthData.aiLoop} />
 
             {/* Backend Status Panel - Only show in live mode */}
-            {!isDemoMode() && (
+            {!isPreviewMode() && (
               <div className="pt-1">
                 <BackendStatusPanel />
               </div>

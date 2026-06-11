@@ -16,6 +16,7 @@ import AuthLogin from "./pages/AuthLogin";
 import AuthCallback from "./pages/AuthCallback";
 import AuthUnauthorized from "./pages/AuthUnauthorized";
 import AuthSessionExpired from "./pages/AuthSessionExpired";
+import DemoEntry from "./pages/DemoEntry";
 import { DashboardLayout } from "@/components/layout";
 import NotFound from "./pages/NotFound";
 import { GlobalErrorBoundary } from "@/components/ui/global-error-boundary";
@@ -33,6 +34,7 @@ const App = () => (
             <BrowserRouter>
               <Routes>
                 <Route path="/" element={<Index />} />
+                <Route path="/demo" element={<DemoEntry />} />
                 <Route path="/auth/login" element={<AuthLogin />} />
                 <Route path="/auth/callback" element={<AuthCallback />} />
                 <Route path="/auth/unauthorized" element={<AuthUnauthorized />} />

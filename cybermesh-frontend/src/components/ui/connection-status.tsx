@@ -1,7 +1,7 @@
 import { Wifi, WifiOff, Clock, AlertCircle, FlaskConical } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import { isDemoMode } from "@/config/demo-mode";
+import { isPreviewMode } from "@/config/demo-mode";
 
 interface ConnectionStatusProps {
   isOnline: boolean;
@@ -17,7 +17,7 @@ export const ConnectionStatus = ({
   isFetching,
 }: ConnectionStatusProps) => {
   // Demo mode - show distinct demo indicator
-  const inDemoMode = isDemoMode();
+  const inDemoMode = isPreviewMode();
   
   // Determine status and styling
   const getStatusConfig = () => {

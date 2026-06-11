@@ -166,7 +166,7 @@ function DelegationCard({
 }
 
 export default function Delegations() {
-  const { session, refreshSession } = useAuth();
+  const { authEnabled, session, refreshSession } = useAuth();
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
@@ -186,6 +186,12 @@ export default function Delegations() {
   const breakGlassEnabled = session?.capabilities.break_glass_enabled ?? false;
 
   const loadDelegations = useCallback(async () => {
+    if (!authEnabled) {
+      setMyDelegations([]);
+      setAdminDelegations([]);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     try {
       const own = await fetchDelegations("self");
@@ -204,18 +210,21 @@ export default function Delegations() {
     } finally {
       setLoading(false);
     }
-  }, [canManageDelegations]);
+  }, [authEnabled, canManageDelegations]);
 
   useEffect(() => {
     void loadDelegations();
   }, [loadDelegations]);
 
   useEffect(() => {
+    if (!authEnabled) {
+      return;
+    }
     const interval = window.setInterval(() => {
       void loadDelegations();
     }, 60_000);
     return () => window.clearInterval(interval);
-  }, [loadDelegations]);
+  }, [authEnabled, loadDelegations]);
 
   const pendingApprovals = useMemo(
     () => adminDelegations.filter((item) => item.status === "pending"),
@@ -331,7 +340,18 @@ export default function Delegations() {
           </p>
         </div>
 
-        {session?.active_delegation && (
+        {!authEnabled && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-xl">Delegations unavailable</CardTitle>
+              <CardDescription>
+                Hosted frontend authentication is disabled for this deployment, so delegation workflows are intentionally hidden from the public app shell.
+              </CardDescription>
+            </CardHeader>
+          </Card>
+        )}
+
+        {authEnabled && session?.active_delegation && (
           <Card className={session.active_delegation.break_glass ? "border-amber-500/40 bg-amber-500/5" : "border-primary/20 bg-primary/5"}>
             <CardHeader>
               <CardTitle className="flex items-center gap-2 text-xl">
@@ -348,6 +368,7 @@ export default function Delegations() {
           </Card>
         )}
 
+        {authEnabled && (
         <div className="grid gap-6 xl:grid-cols-[minmax(0,420px)_1fr]">
           <Card>
             <CardHeader>
@@ -520,6 +541,7 @@ export default function Delegations() {
             )}
           </div>
         </div>
+        )}
       </div>
     </>
   );

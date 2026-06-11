@@ -1,3 +1,5 @@
+import { getRuntimeConfig, isConfigLoaded } from "@/config/runtime";
+
 /**
  * Demo Mode Configuration
  * 
@@ -29,6 +31,17 @@ export const isDemoMode = (): boolean => {
   
   // Fall back to environment variable
   return import.meta.env.VITE_DEMO_MODE === 'true';
+};
+
+/**
+ * Public preview mode is active when the app is explicitly in demo mode
+ * or when hosted frontend auth is disabled for this deployment.
+ */
+export const isPreviewMode = (): boolean => {
+  if (isDemoMode()) {
+    return true;
+  }
+  return isConfigLoaded() && !getRuntimeConfig().zitadelEnabled;
 };
 
 /**

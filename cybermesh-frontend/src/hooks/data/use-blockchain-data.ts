@@ -2,7 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { apiClient, type BlockchainResponse } from "@/lib/api";
 import { useVisibilityPause } from "@/hooks/common/use-visibility-pause";
 import { getMockBlockchainRaw, mockLedgerRaw } from "@/mocks/blockchain";
-import { isDemoMode } from "@/config/demo-mode";
+import { isPreviewMode } from "@/config/demo-mode";
 import { adaptBlocksFromApi, adaptBlockchain } from "@/lib/api/adapters/blockchain.adapter";
 
 interface UseBlockchainDataOptions {
@@ -18,7 +18,7 @@ export const useBlockchainData = (options: UseBlockchainDataOptions = {}) => {
   const { enabled } = useVisibilityPause(baseEnabled);
 
   // In demo mode, return mock data immediately without API calls
-  const demoMode = isDemoMode();
+  const demoMode = isPreviewMode();
 
   return useQuery<BlockchainResponse>({
     queryKey: ["blockchain-data", blockLimit],

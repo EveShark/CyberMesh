@@ -1,11 +1,15 @@
 import { useEffect, useState } from "react";
-import { useLocation } from "react-router-dom";
+import { Navigate, useLocation } from "react-router-dom";
 import { useAuth } from "@/lib/auth/AuthProvider";
 
 export default function AuthLogin() {
   const [error, setError] = useState<string>("");
   const location = useLocation();
-  const { startLogin } = useAuth();
+  const { authEnabled, startLogin } = useAuth();
+
+  if (!authEnabled) {
+    return <Navigate to="/dashboard" replace />;
+  }
 
   useEffect(() => {
     const fromState = location.state as { from?: { pathname?: string; search?: string; hash?: string } } | null;

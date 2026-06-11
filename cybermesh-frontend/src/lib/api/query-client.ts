@@ -1,6 +1,6 @@
 import { QueryClient, QueryCache, MutationCache } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { isDemoMode } from "@/config/demo-mode";
+import { isPreviewMode } from "@/config/demo-mode";
 
 // Store refetch callbacks for retry buttons
 const refetchCallbacks = new Map<string, () => void>();
@@ -17,7 +17,7 @@ export const queryClient = new QueryClient({
   queryCache: new QueryCache({
     onError: (error, query) => {
       // Skip error toasts in demo mode - should never happen but just in case
-      if (isDemoMode()) return;
+      if (isPreviewMode()) return;
       
       const queryKey = Array.isArray(query.queryKey) ? query.queryKey[0] : query.queryKey;
       const keyStr = typeof queryKey === "string" ? queryKey : JSON.stringify(queryKey);
@@ -46,7 +46,7 @@ export const queryClient = new QueryClient({
   mutationCache: new MutationCache({
     onError: (error, _variables, _context, mutation) => {
       // Skip error toasts in demo mode
-      if (isDemoMode()) return;
+      if (isPreviewMode()) return;
       
       toast.error("Operation failed", {
         description: error.message,

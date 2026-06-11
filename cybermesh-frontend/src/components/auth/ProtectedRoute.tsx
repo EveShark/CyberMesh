@@ -1,12 +1,13 @@
 import { Navigate, Outlet, useLocation } from "react-router-dom";
 import { useAuth } from "@/lib/auth/AuthProvider";
 import { ROUTES } from "@/config/routes";
+import { isDemoMode } from "@/config/demo-mode";
 
 export default function ProtectedRoute() {
   const location = useLocation();
   const { authEnabled, isLoading, session } = useAuth();
 
-  if (!authEnabled) {
+  if (!authEnabled || isDemoMode()) {
     return <Outlet />;
   }
 

@@ -7,7 +7,7 @@ import { useCallback } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { apiClient } from "@/lib/api";
 import { useSystemHealthData } from "@/hooks/data/use-system-health-data";
-import { isDemoMode } from "@/config/demo-mode";
+import { isPreviewMode } from "@/config/demo-mode";
 
 import {
   Sidebar,
@@ -61,10 +61,10 @@ export function AppSidebar() {
   // Fetch system health for dynamic status display (skip polling in sidebar, use stale data)
   const { data: healthData } = useSystemHealthData({
     pollingInterval: 60000, // Poll less frequently in sidebar
-    enabled: !isDemoMode() // Disable in demo mode
+    enabled: !isPreviewMode() // Disable in preview mode
   });
 
-  const demoMode = isDemoMode();
+  const demoMode = isPreviewMode();
 
   const isActive = (path: string) => currentPath === path;
 

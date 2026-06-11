@@ -6,7 +6,7 @@ interface NavBarProps {
   demoUrl?: string;
 }
 
-const NavBar = ({ demoUrl = "/dashboard" }: NavBarProps) => {
+const NavBar = ({ demoUrl = "/demo" }: NavBarProps) => {
   return (
     <nav className="fixed top-0 left-0 right-0 z-50">
       {/* Glass background */}

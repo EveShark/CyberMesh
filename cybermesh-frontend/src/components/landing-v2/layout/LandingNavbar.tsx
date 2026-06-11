@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { Menu, X, ArrowRight } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 
-const DEMO_URL = (import.meta.env.VITE_DEMO_URL as string | undefined)?.trim() || "/dashboard";
+const DEMO_URL = (import.meta.env.VITE_DEMO_URL as string | undefined)?.trim() || "/demo";
 
 const navLinks = [
   { label: "Product", href: "#product" },

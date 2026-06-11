@@ -192,6 +192,7 @@ async function executeRequest<T>(
   externalSignal?: AbortSignal
 ): Promise<T> {
   const startTime = performance.now();
+  const authEnabled = isConfigLoaded() && getRuntimeConfig().zitadelEnabled;
 
   // Create AbortController for timeout if none provided
   const controller = new AbortController();
@@ -201,7 +202,7 @@ async function executeRequest<T>(
   const signal = externalSignal || controller.signal;
 
   let authHeaders: HeadersInit = {};
-  if (isConfigLoaded() && getRuntimeConfig().zitadelEnabled) {
+  if (authEnabled) {
     try {
       const accessToken = await getAccessToken();
       if (accessToken) {
@@ -242,7 +243,7 @@ async function executeRequest<T>(
       ...fetchOptions,
       ...RATE_LIMIT_CONFIG,
       signal,
-      credentials: "include",
+      credentials: authEnabled ? "include" : "omit",
       headers: {
         ...defaultHeaders,
         ...authHeaders,
@@ -500,7 +501,6 @@ export const apiClient = {
 };
 
 export default apiClient;
-
 
 
 

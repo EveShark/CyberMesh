@@ -114,7 +114,7 @@ const Settings = () => {
             <CardContent className="space-y-6">
               {!authEnabled ? (
                 <div className="rounded-lg border border-border/60 bg-muted/30 p-4 text-sm text-muted-foreground">
-                  Hosted authentication is not enabled for this deployment.
+                  Frontend authentication is disabled for this deployment. Public viewers can use the app shell without login, while backend-protected operations remain enforced server-side.
                 </div>
               ) : (
                 <>

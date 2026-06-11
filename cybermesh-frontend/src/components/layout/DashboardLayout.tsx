@@ -12,7 +12,7 @@ import { Menu, Settings, X } from "lucide-react";
 import { useSwipe } from "@/hooks/ui/use-swipe";
 import { useIsFetching, useQueryClient } from "@tanstack/react-query";
 import { useConnectionStatus } from "@/hooks/common/use-connection-status";
-import { isDemoMode } from "@/config/demo-mode";
+import { isPreviewMode } from "@/config/demo-mode";
 import { ROUTES } from "@/config/routes";
 import { cn } from "@/lib/utils";
 import AccessSwitcher from "@/components/auth/AccessSwitcher";
@@ -20,7 +20,7 @@ import DelegationBanner from "@/components/auth/DelegationBanner";
 
 const DashboardContent = () => {
   const isFetching = useIsFetching();
-  const demoMode = isDemoMode();
+  const demoMode = isPreviewMode();
   const queryClient = useQueryClient();
   const { setOpenMobile, isMobile } = useSidebar();
   const location = useLocation();
@@ -31,7 +31,7 @@ const DashboardContent = () => {
 
   // Subscribe to query cache updates to track successful syncs (skip in demo mode)
   useEffect(() => {
-    if (isDemoMode()) return;
+    if (isPreviewMode()) return;
 
     const unsubscribe = queryClient.getQueryCache().subscribe((event) => {
       if (event.type === "updated") {

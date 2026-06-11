@@ -3,7 +3,7 @@ import { FlaskConical, ArrowRight, X, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Link } from "react-router-dom";
 import { ROUTES } from "@/config/routes";
-import { isDemoMode } from "@/config/demo-mode";
+import { isPreviewMode } from "@/config/demo-mode";
 import { cn } from "@/lib/utils";
 
 const DISMISS_KEY = "cybermesh-demo-banner-dismissed";
@@ -15,7 +15,7 @@ export const DemoModeBanner = () => {
 
   // Check demo mode status and handle visibility
   const checkDemoModeStatus = useCallback(() => {
-    const inDemoMode = isDemoMode();
+    const inDemoMode = isPreviewMode();
     const dismissed = sessionStorage.getItem(DISMISS_KEY);
     const lastDemoModeState = sessionStorage.getItem("demo-banner-last-state");
     

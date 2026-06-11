@@ -3,7 +3,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { cn } from "@/lib/utils";
 import { useQueryClient } from "@tanstack/react-query";
 import { useState, useCallback } from "react";
-import { isDemoMode } from "@/config/demo-mode";
+import { isPreviewMode } from "@/config/demo-mode";
 
 interface RefreshControlProps {
   lastSyncTimeFormatted: string;
@@ -12,7 +12,7 @@ interface RefreshControlProps {
 export const RefreshControl = ({ lastSyncTimeFormatted }: RefreshControlProps) => {
   const queryClient = useQueryClient();
   const [isRefreshing, setIsRefreshing] = useState(false);
-  const inDemoMode = isDemoMode();
+  const inDemoMode = isPreviewMode();
 
   const handleRefresh = useCallback(async () => {
     if (isRefreshing) return;

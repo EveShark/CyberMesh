@@ -147,6 +147,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [authEnabled]);
 
   const completeHostedLogin = useCallback(async () => {
+    if (!authEnabled) {
+      throw new Error("Hosted authentication is disabled for this deployment");
+    }
     const user = await finishHostedLogin();
     if (!user?.access_token) {
       throw new Error("Hosted login completed without an access token");
@@ -155,23 +158,33 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setSession(nextSession);
     setIsLoading(false);
     return nextSession;
-  }, []);
+  }, [authEnabled]);
 
   const startLogin = useCallback(async (returnTo?: string) => {
+    if (!authEnabled) {
+      throw new Error("Hosted authentication is disabled for this deployment");
+    }
     if (returnTo && returnTo.startsWith("/")) {
       sessionStorage.setItem(RETURN_TO_STORAGE_KEY, returnTo);
     } else {
       sessionStorage.removeItem(RETURN_TO_STORAGE_KEY);
     }
     await startHostedLogin();
-  }, []);
+  }, [authEnabled]);
 
   const startLogout = useCallback(async () => {
+    if (!authEnabled) {
+      setSession(null);
+      return;
+    }
     setSession(null);
     await startHostedLogout();
-  }, []);
+  }, [authEnabled]);
 
   const selectAccess = useCallback(async (accessId: string) => {
+    if (!authEnabled) {
+      throw new Error("Hosted authentication is disabled for this deployment");
+    }
     await updateActiveAccess(accessId);
     const nextSession = await loadSession();
     if (!nextSession) {
@@ -179,7 +192,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
     setSession(nextSession);
     return nextSession;
-  }, []);
+  }, [authEnabled]);
 
   const value = useMemo<AuthContextValue>(() => ({
     authEnabled,

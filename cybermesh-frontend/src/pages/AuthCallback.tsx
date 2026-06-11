@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Navigate, useNavigate } from "react-router-dom";
 import { useAuth } from "@/lib/auth/AuthProvider";
 
 const RETURN_TO_STORAGE_KEY = "cybermesh:return_to";
@@ -7,7 +7,11 @@ const RETURN_TO_STORAGE_KEY = "cybermesh:return_to";
 export default function AuthCallback() {
   const navigate = useNavigate();
   const [error, setError] = useState<string>("");
-  const { completeHostedLogin } = useAuth();
+  const { authEnabled, completeHostedLogin } = useAuth();
+
+  if (!authEnabled) {
+    return <Navigate to="/dashboard" replace />;
+  }
 
   useEffect(() => {
     let cancelled = false;

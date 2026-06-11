@@ -3,7 +3,7 @@ import { apiClient, type SystemHealthResponse } from "@/lib/api";
 import { useVisibilityPause } from "@/hooks/common/use-visibility-pause";
 import { getMockSystemHealthData } from "@/mocks/system-health";
 import { systemHealthResponseSchema, validateApiResponse } from "@/lib/api-validation";
-import { isDemoMode } from "@/config/demo-mode";
+import { isPreviewMode } from "@/config/demo-mode";
 
 interface UseSystemHealthDataOptions {
   pollingInterval?: number;
@@ -17,7 +17,7 @@ export const useSystemHealthData = (options: UseSystemHealthDataOptions = {}) =>
   const { enabled } = useVisibilityPause(baseEnabled);
 
   // In demo mode, return mock data immediately without API calls
-  const demoMode = isDemoMode();
+  const demoMode = isPreviewMode();
 
   return useQuery<SystemHealthResponse>({
     queryKey: ["system-health"],

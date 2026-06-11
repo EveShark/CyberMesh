@@ -1,17 +1,21 @@
 import { ShieldAlert } from "lucide-react";
-import { useSearchParams } from "react-router-dom";
+import { Navigate, useSearchParams } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { useAuth } from "@/lib/auth/AuthProvider";
 import { ROUTES } from "@/config/routes";
 
 export default function AuthUnauthorized() {
-  const { startLogin, startLogout } = useAuth();
+  const { authEnabled, startLogin, startLogout } = useAuth();
   const [searchParams] = useSearchParams();
   const returnToCandidate = searchParams.get("returnTo");
   const returnTo = returnToCandidate && returnToCandidate.startsWith("/")
     ? returnToCandidate
     : ROUTES.DASHBOARD;
+
+  if (!authEnabled) {
+    return <Navigate to={returnTo} replace />;
+  }
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center px-6">

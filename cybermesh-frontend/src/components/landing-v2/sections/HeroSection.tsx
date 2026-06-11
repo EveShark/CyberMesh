@@ -2,7 +2,7 @@ import { motion } from "framer-motion";
 import { Shield, CheckCircle, Lock, ArrowRight } from "lucide-react";
 import MeshBackground from "@/components/landing-v2/shared/MeshBackground";
 
-const DEMO_URL = (import.meta.env.VITE_DEMO_URL as string | undefined)?.trim() || "/dashboard";
+const DEMO_URL = (import.meta.env.VITE_DEMO_URL as string | undefined)?.trim() || "/demo";
 
 const steps = [
   { icon: Shield, label: "Threat Detected" },

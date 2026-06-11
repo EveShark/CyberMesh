@@ -4,7 +4,7 @@ import { useVisibilityPause } from "@/hooks/common/use-visibility-pause";
 import { getMockData } from "@/mocks/threats";
 import { adaptThreats } from "@/lib/api/adapters/threats.adapter";
 import { threatsResponseSchema, validateApiResponse } from "@/lib/api-validation";
-import { isDemoMode } from "@/config/demo-mode";
+import { isPreviewMode } from "@/config/demo-mode";
 
 interface UseThreatsDataOptions {
   pollingInterval?: number;
@@ -18,7 +18,7 @@ export const useThreatsData = (options: UseThreatsDataOptions = {}) => {
   const { enabled } = useVisibilityPause(baseEnabled);
 
   // In demo mode, return mock data immediately without API calls
-  const demoMode = isDemoMode();
+  const demoMode = isPreviewMode();
 
   return useQuery<ThreatsResponse>({
     queryKey: ["threats-summary"],

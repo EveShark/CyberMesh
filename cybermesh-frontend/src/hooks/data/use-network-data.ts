@@ -3,7 +3,7 @@ import { apiClient, type NetworkResponse } from "@/lib/api";
 import { useVisibilityPause } from "@/hooks/common/use-visibility-pause";
 import { getMockNetworkRaw, getMockConsensusRaw, mockBlockMetricsRaw } from "@/mocks/network";
 import { adaptNetwork } from "@/lib/api/adapters/network.adapter";
-import { isDemoMode } from "@/config/demo-mode";
+import { isPreviewMode } from "@/config/demo-mode";
 
 interface UseNetworkDataOptions {
   pollingInterval?: number;
@@ -17,7 +17,7 @@ export const useNetworkData = (options: UseNetworkDataOptions = {}) => {
   const { enabled } = useVisibilityPause(baseEnabled);
 
   // In demo mode, return mock data immediately without API calls
-  const demoMode = isDemoMode();
+  const demoMode = isPreviewMode();
 
   return useQuery<NetworkResponse>({
     queryKey: ["network-status"],

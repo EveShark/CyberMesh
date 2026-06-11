@@ -3,7 +3,7 @@ import { apiClient, type AIEngineResponse } from "@/lib/api";
 import { useVisibilityPause } from "@/hooks/common/use-visibility-pause";
 import { getMockAIEngineRaw } from "@/mocks/ai-engine";
 import { adaptAIEngine } from "@/lib/api/adapters/ai-engine.adapter";
-import { isDemoMode } from "@/config/demo-mode";
+import { isPreviewMode } from "@/config/demo-mode";
 
 interface UseAIEngineDataOptions {
   pollingInterval?: number;
@@ -17,7 +17,7 @@ export const useAIEngineData = (options: UseAIEngineDataOptions = {}) => {
   const { enabled } = useVisibilityPause(baseEnabled);
 
   // In demo mode, return mock data immediately without API calls
-  const demoMode = isDemoMode();
+  const demoMode = isPreviewMode();
 
   return useQuery<AIEngineResponse>({
     queryKey: ["ai-engine-status"],
