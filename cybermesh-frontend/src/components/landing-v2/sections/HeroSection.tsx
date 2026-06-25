@@ -1,101 +1,102 @@
 import { motion } from "framer-motion";
-import { Shield, CheckCircle, Lock, ArrowRight } from "lucide-react";
-import MeshBackground from "@/components/landing-v2/shared/MeshBackground";
+import { ArrowRight } from "lucide-react";
+import ProductFrame from "@/components/landing-v2/shared/ProductFrame";
 
 const DEMO_URL = (import.meta.env.VITE_DEMO_URL as string | undefined)?.trim() || "/demo";
 
-const steps = [
-  { icon: Shield, label: "Threat Detected" },
-  { icon: CheckCircle, label: "Consensus Validated" },
-  { icon: Lock, label: "Automatically Contained" },
-];
-
 const HeroSection = () => {
   return (
-    <section className="relative pt-36 pb-12 sm:pt-48 sm:pb-16 px-6 overflow-hidden">
-      <MeshBackground />
-      <div className="pointer-events-none absolute top-0 left-1/2 -translate-x-1/2 w-[800px] h-[600px] opacity-[0.07]"
-        style={{ background: "radial-gradient(ellipse, hsl(42 78% 60%), transparent 70%)" }}
+    <section className="relative pt-28 sm:pt-36 pb-0 px-6 overflow-hidden">
+      <div
+        className="pointer-events-none absolute inset-0"
+        style={{
+          backgroundImage:
+            "radial-gradient(circle, hsl(220 15% 72% / 0.3) 1px, transparent 1px)",
+          backgroundSize: "28px 28px",
+        }}
       />
 
-      <div className="relative mx-auto max-w-4xl text-center">
-        <motion.h1
-          initial={{ opacity: 0, y: 30 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.8 }}
-          className="section-headline text-4xl sm:text-5xl lg:text-[3.75rem] leading-[1.12]"
-        >
-          Your Network Responds<br className="hidden sm:block" /> Before Your Team Can React.
-        </motion.h1>
+      <div className="relative mx-auto max-w-6xl">
+        <div className="grid lg:grid-cols-[5fr_7fr] gap-12 xl:gap-16 items-center">
+          <div>
+            <motion.h1
+              initial={{ opacity: 0, y: 18 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.6, delay: 0.05 }}
+              className="text-5xl sm:text-6xl lg:text-[3.5rem] xl:text-[4rem] font-display font-bold text-primary tracking-tight leading-[1.06]"
+            >
+              Trust autonomous defense.{" "}
+              <span className="italic" style={{ color: "hsl(var(--accent))" }}>
+                Not autonomous mistakes.
+              </span>
+            </motion.h1>
 
-        <motion.p
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.7, delay: 0.15 }}
-          className="mt-7 text-lg text-muted-foreground max-w-2xl mx-auto leading-relaxed"
-        >
-          CyberMesh autonomously detects and contains network threats at the
-          infrastructure level, with built-in safety guarantees that ensure
-          it never acts without certainty.
-        </motion.p>
+            <motion.p
+              initial={{ opacity: 0, y: 14 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.55, delay: 0.18 }}
+              className="mt-7 text-base text-muted-foreground max-w-md leading-relaxed"
+            >
+              CyberMesh is the trust layer for autonomous network defense. It detects and contains threats at the infrastructure level, validating every decision before it acts, in under a second.
+            </motion.p>
+
+            <motion.div
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.5, delay: 0.3 }}
+              className="mt-9 flex flex-wrap items-center gap-4"
+            >
+              <a href="#contact" className="landing-btn-primary">
+                Request a Pilot <ArrowRight className="w-4 h-4" />
+              </a>
+              <a href={DEMO_URL} className="landing-btn-secondary">
+                View live demo →
+              </a>
+            </motion.div>
+
+            <motion.p
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              transition={{ duration: 0.5, delay: 0.45 }}
+              className="mt-5 text-xs text-muted-foreground/70"
+            >
+              No commitment · 48-hour deployment · Full report included
+            </motion.p>
+          </div>
+
+          <motion.div
+            initial={{ opacity: 0, y: 32, scale: 0.97 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            transition={{ duration: 0.9, delay: 0.3, ease: [0.21, 0.47, 0.32, 0.98] }}
+            className="hidden lg:block"
+          >
+            <ProductFrame
+              src="/screenshots/overview.png"
+              alt="CyberMesh Command Center — full platform overview showing system health, AI engine status, network topology and blockchain integrity"
+              clipHeight={500}
+            />
+          </motion.div>
+        </div>
 
         <motion.div
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.7, delay: 0.3 }}
-          className="mt-10 flex flex-col sm:flex-row items-center justify-center gap-4"
-        >
-          <a href="#contact" className="btn-gold">
-            Request a Pilot <ArrowRight className="w-4 h-4" />
-          </a>
-          <a href={DEMO_URL} className="btn-outline">
-            View Demo
-          </a>
-        </motion.div>
-
-        <motion.p
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
-          transition={{ duration: 0.7, delay: 0.5 }}
-          className="mt-6 text-xs text-muted-foreground tracking-wide"
+          transition={{ duration: 0.6, delay: 0.6 }}
+          className="mt-20 border-t border-border"
         >
-          Trusted by security teams who cannot afford a 4-minute response window.
-        </motion.p>
-
-        <motion.div
-          initial={{ opacity: 0, y: 30 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.8, delay: 0.6 }}
-          className="mt-20 flex items-center justify-center gap-2 sm:gap-6"
-        >
-          {steps.map((step, i) => (
-            <div key={step.label} className="flex items-center gap-2 sm:gap-6">
-              <motion.div
-                initial={{ scale: 0 }}
-                animate={{ scale: 1 }}
-                transition={{ delay: 0.8 + i * 0.2, type: "spring", stiffness: 200 }}
-                className="flex flex-col items-center gap-3"
-              >
-                <div className="w-14 h-14 sm:w-16 sm:h-16 rounded-2xl bg-card border border-border flex items-center justify-center animate-pulse-glow"
-                  style={{ boxShadow: "0 2px 12px hsl(222 47% 11% / 0.06)" }}
-                >
-                  <step.icon className="w-6 h-6 sm:w-7 sm:h-7 text-accent" />
-                </div>
-                <span className="text-[11px] sm:text-sm font-medium text-primary whitespace-nowrap">
-                  {step.label}
-                </span>
-              </motion.div>
-
-              {i < steps.length - 1 && (
-                <svg width="50" height="2" className="hidden sm:block flex-shrink-0">
-                  <line x1="0" y1="1" x2="50" y2="1"
-                    stroke="hsl(42 78% 60%)" strokeWidth="2" strokeDasharray="6 6"
-                    className="animate-flow-dots"
-                  />
-                </svg>
-              )}
-            </div>
-          ))}
+          <div className="grid grid-cols-1 sm:grid-cols-3 divide-y sm:divide-y-0 sm:divide-x divide-border">
+            {[
+              { stat: "< 1s", label: "Containment time", context: "vs. 4-minute industry average" },
+              { stat: "Zero-touch", label: "Enforcement", context: "Autonomous from detection to response" },
+              { stat: "< 1 hr", label: "What attackers need", context: "For an AI-driven attack to fully compromise a network" },
+            ].map((item) => (
+              <div key={item.label} className="py-10 sm:px-10 first:pl-0 last:pr-0">
+                <p className="text-3xl font-display font-bold text-primary">{item.stat}</p>
+                <p className="mt-1 text-sm font-semibold text-foreground">{item.label}</p>
+                <p className="mt-1 text-xs text-muted-foreground">{item.context}</p>
+              </div>
+            ))}
+          </div>
         </motion.div>
       </div>
     </section>

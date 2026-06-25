@@ -1,74 +1,61 @@
-import { motion, useInView, animate } from "framer-motion";
-import { useRef, useEffect, useState } from "react";
+import { motion, useInView } from "framer-motion";
+import { useRef } from "react";
 
 const stats = [
-  { target: 4, suffix: " min", prefix: "", desc: "Average human response time to a confirmed threat" },
-  { target: 1, suffix: " hr", prefix: "< ", desc: "Time for an AI agent to achieve full network compromise (MIT, 2025)" },
-  { target: 83, suffix: "%", prefix: "", desc: "Of breaches involve the network layer, not just endpoints" },
+  { value: "4 min", desc: "Average human response time to a confirmed threat" },
+  { value: "< 1 hr", desc: "Time for an AI agent to achieve full network compromise" },
+  { value: "83%", desc: "Of breaches involve the network layer, not endpoints" },
 ];
-
-const CountUp = ({ target, prefix, suffix, inView }: { target: number; prefix: string; suffix: string; inView: boolean }) => {
-  const [display, setDisplay] = useState(0);
-  useEffect(() => {
-    if (!inView) return;
-    const controls = animate(0, target, {
-      duration: 1.5, ease: "easeOut",
-      onUpdate: (v) => setDisplay(Math.round(v)),
-    });
-    return () => controls.stop();
-  }, [inView, target]);
-  return <>{prefix}{display}{suffix}</>;
-};
 
 const ProblemSection = () => {
   const ref = useRef(null);
-  const inView = useInView(ref, { once: true, margin: "-100px" });
+  const inView = useInView(ref, { once: true, margin: "-80px" });
 
   return (
-    <section id="problem" className="py-24 px-6" ref={ref}>
-      <div className="mx-auto max-w-5xl">
-        <motion.div
-          initial={{ opacity: 0, y: 30 }}
-          animate={inView ? { opacity: 1, y: 0 } : {}}
-          transition={{ duration: 0.6 }}
-          className="text-center"
-        >
-          <p className="section-label justify-center">THE PROBLEM</p>
-          <h2 className="section-headline mt-4">
-            Detection is solved.<br />Response is broken.
-          </h2>
-        </motion.div>
+    <section id="problem" className="py-24 px-6 bg-stat-bg border-y border-border" ref={ref}>
+      <div className="mx-auto max-w-6xl">
+        <div className="grid lg:grid-cols-2 gap-16 items-start">
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={inView ? { opacity: 1, y: 0 } : {}}
+            transition={{ duration: 0.55 }}
+          >
+            <p className="section-label">THE PROBLEM</p>
+            <h2 className="section-headline mt-4">
+              Detection is solved.<br />Response is broken.
+            </h2>
+          </motion.div>
 
-        <motion.div
-          initial={{ opacity: 0, y: 20 }}
-          animate={inView ? { opacity: 1, y: 0 } : {}}
-          transition={{ duration: 0.6, delay: 0.2 }}
-          className="mt-8 max-w-3xl mx-auto space-y-4 text-muted-foreground leading-relaxed text-center"
-        >
-          <p>
-            Modern security tools are remarkably good at detecting threats.
-            CrowdStrike sees it. Darktrace flags it. Your SIEM alerts. And then
-            someone has to act. That window between detection and enforcement
-            is where breaches happen.
-          </p>
-          <p>
-            The average security team takes 4 minutes to manually respond to a
-            confirmed threat. An AI-powered attack can achieve full network
-            compromise in under an hour. The math does not work.
-          </p>
-        </motion.div>
+          <motion.div
+            initial={{ opacity: 0, y: 16 }}
+            animate={inView ? { opacity: 1, y: 0 } : {}}
+            transition={{ duration: 0.55, delay: 0.12 }}
+            className="space-y-4 text-muted-foreground leading-relaxed pt-1 lg:pt-12"
+          >
+            <p>
+              Modern security tools are remarkably good at detecting threats.
+              CrowdStrike sees it. Darktrace flags it. Your SIEM alerts. Then
+              someone has to act. That window between detection and enforcement
+              is where breaches happen.
+            </p>
+            <p>
+              Security teams take minutes to respond. AI-driven attacks compromise
+              a network in under an hour. The math does not work.
+            </p>
+          </motion.div>
+        </div>
 
-        <div className="mt-14 grid gap-6 sm:grid-cols-3">
+        <div className="mt-16 grid gap-px bg-border sm:grid-cols-3 rounded-xl overflow-hidden">
           {stats.map((stat, i) => (
             <motion.div
               key={stat.desc}
-              initial={{ opacity: 0, y: 40, scale: 0.97 }}
-              animate={inView ? { opacity: 1, y: 0, scale: 1 } : {}}
-              transition={{ duration: 0.6, delay: 0.3 + i * 0.12, ease: [0.21, 0.47, 0.32, 0.98] }}
-              className="card-elevated text-center"
+              initial={{ opacity: 0 }}
+              animate={inView ? { opacity: 1 } : {}}
+              transition={{ duration: 0.5, delay: 0.2 + i * 0.1 }}
+              className="bg-background px-8 py-10"
             >
-              <p className="text-3xl font-display font-bold text-accent">
-                <CountUp target={stat.target} prefix={stat.prefix} suffix={stat.suffix} inView={inView} />
+              <p className="text-4xl font-display font-bold text-primary tabular-nums">
+                {stat.value}
               </p>
               <p className="mt-3 text-sm text-muted-foreground leading-relaxed">
                 {stat.desc}

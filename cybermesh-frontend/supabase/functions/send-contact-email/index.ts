@@ -330,6 +330,59 @@ async function sendViaZoho(
   }
 }
 
+// Send via Resend
+async function sendViaResend(
+  to: string,
+  replyTo: string,
+  subject: string,
+  htmlContent: string,
+  textContent: string,
+  requestId: string
+): Promise<{ success: boolean; messageId?: string; error?: string }> {
+  const apiKey = Deno.env.get("RESEND_API_KEY");
+  const fromEmail = Deno.env.get("CONTACT_FROM_EMAIL") || Deno.env.get("RESEND_FROM_EMAIL") || "onboarding@resend.dev";
+
+  if (!apiKey || !fromEmail) {
+    return { success: false, error: "Resend service not configured" };
+  }
+
+  logRequest(FUNCTION_NAME, requestId, "system", "RESEND_SEND", { provider: "resend" });
+
+  try {
+    const response = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from: fromEmail,
+        to: [to],
+        reply_to: replyTo,
+        subject,
+        html: htmlContent,
+        text: textContent,
+      }),
+    });
+
+    const result = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      logResponse(FUNCTION_NAME, requestId, response.status, { provider: "resend", error: "send_failed" });
+      return { success: false, error: result?.message || "Failed to send email" };
+    }
+
+    logResponse(FUNCTION_NAME, requestId, 200, { provider: "resend", success: true });
+    return { success: true, messageId: result?.id };
+  } catch (error: unknown) {
+    logResponse(FUNCTION_NAME, requestId, 500, {
+      provider: "resend",
+      error: error instanceof Error ? error.message : "Unknown",
+    });
+    return { success: false, error: "Email service error" };
+  }
+}
+
 // Generate JWT for Google Service Account
 async function generateGoogleJWT(clientEmail: string, privateKey: string): Promise<string> {
   const header = { alg: "RS256", typ: "JWT" };
@@ -544,7 +597,16 @@ const handler = async (req: Request): Promise<Response> => {
     let result: { success: boolean; messageId?: string; error?: string };
     let usedProvider = emailProvider;
 
-    if (emailProvider === "smtp") {
+    if (emailProvider === "resend") {
+      result = await sendViaResend(
+        adminEmail,
+        contactData.email,
+        subject,
+        htmlContent,
+        textContent,
+        requestId
+      );
+    } else if (emailProvider === "smtp") {
       // SMTP primary (Google Workspace SMTP Relay)
       const smtpConfig = getSMTPConfig();
       

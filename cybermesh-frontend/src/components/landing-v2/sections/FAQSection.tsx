@@ -3,13 +3,13 @@ import { useRef, useState } from "react";
 import { ChevronRight } from "lucide-react";
 
 const faqs = [
-  { q: "What if it blocks real traffic?", a: "We hear this one a lot, and honestly, it is the first thing we worried about too. That is why every pilot starts in passive mode. CyberMesh watches and learns, but does not touch anything until you say so. When it does act, multiple checks have to agree first. You are always in control." },
-  { q: "How is this different from Darktrace or CrowdStrike?", a: "Those tools are great at what they do. Darktrace spots anomalies, CrowdStrike guards endpoints. But neither one closes the loop and actually enforces at the network level. We are not here to replace them. We are the missing piece that makes them complete." },
-  { q: "Do you store our data?", a: "No. We only look at flow metadata like source, destination, and timing. No deep packet inspection, no payloads, nothing leaves your environment. Your data is yours." },
-  { q: "How fast can we get started?", a: "You can have passive mode running in 48 hours. No agents to install on day one. Most teams see their first real detections within the first week of the pilot." },
-  { q: "Will it work with what we already use?", a: "Yes. We built CyberMesh to sit alongside your existing stack, whether that is a SIEM, EDR, NDR, or all three. It plugs into Kubernetes and cloud infrastructure natively." },
-  { q: "What if CyberMesh goes down?", a: "Your network keeps running. Existing enforcement rules stay active, and no new actions fire until the system recovers. We never become a single point of failure." },
-  { q: "Is this built for SaaS teams?", a: "Absolutely. Cloud-native from day one. We understand east-west traffic between your services and enforce policy right at the network fabric, which is exactly where SaaS environments are most exposed." },
+  { q: "What if it blocks real traffic?", a: "First thing we worried about too. Every pilot starts in passive mode. CyberMesh watches and learns, but doesn't touch anything until you say so. When it does act, multiple checks have to agree first. You're always in control." },
+  { q: "How is this different from Darktrace or CrowdStrike?", a: "Those tools are great at what they do. Darktrace spots anomalies, CrowdStrike guards endpoints. Neither closes the loop and enforces at the network level. We're not here to replace them. We're the missing piece that makes them complete." },
+  { q: "Do you store our data?", a: "No. We only look at flow metadata: source, destination, timing. No deep packet inspection, no payloads, nothing leaves your environment." },
+  { q: "How fast can we get started?", a: "Passive mode running in 48 hours. No agents to install on day one. Most teams see their first real detections within the first week." },
+  { q: "Will it work with what we already use?", a: "Yes. CyberMesh sits alongside your existing stack, SIEM, EDR, NDR, or all three. Plugs into Kubernetes and cloud infrastructure natively." },
+  { q: "What if CyberMesh goes down?", a: "Your network keeps running. Existing enforcement rules stay active. No new actions fire until the system recovers. We never become a single point of failure." },
+  { q: "Is this built for SaaS teams?", a: "Yes. Cloud-native from day one. We understand east-west traffic between your services and enforce policy right at the network fabric, exactly where SaaS environments are most exposed." },
 ];
 
 const FAQSection = () => {
@@ -22,24 +22,16 @@ const FAQSection = () => {
     <section className="py-20 px-6 relative" ref={ref}>
       <div className="mx-auto max-w-5xl relative z-10">
         <motion.div initial={{ opacity: 0, y: 30 }} animate={inView ? { opacity: 1, y: 0 } : {}} transition={{ duration: 0.6 }} className="mb-14">
-          <p className="section-label">COMMON QUESTIONS</p>
-          <h2 className="text-2xl sm:text-3xl font-bold tracking-tight text-primary mt-4" style={{ fontFamily: "'Playfair Display', Georgia, serif" }}>
+          <h2 className="text-2xl sm:text-3xl font-bold tracking-tight text-primary" style={{ fontFamily: "'Playfair Display', Georgia, serif" }}>
             We get asked these a lot.{" "}
             <span className="italic" style={{ color: "hsl(var(--accent))" }}>Here are honest answers.</span>
           </h2>
         </motion.div>
 
-        <div className="grid md:grid-cols-2 gap-x-12 gap-y-0">
-          <div>
-            {faqs.slice(0, 4).map((faq, i) => (
-              <FAQItem key={i} q={faq.q} a={faq.a} index={i} isOpen={openIndex === i} onToggle={() => toggle(i)} inView={inView} />
-            ))}
-          </div>
-          <div>
-            {faqs.slice(4).map((faq, i) => (
-              <FAQItem key={i + 4} q={faq.q} a={faq.a} index={i + 4} isOpen={openIndex === i + 4} onToggle={() => toggle(i + 4)} inView={inView} />
-            ))}
-          </div>
+        <div className="max-w-3xl">
+          {faqs.map((faq, i) => (
+            <FAQItem key={i} q={faq.q} a={faq.a} index={i} isOpen={openIndex === i} onToggle={() => toggle(i)} inView={inView} />
+          ))}
         </div>
       </div>
     </section>

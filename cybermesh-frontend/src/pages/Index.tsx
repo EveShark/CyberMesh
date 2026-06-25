@@ -4,31 +4,30 @@ import LandingFooter from "@/components/landing-v2/layout/LandingFooter";
 import HeroSection from "@/components/landing-v2/sections/HeroSection";
 import LogoTicker from "@/components/landing-v2/sections/LogoTicker";
 import ProblemSection from "@/components/landing-v2/sections/ProblemSection";
+import WorldviewSection from "@/components/landing-v2/sections/WorldviewSection";
 import ComparisonSection from "@/components/landing-v2/sections/ComparisonSection";
 import SolutionSection from "@/components/landing-v2/sections/SolutionSection";
+import ProductGallerySection from "@/components/landing-v2/sections/ProductGallerySection";
 import PilotSection from "@/components/landing-v2/sections/PilotSection";
 import ResearchSection from "@/components/landing-v2/sections/ResearchSection";
 import TeamSection from "@/components/landing-v2/sections/TeamSection";
 import FAQSection from "@/components/landing-v2/sections/FAQSection";
 import ScrollReveal from "@/components/landing-v2/shared/ScrollReveal";
-import { InlineContactForm } from "@/components/landing";
+import ContactSection from "@/components/landing-v2/sections/ContactSection";
 
-const ContactSection = () => (
-  <section id="contact" className="py-24 px-6 bg-cta-bg text-cta-foreground relative overflow-hidden">
-    <div
-      className="pointer-events-none absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[400px] opacity-[0.06]"
-      style={{ background: "radial-gradient(ellipse, hsl(42 78% 60%), transparent 70%)" }}
-    />
-    <div className="relative mx-auto max-w-2xl text-center">
-      <h2 className="text-3xl sm:text-4xl lg:text-5xl font-display font-bold tracking-tight">
-        Let&apos;s talk about your network.
-      </h2>
-      <p className="mt-4 text-cta-muted text-lg">
-        Tell us a bit about your environment and we will get back to you within 24 hours.
+const StatementSection = () => (
+  <section className="py-20 px-6" style={{ background: "hsl(222 50% 7%)" }}>
+    <div className="mx-auto max-w-6xl">
+      <p className="text-4xl sm:text-5xl lg:text-[3.5rem] font-display font-bold text-white leading-[1.1] tracking-tight">
+        Detection without enforcement
+        <br />
+        <span className="italic" style={{ color: "hsl(42 78% 60%)" }}>
+          is just expensive noise.
+        </span>
       </p>
-      <div className="mt-10">
-        <InlineContactForm />
-      </div>
+      <p className="mt-6 text-white/45 text-base leading-relaxed max-w-lg">
+        Every SIEM alert, every NDR flag, every EDR event ends the same way: a human has to decide what to do. The moment your attacker is autonomous, that dependency is the breach. CyberMesh ends it.
+      </p>
     </div>
   </section>
 );
@@ -37,10 +36,10 @@ const Index = () => {
   return (
     <>
       <Helmet>
-        <title>CyberMesh - AI-Powered Blockchain Security</title>
+        <title>CyberMesh: The trust layer for autonomous network defense</title>
         <meta
           name="description"
-          content="CyberMesh provides enterprise-grade blockchain security with AI-powered threat detection and autonomous response."
+          content="CyberMesh is the trust layer for autonomous network defense. It detects and contains threats at the infrastructure level, validating every decision before it acts, in under a second."
         />
       </Helmet>
       <div className="min-h-screen bg-background">
@@ -50,9 +49,14 @@ const Index = () => {
           <ScrollReveal>
             <LogoTicker />
           </ScrollReveal>
+          <StatementSection />
+          <ScrollReveal>
+            <ProductGallerySection />
+          </ScrollReveal>
           <ScrollReveal>
             <ProblemSection />
           </ScrollReveal>
+          <WorldviewSection />
           <ScrollReveal>
             <ComparisonSection />
           </ScrollReveal>

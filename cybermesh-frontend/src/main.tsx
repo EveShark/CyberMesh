@@ -6,6 +6,7 @@ import React from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App.tsx";
 import "./index.css";
+import "./landing-buttons.css";
 import { loadRuntimeConfig } from './config/runtime';
 
 // Load runtime config before rendering app

@@ -1,0 +1,51 @@
+.landing-btn-primary {
+  @apply inline-flex items-center gap-2 px-6 py-3 text-sm font-semibold transition-all duration-200;
+  background: hsl(var(--primary));
+  color: hsl(var(--primary-foreground));
+  border-radius: 6px;
+  letter-spacing: -0.01em;
+}
+
+.landing-btn-primary:hover {
+  background: hsl(222 40% 20%);
+  box-shadow: 0 4px 16px hsl(222 47% 11% / 0.2);
+}
+
+.landing-btn-secondary {
+  @apply inline-flex items-center gap-2 px-6 py-3 text-sm font-semibold transition-all duration-200;
+  background: transparent;
+  color: hsl(var(--primary));
+  border: 1.5px solid hsl(var(--primary) / 0.35);
+  border-radius: 6px;
+  letter-spacing: -0.01em;
+}
+
+.landing-btn-secondary:hover {
+  border-color: hsl(var(--primary));
+  background: hsl(var(--primary) / 0.05);
+}
+
+.landing-btn-ghost {
+  @apply inline-flex items-center gap-1 text-sm font-medium transition-colors duration-200;
+  color: hsl(var(--muted-foreground));
+  position: relative;
+}
+
+.landing-btn-ghost::after {
+  content: '';
+  position: absolute;
+  bottom: -1px;
+  left: 0;
+  width: 0;
+  height: 1px;
+  background: hsl(var(--primary));
+  transition: width 0.2s ease;
+}
+
+.landing-btn-ghost:hover {
+  color: hsl(var(--primary));
+}
+
+.landing-btn-ghost:hover::after {
+  width: 100%;
+}
